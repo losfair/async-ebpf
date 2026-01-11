@@ -15,7 +15,6 @@ use std::{
   rc::Rc,
   sync::{
     atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
-    mpsc::RecvTimeoutError,
     Arc, Once,
   },
   thread::ThreadId,
@@ -28,6 +27,7 @@ use corosensei::{
 };
 use futures::{Future, FutureExt};
 use memmap2::{MmapOptions, MmapRaw};
+use parking_lot::{Condvar, Mutex};
 use rand::prelude::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -245,12 +245,22 @@ pub type AsyncTaskOutput = Box<dyn FnOnce(&HelperScope) -> Result<u64, ()>>;
 
 static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Copy, Clone, Debug)]
+enum PreemptionState {
+  Inactive,
+  Active(usize),
+  Shutdown,
+}
+
+type PreemptionStateSignal = (Mutex<PreemptionState>, Condvar);
+
 thread_local! {
   static RUST_TID: ThreadId = std::thread::current().id();
   static SIGUSR1_COUNTER: Cell< u64> = Cell::new(0);
   static ACTIVE_JIT_CODE_ZONE: ActiveJitCodeZone = ActiveJitCodeZone::default();
   static EXEC_CONTEXT_POOL: RefCell<Vec<ExecContext>> = Default::default();
   static PENDING_ASYNC_TASK: RefCell<Option<PendingAsyncTask>> = RefCell::new(None);
+  static PREEMPTION_STATE: Arc<PreemptionStateSignal> = Arc::new((Mutex::new(PreemptionState::Inactive), Condvar::new()));
 }
 
 struct BorrowedExecContext {
@@ -329,6 +339,7 @@ pub struct Program {
   unbound: UnboundProgram,
   data: RefCell<HashMap<TypeId, Rc<dyn Any>>>,
   stack_rng: RefCell<ChaCha8Rng>,
+  t: ThreadEnv,
 }
 
 #[derive(Copy, Clone)]
@@ -412,15 +423,12 @@ impl GlobalEnv {
 
   /// Initializes per-thread state and starts the async preemption watcher.
   pub fn init_thread(self, async_preemption_interval: Duration) -> ThreadEnv {
-    struct DeferDrop(
-      Option<std::sync::mpsc::Sender<()>>,
-      std::sync::mpsc::Receiver<()>,
-    );
+    struct DeferDrop(Arc<PreemptionStateSignal>);
     impl Drop for DeferDrop {
       fn drop(&mut self) {
-        self.0.take();
-        let _ = self.1.recv();
-        // tracing::info! uses TLS state and it is not allowed during thread exit
+        let x = &self.0;
+        *x.0.lock() = PreemptionState::Shutdown;
+        x.1.notify_one();
       }
     }
 
@@ -434,26 +442,37 @@ impl GlobalEnv {
       };
     }
 
+    let preemption_state = PREEMPTION_STATE.with(|x| x.clone());
+
     unsafe {
       let tgid = libc::getpid();
       let tid = libc::gettid();
-      let (watcher_completion_tx, watcher_completion_rx) = std::sync::mpsc::channel::<()>();
-      let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
       std::thread::Builder::new()
         .name("preempt-watcher".to_string())
         .spawn(move || {
-          let _watcher_completion_tx = watcher_completion_tx;
+          let mut state = preemption_state.0.lock();
           loop {
-            if !matches!(
-              shutdown_rx.recv_timeout(async_preemption_interval),
-              Err(RecvTimeoutError::Timeout)
-            ) {
-              break;
-            }
-            let ret = libc::syscall(libc::SYS_tgkill, tgid, tid, libc::SIGUSR1);
-            if ret != 0 {
-              break;
+            match *state {
+              PreemptionState::Shutdown => break,
+              PreemptionState::Inactive => {
+                preemption_state.1.wait(&mut state);
+              }
+              PreemptionState::Active(_) => {
+                let timeout = preemption_state
+                  .1
+                  .wait_while_for(
+                    &mut state,
+                    |x| matches!(x, PreemptionState::Active(_)),
+                    async_preemption_interval,
+                  );
+                if timeout.timed_out() {
+                  let ret = libc::syscall(libc::SYS_tgkill, tgid, tid, libc::SIGUSR1);
+                  if ret != 0 {
+                    break;
+                  }
+                }
+              }
             }
           }
         })
@@ -461,7 +480,7 @@ impl GlobalEnv {
 
       WATCHER.with(|x| {
         x.borrow_mut()
-          .replace(DeferDrop(Some(shutdown_tx), watcher_completion_rx));
+          .replace(DeferDrop(PREEMPTION_STATE.with(|x| x.clone())));
       });
 
       ThreadEnv {
@@ -473,13 +492,58 @@ impl GlobalEnv {
 
 impl UnboundProgram {
   /// Pins the program to the current thread using a prepared `ThreadEnv`.
-  pub fn pin_to_current_thread(self, _: ThreadEnv) -> Program {
+  pub fn pin_to_current_thread(self, t: ThreadEnv) -> Program {
     let stack_rng = RefCell::new(ChaCha8Rng::from_seed(self.stack_rng_seed));
     Program {
       unbound: self,
       data: RefCell::new(HashMap::new()),
       stack_rng,
+      t,
     }
+  }
+}
+
+pub struct PreemptionEnabled(());
+
+impl PreemptionEnabled {
+  pub fn new(_: ThreadEnv) -> Self {
+    PREEMPTION_STATE.with(|x| {
+      let mut notify = false;
+      {
+        let mut st = x.0.lock();
+        let next = match *st {
+          PreemptionState::Inactive => {
+            notify = true;
+            PreemptionState::Active(1)
+          }
+          PreemptionState::Active(n) => PreemptionState::Active(n + 1),
+          PreemptionState::Shutdown => unreachable!(),
+        };
+        *st = next;
+      }
+
+      if notify {
+        x.1.notify_one();
+      }
+    });
+    Self(())
+  }
+}
+
+impl Drop for PreemptionEnabled {
+  fn drop(&mut self) {
+    PREEMPTION_STATE.with(|x| {
+      let mut st = x.0.lock();
+      let next = match *st {
+        PreemptionState::Active(1) => PreemptionState::Inactive,
+        PreemptionState::Active(n) => {
+          assert!(n > 1);
+          PreemptionState::Active(n - 1)
+        }
+        PreemptionState::Inactive | PreemptionState::Shutdown => unreachable!(),
+      };
+      *st = next;
+    });
   }
 }
 
@@ -487,6 +551,10 @@ impl Program {
   /// Returns the unique program identifier.
   pub fn id(&self) -> u64 {
     self.unbound.id
+  }
+
+  pub fn thread_env(&self) -> ThreadEnv {
+    self.t
   }
 
   /// Gets or creates shared typed data for this program instance.
@@ -509,9 +577,12 @@ impl Program {
     entrypoint: &str,
     resources: &mut [&mut dyn Any],
     calldata: &[u8],
+    preemption: &PreemptionEnabled,
   ) -> Result<i64, Error> {
     self
-      ._run(timeslice, timeslicer, entrypoint, resources, calldata)
+      ._run(
+        timeslice, timeslicer, entrypoint, resources, calldata, preemption,
+      )
       .await
       .map_err(Error)
   }
@@ -523,6 +594,7 @@ impl Program {
     entrypoint: &str,
     resources: &mut [&mut dyn Any],
     calldata: &[u8],
+    _: &PreemptionEnabled,
   ) -> Result<i64, RuntimeError> {
     let Some(entrypoint) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));

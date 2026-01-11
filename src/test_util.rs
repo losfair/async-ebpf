@@ -7,7 +7,8 @@ use crate::{
   error::Error,
   helpers::Helper,
   program::{
-    DummyProgramEventListener, GlobalEnv, ProgramLoader, ThreadEnv, TimesliceConfig, Timeslicer,
+    DummyProgramEventListener, GlobalEnv, PreemptionEnabled, ProgramLoader, ThreadEnv,
+    TimesliceConfig, Timeslicer,
   },
 };
 
@@ -197,6 +198,7 @@ pub async fn run_one_program(opts: RunOpts<'_, '_>, code: &str) -> Result<i64, E
       opts.entrypoint,
       opts.resources,
       opts.calldata,
+      &PreemptionEnabled::new(t_env),
     )
     .await
 }

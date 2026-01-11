@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Instant};
 
 use async_ebpf::{
   helpers::Helper,
-  program::{DummyProgramEventListener, HelperScope, Program, ProgramLoader},
+  program::{DummyProgramEventListener, HelperScope, PreemptionEnabled, Program, ProgramLoader},
   test_util::{compile_ebpf, gt_env, timeslice_config, TokioTimeslicer},
 };
 use criterion::{criterion_group, criterion_main, measurement::WallTime, Bencher, Criterion};
@@ -20,9 +20,17 @@ fn criterion_benchmark(c: &mut Criterion) {
     );
     let mut b = b.to_async(&rt);
 
+    let preemption = PreemptionEnabled::new(prog.thread_env());
     b.iter(|| async {
       let ret = prog
-        .run(&timeslice_config(), &TokioTimeslicer, "test", &mut [], b"")
+        .run(
+          &timeslice_config(),
+          &TokioTimeslicer,
+          "test",
+          &mut [],
+          b"",
+          &preemption,
+        )
         .await
         .unwrap();
       assert_eq!(ret, 42);
@@ -52,9 +60,11 @@ fn criterion_benchmark(c: &mut Criterion) {
       }],
     );
     let mut b = b.to_async(&rt);
+    let preemption = PreemptionEnabled::new(prog.thread_env());
 
     b.iter_custom(|iters| {
       let prog = &prog;
+      let preemption = &preemption;
       async move {
         let start = Instant::now();
         let calldata: [u8; 8] = iters.to_le_bytes();
@@ -65,6 +75,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             "test",
             &mut [],
             &calldata,
+            &preemption,
           )
           .await
           .unwrap();

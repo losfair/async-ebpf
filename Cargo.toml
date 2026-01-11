@@ -25,8 +25,10 @@ elf = "0.7"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 libc = "0.2"
 memmap2 = "0.9"
+parking_lot = "0.12"
 rand = { version = "0.8", default-features = false }
 rand_chacha = "0.3"
+scopeguard = "1"
 thiserror = "1"
 tokio = { version = "1", optional = true, features = ["full"] }
 tracing = "0.1"
