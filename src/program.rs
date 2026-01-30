@@ -43,7 +43,8 @@ use crate::{
 const NATIVE_STACK_SIZE: usize = 16384;
 const SHADOW_STACK_SIZE: usize = 4096;
 const MAX_CALLDATA_SIZE: usize = 512;
-const MAX_DEREF_REGIONS: usize = 4;
+const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
+const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 
 /// Per-invocation storage for helper state during a program run.
 pub struct InvokeScope {
@@ -70,8 +71,8 @@ pub struct HelperScope<'a, 'b> {
   /// Mutable per-invocation data for helpers.
   pub invoke: RefCell<&'a mut InvokeScope>,
   resources: RefCell<&'a mut [&'b mut dyn Any]>,
-  mutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_DEREF_REGIONS],
-  immutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_DEREF_REGIONS],
+  mutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_MUTABLE_DEREF_REGIONS],
+  immutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_IMMUTABLE_DEREF_REGIONS],
   can_post_task: bool,
 }
 
@@ -459,13 +460,11 @@ impl GlobalEnv {
                 preemption_state.1.wait(&mut state);
               }
               PreemptionState::Active(_) => {
-                let timeout = preemption_state
-                  .1
-                  .wait_while_for(
-                    &mut state,
-                    |x| matches!(x, PreemptionState::Active(_)),
-                    async_preemption_interval,
-                  );
+                let timeout = preemption_state.1.wait_while_for(
+                  &mut state,
+                  |x| matches!(x, PreemptionState::Active(_)),
+                  async_preemption_interval,
+                );
                 if timeout.timed_out() {
                   let ret = libc::syscall(libc::SYS_tgkill, tgid, tid, libc::SIGUSR1);
                   if ret != 0 {
