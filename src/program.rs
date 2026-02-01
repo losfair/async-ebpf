@@ -29,8 +29,6 @@ use futures::{Future, FutureExt};
 use memmap2::{MmapOptions, MmapRaw};
 use parking_lot::{Condvar, Mutex};
 use rand::prelude::SliceRandom;
-use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
 
 use crate::{
   error::{Error, RuntimeError},
@@ -269,13 +267,13 @@ struct BorrowedExecContext {
 }
 
 impl BorrowedExecContext {
-  fn new(stack_rng: &mut impl rand::Rng) -> Self {
+  fn new() -> Self {
     let mut me = Self {
       ctx: ManuallyDrop::new(
         EXEC_CONTEXT_POOL.with(|x| x.borrow_mut().pop().unwrap_or_else(ExecContext::new)),
       ),
     };
-    stack_rng.fill(&mut *me.ctx.copy_stack);
+    me.ctx.copy_stack.fill(0x8e);
     me
   }
 }
@@ -332,14 +330,12 @@ pub struct UnboundProgram {
   helpers: Arc<Vec<(u16, &'static str, Helper)>>,
   event_listener: Arc<dyn ProgramEventListener>,
   entrypoints: HashMap<String, Entrypoint>,
-  stack_rng_seed: [u8; 32],
 }
 
 /// A program pinned to a specific thread and ready to execute.
 pub struct Program {
   unbound: UnboundProgram,
   data: RefCell<HashMap<TypeId, Rc<dyn Any>>>,
-  stack_rng: RefCell<ChaCha8Rng>,
   t: ThreadEnv,
 }
 
@@ -492,11 +488,9 @@ impl GlobalEnv {
 impl UnboundProgram {
   /// Pins the program to the current thread using a prepared `ThreadEnv`.
   pub fn pin_to_current_thread(self, t: ThreadEnv) -> Program {
-    let stack_rng = RefCell::new(ChaCha8Rng::from_seed(self.stack_rng_seed));
     Program {
       unbound: self,
       data: RefCell::new(HashMap::new()),
-      stack_rng,
       t,
     }
   }
@@ -624,7 +618,7 @@ impl Program {
       }
     }
 
-    let mut ectx = BorrowedExecContext::new(&mut *self.stack_rng.borrow_mut());
+    let mut ectx = BorrowedExecContext::new();
 
     if calldata.len() > MAX_CALLDATA_SIZE {
       return Err(RuntimeError::InvalidArgument("calldata too large"));
@@ -1099,7 +1093,6 @@ impl ProgramLoader {
         helpers: self.helpers.clone(),
         event_listener: self.event_listener.clone(),
         entrypoints,
-        stack_rng_seed: rng.gen(),
       })
     }
   }
