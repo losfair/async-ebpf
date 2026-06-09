@@ -79,6 +79,9 @@ pub fn link_elf(
     if cs.sh_type != SHT_PROGBITS || cs.sh_flags != SHF_ALLOC | SHF_EXECINSTR {
       continue;
     }
+    if cs.sh_size == 0 {
+      continue;
+    }
 
     let Ok(cs_name) = sht_strtab.get(cs.sh_name as usize) else {
       continue;
