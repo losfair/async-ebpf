@@ -38,10 +38,18 @@
 #define _countof(array) (sizeof(array) / sizeof(array[0]))
 #endif
 
-/* Special values for target_pc in struct jump */
-#define TARGET_PC_EXIT ~UINT32_C(0)
-#define TARGET_PC_ENTER (~UINT32_C(0) & 0x0101)
-#define TARGET_PC_EXTERNAL_DISPATCHER (~UINT32_C(0) & 0x1010)
+/* Special values for target_pc in struct jump.
+ *
+ * These must be sentinels that can never equal a real eBPF instruction index.
+ * The previous values `(~0 & 0x0101)` = 257 and `(~0 & 0x1010)` = 4112 are small
+ * and DO collide with valid program counters: any program with >257 (resp.
+ * >4112) instructions that contains a jump to instruction 257 (resp. 4112) had
+ * that jump misresolved to the function entry / external dispatcher, producing
+ * an infinite loop. Use values just below UINT32_MAX, which exceed
+ * UBPF_MAX_INSTS and so can never be a real instruction index. */
+#define TARGET_PC_EXIT (~UINT32_C(0))
+#define TARGET_PC_ENTER (~UINT32_C(0) - 1)
+#define TARGET_PC_EXTERNAL_DISPATCHER (~UINT32_C(0) - 2)
 
 // This is guaranteed to be an illegal A64 instruction.
 #define BAD_OPCODE ~UINT32_C(0)
