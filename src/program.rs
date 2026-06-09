@@ -9,7 +9,6 @@ use std::{
   marker::PhantomData,
   mem::ManuallyDrop,
   ops::{Deref, DerefMut},
-  os::raw::c_void,
   pin::Pin,
   ptr::NonNull,
   rc::Rc,
@@ -260,6 +259,7 @@ thread_local! {
   static EXEC_CONTEXT_POOL: RefCell<Vec<ExecContext>> = Default::default();
   static PENDING_ASYNC_TASK: RefCell<Option<PendingAsyncTask>> = RefCell::new(None);
   static PREEMPTION_STATE: Arc<PreemptionStateSignal> = Arc::new((Mutex::new(PreemptionState::Inactive), Condvar::new()));
+  static LOADING_PROGRAM_LOADER: Cell<*const ProgramLoader> = const { Cell::new(std::ptr::null()) };
 }
 
 struct BorrowedExecContext {
@@ -594,9 +594,10 @@ impl Program {
     };
 
     let entry = unsafe {
-      std::mem::transmute::<_, unsafe extern "C" fn(ctx: usize, shadow_stack: usize) -> u64>(
-        entrypoint.code_ptr,
-      )
+      std::mem::transmute::<
+        _,
+        unsafe extern "C" fn(ctx: usize, mem_len: usize, stack: usize, stack_len: usize) -> u64,
+      >(entrypoint.code_ptr)
     };
     struct CoDropper<'a, Input, Yield, Return, DefaultStack: Stack>(
       ScopedCoroutine<'a, Input, Yield, Return, DefaultStack>,
@@ -628,6 +629,7 @@ impl Program {
 
     let program_ret: u64 = {
       let shadow_stack_top = self.unbound.cage.stack_top();
+      let shadow_stack_bottom = self.unbound.cage.stack_bottom();
       let shadow_stack_ptr = AssumeSend(
         self
           .unbound
@@ -643,9 +645,12 @@ impl Program {
           ACTIVE_JIT_CODE_ZONE.with(|x| {
             x.yielder.set(NonNull::new(yielder as *const _ as *mut _));
           });
+          let stack_len = SHADOW_STACK_SIZE - calldata_len;
           entry(
             shadow_stack_top - calldata_len,
             shadow_stack_top - calldata_len,
+            shadow_stack_bottom,
+            stack_len,
           )
         },
       )));
@@ -848,7 +853,6 @@ impl Vm {
     let vm = NonNull::new(unsafe { crate::ubpf::ubpf_create() }).expect("failed to create ubpf_vm");
     unsafe {
       crate::ubpf::ubpf_toggle_bounds_check(vm.as_ptr(), false);
-      crate::ubpf::ubpf_toggle_jit_shadow_stack(vm.as_ptr(), true);
       crate::ubpf::ubpf_set_jit_pointer_mask_and_offset(vm.as_ptr(), cage.mask(), cage.offset());
     }
     Self(vm)
@@ -860,6 +864,27 @@ impl Drop for Vm {
     unsafe {
       crate::ubpf::ubpf_destroy(self.0.as_ptr());
     }
+  }
+}
+
+struct LoaderValidationScope {
+  previous: *const ProgramLoader,
+}
+
+impl LoaderValidationScope {
+  fn new(loader: &ProgramLoader) -> Self {
+    let previous = LOADING_PROGRAM_LOADER.with(|x| {
+      let previous = x.get();
+      x.set(loader as *const _);
+      previous
+    });
+    Self { previous }
+  }
+}
+
+impl Drop for LoaderValidationScope {
+  fn drop(&mut self) {
+    LOADING_PROGRAM_LOADER.with(|x| x.set(self.previous));
   }
 }
 
@@ -950,7 +975,6 @@ impl ProgramLoader {
         vm.0.as_ptr(),
         Some(tls_dispatcher),
         Some(std_validator),
-        self as *const _ as *mut c_void,
       ) != 0
       {
         return Err(RuntimeError::PlatformError(
@@ -995,12 +1019,17 @@ impl ProgramLoader {
         let code = cage
           .safe_deref_for_read(code_vaddr_size.0, code_vaddr_size.1)
           .unwrap();
-        let ret = crate::ubpf::ubpf_load(
-          vm.0.as_ptr(),
-          code.as_ptr() as *const _,
-          code.len() as u32,
-          &mut errmsg_ptr,
-        );
+        let ret = {
+          let validation_scope = LoaderValidationScope::new(self);
+          let ret = crate::ubpf::ubpf_load(
+            vm.0.as_ptr(),
+            code.as_ptr() as *const _,
+            code.len() as u32,
+            &mut errmsg_ptr,
+          );
+          drop(validation_scope);
+          ret
+        };
         if ret != 0 {
           let errmsg = if errmsg_ptr.is_null() {
             "".to_string()
@@ -1015,11 +1044,12 @@ impl ProgramLoader {
         }
 
         let mut written_len = code_slice.len();
-        let ret = crate::ubpf::ubpf_translate(
+        let ret = crate::ubpf::ubpf_translate_ex(
           vm.0.as_ptr(),
           code_slice.as_mut_ptr(),
           &mut written_len,
           &mut errmsg_ptr,
+          crate::ubpf::JitMode_ExtendedJitMode,
         );
         if ret != 0 {
           let errmsg = if errmsg_ptr.is_null() {
@@ -1048,6 +1078,23 @@ impl ProgramLoader {
 
       // Align up code_len to page size
       let unpadded_code_len = code_len_allocated - code_slice.len();
+      eprintln!(
+        "[JITSIZE] elf={} native_unpadded={} buffer={}",
+        elf.len(),
+        unpadded_code_len,
+        code_len_allocated
+      );
+      if std::env::var("JIT_DUMP").is_ok() {
+        let native = std::slice::from_raw_parts(
+          code_mem.as_ptr().offset(guard_size_before as isize),
+          unpadded_code_len,
+        );
+        let mut hex = String::with_capacity(native.len() * 2);
+        for b in native {
+          hex.push_str(&format!("{b:02x}"));
+        }
+        eprintln!("[JITHEX] {hex}");
+      }
       let code_len = (unpadded_code_len + page_size - 1) & !(page_size - 1);
       assert!(code_len <= code_len_allocated);
 
@@ -1139,9 +1186,13 @@ unsafe extern "C" fn tls_dispatcher(
 
 unsafe extern "C" fn std_validator(
   index: std::os::raw::c_uint,
-  loader: *mut std::os::raw::c_void,
+  _vm: *const crate::ubpf::ubpf_vm,
 ) -> bool {
-  let loader = &*(loader as *const ProgramLoader);
+  let loader = LOADING_PROGRAM_LOADER.with(|x| x.get());
+  if loader.is_null() {
+    return false;
+  }
+  let loader = &*loader;
   let entropy = (index >> 16) & 0xffff;
   let index = (((index & 0xffff) as u16) ^ loader.helper_id_xor).wrapping_sub(1);
   loader.helpers.get(index as usize).map(|x| x.0) == Some(entropy as u16)

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 fn main() {
   let dst = cmake::Config::new("vendor/ubpf")
+    .define("UBPF_SKIP_EXTERNAL", "ON")
     .build_target("ubpf")
     .build();
 

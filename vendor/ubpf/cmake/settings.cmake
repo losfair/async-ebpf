@@ -7,6 +7,7 @@
 #
 
 add_library("ubpf_settings" INTERFACE)
+add_library("ubpf_settings_libfuzzer" INTERFACE)
 
 # Only configure our settings target if we are being built directly.
 # If we are being used as a submodule, give a chance to the parent
@@ -26,6 +27,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
       CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
 
       target_compile_options("ubpf_settings" INTERFACE
+        -O0
         -g
       )
     endif()
@@ -63,6 +65,30 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
       )
     endif()
 
+    if(UBPF_ENABLE_LIBFUZZER)
+      # Do not link in a main here -- that screws up other targets.
+      # Link in main for the ubpf_fuzzer target (see libfuzzer/CmakeLists.txt)
+      set(fuzzer_flags
+        -g
+        -O0
+        -fsanitize=fuzzer-no-link
+        -fsanitize=address
+        -fsanitize-coverage=edge,indirect-calls,trace-cmp,trace-div,trace-gep
+        )
+
+      # Check if compiler is clang and emit error if not
+        if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+            message(FATAL_ERROR "LibFuzzer is only supported with Clang")
+        endif()
+
+        target_compile_options("ubpf_settings" INTERFACE
+            ${fuzzer_flags}
+        )
+
+        target_link_options("ubpf_settings" INTERFACE
+            ${fuzzer_flags}
+        )
+    endif()
   elseif(PLATFORM_WINDOWS)
     set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "8.1")
 
