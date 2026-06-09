@@ -364,6 +364,41 @@ emit_masked_address(
 }
 
 static void
+emit_masked_address_with_offset(
+    const struct ubpf_vm* vm,
+    struct jit_state* state,
+    enum Registers src,
+    enum Registers dst,
+    enum Registers scratch,
+    int16_t offset)
+{
+    assert(dst != scratch);
+
+    if (src != dst) {
+        emit_logical_register(state, true, LOG_ORR, dst, RZ, src);
+    }
+
+    if (offset != 0) {
+        int32_t abs_offset = offset;
+        enum AddSubOpcode addsub_op = AS_ADD;
+
+        if (offset < 0) {
+            addsub_op = AS_SUB;
+            abs_offset = -(int32_t)offset;
+        }
+
+        if (abs_offset < 0x1000) {
+            emit_addsub_immediate(state, true, addsub_op, dst, dst, (uint32_t)abs_offset);
+        } else {
+            emit_movewide_immediate(state, true, scratch, (uint32_t)abs_offset);
+            emit_addsub_register(state, true, addsub_op, dst, dst, scratch);
+        }
+    }
+
+    emit_masked_address(vm, state, dst, dst, scratch);
+}
+
+static void
 emit_masked_loadstore(
     const struct ubpf_vm* vm,
     struct jit_state* state,
@@ -372,14 +407,14 @@ emit_masked_loadstore(
     enum Registers rn,
     int16_t offset)
 {
-    enum Registers addr = rn;
     if (vm->jit_pointer_mask) {
-        emit_masked_address(vm, state, rn, temp_div_register, offset_register);
-        addr = temp_div_register;
+        emit_masked_address_with_offset(vm, state, rn, temp_div_register, offset_register, offset);
+        emit_loadstore_immediate(state, op, rt, temp_div_register, 0);
+        return;
     }
 
     if (offset >= -256 && offset < 256) {
-        emit_loadstore_immediate(state, op, rt, addr, offset);
+        emit_loadstore_immediate(state, op, rt, rn, offset);
     } else {
         enum Registers addr_temp = temp_div_register;
         int32_t abs_offset = offset;
@@ -391,10 +426,10 @@ emit_masked_loadstore(
         }
 
         if (abs_offset < 0x1000) {
-            emit_addsub_immediate(state, true, addsub_op, addr_temp, addr, (uint32_t)abs_offset);
+            emit_addsub_immediate(state, true, addsub_op, addr_temp, rn, (uint32_t)abs_offset);
         } else {
             emit_movewide_immediate(state, true, offset_register, (uint32_t)abs_offset);
-            emit_addsub_register(state, true, addsub_op, addr_temp, addr, offset_register);
+            emit_addsub_register(state, true, addsub_op, addr_temp, rn, offset_register);
         }
 
         emit_loadstore_immediate(state, op, rt, addr_temp, 0);
@@ -831,15 +866,15 @@ emit_atomic_operation(
     enum Registers addr_temp =
         (status_reg == temp_div_register) ? offset_register : temp_div_register;
 
-    if (vm->jit_pointer_mask) {
-        enum Registers mask_scratch =
-            (addr_temp == offset_register) ? temp_div_register : offset_register;
-        emit_masked_address(vm, state, addr_reg, addr_temp, mask_scratch);
-        addr_reg = addr_temp;
-    }
+    enum Registers scratch =
+        (addr_temp == offset_register) ? temp_div_register : offset_register;
 
-    if (offset != 0) {
-        // Use int32_t to avoid undefined behavior when negating INT16_MIN
+    // Copy addr_reg into addr_temp so that the base register used by LDXR/STXR
+    // is guaranteed not to alias status_reg.
+    if (vm->jit_pointer_mask) {
+        emit_masked_address_with_offset(vm, state, addr_reg, addr_temp, scratch, offset);
+    } else if (offset != 0) {
+        // Use int32_t to avoid undefined behavior when negating INT16_MIN.
         int32_t abs_offset = offset;
         enum AddSubOpcode op = AS_ADD;
 
@@ -848,18 +883,13 @@ emit_atomic_operation(
             abs_offset = -(int32_t)offset;
         }
 
-        if (abs_offset < 256) {
-            emit_addsub_immediate(state, true, op, addr_temp, addr_reg, (int16_t)abs_offset);
+        if (abs_offset < 0x1000) {
+            emit_addsub_immediate(state, true, op, addr_temp, addr_reg, (uint32_t)abs_offset);
         } else {
-            // Choose a scratch register for the offset that is distinct from addr_temp.
-            enum Registers offset_temp =
-                (addr_temp == offset_register) ? temp_div_register : offset_register;
-            EMIT_MOVEWIDE_IMMEDIATE(vm, state, true, offset_temp, offset);
-            emit_addsub_register(state, true, AS_ADD, addr_temp, addr_reg, offset_temp);
+            emit_movewide_immediate(state, true, scratch, (uint32_t)abs_offset);
+            emit_addsub_register(state, true, op, addr_temp, addr_reg, scratch);
         }
     } else {
-        // Copy addr_reg into addr_temp so that the base register used by LDXR/STXR
-        // is guaranteed not to alias status_reg.
         emit_logical_register(state, true, LOG_ORR, addr_temp, RZ, addr_reg);
     }
 

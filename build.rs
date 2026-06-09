@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
 fn main() {
+  println!("cargo:rerun-if-changed=vendor/ubpf/CMakeLists.txt");
+  println!("cargo:rerun-if-changed=vendor/ubpf/cmake");
+  println!("cargo:rerun-if-changed=vendor/ubpf/vm");
+
   let dst = cmake::Config::new("vendor/ubpf")
     .define("UBPF_SKIP_EXTERNAL", "ON")
     .build_target("ubpf")

@@ -489,12 +489,32 @@ emit_masked_address(const struct ubpf_vm* vm, struct jit_state* state, int src, 
 }
 
 static inline void
+emit_masked_address_with_offset(
+    const struct ubpf_vm* vm, struct jit_state* state, int src, int dst, int scratch, int32_t offset)
+{
+    assert(dst != scratch);
+
+    if (src != dst) {
+        emit_mov(state, src, dst);
+    }
+
+    if (offset != 0) {
+        emit_alu64_imm32(state, 0x81, 0, dst, offset);
+    }
+
+    if (vm->jit_pointer_mask) {
+        emit_alu64_imm32(state, 0x81, 4, dst, vm->jit_pointer_mask);
+        emit_add_imm64(state, dst, vm->jit_pointer_offset, scratch);
+    }
+}
+
+static inline void
 emit_masked_load(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address(vm, state, src, R11, RCX);
-        emit_load(state, size, R11, dst, offset);
+        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset);
+        emit_load(state, size, R11, dst, 0);
     } else {
         emit_load(state, size, src, dst, offset);
     }
@@ -505,8 +525,8 @@ emit_masked_load_sx(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address(vm, state, src, R11, RCX);
-        emit_load_sx(state, size, R11, dst, offset);
+        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset);
+        emit_load_sx(state, size, R11, dst, 0);
     } else {
         emit_load_sx(state, size, src, dst, offset);
     }
@@ -814,8 +834,8 @@ emit_masked_store(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address(vm, state, dst, R11, RCX);
-        emit_store(state, size, src, R11, offset);
+        emit_masked_address_with_offset(vm, state, dst, R11, RCX, offset);
+        emit_store(state, size, src, R11, 0);
     } else {
         emit_store(state, size, src, dst, offset);
     }
@@ -1771,12 +1791,12 @@ emit_masked_store_imm32(
     int32_t imm)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address(vm, state, dst, RCX, R11);
+        emit_masked_address_with_offset(vm, state, dst, RCX, R11, offset);
         if (vm->constant_blinding_enabled) {
-            emit_store_imm32_blinded(state, size, RCX, offset, imm);
+            emit_store_imm32_blinded(state, size, RCX, 0, imm);
         } else {
             emit_load_imm(state, R11, imm);
-            emit_store(state, size, R11, RCX, offset);
+            emit_store(state, size, R11, RCX, 0);
         }
     } else {
         EMIT_STORE_IMM32(vm, state, size, dst, offset, imm);
@@ -2436,44 +2456,46 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_ATOMIC_STORE: {
             bool fetch = inst.imm & EBPF_ATOMIC_OP_FETCH;
             int atomic_dst = dst;
+            int atomic_offset = inst.offset;
             if (vm->jit_pointer_mask) {
-                emit_masked_address(vm, state, dst, R11, RCX);
+                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset);
                 atomic_dst = R11;
+                atomic_offset = 0;
             }
             switch (inst.imm & EBPF_ALU_OP_MASK) {
             case EBPF_ALU_OP_ADD:
                 if (fetch) {
-                    emit_atomic_fetch_add64(state, src, atomic_dst, inst.offset);
+                    emit_atomic_fetch_add64(state, src, atomic_dst, atomic_offset);
                 } else {
-                    emit_atomic_add64(state, src, atomic_dst, inst.offset);
+                    emit_atomic_add64(state, src, atomic_dst, atomic_offset);
                 }
                 break;
             case EBPF_ALU_OP_OR:
                 if (fetch) {
-                    emit_atomic_fetch_or64(state, src, atomic_dst, inst.offset);
+                    emit_atomic_fetch_or64(state, src, atomic_dst, atomic_offset);
                 } else {
-                    emit_atomic_or64(state, src, atomic_dst, inst.offset);
+                    emit_atomic_or64(state, src, atomic_dst, atomic_offset);
                 }
                 break;
             case EBPF_ALU_OP_AND:
                 if (fetch) {
-                    emit_atomic_fetch_and64(state, src, atomic_dst, inst.offset);
+                    emit_atomic_fetch_and64(state, src, atomic_dst, atomic_offset);
                 } else {
-                    emit_atomic_and64(state, src, atomic_dst, inst.offset);
+                    emit_atomic_and64(state, src, atomic_dst, atomic_offset);
                 }
                 break;
             case EBPF_ALU_OP_XOR:
                 if (fetch) {
-                    emit_atomic_fetch_xor64(state, src, atomic_dst, inst.offset);
+                    emit_atomic_fetch_xor64(state, src, atomic_dst, atomic_offset);
                 } else {
-                    emit_atomic_xor64(state, src, atomic_dst, inst.offset);
+                    emit_atomic_xor64(state, src, atomic_dst, atomic_offset);
                 }
                 break;
             case (EBPF_ATOMIC_OP_XCHG & ~EBPF_ATOMIC_OP_FETCH):
-                emit_atomic_exchange64(state, src, atomic_dst, inst.offset);
+                emit_atomic_exchange64(state, src, atomic_dst, atomic_offset);
                 break;
             case (EBPF_ATOMIC_OP_CMPXCHG & ~EBPF_ATOMIC_OP_FETCH):
-                emit_atomic_compare_exchange64(state, src, atomic_dst, inst.offset);
+                emit_atomic_compare_exchange64(state, src, atomic_dst, atomic_offset);
                 break;
             default:
                 *errmsg = ubpf_error("Error: unknown atomic opcode %d at PC %d\n", inst.imm, i);
@@ -2484,45 +2506,47 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_ATOMIC32_STORE: {
             bool fetch = inst.imm & EBPF_ATOMIC_OP_FETCH;
             int atomic_dst = dst;
+            int atomic_offset = inst.offset;
             if (vm->jit_pointer_mask) {
-                emit_masked_address(vm, state, dst, R11, RCX);
+                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset);
                 atomic_dst = R11;
+                atomic_offset = 0;
             }
             switch (inst.imm & EBPF_ALU_OP_MASK) {
             case EBPF_ALU_OP_ADD:
                 if (fetch) {
-                    emit_atomic_fetch_add32(state, src, atomic_dst, inst.offset);
+                    emit_atomic_fetch_add32(state, src, atomic_dst, atomic_offset);
                 } else {
-                    emit_atomic_add32(state, src, atomic_dst, inst.offset);
+                    emit_atomic_add32(state, src, atomic_dst, atomic_offset);
                 }
                 break;
             case EBPF_ALU_OP_OR:
                 if (fetch) {
-                    emit_atomic_fetch_or32(state, src, atomic_dst, inst.offset);
+                    emit_atomic_fetch_or32(state, src, atomic_dst, atomic_offset);
                 } else {
-                    emit_atomic_or32(state, src, atomic_dst, inst.offset);
+                    emit_atomic_or32(state, src, atomic_dst, atomic_offset);
                 }
                 break;
             case EBPF_ALU_OP_AND:
                 if (fetch) {
-                    emit_atomic_fetch_and32(state, src, atomic_dst, inst.offset);
+                    emit_atomic_fetch_and32(state, src, atomic_dst, atomic_offset);
                 } else {
-                    emit_atomic_and32(state, src, atomic_dst, inst.offset);
+                    emit_atomic_and32(state, src, atomic_dst, atomic_offset);
                 }
                 break;
             case EBPF_ALU_OP_XOR:
                 if (fetch) {
-                    emit_atomic_fetch_xor32(state, src, atomic_dst, inst.offset);
+                    emit_atomic_fetch_xor32(state, src, atomic_dst, atomic_offset);
                 } else {
-                    emit_atomic_xor32(state, src, atomic_dst, inst.offset);
+                    emit_atomic_xor32(state, src, atomic_dst, atomic_offset);
                 }
                 break;
             case (EBPF_ATOMIC_OP_XCHG & ~EBPF_ATOMIC_OP_FETCH):
-                emit_atomic_exchange32(state, src, atomic_dst, inst.offset);
+                emit_atomic_exchange32(state, src, atomic_dst, atomic_offset);
                 emit_truncate_u32(state, src);
                 break;
             case (EBPF_ATOMIC_OP_CMPXCHG & ~EBPF_ATOMIC_OP_FETCH):
-                emit_atomic_compare_exchange32(state, src, atomic_dst, inst.offset);
+                emit_atomic_compare_exchange32(state, src, atomic_dst, atomic_offset);
                 emit_truncate_u32(state, map_register(0));
                 break;
             default:

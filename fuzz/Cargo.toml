@@ -1,0 +1,28 @@
+[package]
+name = "async-ebpf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+async-ebpf = { path = "..", features = ["testing"] }
+libfuzzer-sys = "0.4"
+rand = "0.8"
+tokio = { version = "1", features = ["rt", "time"] }
+
+[[bin]]
+name = "jit_memory_safety"
+path = "fuzz_targets/jit_memory_safety.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_pointer_escape"
+path = "fuzz_targets/host_pointer_escape.rs"
+test = false
+doc = false
+bench = false

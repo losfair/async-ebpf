@@ -400,8 +400,8 @@ impl GlobalEnv {
       let sa_mask = get_blocked_sigset();
 
       for (sig, handler) in [
-        (libc::SIGUSR1, sigusr1_handler as usize),
-        (libc::SIGSEGV, sigsegv_handler as usize),
+        (libc::SIGUSR1, sigusr1_handler as *const () as usize),
+        (libc::SIGSEGV, sigsegv_handler as *const () as usize),
       ] {
         let act = libc::sigaction {
           sa_sigaction: handler,
@@ -645,10 +645,12 @@ impl Program {
           ACTIVE_JIT_CODE_ZONE.with(|x| {
             x.yielder.set(NonNull::new(yielder as *const _ as *mut _));
           });
-          let stack_len = SHADOW_STACK_SIZE - calldata_len;
+          let calldata_start = shadow_stack_top - calldata_len;
+          let stack_top = calldata_start & !0x7;
+          let stack_len = stack_top - shadow_stack_bottom;
           entry(
-            shadow_stack_top - calldata_len,
-            shadow_stack_top - calldata_len,
+            calldata_start,
+            calldata_start,
             shadow_stack_bottom,
             stack_len,
           )
@@ -1078,13 +1080,13 @@ impl ProgramLoader {
 
       // Align up code_len to page size
       let unpadded_code_len = code_len_allocated - code_slice.len();
-      eprintln!(
-        "[JITSIZE] elf={} native_unpadded={} buffer={}",
-        elf.len(),
-        unpadded_code_len,
-        code_len_allocated
-      );
       if std::env::var("JIT_DUMP").is_ok() {
+        eprintln!(
+          "[JITSIZE] elf={} native_unpadded={} buffer={}",
+          elf.len(),
+          unpadded_code_len,
+          code_len_allocated
+        );
         let native = std::slice::from_raw_parts(
           code_mem.as_ptr().offset(guard_size_before as isize),
           unpadded_code_len,
