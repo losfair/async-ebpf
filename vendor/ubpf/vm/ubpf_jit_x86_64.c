@@ -474,21 +474,6 @@ emit_add_imm64(struct jit_state* state, int dst, uint64_t imm, int scratch)
 }
 
 static inline void
-emit_masked_address(const struct ubpf_vm* vm, struct jit_state* state, int src, int dst, int scratch)
-{
-    assert(dst != scratch);
-
-    if (src != dst) {
-        emit_mov(state, src, dst);
-    }
-
-    if (vm->jit_pointer_mask) {
-        emit_alu64_imm32(state, 0x81, 4, dst, vm->jit_pointer_mask);
-        emit_add_imm64(state, dst, vm->jit_pointer_offset, scratch);
-    }
-}
-
-static inline void
 emit_masked_address_with_offset(
     const struct ubpf_vm* vm, struct jit_state* state, int src, int dst, int scratch, int32_t offset)
 {
