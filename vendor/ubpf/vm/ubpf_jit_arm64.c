@@ -1787,46 +1787,64 @@ divmod(struct jit_state* state, uint8_t opcode, int rd, int rn, int rm, int16_t 
     }
 }
 
-static void
+static bool
 resolve_branch_immediate(struct jit_state* state, uint32_t offset, int32_t imm)
 {
-    assert((imm & 3) == 0);
+    if ((imm & 3) != 0) {
+        return false;
+    }
     uint32_t instr;
     imm >>= 2;
     memcpy(&instr, state->buf + offset, sizeof(uint32_t));
     if ((instr & 0xfe000000U) == 0x54000000U       /* Conditional branch immediate.  */
         || (instr & 0x7e000000U) == 0x34000000U) { /* Compare and branch immediate.  */
-        assert((imm >> 19) == INT64_C(-1) || (imm >> 19) == 0);
+        /* Signed 19-bit immediate. */
+        if ((imm >> 18) != INT64_C(-1) && (imm >> 18) != 0) {
+            return false;
+        }
         instr |= (imm & 0x7ffff) << 5;
     } else if ((instr & 0x7c000000U) == 0x14000000U) {
-        /* Unconditional branch immediate.  */
-        assert((imm >> 26) == INT64_C(-1) || (imm >> 26) == 0);
+        /* Unconditional branch immediate: signed 26-bit immediate. */
+        if ((imm >> 25) != INT64_C(-1) && (imm >> 25) != 0) {
+            return false;
+        }
         instr |= (imm & 0x03ffffffU) << 0;
     } else {
-        assert(false);
-        instr = BAD_OPCODE;
+        return false;
     }
     memcpy(state->buf + offset, &instr, sizeof(uint32_t));
+    return true;
 }
 
-static void
+static bool
 resolve_load_literal(struct jit_state* state, uint32_t instr_offset, int32_t target_offset)
 {
+    /* LDR (literal) has a signed 19-bit immediate. */
+    if ((target_offset >> 18) != INT64_C(-1) && (target_offset >> 18) != 0) {
+        return false;
+    }
     uint32_t instr;
     target_offset = (0x7FFFF & target_offset) << 5;
     memcpy(&instr, state->buf + instr_offset, sizeof(uint32_t));
     instr |= target_offset;
     memcpy(state->buf + instr_offset, &instr, sizeof(uint32_t));
+    return true;
 }
 
-static void
+static bool
 resolve_adr(struct jit_state* state, uint32_t instr_offset, int32_t immediate)
 {
+    /* The immhi field of ADR is signed 19-bit; a wider value would also
+     * corrupt opcode bits 28:24. */
+    if ((immediate >> 18) != INT64_C(-1) && (immediate >> 18) != 0) {
+        return false;
+    }
     uint32_t instr;
-    uint32_t immhi = (immediate & 0x00ffffff) << 5;
+    uint32_t immhi = (immediate & 0x7FFFF) << 5;
     memcpy(&instr, state->buf + instr_offset, sizeof(uint32_t));
     instr |= immhi;
     memcpy(state->buf + instr_offset, &instr, sizeof(uint32_t));
+    return true;
 }
 
 static bool
@@ -1859,7 +1877,9 @@ resolve_jumps(struct jit_state* state)
         }
 
         int32_t rel = target_loc - jump.offset_loc;
-        resolve_branch_immediate(state, jump.offset_loc, rel);
+        if (!resolve_branch_immediate(state, jump.offset_loc, rel)) {
+            return false;
+        }
     }
     return true;
 }
@@ -1879,9 +1899,13 @@ resolve_loads(struct jit_state* state)
         }
 
         int32_t rel = target_loc - jump.offset_loc;
-        assert(rel % 4 == 0);
+        if (rel % 4 != 0) {
+            return false;
+        }
         rel >>= 2;
-        resolve_load_literal(state, jump.offset_loc, rel);
+        if (!resolve_load_literal(state, jump.offset_loc, rel)) {
+            return false;
+        }
     }
     return true;
 }
@@ -1901,9 +1925,13 @@ resolve_leas(struct jit_state* state)
         }
 
         int32_t rel = target_loc - jump.offset_loc;
-        assert(rel % 4 == 0);
+        if (rel % 4 != 0) {
+            return false;
+        }
         rel >>= 2;
-        resolve_adr(state, jump.offset_loc, rel);
+        if (!resolve_adr(state, jump.offset_loc, rel)) {
+            return false;
+        }
     }
     return true;
 }
@@ -1921,7 +1949,9 @@ resolve_local_calls(struct jit_state* state)
 
         int32_t rel = target_loc - local_call.offset_loc;
         rel -= state->bpf_function_prolog_size;
-        resolve_branch_immediate(state, local_call.offset_loc, rel);
+        if (!resolve_branch_immediate(state, local_call.offset_loc, rel)) {
+            return false;
+        }
     }
     return true;
 }

@@ -964,7 +964,11 @@ impl ProgramLoader {
     let guard_size_before = rng.gen_range(16..128) * page_size;
     let mut guard_size_after = rng.gen_range(16..128) * page_size;
 
-    let code_len_allocated: usize = 65536;
+    // Must stay <= 1 MiB: arm64 conditional branches and literal loads emitted by
+    // the JIT have a ±1 MiB range (imm19), and can span an entire section. Must
+    // also be a multiple of 64 KiB so the trailing guard mprotect stays
+    // page-aligned on 64 KiB-page systems.
+    let code_len_allocated: usize = 1 << 20;
     let code_mem = MmapRaw::from(
       MmapOptions::new()
         .len(code_len_allocated + guard_size_before + guard_size_after)
