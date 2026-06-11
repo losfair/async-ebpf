@@ -1,6 +1,6 @@
 [package]
 name = "async-ebpf"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 resolver = "2"
 description = "Async-friendly, fully preemptive userspace eBPF runtime"
