@@ -1754,6 +1754,10 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             *errmsg = ubpf_error("Target buffer too small");
             break;
         }
+        case RelocationOutOfRange: {
+            // Set only while resolving relocations, which happens after this point.
+            break;
+        }
         case NoError: {
             assert(false);
         }
@@ -1800,12 +1804,14 @@ resolve_branch_immediate(struct jit_state* state, uint32_t offset, int32_t imm)
         || (instr & 0x7e000000U) == 0x34000000U) { /* Compare and branch immediate.  */
         /* Signed 19-bit immediate. */
         if ((imm >> 18) != INT64_C(-1) && (imm >> 18) != 0) {
+            state->jit_status = RelocationOutOfRange;
             return false;
         }
         instr |= (imm & 0x7ffff) << 5;
     } else if ((instr & 0x7c000000U) == 0x14000000U) {
         /* Unconditional branch immediate: signed 26-bit immediate. */
         if ((imm >> 25) != INT64_C(-1) && (imm >> 25) != 0) {
+            state->jit_status = RelocationOutOfRange;
             return false;
         }
         instr |= (imm & 0x03ffffffU) << 0;
@@ -1821,6 +1827,7 @@ resolve_load_literal(struct jit_state* state, uint32_t instr_offset, int32_t tar
 {
     /* LDR (literal) has a signed 19-bit immediate. */
     if ((target_offset >> 18) != INT64_C(-1) && (target_offset >> 18) != 0) {
+        state->jit_status = RelocationOutOfRange;
         return false;
     }
     uint32_t instr;
@@ -1837,6 +1844,7 @@ resolve_adr(struct jit_state* state, uint32_t instr_offset, int32_t immediate)
     /* The immhi field of ADR is signed 19-bit; a wider value would also
      * corrupt opcode bits 28:24. */
     if ((immediate >> 18) != INT64_C(-1) && (immediate >> 18) != 0) {
+        state->jit_status = RelocationOutOfRange;
         return false;
     }
     uint32_t instr;
@@ -2006,7 +2014,13 @@ ubpf_translate_arm64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum Jit
     }
 
     if (!resolve_jumps(&state) || !resolve_loads(&state) || !resolve_leas(&state) || !resolve_local_calls(&state)) {
-        compile_result.errmsg = ubpf_error("Could not patch the relative addresses in the JIT'd code.");
+        if (state.jit_status == RelocationOutOfRange) {
+            compile_result.errmsg = ubpf_error(
+                "Branch or load target out of range in the JIT'd code (the program is too large for arm64 "
+                "PC-relative addressing).");
+        } else {
+            compile_result.errmsg = ubpf_error("Could not patch the relative addresses in the JIT'd code.");
+        }
         goto out;
     }
 

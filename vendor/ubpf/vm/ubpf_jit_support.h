@@ -37,7 +37,8 @@ enum JitProgress
     TooManyLocalCalls,
     NotEnoughSpace,
     UnexpectedInstruction,
-    UnknownInstruction
+    UnknownInstruction,
+    RelocationOutOfRange
 };
 
 

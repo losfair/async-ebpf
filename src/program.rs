@@ -313,12 +313,16 @@ pub trait ProgramEventListener: Send + Sync + 'static {
 pub struct DummyProgramEventListener;
 impl ProgramEventListener for DummyProgramEventListener {}
 
+/// Default limit for the total JIT-compiled native code size of one program.
+pub const DEFAULT_CODE_SIZE_LIMIT: usize = 1 << 20;
+
 /// Prepares helper tables and loads eBPF programs.
 pub struct ProgramLoader {
   helpers_inverse: HashMap<&'static str, i32>,
   event_listener: Arc<dyn ProgramEventListener>,
   helper_id_xor: u16,
   helpers: Arc<Vec<(u16, &'static str, Helper)>>,
+  code_size_limit: usize,
 }
 
 /// A loaded program that is not yet pinned to a thread.
@@ -926,7 +930,30 @@ impl ProgramLoader {
       helpers: Arc::new(helpers),
       helpers_inverse,
       event_listener,
+      code_size_limit: DEFAULT_CODE_SIZE_LIMIT,
     }
+  }
+
+  /// Sets the maximum total size of JIT-compiled native code per program.
+  ///
+  /// Must be a non-zero multiple of 64 KiB so the code region stays
+  /// page-aligned on all supported page sizes.
+  ///
+  /// Note for arm64: conditional branches and literal loads emitted by the
+  /// JIT have a ±1 MiB range, and a section's helper calls reference a
+  /// literal pool at the end of that section's code. Any single ELF section
+  /// whose jitted code exceeds ~1 MiB is therefore rejected at load time
+  /// ("ubpf: code translation failed") regardless of this limit; raising it
+  /// past 1 MiB only adds room for more or larger sections within that
+  /// per-section ceiling. x86-64 has no such per-section constraint.
+  pub fn with_code_size_limit(mut self, limit: usize) -> Self {
+    assert!(
+      limit > 0 && limit % (64 * 1024) == 0,
+      "code size limit must be a non-zero multiple of 64 KiB"
+    );
+    assert!(limit <= u32::MAX as usize, "code size limit must fit in u32");
+    self.code_size_limit = limit;
+    self
   }
 
   /// Loads an ELF image into a new `UnboundProgram`.
@@ -964,11 +991,7 @@ impl ProgramLoader {
     let guard_size_before = rng.gen_range(16..128) * page_size;
     let mut guard_size_after = rng.gen_range(16..128) * page_size;
 
-    // Must stay <= 1 MiB: arm64 conditional branches and literal loads emitted by
-    // the JIT have a ±1 MiB range (imm19), and can span an entire section. Must
-    // also be a multiple of 64 KiB so the trailing guard mprotect stays
-    // page-aligned on 64 KiB-page systems.
-    let code_len_allocated: usize = 1 << 20;
+    let code_len_allocated = self.code_size_limit;
     let code_mem = MmapRaw::from(
       MmapOptions::new()
         .len(code_len_allocated + guard_size_before + guard_size_after)

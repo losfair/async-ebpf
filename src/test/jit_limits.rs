@@ -103,7 +103,7 @@ fn test_out_of_range_conditional_branch_rejected() {
     );
     let msg = take_errmsg(errmsg);
     assert!(
-      msg.contains("patch"),
+      msg.contains("out of range"),
       "translation failed for an unexpected reason: {msg}"
     );
 

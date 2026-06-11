@@ -2583,6 +2583,10 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             *errmsg = ubpf_error("Target buffer too small");
             break;
         }
+        case RelocationOutOfRange: {
+            // Set only by the arm64 backend while resolving relocations.
+            break;
+        }
         case NoError: {
             assert(false);
         }

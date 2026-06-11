@@ -143,3 +143,44 @@ fn h_return_7_async(
   });
   Ok(0)
 }
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_custom_code_size_limit() {
+  use crate::program::{DummyProgramEventListener, ProgramLoader};
+  use crate::test_util::compile_ebpf;
+  use std::sync::Arc;
+
+  let binary = compile_ebpf(
+    br#"
+  int __attribute__((section("test"))) entry(void) {
+    return 42;
+  }
+  "#
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+
+  let loader = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_code_size_limit(64 * 1024);
+  loader.load(&mut rand::thread_rng(), &binary).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "multiple of 64 KiB")]
+fn test_invalid_code_size_limit() {
+  use crate::program::{DummyProgramEventListener, ProgramLoader};
+  use std::sync::Arc;
+
+  let _ = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_code_size_limit(4096);
+}
