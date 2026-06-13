@@ -282,7 +282,14 @@ fn successors(pc: usize, inst: &Inst, num_slots: usize) -> Vec<usize> {
       }
       return out;
     }
-    let target = (pc as i64 + 1 + inst.offset as i64) as usize;
+    // JA32 is the only jump whose target is the 32-bit imm; every other jump
+    // (JA and all conditional JMP/JMP32 forms) uses the 16-bit offset. This
+    // matches how the JIT/linker resolve branch targets.
+    let target = if inst.opcode == EBPF_OP_JA32 {
+      pc as i64 + 1 + inst.imm as i64
+    } else {
+      pc as i64 + 1 + inst.offset as i64
+    } as usize;
     push(target);
     if inst.opcode != EBPF_OP_JA && inst.opcode != EBPF_OP_JA32 {
       push(fallthrough); // conditional branch also falls through
@@ -642,6 +649,24 @@ mod tests {
       "unexpected unresolved: {:?}",
       result.unresolved
     );
+  }
+
+  #[test]
+  fn ja32_target_follows_imm_not_offset() {
+    // JA32 jumps to pc+imm+1. Here imm routes control to the real load (r6 is a
+    // stack pointer); the misleading offset=0 would fall onto a poison block
+    // that reassigns r6 to a data pointer. The load must be classified from the
+    // imm path (stack), not the offset path (data).
+    let code = flatten(&[
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 6, 10, 0, 0), // r6 = r10 (stack)
+      slot(EBPF_OP_JA32, 0, 0, 0, 2), // goto slot 4 (pc+imm+1); offset=0 would target slot 2
+      slot(EBPF_OP_LDDW, 6, 0, 0, DATA_LO as i32), // poison: r6 = <data> (only reached if offset is used)
+      slot(0, 0, 0, 0, 0),                         // lddw high half
+      slot(EBPF_CLS_LDX | 0x18, 0, 6, 0, 0), // r0 = *(u64*)(r6)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let hints = analyze(&code, DATA_LO, DATA_HI).hints;
+    assert_eq!(hints[4], REGION_STACK);
   }
 
   #[test]
