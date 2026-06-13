@@ -488,21 +488,6 @@ emit_load_imm(struct jit_state* state, int dst, int64_t imm)
     }
 }
 
-static inline void
-emit_add_imm64(struct jit_state* state, int dst, uint64_t imm, int scratch)
-{
-    if (imm == 0) {
-        return;
-    }
-
-    if (imm <= INT32_MAX) {
-        emit_alu64_imm32(state, 0x81, 0, dst, (int32_t)imm);
-    } else {
-        emit_load_imm(state, scratch, (int64_t)imm);
-        emit_alu64(state, 0x01, scratch, dst);
-    }
-}
-
 /* Forward declaration for emit_store (defined later) */
 static inline void
 emit_store(struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset);
