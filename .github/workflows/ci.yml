@@ -28,6 +28,99 @@ jobs:
       - name: Run unit tests
         run: cargo test --features testing
 
+  coremark:
+    name: CoreMark (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            nominal_cpu_mhz: ""
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            # GitHub's arm64 runners use Azure Cobalt 100 CPUs. The runner does
+            # not expose a current CPU MHz value, so use the documented 3.4 GHz
+            # nominal frequency for CoreMark/MHz reporting.
+            nominal_cpu_mhz: "3400"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            llvm
+
+      - name: Checkout CoreMark
+        run: |
+          git clone https://github.com/eembc/coremark.git /tmp/coremark
+          git -C /tmp/coremark checkout 1f483d5
+
+      - name: Record CPU MHz
+        run: |
+          lscpu
+
+          nominal_cpu_mhz="${{ matrix.nominal_cpu_mhz }}"
+          cpu_model="$(lscpu | awk -F: '/Model name/ { gsub(/^[ \t]+/, "", $2); print $2; exit }')"
+          if [ -z "$cpu_model" ]; then
+            cpu_model="$(awk -F: '/model name|Hardware|Processor/ { gsub(/^[ \t]+/, "", $2); print $2; exit }' /proc/cpuinfo)"
+          fi
+
+          cpu_mhz_source="lscpu"
+          cpu_mhz="$(lscpu | awk -F: '/CPU max MHz|CPU MHz/ { gsub(/^[ \t]+/, "", $2); print $2; exit }')"
+          if [ -z "$cpu_mhz" ]; then
+            cpu_mhz_source="/proc/cpuinfo"
+            cpu_mhz="$(awk -F: '/cpu MHz/ { gsub(/^[ \t]+/, "", $2); print $2; exit }' /proc/cpuinfo)"
+          fi
+          if [ -z "$cpu_mhz" ] && [ -r /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]; then
+            cpu_mhz_source="cpuinfo_max_freq"
+            cpu_mhz="$(awk '{ printf("%.3f\n", $1 / 1000) }' /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq)"
+          fi
+          if [ -z "$cpu_mhz" ] && [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
+            cpu_mhz_source="scaling_cur_freq"
+            cpu_mhz="$(awk '{ printf("%.3f\n", $1 / 1000) }' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)"
+          fi
+          if [ -z "$cpu_mhz" ] && [ -n "$nominal_cpu_mhz" ]; then
+            cpu_mhz_source="runner_nominal"
+            cpu_mhz="$nominal_cpu_mhz"
+          fi
+
+          if [ -z "$cpu_model" ]; then
+            echo "Could not determine CPU model" >&2
+            exit 1
+          fi
+          if [ -z "$cpu_mhz" ]; then
+            echo "Could not determine cpu MHz" >&2
+            exit 1
+          fi
+          echo "CPU_MHZ=$cpu_mhz" >> "$GITHUB_ENV"
+          echo "cpu_model: $cpu_model"
+          echo "cpu_mhz: $cpu_mhz"
+          echo "cpu_mhz_source: $cpu_mhz_source"
+
+      - name: Run async-ebpf CoreMark
+        run: COREMARK_DIR=/tmp/coremark cargo run --release --features testing --example coremark -- 10 "$CPU_MHZ"
+
+      - name: Run native CoreMark
+        run: |
+          make -C /tmp/coremark clean
+          make -C /tmp/coremark PORT_DIR=linux CC=clang XCFLAGS='-O3' ITERATIONS=0 REBUILD=1 run1.log
+          cat /tmp/coremark/run1.log
+          grep -q "Correct operation validated" /tmp/coremark/run1.log
+          native_coremark="$(awk '$1 == "Iterations/Sec" { print $3; exit }' /tmp/coremark/run1.log)"
+          if [ -z "$native_coremark" ]; then
+            echo "Could not extract native CoreMark score" >&2
+            exit 1
+          fi
+          awk -v coremark="$native_coremark" -v mhz="$CPU_MHZ" 'BEGIN { printf("native_coremark_per_mhz: %.9f\n", coremark / mhz) }'
+
   fuzz:
     name: Fuzz (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
