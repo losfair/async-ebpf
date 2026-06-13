@@ -32,13 +32,13 @@ use rand::prelude::SliceRandom;
 use crate::{
   error::{Error, RuntimeError},
   helpers::Helper,
-  linker::link_elf,
+  linker::{link_elf, validate_local_call_graph},
   pointer_cage::PointerCage,
   util::nonnull_bytes_overlap,
 };
 
 const NATIVE_STACK_SIZE: usize = 16384;
-const SHADOW_STACK_SIZE: usize = 4096;
+const SHADOW_STACK_SIZE: usize = 32768;
 const MAX_CALLDATA_SIZE: usize = 512;
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
@@ -1101,6 +1101,12 @@ impl ProgramLoader {
         let code = cage
           .safe_deref_for_read(code_vaddr_size.0, code_vaddr_size.1)
           .unwrap();
+        let code_bytes = std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len());
+        validate_local_call_graph(code_bytes).map_err(|err| {
+          RuntimeError::InvalidArgumentOwned(format!(
+            "local call graph validation failed in {section_name}: {err}"
+          ))
+        })?;
         let ret = {
           let validation_scope = LoaderValidationScope::new(self);
           let ret = crate::ubpf::ubpf_load(
@@ -1122,7 +1128,9 @@ impl ProgramLoader {
             libc::free(errmsg_ptr as _);
           }
           tracing::error!(section_name, error = errmsg, "failed to load code");
-          return Err(RuntimeError::PlatformError("ubpf: code load failed"));
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "ubpf: code load failed: {errmsg}"
+          )));
         }
 
         let mut written_len = code_slice.len();
@@ -1143,7 +1151,9 @@ impl ProgramLoader {
             libc::free(errmsg_ptr as _);
           }
           tracing::error!(section_name, error = errmsg, "failed to translate code");
-          return Err(RuntimeError::PlatformError("ubpf: code translation failed"));
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "ubpf: code translation failed: {errmsg}"
+          )));
         }
 
         assert!(written_len <= code_slice.len());
