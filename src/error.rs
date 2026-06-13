@@ -13,6 +13,9 @@ pub(crate) enum RuntimeError {
   #[error("invalid argument: {0}")]
   InvalidArgument(&'static str),
 
+  #[error("invalid argument: {0}")]
+  InvalidArgumentOwned(String),
+
   #[error("platform error: {0}")]
   PlatformError(&'static str),
 
@@ -36,9 +39,6 @@ pub(crate) enum LinkerError {
 
   #[error("bad relocation: {0} ({1:?})")]
   Reloc(String, Rel),
-
-  #[error("program rejected: {0}")]
-  Rejected(String),
 
   #[error("elf parse failed: {0}")]
   Parse(Arc<ParseError>),

@@ -38,7 +38,7 @@ use crate::{
 };
 
 const NATIVE_STACK_SIZE: usize = 16384;
-const SHADOW_STACK_SIZE: usize = 4096;
+const SHADOW_STACK_SIZE: usize = 32768;
 const MAX_CALLDATA_SIZE: usize = 512;
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
@@ -1122,7 +1122,9 @@ impl ProgramLoader {
             libc::free(errmsg_ptr as _);
           }
           tracing::error!(section_name, error = errmsg, "failed to load code");
-          return Err(RuntimeError::PlatformError("ubpf: code load failed"));
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "ubpf: code load failed: {errmsg}"
+          )));
         }
 
         let mut written_len = code_slice.len();

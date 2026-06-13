@@ -138,7 +138,28 @@ pub fn link_elf(
           ));
         }
 
-        let Some(&func_index) = ext_func_table.get(sym_name) else {
+        if let Some(&func_index) = ext_func_table.get(sym_name) {
+          insn.imm = func_index;
+          insn.src = 0;
+        } else if code_section_indexes.contains(&(sym.st_shndx as usize)) {
+          let code_section = sht.get(sym.st_shndx as usize)?;
+          let old_imm = insn.imm as i64;
+          let symbol_offset = if sym.st_value == 0 && old_imm != -1 {
+            ((old_imm + 1) as u64).saturating_mul(8)
+          } else {
+            sym.st_value
+          };
+          let target_addr = code_section.sh_offset.wrapping_add(symbol_offset);
+          let call_addr = target_section.sh_offset.wrapping_add(reloc.r_offset);
+          let delta = (target_addr as i128 - call_addr as i128 - 8) / 8;
+          if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+            return Err(LinkerError::Reloc(
+              "R_BPF_64_32: local call target out of range".to_string(),
+              reloc,
+            ));
+          }
+          insn.imm = delta as i32;
+        } else {
           return Err(LinkerError::Reloc(
             format!(
               "R_BPF_64_32: unknown symbol {} in section {}",
@@ -146,9 +167,7 @@ pub fn link_elf(
             ),
             reloc,
           ));
-        };
-        insn.imm = func_index;
-        insn.src = 0;
+        }
         insn_rewrites.push((
           target_section.sh_offset as usize + reloc.r_offset as usize,
           insn.to_u64(),
@@ -227,12 +246,7 @@ pub fn link_elf(
       let insn = u64::from_le_bytes(input[offset..offset + 8].try_into().unwrap());
       let insn = EbpfInsn::from_u64(insn);
 
-      if insn.opcode == EBPF_OP_CALL && insn.src != 0 {
-        return Err(LinkerError::Rejected(format!(
-          "call op rejected (src != 0) in section {} at offset {}",
-          cs_name, offset
-        )));
-      }
+      let _ = (cs_name, insn, offset);
     }
   }
 
