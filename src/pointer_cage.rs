@@ -98,6 +98,16 @@ impl PointerCage {
     self.data_bottom
   }
 
+  /// Returns the top offset of the data region within the cage.
+  pub fn data_top(&self) -> usize {
+    self.data_top
+  }
+
+  /// Returns the native address backing the data region.
+  pub fn data_native_base(&self) -> usize {
+    unsafe { self.region.as_ptr().add(self.margin + self.data_bottom) as usize }
+  }
+
   /// Returns the pointer mask used for JIT pointer masking.
   pub fn mask(&self) -> i32 {
     let addressable_len = self.region.len() - 2 * self.margin;
@@ -109,14 +119,6 @@ impl PointerCage {
   /// Returns the pointer offset used alongside the mask for JIT pointers.
   pub fn offset(&self) -> usize {
     self.region.as_ptr() as usize + self.margin
-  }
-
-  /// Returns the protected address range excluding the outer margins.
-  pub fn protected_range_without_margins(&self) -> (usize, usize) {
-    (
-      self.region.as_ptr() as usize + self.margin,
-      self.region.as_ptr() as usize + self.region.len() - self.margin,
-    )
   }
 
   /// Makes the data region read-only after initialization.
@@ -132,27 +134,6 @@ impl PointerCage {
       }
     }
     tracing::info!(len = self.data_top - self.data_bottom, "frozen data region");
-  }
-
-  /// Validates a stack write and returns a writable slice on success.
-  pub fn safe_deref_for_write(&self, offset: usize, size: usize) -> Option<NonNull<[u8]>> {
-    if size == 0 {
-      return Some(NonNull::slice_from_raw_parts(NonNull::dangling(), 0));
-    }
-
-    let Some(end) = offset.checked_add(size) else {
-      return None;
-    };
-    let ptr = if offset >= self.stack_bottom && end <= self.stack_top {
-      unsafe { self.region.as_ptr().add(self.margin).add(offset) as *mut u8 }
-    } else {
-      return None;
-    };
-    unsafe {
-      Some(NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(
-        ptr, size,
-      )))
-    }
   }
 
   /// Validates a stack or data read and returns a readable slice on success.

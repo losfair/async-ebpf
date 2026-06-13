@@ -57,6 +57,14 @@
 
 #define VOLATILE_CTXT 11
 
+#define JIT_MEMORY_STACK_GUEST_BOTTOM 0
+#define JIT_MEMORY_STACK_GUEST_TOP 8
+#define JIT_MEMORY_STACK_NATIVE_BASE 16
+#define JIT_MEMORY_DATA_GUEST_BOTTOM 24
+#define JIT_MEMORY_DATA_GUEST_TOP 32
+#define JIT_MEMORY_DATA_NATIVE_BASE 40
+#define JIT_MEMORY_FRAME_OFFSET -8
+
 enum operand_size
 {
     S8,
@@ -404,6 +412,9 @@ emit_jcc(struct jit_state* state, int code, struct PatchableTarget target)
     return emit_jump_address_reloc(state, target);
 }
 
+static uint32_t
+emit_jmp(struct jit_state* state, struct PatchableTarget target);
+
 /* Load [src + offset] into dst */
 static inline void
 emit_load(struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
@@ -475,7 +486,7 @@ emit_add_imm64(struct jit_state* state, int dst, uint64_t imm, int scratch)
 
 static inline void
 emit_masked_address_with_offset(
-    const struct ubpf_vm* vm, struct jit_state* state, int src, int dst, int scratch, int32_t offset)
+    const struct ubpf_vm* vm, struct jit_state* state, int src, int dst, int scratch, int32_t offset, int size, bool store)
 {
     assert(dst != scratch);
 
@@ -488,8 +499,76 @@ emit_masked_address_with_offset(
     }
 
     if (vm->jit_pointer_mask) {
-        emit_alu64_imm32(state, 0x81, 4, dst, vm->jit_pointer_mask);
-        emit_add_imm64(state, dst, vm->jit_pointer_offset, scratch);
+        int end = R9;
+
+        emit_mov(state, dst, end);
+        if (size != 0) {
+            emit_add_imm64(state, end, (uint64_t)size, scratch);
+        }
+
+        DECLARE_PATCHABLE_TARGET(non_stack_tgt);
+        DECLARE_PATCHABLE_TARGET(done_tgt);
+        DECLARE_PATCHABLE_TARGET(fault_tgt);
+
+        emit_cmp(state, dst, end);
+        uint32_t overflow_fault_src = emit_jcc(state, 0x82, fault_tgt);
+
+        emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
+        emit_load(state, S64, scratch, scratch, JIT_MEMORY_STACK_GUEST_BOTTOM);
+        emit_cmp(state, scratch, dst);
+        uint32_t stack_low_src = emit_jcc(state, 0x82, non_stack_tgt);
+
+        emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
+        emit_load(state, S64, scratch, scratch, JIT_MEMORY_STACK_GUEST_TOP);
+        emit_cmp(state, scratch, end);
+        uint32_t stack_high_src = emit_jcc(state, 0x87, non_stack_tgt);
+
+        emit_load(state, S64, RBP, end, JIT_MEMORY_FRAME_OFFSET);
+        emit_load(state, S64, end, end, JIT_MEMORY_STACK_GUEST_BOTTOM);
+        emit_alu64(state, 0x29, end, dst);
+        emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
+        emit_load(state, S64, scratch, scratch, JIT_MEMORY_STACK_NATIVE_BASE);
+        emit_alu64(state, 0x01, scratch, dst);
+        uint32_t stack_done_src = emit_jmp(state, done_tgt);
+
+        emit_jump_target(state, stack_low_src);
+        emit_jump_target(state, stack_high_src);
+
+        if (store) {
+            uint32_t store_fault_src = emit_jmp(state, fault_tgt);
+
+            emit_jump_target(state, overflow_fault_src);
+            emit_jump_target(state, store_fault_src);
+            emit_load_imm(state, dst, 0);
+
+            emit_jump_target(state, stack_done_src);
+        } else {
+            emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
+            emit_load(state, S64, scratch, scratch, JIT_MEMORY_DATA_GUEST_BOTTOM);
+            emit_cmp(state, scratch, dst);
+            uint32_t data_low_src = emit_jcc(state, 0x82, fault_tgt);
+
+            emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
+            emit_load(state, S64, scratch, scratch, JIT_MEMORY_DATA_GUEST_TOP);
+            emit_cmp(state, scratch, end);
+            uint32_t data_high_src = emit_jcc(state, 0x87, fault_tgt);
+
+            emit_load(state, S64, RBP, end, JIT_MEMORY_FRAME_OFFSET);
+            emit_load(state, S64, end, end, JIT_MEMORY_DATA_GUEST_BOTTOM);
+            emit_alu64(state, 0x29, end, dst);
+            emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
+            emit_load(state, S64, scratch, scratch, JIT_MEMORY_DATA_NATIVE_BASE);
+            emit_alu64(state, 0x01, scratch, dst);
+            uint32_t data_done_src = emit_jmp(state, done_tgt);
+
+            emit_jump_target(state, overflow_fault_src);
+            emit_jump_target(state, data_low_src);
+            emit_jump_target(state, data_high_src);
+            emit_load_imm(state, dst, 0);
+
+            emit_jump_target(state, stack_done_src);
+            emit_jump_target(state, data_done_src);
+        }
     }
 }
 
@@ -498,7 +577,7 @@ emit_masked_load(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset);
+        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, false);
         emit_load(state, size, R11, dst, 0);
     } else {
         emit_load(state, size, src, dst, offset);
@@ -510,7 +589,7 @@ emit_masked_load_sx(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset);
+        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, false);
         emit_load_sx(state, size, R11, dst, 0);
     } else {
         emit_load_sx(state, size, src, dst, offset);
@@ -819,7 +898,7 @@ emit_masked_store(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, dst, R11, RCX, offset);
+        emit_masked_address_with_offset(vm, state, dst, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, true);
         emit_store(state, size, src, R11, 0);
     } else {
         emit_store(state, size, src, dst, offset);
@@ -1776,7 +1855,7 @@ emit_masked_store_imm32(
     int32_t imm)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, dst, RCX, R11, offset);
+        emit_masked_address_with_offset(vm, state, dst, RCX, R11, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, true);
         if (vm->constant_blinding_enabled) {
             emit_store_imm32_blinded(state, size, RCX, 0, imm);
         } else {
@@ -1841,6 +1920,8 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         /* Use given eBPF program stack space */
         emit_mov(state, platform_parameter_registers[2], map_register(BPF_REG_10));
         emit_alu64(state, 0x01, platform_parameter_registers[3], map_register(BPF_REG_10));
+        emit_alu64_imm32(state, 0x81, 5, RSP, 16);
+        emit_store(state, S64, platform_parameter_registers[5], RBP, JIT_MEMORY_FRAME_OFFSET);
     }
 
 #if defined(_WIN32)
@@ -2443,7 +2524,7 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             int atomic_dst = dst;
             int atomic_offset = inst.offset;
             if (vm->jit_pointer_mask) {
-                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset);
+                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset, 8, true);
                 atomic_dst = R11;
                 atomic_offset = 0;
             }
@@ -2493,7 +2574,7 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             int atomic_dst = dst;
             int atomic_offset = inst.offset;
             if (vm->jit_pointer_mask) {
-                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset);
+                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset, 4, true);
                 atomic_dst = R11;
                 atomic_offset = 0;
             }

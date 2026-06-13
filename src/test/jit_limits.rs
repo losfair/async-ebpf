@@ -84,7 +84,12 @@ fn test_out_of_range_conditional_branch_rejected() {
     );
 
     let mut errmsg = std::ptr::null_mut();
-    let ret = crate::ubpf::ubpf_load(vm, prog.as_ptr() as *const _, prog.len() as u32, &mut errmsg);
+    let ret = crate::ubpf::ubpf_load(
+      vm,
+      prog.as_ptr() as *const _,
+      prog.len() as u32,
+      &mut errmsg,
+    );
     assert_eq!(ret, 0, "load failed: {}", take_errmsg(errmsg));
 
     let mut buf = vec![0u8; 8 << 20];

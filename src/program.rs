@@ -68,6 +68,7 @@ pub struct HelperScope<'a, 'b> {
   /// Mutable per-invocation data for helpers.
   pub invoke: RefCell<&'a mut InvokeScope>,
   resources: RefCell<&'a mut [&'b mut dyn Any]>,
+  memory: &'a JitMemory,
   mutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_MUTABLE_DEREF_REGIONS],
   immutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_IMMUTABLE_DEREF_REGIONS],
   can_post_task: bool,
@@ -132,12 +133,7 @@ impl<'a, 'b> HelperScope<'a, 'b> {
 
   /// Validates and returns an immutable view into user memory.
   pub fn user_memory(&self, ptr: u64, size: u64) -> Result<&[u8], ()> {
-    let Some(region) = self
-      .program
-      .unbound
-      .cage
-      .safe_deref_for_read(ptr as usize, size as usize)
-    else {
+    let Some(region) = self.memory.safe_deref_for_read(ptr as usize, size as usize) else {
       tracing::warn!(ptr, size, "invalid read");
       return Err(());
     };
@@ -176,9 +172,7 @@ impl<'a, 'b> HelperScope<'a, 'b> {
     size: u64,
   ) -> Result<MutableUserMemory<'a, 'b, 'c>, ()> {
     let Some(region) = self
-      .program
-      .unbound
-      .cage
+      .memory
       .safe_deref_for_write(ptr as usize, size as usize)
     else {
       tracing::warn!(ptr, size, "invalid write");
@@ -223,7 +217,7 @@ unsafe impl<T> Send for AssumeSend<T> {}
 
 struct ExecContext {
   native_stack: DefaultStack,
-  copy_stack: Box<[u8; SHADOW_STACK_SIZE]>,
+  guest_stack: Box<[u8; SHADOW_STACK_SIZE]>,
 }
 
 impl ExecContext {
@@ -231,8 +225,72 @@ impl ExecContext {
     Self {
       native_stack: DefaultStack::new(NATIVE_STACK_SIZE)
         .expect("failed to initialize native stack"),
-      copy_stack: Box::new([0u8; SHADOW_STACK_SIZE]),
+      guest_stack: Box::new([0u8; SHADOW_STACK_SIZE]),
     }
+  }
+}
+
+#[repr(C)]
+struct JitMemory {
+  stack_guest_bottom: usize,
+  stack_guest_top: usize,
+  stack_native_base: usize,
+  data_guest_bottom: usize,
+  data_guest_top: usize,
+  data_native_base: usize,
+}
+
+impl JitMemory {
+  fn checked_region(
+    guest: usize,
+    size: usize,
+    guest_bottom: usize,
+    guest_top: usize,
+    native_base: usize,
+  ) -> Option<NonNull<[u8]>> {
+    if size == 0 {
+      return Some(NonNull::slice_from_raw_parts(NonNull::dangling(), 0));
+    }
+
+    let end = guest.checked_add(size)?;
+    if guest < guest_bottom || end > guest_top {
+      return None;
+    }
+    let native = native_base.checked_add(guest - guest_bottom)? as *mut u8;
+    unsafe {
+      Some(NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(
+        native, size,
+      )))
+    }
+  }
+
+  fn safe_deref_for_write(&self, guest: usize, size: usize) -> Option<NonNull<[u8]>> {
+    Self::checked_region(
+      guest,
+      size,
+      self.stack_guest_bottom,
+      self.stack_guest_top,
+      self.stack_native_base,
+    )
+  }
+
+  fn safe_deref_for_read(&self, guest: usize, size: usize) -> Option<NonNull<[u8]>> {
+    Self::checked_region(
+      guest,
+      size,
+      self.stack_guest_bottom,
+      self.stack_guest_top,
+      self.stack_native_base,
+    )
+    .or_else(|| {
+      Self::checked_region(
+        guest,
+        size,
+        self.data_guest_bottom,
+        self.data_guest_top,
+        self.data_native_base,
+      )
+    })
   }
 }
 
@@ -273,7 +331,7 @@ impl BorrowedExecContext {
         EXEC_CONTEXT_POOL.with(|x| x.borrow_mut().pop().unwrap_or_else(ExecContext::new)),
       ),
     };
-    me.ctx.copy_stack.fill(0x8e);
+    me.ctx.guest_stack.fill(0x8e);
     me
   }
 }
@@ -303,10 +361,6 @@ pub trait ProgramEventListener: Send + Sync + 'static {
   fn did_throttle(&self, _scope: &HelperScope) -> Option<Pin<Box<dyn Future<Output = ()>>>> {
     None
   }
-  /// Called after saving the shadow stack before yielding.
-  fn did_save_shadow_stack(&self) {}
-  /// Called after restoring the shadow stack on resume.
-  fn did_restore_shadow_stack(&self) {}
 }
 
 /// No-op event listener implementation.
@@ -600,7 +654,14 @@ impl Program {
     let entry = unsafe {
       std::mem::transmute::<
         _,
-        unsafe extern "C" fn(ctx: usize, mem_len: usize, stack: usize, stack_len: usize) -> u64,
+        unsafe extern "C" fn(
+          ctx: usize,
+          mem_len: usize,
+          stack: usize,
+          stack_len: usize,
+          reserved: usize,
+          memory: usize,
+        ) -> u64,
       >(entrypoint.code_ptr)
     };
     struct CoDropper<'a, Input, Yield, Return, DefaultStack: Stack>(
@@ -628,20 +689,22 @@ impl Program {
     if calldata.len() > MAX_CALLDATA_SIZE {
       return Err(RuntimeError::InvalidArgument("calldata too large"));
     }
-    ectx.ctx.copy_stack[SHADOW_STACK_SIZE - calldata.len()..].copy_from_slice(calldata);
+    ectx.ctx.guest_stack[SHADOW_STACK_SIZE - calldata.len()..].copy_from_slice(calldata);
     let calldata_len = calldata.len();
 
     let program_ret: u64 = {
-      let shadow_stack_top = self.unbound.cage.stack_top();
-      let shadow_stack_bottom = self.unbound.cage.stack_bottom();
-      let shadow_stack_ptr = AssumeSend(
-        self
-          .unbound
-          .cage
-          .safe_deref_for_write(self.unbound.cage.stack_bottom(), SHADOW_STACK_SIZE)
-          .unwrap(),
-      );
+      let guest_stack_top = self.unbound.cage.stack_top();
+      let guest_stack_bottom = self.unbound.cage.stack_bottom();
       let ctx = &mut *ectx.ctx;
+      let memory = JitMemory {
+        stack_guest_bottom: guest_stack_bottom,
+        stack_guest_top: guest_stack_top,
+        stack_native_base: ctx.guest_stack.as_mut_ptr() as usize,
+        data_guest_bottom: self.unbound.cage.data_bottom(),
+        data_guest_top: self.unbound.cage.data_top(),
+        data_native_base: self.unbound.cage.data_native_base(),
+      };
+      let memory_ptr = &memory as *const JitMemory as usize;
 
       let mut co = AssumeSend(CoDropper(Coroutine::with_stack(
         &mut ctx.native_stack,
@@ -649,14 +712,16 @@ impl Program {
           ACTIVE_JIT_CODE_ZONE.with(|x| {
             x.yielder.set(NonNull::new(yielder as *const _ as *mut _));
           });
-          let calldata_start = shadow_stack_top - calldata_len;
+          let calldata_start = guest_stack_top - calldata_len;
           let stack_top = calldata_start & !0x7;
-          let stack_len = stack_top - shadow_stack_bottom;
+          let stack_len = stack_top - guest_stack_bottom;
           entry(
             calldata_start,
             calldata_start,
-            shadow_stack_bottom,
+            guest_stack_bottom,
             stack_len,
+            0,
+            memory_ptr,
           )
         },
       )));
@@ -666,7 +731,6 @@ impl Program {
       let mut yielder: Option<AssumeSend<NonNull<Yielder<u64, Dispatch>>>> = None;
       let mut resume_input: u64 = 0;
       let mut did_throttle = false;
-      let mut shadow_stack_saved = true;
       let mut rust_tid_sigusr1_counter = (RUST_TID.with(|x| *x), SIGUSR1_COUNTER.with(|x| x.get()));
       let mut prev_async_task_output: Option<(&'static str, AsyncTaskOutput)> = None;
       let mut invoke_scope = InvokeScope {
@@ -680,26 +744,10 @@ impl Program {
             entrypoint.code_ptr + entrypoint.code_len,
           ));
           x.yielder.set(yielder.map(|x| x.0));
-          x.pointer_cage_protected_range
-            .set(self.unbound.cage.protected_range_without_margins());
+          x.pointer_cage_protected_range.set((0, 4096));
           compiler_fence(Ordering::Release);
           x.valid.store(true, Ordering::Relaxed);
         });
-
-        if shadow_stack_saved {
-          shadow_stack_saved = false;
-
-          // restore shadow stack
-          unsafe {
-            std::ptr::copy_nonoverlapping(
-              ctx.copy_stack.as_ptr() as *const u8,
-              shadow_stack_ptr.0.as_ptr() as *mut u8,
-              SHADOW_STACK_SIZE,
-            );
-          }
-
-          self.unbound.event_listener.did_restore_shadow_stack();
-        }
 
         // If the previous iteration wants to write back to machine state
         if let Some((helper_name, prev_async_task_output)) = prev_async_task_output.take() {
@@ -707,6 +755,7 @@ impl Program {
             program: self,
             invoke: RefCell::new(&mut invoke_scope),
             resources: RefCell::new(resources),
+            memory: &memory,
             mutable_dereferenced_regions: unsafe { std::mem::zeroed() },
             immutable_dereferenced_regions: unsafe { std::mem::zeroed() },
             can_post_task: false,
@@ -735,7 +784,18 @@ impl Program {
         }
 
         if let Some(si_addr) = dispatch.memory_access_error {
-          let vaddr = si_addr - self.unbound.cage.offset();
+          let vaddr = if si_addr >= memory.stack_native_base
+            && si_addr < memory.stack_native_base + SHADOW_STACK_SIZE
+          {
+            memory.stack_guest_bottom + (si_addr - memory.stack_native_base)
+          } else if si_addr >= memory.data_native_base
+            && si_addr
+              < memory.data_native_base + (memory.data_guest_top - memory.data_guest_bottom)
+          {
+            memory.data_guest_bottom + (si_addr - memory.data_native_base)
+          } else {
+            0
+          };
           return Err(RuntimeError::MemoryFault(vaddr));
         }
 
@@ -747,6 +807,7 @@ impl Program {
           program: self,
           invoke: RefCell::new(&mut invoke_scope),
           resources: RefCell::new(resources),
+          memory: &memory,
           mutable_dereferenced_regions: unsafe { std::mem::zeroed() },
           immutable_dereferenced_regions: unsafe { std::mem::zeroed() },
           can_post_task: false,
@@ -803,17 +864,6 @@ impl Program {
         let should_yield = now > last_yield_time
           && now.duration_since(last_yield_time) >= timeslice.max_run_time_before_yield;
         if should_throttle || should_yield || pending_async_task.is_some() {
-          // We are about to yield control to tokio. Save the shadow stack, and release the guard.
-          shadow_stack_saved = true;
-          unsafe {
-            std::ptr::copy_nonoverlapping(
-              shadow_stack_ptr.0.as_ptr() as *const u8,
-              ctx.copy_stack.as_mut_ptr() as *mut u8,
-              SHADOW_STACK_SIZE,
-            );
-          }
-          self.unbound.event_listener.did_save_shadow_stack();
-
           // we are now free to give up control of current thread to other async tasks
 
           if should_throttle {
@@ -951,7 +1001,10 @@ impl ProgramLoader {
       limit > 0 && limit % (64 * 1024) == 0,
       "code size limit must be a non-zero multiple of 64 KiB"
     );
-    assert!(limit <= u32::MAX as usize, "code size limit must fit in u32");
+    assert!(
+      limit <= u32::MAX as usize,
+      "code size limit must fit in u32"
+    );
     self.code_size_limit = limit;
     self
   }
@@ -1265,8 +1318,8 @@ unsafe extern "C" fn sigsegv_handler(
     return fail();
   }
 
-  // SEGV_ACCERR
-  if (*siginfo).si_code != 2 {
+  // SEGV_MAPERR or SEGV_ACCERR.
+  if (*siginfo).si_code != 1 && (*siginfo).si_code != 2 {
     return fail();
   }
 

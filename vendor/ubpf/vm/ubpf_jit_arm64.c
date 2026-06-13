@@ -89,6 +89,14 @@ static enum Registers offset_register = R26;
 // Special register for external dispatcher context.
 static enum Registers VOLATILE_CTXT = R26;
 
+#define JIT_MEMORY_STACK_GUEST_BOTTOM 0
+#define JIT_MEMORY_STACK_GUEST_TOP 8
+#define JIT_MEMORY_STACK_NATIVE_BASE 16
+#define JIT_MEMORY_DATA_GUEST_BOTTOM 24
+#define JIT_MEMORY_DATA_GUEST_TOP 32
+#define JIT_MEMORY_DATA_NATIVE_BASE 40
+#define JIT_MEMORY_FRAME_OFFSET -8
+
 // Number of eBPF registers
 #define REGISTER_MAP_SIZE 11
 
@@ -363,6 +371,24 @@ emit_masked_address(
     }
 }
 
+static uint32_t
+emit_checked_unconditionalbranch_immediate(struct jit_state* state, uint32_t op, struct PatchableTarget target)
+{
+    uint32_t source_offset = state->offset;
+    emit_patchable_relative(state->jumps, state->offset, target, state->num_jumps++);
+    emit_instruction(state, op);
+    return source_offset;
+}
+
+static uint32_t
+emit_checked_conditionalbranch_immediate(struct jit_state* state, uint32_t cond, struct PatchableTarget target)
+{
+    uint32_t source_offset = state->offset;
+    emit_patchable_relative(state->jumps, state->offset, target, state->num_jumps++);
+    emit_instruction(state, 0x54000000U | (0 << 5) | cond);
+    return source_offset;
+}
+
 static void
 emit_masked_address_with_offset(
     const struct ubpf_vm* vm,
@@ -370,7 +396,9 @@ emit_masked_address_with_offset(
     enum Registers src,
     enum Registers dst,
     enum Registers scratch,
-    int16_t offset)
+    int16_t offset,
+    int size,
+    bool store)
 {
     assert(dst != scratch);
 
@@ -395,7 +423,112 @@ emit_masked_address_with_offset(
         }
     }
 
+    if (vm->jit_pointer_mask) {
+        enum Registers end = temp_register;
+        emit_logical_register(state, true, LOG_ORR, end, RZ, dst);
+        if (size != 0) {
+            emit_addsub_immediate(state, true, AS_ADD, end, end, (uint32_t)size);
+        }
+
+        DECLARE_PATCHABLE_REGULAR_EBPF_TARGET(non_stack_tgt, 0);
+        DECLARE_PATCHABLE_REGULAR_EBPF_TARGET(fault_tgt, 0);
+        DECLARE_PATCHABLE_REGULAR_EBPF_TARGET(done_tgt, 0);
+
+        emit_addsub_register(state, true, AS_SUBS, RZ, end, dst);
+        uint32_t overflow_fault_src = emit_checked_conditionalbranch_immediate(state, 3, fault_tgt);
+
+        emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+        emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_STACK_GUEST_BOTTOM);
+        emit_addsub_register(state, true, AS_SUBS, RZ, dst, scratch);
+        uint32_t stack_low_src = emit_checked_conditionalbranch_immediate(state, 3, non_stack_tgt);
+
+        emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+        emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_STACK_GUEST_TOP);
+        emit_addsub_register(state, true, AS_SUBS, RZ, end, scratch);
+        uint32_t stack_high_src = emit_checked_conditionalbranch_immediate(state, 8, non_stack_tgt);
+
+        emit_loadstore_immediate(state, LS_LDRX, end, R29, JIT_MEMORY_FRAME_OFFSET);
+        emit_loadstore_immediate(state, LS_LDRX, end, end, JIT_MEMORY_STACK_GUEST_BOTTOM);
+        emit_addsub_register(state, true, AS_SUB, dst, dst, end);
+        emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+        emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_STACK_NATIVE_BASE);
+        emit_addsub_register(state, true, AS_ADD, dst, dst, scratch);
+        uint32_t stack_done_src = emit_checked_unconditionalbranch_immediate(state, 0x14000000U, done_tgt);
+
+        emit_jump_target(state, stack_low_src);
+        emit_jump_target(state, stack_high_src);
+
+        if (store) {
+            uint32_t store_fault_src = emit_checked_unconditionalbranch_immediate(state, 0x14000000U, fault_tgt);
+
+            emit_jump_target(state, overflow_fault_src);
+            emit_jump_target(state, store_fault_src);
+            emit_movewide_immediate(state, true, dst, 0);
+
+            emit_jump_target(state, stack_done_src);
+        } else {
+            emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+            emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_DATA_GUEST_BOTTOM);
+            emit_addsub_register(state, true, AS_SUBS, RZ, dst, scratch);
+            uint32_t data_low_src = emit_checked_conditionalbranch_immediate(state, 3, fault_tgt);
+
+            emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+            emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_DATA_GUEST_TOP);
+            emit_addsub_register(state, true, AS_SUBS, RZ, end, scratch);
+            uint32_t data_high_src = emit_checked_conditionalbranch_immediate(state, 8, fault_tgt);
+
+            emit_loadstore_immediate(state, LS_LDRX, end, R29, JIT_MEMORY_FRAME_OFFSET);
+            emit_loadstore_immediate(state, LS_LDRX, end, end, JIT_MEMORY_DATA_GUEST_BOTTOM);
+            emit_addsub_register(state, true, AS_SUB, dst, dst, end);
+            emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+            emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_DATA_NATIVE_BASE);
+            emit_addsub_register(state, true, AS_ADD, dst, dst, scratch);
+            uint32_t data_done_src = emit_checked_unconditionalbranch_immediate(state, 0x14000000U, done_tgt);
+
+            emit_jump_target(state, overflow_fault_src);
+            emit_jump_target(state, data_low_src);
+            emit_jump_target(state, data_high_src);
+            emit_movewide_immediate(state, true, dst, 0);
+
+            emit_jump_target(state, stack_done_src);
+            emit_jump_target(state, data_done_src);
+        }
+        return;
+    }
+
     emit_masked_address(vm, state, dst, dst, scratch);
+}
+
+static int
+loadstore_access_size(enum LoadStoreOpcode op)
+{
+    switch (op) {
+    case LS_STRB:
+    case LS_LDRB:
+    case LS_LDRSBX:
+    case LS_LDRSBW:
+        return 1;
+    case LS_STRH:
+    case LS_LDRH:
+    case LS_LDRSHX:
+    case LS_LDRSHW:
+        return 2;
+    case LS_STRW:
+    case LS_LDRW:
+    case LS_LDRSW:
+        return 4;
+    case LS_STRX:
+    case LS_LDRX:
+        return 8;
+    default:
+        return 8;
+    }
+}
+
+static bool
+loadstore_is_store(enum LoadStoreOpcode op)
+{
+    return op == LS_STRB || op == LS_STRH || op == LS_STRW || op == LS_STRX;
 }
 
 static void
@@ -408,7 +541,7 @@ emit_masked_loadstore(
     int16_t offset)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, rn, temp_div_register, offset_register, offset);
+        emit_masked_address_with_offset(vm, state, rn, temp_div_register, offset_register, offset, loadstore_access_size(op), loadstore_is_store(op));
         emit_loadstore_immediate(state, op, rt, temp_div_register, 0);
         return;
     }
@@ -702,6 +835,8 @@ emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
     } else {
         emit_addsub_immediate(state, true, AS_ADD, map_register(10), R2, 0);
         emit_addsub_register(state, true, AS_ADD, map_register(10), map_register(10), R3);
+        emit_addsub_immediate(state, true, AS_SUB, SP, SP, 16);
+        emit_loadstore_immediate(state, LS_STRX, R5, R29, JIT_MEMORY_FRAME_OFFSET);
     }
 
     /* Copy R0 to the volatile context for safe keeping. */
@@ -872,7 +1007,7 @@ emit_atomic_operation(
     // Copy addr_reg into addr_temp so that the base register used by LDXR/STXR
     // is guaranteed not to alias status_reg.
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, addr_reg, addr_temp, scratch, offset);
+        emit_masked_address_with_offset(vm, state, addr_reg, addr_temp, scratch, offset, is_64bit ? 8 : 4, true);
     } else if (offset != 0) {
         // Use int32_t to avoid undefined behavior when negating INT16_MIN.
         int32_t abs_offset = offset;

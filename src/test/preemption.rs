@@ -39,8 +39,6 @@ unsigned long long __attribute__((section("test"))) entry(void) {
 struct CountingEventListener {
   async_preempts: AtomicUsize,
   yields: AtomicUsize,
-  saves: AtomicUsize,
-  restores: AtomicUsize,
 }
 
 impl ProgramEventListener for CountingEventListener {
@@ -50,14 +48,6 @@ impl ProgramEventListener for CountingEventListener {
 
   fn did_yield(&self) {
     self.yields.fetch_add(1, Ordering::SeqCst);
-  }
-
-  fn did_save_shadow_stack(&self) {
-    self.saves.fetch_add(1, Ordering::SeqCst);
-  }
-
-  fn did_restore_shadow_stack(&self) {
-    self.restores.fetch_add(1, Ordering::SeqCst);
   }
 }
 
@@ -74,8 +64,6 @@ fn test_async_preemption_preserves_guest_state() {
   assert_eq!(ret, EXPECTED_SUM);
   assert!(events.async_preempts.load(Ordering::SeqCst) > 0);
   assert_eq!(events.yields.load(Ordering::SeqCst), 0);
-  assert_eq!(events.saves.load(Ordering::SeqCst), 0);
-  assert_eq!(events.restores.load(Ordering::SeqCst), 1);
   assert_eq!(heartbeat_ticks, 0);
 }
 
@@ -92,11 +80,6 @@ fn test_async_preemption_yields_to_async_runtime() {
   assert_eq!(ret, EXPECTED_SUM);
   assert!(events.async_preempts.load(Ordering::SeqCst) > 0);
   assert!(events.yields.load(Ordering::SeqCst) > 0);
-  assert!(events.saves.load(Ordering::SeqCst) > 0);
-  assert_eq!(
-    events.restores.load(Ordering::SeqCst),
-    events.saves.load(Ordering::SeqCst) + 1
-  );
   assert!(heartbeat_ticks > 0);
 }
 
