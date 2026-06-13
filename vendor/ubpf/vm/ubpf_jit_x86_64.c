@@ -64,9 +64,15 @@
 #define JIT_MEMORY_DATA_GUEST_TOP 32
 #define JIT_MEMORY_DATA_NATIVE_BASE 40
 #define JIT_MEMORY_FRAME_OFFSET -8
-// Scratch spill slot in the reserved frame area ([RBP-16]; [RBP-8] holds the
-// memory descriptor pointer).
+// Scratch spill slots in the reserved frame area ([RBP-8] holds the memory
+// descriptor pointer). SPILL is the transient slot used by
+// emit_single_region_address; ADDR_SPILL / ACC_SPILL hold the guest address and
+// the first region's translated candidate across the branchless dual-region
+// probe. All four (descriptor + three scratch) fit in the 32 bytes reserved
+// below RBP by the prologue.
 #define JIT_MEMORY_SPILL_OFFSET -16
+#define JIT_MEMORY_ADDR_SPILL_OFFSET -24
+#define JIT_MEMORY_ACC_SPILL_OFFSET -32
 
 // Per-load region routing hints (computed by the Rust region analysis and
 // supplied via ubpf_set_region_hints). A load whose pointer provably targets a
@@ -583,89 +589,35 @@ emit_masked_address_with_offset(
     if (vm->jit_pointer_mask) {
         // Stores are always confined to the active stack regardless of the hint,
         // preserving the read-only guarantee for the data region. Loads with a
-        // confident hint check only their region; otherwise fall through to the
-        // dual-region probe below.
-        if (!store && region_hint == JIT_REGION_STACK) {
+        // confident hint check only their region. All of these are single-region
+        // and use the branchless emit_single_region_address directly.
+        if (store || region_hint == JIT_REGION_STACK) {
             emit_single_region_address(
                 state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
             return;
         }
-        if (!store && region_hint == JIT_REGION_DATA) {
+        if (region_hint == JIT_REGION_DATA) {
             emit_single_region_address(
                 state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
             return;
         }
 
-        int end = R9;
-
-        emit_mov(state, dst, end);
-        if (size != 0) {
-            emit_add_imm64(state, end, (uint64_t)size, scratch);
-        }
-
-        DECLARE_PATCHABLE_TARGET(non_stack_tgt);
-        DECLARE_PATCHABLE_TARGET(done_tgt);
-        DECLARE_PATCHABLE_TARGET(fault_tgt);
-
-        emit_cmp(state, dst, end);
-        uint32_t overflow_fault_src = emit_jcc(state, 0x82, fault_tgt);
-
-        emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
-        emit_load(state, S64, scratch, scratch, JIT_MEMORY_STACK_GUEST_BOTTOM);
-        emit_cmp(state, scratch, dst);
-        uint32_t stack_low_src = emit_jcc(state, 0x82, non_stack_tgt);
-
-        emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
-        emit_load(state, S64, scratch, scratch, JIT_MEMORY_STACK_GUEST_TOP);
-        emit_cmp(state, scratch, end);
-        uint32_t stack_high_src = emit_jcc(state, 0x87, non_stack_tgt);
-
-        emit_load(state, S64, RBP, end, JIT_MEMORY_FRAME_OFFSET);
-        emit_load(state, S64, end, end, JIT_MEMORY_STACK_GUEST_BOTTOM);
-        emit_alu64(state, 0x29, end, dst);
-        emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
-        emit_load(state, S64, scratch, scratch, JIT_MEMORY_STACK_NATIVE_BASE);
-        emit_alu64(state, 0x01, scratch, dst);
-        uint32_t stack_done_src = emit_jmp(state, done_tgt);
-
-        emit_jump_target(state, stack_low_src);
-        emit_jump_target(state, stack_high_src);
-
-        if (store) {
-            uint32_t store_fault_src = emit_jmp(state, fault_tgt);
-
-            emit_jump_target(state, overflow_fault_src);
-            emit_jump_target(state, store_fault_src);
-            emit_load_imm(state, dst, 0);
-
-            emit_jump_target(state, stack_done_src);
-        } else {
-            emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
-            emit_load(state, S64, scratch, scratch, JIT_MEMORY_DATA_GUEST_BOTTOM);
-            emit_cmp(state, scratch, dst);
-            uint32_t data_low_src = emit_jcc(state, 0x82, fault_tgt);
-
-            emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
-            emit_load(state, S64, scratch, scratch, JIT_MEMORY_DATA_GUEST_TOP);
-            emit_cmp(state, scratch, end);
-            uint32_t data_high_src = emit_jcc(state, 0x87, fault_tgt);
-
-            emit_load(state, S64, RBP, end, JIT_MEMORY_FRAME_OFFSET);
-            emit_load(state, S64, end, end, JIT_MEMORY_DATA_GUEST_BOTTOM);
-            emit_alu64(state, 0x29, end, dst);
-            emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET);
-            emit_load(state, S64, scratch, scratch, JIT_MEMORY_DATA_NATIVE_BASE);
-            emit_alu64(state, 0x01, scratch, dst);
-            uint32_t data_done_src = emit_jmp(state, done_tgt);
-
-            emit_jump_target(state, overflow_fault_src);
-            emit_jump_target(state, data_low_src);
-            emit_jump_target(state, data_high_src);
-            emit_load_imm(state, dst, 0);
-
-            emit_jump_target(state, stack_done_src);
-            emit_jump_target(state, data_done_src);
-        }
+        // Unknown region: probe both regions branchlessly. Each region is
+        // translated by emit_single_region_address, which yields the native
+        // address when the access is in range and 0 otherwise. The two guest
+        // ranges are disjoint, so at most one candidate is non-zero; OR-ing them
+        // recovers the address (or 0, a guaranteed faulting access, when neither
+        // matches). No data-dependent branch is emitted, so there is no
+        // mis-speculatable path that could perform a transient OOB access
+        // (Spectre-v1).
+        emit_store(state, S64, dst, RBP, JIT_MEMORY_ADDR_SPILL_OFFSET); // save guest address
+        emit_single_region_address(
+            state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
+        emit_store(state, S64, dst, RBP, JIT_MEMORY_ACC_SPILL_OFFSET);  // save stack candidate
+        emit_load(state, S64, RBP, dst, JIT_MEMORY_ADDR_SPILL_OFFSET);  // restore guest address
+        emit_single_region_address(
+            state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
+        emit_alu64_mem(state, 0x0B, dst, RBP, JIT_MEMORY_ACC_SPILL_OFFSET); // dst |= stack candidate
     }
 }
 
@@ -2013,7 +1965,9 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         /* Use given eBPF program stack space */
         emit_mov(state, platform_parameter_registers[2], map_register(BPF_REG_10));
         emit_alu64(state, 0x01, platform_parameter_registers[3], map_register(BPF_REG_10));
-        emit_alu64_imm32(state, 0x81, 5, RSP, 16);
+        // Reserve 32 bytes (16-byte aligned) for the descriptor pointer at
+        // [RBP-8] and the three scratch spill slots [RBP-16/-24/-32].
+        emit_alu64_imm32(state, 0x81, 5, RSP, 32);
         emit_store(state, S64, platform_parameter_registers[5], RBP, JIT_MEMORY_FRAME_OFFSET);
     }
 

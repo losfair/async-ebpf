@@ -25,7 +25,7 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "async-ebpf"
-version = "0.3.2"
+version = "0.4.0-alpha.1"
 dependencies = [
  "anyhow",
  "bindgen",

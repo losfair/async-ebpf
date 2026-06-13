@@ -381,24 +381,6 @@ emit_masked_address(
     }
 }
 
-static uint32_t
-emit_checked_unconditionalbranch_immediate(struct jit_state* state, uint32_t op, struct PatchableTarget target)
-{
-    uint32_t source_offset = state->offset;
-    emit_patchable_relative(state->jumps, state->offset, target, state->num_jumps++);
-    emit_instruction(state, op);
-    return source_offset;
-}
-
-static uint32_t
-emit_checked_conditionalbranch_immediate(struct jit_state* state, uint32_t cond, struct PatchableTarget target)
-{
-    uint32_t source_offset = state->offset;
-    emit_patchable_relative(state->jumps, state->offset, target, state->num_jumps++);
-    emit_instruction(state, 0x54000000U | (0 << 5) | cond);
-    return source_offset;
-}
-
 // CSEL Rd, Rn, Rm, cond (64-bit): Rd = cond ? Rn : Rm.
 static void
 emit_conditionalselect(struct jit_state* state, enum Registers rd, enum Registers rn, enum Registers rm, int cond)
@@ -491,88 +473,41 @@ emit_masked_address_with_offset(
     if (vm->jit_pointer_mask) {
         // Stores are always confined to the active stack regardless of the
         // hint, preserving the read-only guarantee for the data region. Loads
-        // with a confident hint check only their region; otherwise fall through
-        // to the dual-region probe below.
-        if (!store && region_hint == JIT_REGION_STACK) {
+        // with a confident hint check only their region. All of these are
+        // single-region and use the branchless emit_single_region_address
+        // directly.
+        if (store || region_hint == JIT_REGION_STACK) {
             emit_single_region_address(
                 state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
             return;
         }
-        if (!store && region_hint == JIT_REGION_DATA) {
+        if (region_hint == JIT_REGION_DATA) {
             emit_single_region_address(
                 state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
             return;
         }
 
-        enum Registers end = temp_register;
-        emit_logical_register(state, true, LOG_ORR, end, RZ, dst);
-        if (size != 0) {
-            emit_addsub_immediate(state, true, AS_ADD, end, end, (uint32_t)size);
-        }
+        // Unknown region: probe both regions branchlessly. Each region is
+        // translated by emit_single_region_address, which yields the native
+        // address when the access is in range and 0 otherwise. The two guest
+        // ranges are disjoint, so at most one candidate is non-zero; OR-ing them
+        // recovers the address (or 0, a guaranteed faulting access, when neither
+        // matches). No data-dependent branch is emitted, so there is no
+        // mis-speculatable path that could perform a transient OOB access
+        // (Spectre-v1). R16/R17 are the AArch64 intra-procedure scratch
+        // registers (IP0/IP1); they are not mapped to any eBPF register and are
+        // free to use here to hold the guest address and the stack candidate.
+        enum Registers saved_addr = R16;
+        enum Registers stack_candidate = R17;
 
-        DECLARE_PATCHABLE_REGULAR_EBPF_TARGET(non_stack_tgt, 0);
-        DECLARE_PATCHABLE_REGULAR_EBPF_TARGET(fault_tgt, 0);
-        DECLARE_PATCHABLE_REGULAR_EBPF_TARGET(done_tgt, 0);
-
-        emit_addsub_register(state, true, AS_SUBS, RZ, end, dst);
-        uint32_t overflow_fault_src = emit_checked_conditionalbranch_immediate(state, 3, fault_tgt);
-
-        emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
-        emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_STACK_GUEST_BOTTOM);
-        emit_addsub_register(state, true, AS_SUBS, RZ, dst, scratch);
-        uint32_t stack_low_src = emit_checked_conditionalbranch_immediate(state, 3, non_stack_tgt);
-
-        emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
-        emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_STACK_GUEST_TOP);
-        emit_addsub_register(state, true, AS_SUBS, RZ, end, scratch);
-        uint32_t stack_high_src = emit_checked_conditionalbranch_immediate(state, 8, non_stack_tgt);
-
-        emit_loadstore_immediate(state, LS_LDRX, end, R29, JIT_MEMORY_FRAME_OFFSET);
-        emit_loadstore_immediate(state, LS_LDRX, end, end, JIT_MEMORY_STACK_GUEST_BOTTOM);
-        emit_addsub_register(state, true, AS_SUB, dst, dst, end);
-        emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
-        emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_STACK_NATIVE_BASE);
-        emit_addsub_register(state, true, AS_ADD, dst, dst, scratch);
-        uint32_t stack_done_src = emit_checked_unconditionalbranch_immediate(state, 0x14000000U, done_tgt);
-
-        emit_jump_target(state, stack_low_src);
-        emit_jump_target(state, stack_high_src);
-
-        if (store) {
-            uint32_t store_fault_src = emit_checked_unconditionalbranch_immediate(state, 0x14000000U, fault_tgt);
-
-            emit_jump_target(state, overflow_fault_src);
-            emit_jump_target(state, store_fault_src);
-            emit_movewide_immediate(state, true, dst, 0);
-
-            emit_jump_target(state, stack_done_src);
-        } else {
-            emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
-            emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_DATA_GUEST_BOTTOM);
-            emit_addsub_register(state, true, AS_SUBS, RZ, dst, scratch);
-            uint32_t data_low_src = emit_checked_conditionalbranch_immediate(state, 3, fault_tgt);
-
-            emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
-            emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_DATA_GUEST_TOP);
-            emit_addsub_register(state, true, AS_SUBS, RZ, end, scratch);
-            uint32_t data_high_src = emit_checked_conditionalbranch_immediate(state, 8, fault_tgt);
-
-            emit_loadstore_immediate(state, LS_LDRX, end, R29, JIT_MEMORY_FRAME_OFFSET);
-            emit_loadstore_immediate(state, LS_LDRX, end, end, JIT_MEMORY_DATA_GUEST_BOTTOM);
-            emit_addsub_register(state, true, AS_SUB, dst, dst, end);
-            emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
-            emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, JIT_MEMORY_DATA_NATIVE_BASE);
-            emit_addsub_register(state, true, AS_ADD, dst, dst, scratch);
-            uint32_t data_done_src = emit_checked_unconditionalbranch_immediate(state, 0x14000000U, done_tgt);
-
-            emit_jump_target(state, overflow_fault_src);
-            emit_jump_target(state, data_low_src);
-            emit_jump_target(state, data_high_src);
-            emit_movewide_immediate(state, true, dst, 0);
-
-            emit_jump_target(state, stack_done_src);
-            emit_jump_target(state, data_done_src);
-        }
+        emit_logical_register(state, true, LOG_ORR, saved_addr, RZ, dst); // save guest address
+        emit_single_region_address(
+            state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
+        emit_logical_register(state, true, LOG_ORR, stack_candidate, RZ, dst); // save stack candidate
+        emit_logical_register(state, true, LOG_ORR, dst, RZ, saved_addr);      // restore guest address
+        emit_single_region_address(
+            state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
+        emit_logical_register(state, true, LOG_ORR, dst, dst, stack_candidate); // dst |= stack candidate
         return;
     }
 
