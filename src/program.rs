@@ -1145,7 +1145,9 @@ impl ProgramLoader {
             libc::free(errmsg_ptr as _);
           }
           tracing::error!(section_name, error = errmsg, "failed to translate code");
-          return Err(RuntimeError::PlatformError("ubpf: code translation failed"));
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "ubpf: code translation failed: {errmsg}"
+          )));
         }
 
         assert!(written_len <= code_slice.len());
