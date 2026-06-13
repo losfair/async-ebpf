@@ -156,6 +156,10 @@ pub struct RunOpts<'a, 'b> {
   pub calldata: &'a [u8],
   /// Host resources exposed to helpers.
   pub resources: &'a mut [&'b mut dyn Any],
+  /// Opt out of strict region analysis, which the test harness requires by
+  /// default. Used by tests that intentionally exercise an access pattern that
+  /// cannot be statically routed to a single region.
+  pub allow_dynamic_regions: bool,
 }
 
 impl<'a, 'b> RunOpts<'a, 'b> {
@@ -166,6 +170,7 @@ impl<'a, 'b> RunOpts<'a, 'b> {
       entrypoint,
       calldata: &[],
       resources: &mut [],
+      allow_dynamic_regions: false,
     }
   }
 }
@@ -176,6 +181,9 @@ pub async fn run_one_program(opts: RunOpts<'_, '_>, code: &str) -> Result<i64, E
 
   let binary = compile_ebpf(code.as_bytes().to_vec()).await.unwrap();
   let helpers = opts.helpers;
+  // Strict region analysis is required by default; tests may opt out for
+  // intentionally unanalyzable access patterns.
+  let require_static_regions = !opts.allow_dynamic_regions;
 
   // ensure the Send trait bound works
   let prog = tokio::task::spawn_blocking(move || {
@@ -183,12 +191,12 @@ pub async fn run_one_program(opts: RunOpts<'_, '_>, code: &str) -> Result<i64, E
       &mut rand::thread_rng(),
       Arc::new(DummyProgramEventListener),
       &helpers,
-    );
+    )
+    .require_static_region_analysis(require_static_regions);
     loader.load(&mut rand::thread_rng(), &binary)
   })
   .await
-  .unwrap()
-  .unwrap();
+  .unwrap()?;
 
   let prog = prog.pin_to_current_thread(t_env);
   prog

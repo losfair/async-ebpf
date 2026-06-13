@@ -112,6 +112,8 @@ struct ubpf_vm
     void* bounds_check_user_data;
     int32_t jit_pointer_mask;
     size_t jit_pointer_offset;
+    const uint8_t* region_hints; ///< Per-instruction load region hints (0=unknown, 1=stack, 2=data); indexed by instruction slot. NULL disables.
+    size_t region_hints_len;     ///< Number of valid entries in region_hints.
     int instruction_limit;
     void* debug_function_context; ///< Context pointer that is passed to the debug function.
     ubpf_debug_fn debug_function; ///< Debug function that is called before each instruction.

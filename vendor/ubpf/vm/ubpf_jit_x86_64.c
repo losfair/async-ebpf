@@ -64,6 +64,19 @@
 #define JIT_MEMORY_DATA_GUEST_TOP 32
 #define JIT_MEMORY_DATA_NATIVE_BASE 40
 #define JIT_MEMORY_FRAME_OFFSET -8
+// Scratch spill slot in the reserved frame area ([RBP-16]; [RBP-8] holds the
+// memory descriptor pointer).
+#define JIT_MEMORY_SPILL_OFFSET -16
+
+// Per-load region routing hints (computed by the Rust region analysis and
+// supplied via ubpf_set_region_hints). A load whose pointer provably targets a
+// single region is bounds-checked and translated against only that region; an
+// UNKNOWN load falls back to probing both. Misrouting is safe: the two guest
+// ranges are disjoint and the single-region check is retained, so a wrong hint
+// can only produce a spurious fault, never a cross-region access.
+#define JIT_REGION_UNKNOWN 0
+#define JIT_REGION_STACK 1
+#define JIT_REGION_DATA 2
 
 enum operand_size
 {
@@ -484,9 +497,78 @@ emit_add_imm64(struct jit_state* state, int dst, uint64_t imm, int scratch)
     }
 }
 
+/* Forward declaration for emit_store (defined later) */
+static inline void
+emit_store(struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset);
+
+/* ALU64 with a memory source operand: `op reg, [base + offset]` (reg is the
+ * register operand). Used for SUB (0x2B), ADD (0x03), and CMP (0x3B) r64,r/m64. */
+static inline void
+emit_alu64_mem(struct jit_state* state, int op, int reg, int base, int32_t offset)
+{
+    emit_basic_rex(state, 1, reg, base);
+    emit1(state, op);
+    emit_modrm_and_displacement(state, reg, base, offset);
+}
+
+/* CMOVcc dst, src (64-bit): dst = cc ? src : dst. cc is the low opcode byte
+ * (e.g. 0x42 = CMOVB). */
+static inline void
+emit_cmov(struct jit_state* state, int cc, int dst, int src)
+{
+    emit_basic_rex(state, 1, dst, src);
+    emit1(state, 0x0f);
+    emit1(state, cc);
+    emit_modrm_reg2reg(state, dst, src);
+}
+
+/* Bounds-check [dst, dst+size) against a single guest region described by the
+ * memory descriptor at [RBP + JIT_MEMORY_FRAME_OFFSET], then translate dst to
+ * the corresponding native address. Branchless: the address is translated
+ * unconditionally and a final CMOV substitutes 0 (a guaranteed faulting access)
+ * when out of range, so there is no predictable branch whose mis-speculation
+ * could perform a transient out-of-bounds access (Spectre-v1). The two bounds
+ * are folded into one unsigned comparison: with off = dst - bottom, the access
+ * is in range iff off <= (top - size) - bottom. */
+static inline void
+emit_single_region_address(
+    struct jit_state* state, int dst, int scratch, int size, int bottom_off, int top_off, int base_off)
+{
+    int span = R9;
+
+    emit_load(state, S64, RBP, scratch, JIT_MEMORY_FRAME_OFFSET); // scratch = memory descriptor
+
+    // off = dst - bottom; spill it, then translated = off + base (kept in dst).
+    emit_alu64_mem(state, 0x2B, dst, scratch, bottom_off);
+    emit_store(state, S64, dst, RBP, JIT_MEMORY_SPILL_OFFSET);
+    emit_alu64_mem(state, 0x03, dst, scratch, base_off);
+
+    // span = (top - size) - bottom
+    emit_load(state, S64, scratch, span, top_off);
+    if (size != 0) {
+        emit_alu64_imm32(state, 0x81, 5, span, size); // span -= size
+    }
+    emit_alu64_mem(state, 0x2B, span, scratch, bottom_off);
+
+    // Zero the fault address into scratch (before the compare, which sets flags).
+    emit_alu64(state, 0x31, scratch, scratch); // xor scratch, scratch
+
+    // flags = span - off; CF set (JB) iff span < off iff out of range.
+    emit_alu64_mem(state, 0x3B, span, RBP, JIT_MEMORY_SPILL_OFFSET);
+    emit_cmov(state, 0x42, dst, scratch); // CMOVB dst, 0
+}
+
 static inline void
 emit_masked_address_with_offset(
-    const struct ubpf_vm* vm, struct jit_state* state, int src, int dst, int scratch, int32_t offset, int size, bool store)
+    const struct ubpf_vm* vm,
+    struct jit_state* state,
+    int src,
+    int dst,
+    int scratch,
+    int32_t offset,
+    int size,
+    bool store,
+    int region_hint)
 {
     assert(dst != scratch);
 
@@ -499,6 +581,21 @@ emit_masked_address_with_offset(
     }
 
     if (vm->jit_pointer_mask) {
+        // Stores are always confined to the active stack regardless of the hint,
+        // preserving the read-only guarantee for the data region. Loads with a
+        // confident hint check only their region; otherwise fall through to the
+        // dual-region probe below.
+        if (!store && region_hint == JIT_REGION_STACK) {
+            emit_single_region_address(
+                state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
+            return;
+        }
+        if (!store && region_hint == JIT_REGION_DATA) {
+            emit_single_region_address(
+                state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
+            return;
+        }
+
         int end = R9;
 
         emit_mov(state, dst, end);
@@ -574,10 +671,10 @@ emit_masked_address_with_offset(
 
 static inline void
 emit_masked_load(
-    const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
+    const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset, int region_hint)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, false);
+        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, false, region_hint);
         emit_load(state, size, R11, dst, 0);
     } else {
         emit_load(state, size, src, dst, offset);
@@ -586,10 +683,10 @@ emit_masked_load(
 
 static inline void
 emit_masked_load_sx(
-    const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
+    const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset, int region_hint)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, false);
+        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, false, region_hint);
         emit_load_sx(state, size, R11, dst, 0);
     } else {
         emit_load_sx(state, size, src, dst, offset);
@@ -722,10 +819,6 @@ emit_alu32_imm32_blinded(struct jit_state* state, int op, int src, int dst, int3
         emit_alu32(state, op, temp_reg, dst);
     }
 }
-
-/* Forward declaration for emit_store (defined later) */
-static inline void
-emit_store(struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset);
 
 /* Blinded version of emit_cmp_imm32 (64-bit compare with immediate) */
 static inline void
@@ -898,7 +991,7 @@ emit_masked_store(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, dst, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, true);
+        emit_masked_address_with_offset(vm, state, dst, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, true, JIT_REGION_UNKNOWN);
         emit_store(state, size, src, R11, 0);
     } else {
         emit_store(state, size, src, dst, offset);
@@ -1855,7 +1948,7 @@ emit_masked_store_imm32(
     int32_t imm)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, dst, RCX, R11, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, true);
+        emit_masked_address_with_offset(vm, state, dst, RCX, R11, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, true, JIT_REGION_UNKNOWN);
         if (vm->constant_blinding_enabled) {
             emit_store_imm32_blinded(state, size, RCX, 0, imm);
         } else {
@@ -1956,6 +2049,8 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
 
         int dst = map_register(inst.dst);
         int src = map_register(inst.src);
+
+        int region_hint = (vm->region_hints && i < vm->region_hints_len) ? vm->region_hints[i] : JIT_REGION_UNKNOWN;
 
         // Use int64_t to avoid signed overflow with large immediates
         int64_t target_pc_64;
@@ -2465,26 +2560,26 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             break;
 
         case EBPF_OP_LDXW:
-            emit_masked_load(vm, state, S32, src, dst, inst.offset);
+            emit_masked_load(vm, state, S32, src, dst, inst.offset, region_hint);
             break;
         case EBPF_OP_LDXH:
-            emit_masked_load(vm, state, S16, src, dst, inst.offset);
+            emit_masked_load(vm, state, S16, src, dst, inst.offset, region_hint);
             break;
         case EBPF_OP_LDXB:
-            emit_masked_load(vm, state, S8, src, dst, inst.offset);
+            emit_masked_load(vm, state, S8, src, dst, inst.offset, region_hint);
             break;
         case EBPF_OP_LDXDW:
-            emit_masked_load(vm, state, S64, src, dst, inst.offset);
+            emit_masked_load(vm, state, S64, src, dst, inst.offset, region_hint);
             break;
 
         case EBPF_OP_LDXWSX:
-            emit_masked_load_sx(vm, state, S32, src, dst, inst.offset);
+            emit_masked_load_sx(vm, state, S32, src, dst, inst.offset, region_hint);
             break;
         case EBPF_OP_LDXHSX:
-            emit_masked_load_sx(vm, state, S16, src, dst, inst.offset);
+            emit_masked_load_sx(vm, state, S16, src, dst, inst.offset, region_hint);
             break;
         case EBPF_OP_LDXBSX:
-            emit_masked_load_sx(vm, state, S8, src, dst, inst.offset);
+            emit_masked_load_sx(vm, state, S8, src, dst, inst.offset, region_hint);
             break;
 
         case EBPF_OP_STW:
@@ -2524,7 +2619,7 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             int atomic_dst = dst;
             int atomic_offset = inst.offset;
             if (vm->jit_pointer_mask) {
-                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset, 8, true);
+                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset, 8, true, JIT_REGION_UNKNOWN);
                 atomic_dst = R11;
                 atomic_offset = 0;
             }
@@ -2574,7 +2669,7 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             int atomic_dst = dst;
             int atomic_offset = inst.offset;
             if (vm->jit_pointer_mask) {
-                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset, 4, true);
+                emit_masked_address_with_offset(vm, state, dst, R11, RCX, inst.offset, 4, true, JIT_REGION_UNKNOWN);
                 atomic_dst = R11;
                 atomic_offset = 0;
             }
