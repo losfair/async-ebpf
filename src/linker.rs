@@ -17,6 +17,12 @@ const R_BPF_64_32: u32 = 10;
 
 const EBPF_OP_CALL: u8 = 0x05u8 | 0x80u8;
 const EBPF_OP_LDDW: u8 = 0x18;
+const EBPF_OP_EXIT: u8 = 0x95;
+const EBPF_CLS_MASK: u8 = 0x07;
+const EBPF_CLS_JMP: u8 = 0x05;
+const EBPF_CLS_JMP32: u8 = 0x06;
+const EBPF_OP_JA: u8 = 0x05;
+const EBPF_OP_JA32: u8 = 0x06;
 const MAX_LOCAL_CALL_DEPTH: usize = 8;
 
 #[derive(Copy, Clone, Debug)]
@@ -64,8 +70,93 @@ fn local_call_target(pc: usize, insn: EbpfInsn, num_insns: usize) -> Result<usiz
   Ok(target as usize)
 }
 
-fn visit_local_call_graph(
+fn jump_target(pc: usize, offset: i64, num_insns: usize) -> Result<usize, String> {
+  let target = pc as i64 + offset + 1;
+  if target < 0 || target >= num_insns as i64 {
+    return Err(format!("jump target out of range at PC {pc}: {target}"));
+  }
+  Ok(target as usize)
+}
+
+fn fallthrough_target(pc: usize, step: usize, num_insns: usize) -> Result<usize, String> {
+  let target = pc
+    .checked_add(step)
+    .ok_or_else(|| format!("control flow target overflows at PC {pc}"))?;
+  if target >= num_insns {
+    return Err(format!("control flow falls off the end at PC {pc}"));
+  }
+  Ok(target)
+}
+
+fn reachable_local_calls(
   code: &[u8],
+  entry: usize,
+  starts: &[usize],
+  is_start: &[bool],
+) -> Result<Vec<usize>, String> {
+  let num_insns = code.len() / 8;
+  let mut calls = Vec::new();
+  let mut visited = vec![false; num_insns];
+  let mut pending = vec![entry];
+
+  while let Some(pc) = pending.pop() {
+    if visited[pc] {
+      continue;
+    }
+    visited[pc] = true;
+
+    if pc != entry && is_start[pc] {
+      return Err(format!(
+        "control flow reaches local function entry PC {pc} without local call"
+      ));
+    }
+
+    let insn = insn_at(code, pc);
+    if insn.opcode == EBPF_OP_EXIT {
+      continue;
+    }
+
+    if insn.opcode == EBPF_OP_CALL {
+      if insn.src == 1 {
+        let target = local_call_target(pc, insn, num_insns)?;
+        starts
+          .binary_search(&target)
+          .map_err(|_| format!("local call at PC {pc} targets non-function PC {target}"))?;
+        calls.push(target);
+      }
+      pending.push(fallthrough_target(pc, 1, num_insns)?);
+      continue;
+    }
+
+    if insn.opcode == EBPF_OP_LDDW {
+      pending.push(fallthrough_target(pc, 2, num_insns)?);
+      continue;
+    }
+
+    if (insn.opcode & EBPF_CLS_MASK) == EBPF_CLS_JMP
+      || (insn.opcode & EBPF_CLS_MASK) == EBPF_CLS_JMP32
+    {
+      if insn.opcode == EBPF_OP_JA {
+        pending.push(jump_target(pc, insn.offset as i64, num_insns)?);
+      } else if insn.opcode == EBPF_OP_JA32 {
+        pending.push(jump_target(pc, insn.imm as i64, num_insns)?);
+      } else {
+        pending.push(jump_target(pc, insn.offset as i64, num_insns)?);
+        pending.push(fallthrough_target(pc, 1, num_insns)?);
+      }
+      continue;
+    }
+
+    pending.push(fallthrough_target(pc, 1, num_insns)?);
+  }
+
+  calls.sort_unstable();
+  calls.dedup();
+  Ok(calls)
+}
+
+fn visit_local_call_graph(
+  reachable_calls: &[Vec<usize>],
   starts: &[usize],
   states: &mut [u8],
   depths: &mut [usize],
@@ -83,26 +174,18 @@ fn visit_local_call_graph(
   }
 
   states[func_index] = 1;
-  let num_insns = code.len() / 8;
-  let start = starts[func_index];
-  let end = starts.get(func_index + 1).copied().unwrap_or(num_insns);
   let mut max_depth = 1;
 
-  for pc in start..end {
-    let insn = insn_at(code, pc);
-    if insn.opcode != EBPF_OP_CALL || insn.src != 1 {
-      continue;
-    }
-
-    let target = local_call_target(pc, insn, num_insns)?;
+  for &target in &reachable_calls[func_index] {
     let callee_index = starts
       .binary_search(&target)
-      .map_err(|_| format!("local call at PC {pc} targets non-function PC {target}"))?;
-    let callee_depth = visit_local_call_graph(code, starts, states, depths, callee_index)?;
+      .map_err(|_| format!("local call targets non-function PC {target}"))?;
+    let callee_depth =
+      visit_local_call_graph(reachable_calls, starts, states, depths, callee_index)?;
     let candidate_depth = callee_depth + 1;
     if candidate_depth > MAX_LOCAL_CALL_DEPTH {
       return Err(format!(
-        "local function call graph depth ({candidate_depth}) exceeds max ({MAX_LOCAL_CALL_DEPTH}) at PC {pc}"
+        "local function call graph depth ({candidate_depth}) exceeds max ({MAX_LOCAL_CALL_DEPTH})"
       ));
     }
     max_depth = max_depth.max(candidate_depth);
@@ -135,10 +218,26 @@ pub(crate) fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
   starts.sort_unstable();
   starts.dedup();
 
+  let mut is_start = vec![false; num_insns];
+  for &start in &starts {
+    is_start[start] = true;
+  }
+
+  let mut reachable_calls = Vec::with_capacity(starts.len());
+  for &start in &starts {
+    reachable_calls.push(reachable_local_calls(code, start, &starts, &is_start)?);
+  }
+
   let mut states = vec![0u8; starts.len()];
   let mut depths = vec![0usize; starts.len()];
   for func_index in 0..starts.len() {
-    visit_local_call_graph(code, &starts, &mut states, &mut depths, func_index)?;
+    visit_local_call_graph(
+      &reachable_calls,
+      &starts,
+      &mut states,
+      &mut depths,
+      func_index,
+    )?;
   }
 
   Ok(())
@@ -354,7 +453,7 @@ pub fn link_elf(
 mod tests {
   use super::*;
 
-  const EBPF_OP_EXIT: u8 = 0x95;
+  const EBPF_OP_MOV64_IMM: u8 = 0xb7;
 
   fn inst(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> [u8; 8] {
     let mut b = [0u8; 8];
@@ -371,6 +470,14 @@ mod tests {
 
   fn exit() -> [u8; 8] {
     inst(EBPF_OP_EXIT, 0, 0, 0, 0)
+  }
+
+  fn ja(pc: usize, target: usize) -> [u8; 8] {
+    inst(EBPF_OP_JA, 0, 0, target as i16 - pc as i16 - 1, 0)
+  }
+
+  fn mov64_imm() -> [u8; 8] {
+    inst(EBPF_OP_MOV64_IMM, 0, 0, 0, 0)
   }
 
   fn local_call_chain(function_count: usize) -> Vec<u8> {
@@ -414,6 +521,59 @@ mod tests {
     let err = validate_local_call_graph(&code).unwrap_err();
     assert!(
       err.contains("recursive"),
+      "unexpected validation error: {err}"
+    );
+  }
+
+  #[test]
+  fn local_call_graph_rejects_fallthrough_into_function_entry() {
+    let mut code = Vec::new();
+    code.extend_from_slice(&ja(0, 4));
+    code.extend_from_slice(&local_call(1, 5));
+    code.extend_from_slice(&exit());
+    code.extend_from_slice(&exit());
+    code.extend_from_slice(&mov64_imm());
+    code.extend_from_slice(&local_call(5, 4));
+    code.extend_from_slice(&exit());
+
+    let err = validate_local_call_graph(&code).unwrap_err();
+    assert!(
+      err.contains("without local call"),
+      "unexpected validation error: {err}"
+    );
+  }
+
+  #[test]
+  fn local_call_graph_rejects_disguised_excessive_depth() {
+    let function_count = MAX_LOCAL_CALL_DEPTH + 1;
+    let factory_start = 1;
+    let factory_len = function_count - 1;
+    let chain_start = factory_start + factory_len + 1;
+    let mut code = Vec::new();
+
+    code.extend_from_slice(&ja(0, chain_start));
+    for i in 0..factory_len {
+      let r_i = chain_start + i * 3 + 1;
+      code.extend_from_slice(&local_call(factory_start + i, r_i));
+    }
+    code.extend_from_slice(&exit());
+    for i in 0..function_count {
+      let e_i = chain_start + i * 3;
+      code.extend_from_slice(&mov64_imm());
+      if i + 1 == function_count {
+        code.extend_from_slice(&exit());
+        code.extend_from_slice(&exit());
+      } else {
+        let r_i = e_i + 1;
+        let next_e = e_i + 3;
+        code.extend_from_slice(&local_call(r_i, next_e));
+        code.extend_from_slice(&exit());
+      }
+    }
+
+    let err = validate_local_call_graph(&code).unwrap_err();
+    assert!(
+      err.contains("without local call"),
       "unexpected validation error: {err}"
     );
   }
