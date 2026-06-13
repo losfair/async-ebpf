@@ -60,6 +60,30 @@ async fn test_calldata() {
 
 #[tokio::test]
 #[tracing_test::traced_test]
+async fn test_noinline_local_function_calls() {
+  let ret = run_one_program(
+    RunOpts::simple(vec![], "test"),
+    r#"
+  static int __attribute__((noinline, section("test"))) add_seven(int x) {
+    return x + 7;
+  }
+
+  static int __attribute__((noinline, section("test"))) twice_after_add(int x) {
+    return add_seven(x) * 2;
+  }
+
+  int __attribute__((section("test"))) entry(void) {
+    return twice_after_add(4);
+  }
+  "#,
+  )
+  .await
+  .unwrap();
+  assert_eq!(ret, 22);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
 async fn test_fault_write_rodata() {
   let ret = run_one_program(
     RunOpts::simple(vec![HELPERS], "test"),
