@@ -314,12 +314,25 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
       }
     }
     EBPF_CLS_LDX => {
-      // Fill: a load off R10 at a constant offset recovers the spilled kind.
-      // Any other load reads a value whose region is not tracked.
+      // A value loaded from memory is a scalar for routing purposes. Treating
+      // it as Scalar (rather than Unknown) lets it serve as an index into a
+      // known pointer — `ptr + loaded_index` keeps the pointer's region — which
+      // is both common (e.g. `literal[i]`) and safe: using a loaded value
+      // directly as a pointer base still yields Scalar (unroutable), and the
+      // retained single-region bounds check backstops any mis-sized index.
+      //
+      // A fill off R10 recovers a spilled *pointer* only when a concrete
+      // Stack/Data kind is still tracked at that offset. An absent, scalar, or
+      // call-invalidated slot reads back as a scalar — e.g. a byte loaded from a
+      // stack buffer after a helper call, which must not poison later pointer
+      // arithmetic that uses it as an index.
       s.regs[inst.dst] = if inst.src == R10 {
-        s.slots.get(&inst.offset).copied().unwrap_or(RegKind::Unknown)
+        match s.slots.get(&inst.offset).copied() {
+          Some(k @ (RegKind::Stack | RegKind::Data)) => k,
+          _ => RegKind::Scalar,
+        }
       } else {
-        RegKind::Unknown
+        RegKind::Scalar
       };
     }
     EBPF_CLS_ST | EBPF_CLS_STX => {
@@ -393,7 +406,14 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
         // Helper/local call: R0 is the return value, R1-R5 are caller-saved and
         // clobbered; R6-R10 are preserved. A callee may write through a stack
         // pointer it was handed, so spilled slots can no longer be trusted.
-        s.regs[0] = RegKind::Unknown;
+        //
+        // The return value is treated as a scalar: helpers return handles,
+        // lengths, and status codes, so a returned value commonly indexes a
+        // pointer (`buf + helper_len`) and must keep that pointer's region.
+        // Using a returned value directly as a pointer base still yields Scalar
+        // (unroutable), and the single-region bounds check backstops any
+        // out-of-range index, so this stays safe.
+        s.regs[0] = RegKind::Scalar;
         for r in 1..=5 {
           s.regs[r] = RegKind::Unknown;
         }
@@ -558,6 +578,70 @@ mod tests {
     let result = analyze(&code, DATA_LO, DATA_HI);
     assert_eq!(result.hints[2], REGION_STACK);
     assert!(result.unresolved.is_empty());
+  }
+
+  #[test]
+  fn data_pointer_indexed_by_loaded_value_stays_data() {
+    // Mirrors the unrolled `zs_strcmp` tail `literal[i]`, where `i` was derived
+    // from a byte loaded out of a stack buffer. The loaded value is a scalar
+    // index, so `data_ptr + i` must remain routable to the data region.
+    let addr = DATA_LO as i32;
+    let code = flatten(&[
+      slot(EBPF_CLS_LDX | 0x10, 3, 10, -16, 0), // r3 = *(u8*)(r10-16)  [index from stack data]
+      slot(EBPF_OP_LDDW, 1, 0, 0, addr),        // r1 = <data literal>
+      slot(0, 0, 0, 0, 0),                      // lddw high half
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_ADD, 1, 3, 0, 0), // r1 += r3
+      slot(EBPF_CLS_LDX | 0x10, 0, 1, 0, 0),    // r0 = *(u8*)(r1)  [literal[i]]
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[4], REGION_DATA);
+    assert!(result.unresolved.is_empty());
+  }
+
+  #[test]
+  fn call_return_used_as_index_keeps_pointer_region() {
+    // Mirrors `bp += len; *bp = ...` where `len` is a helper return value. The
+    // return is a scalar index, so the store through `stack_ptr + len` stays
+    // routable to the stack.
+    let code = flatten(&[
+      slot(EBPF_OP_CALL, 0, 0, 0, 1), // r0 = helper()  -> scalar
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 6, 10, 0, 0), // r6 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_ADD, 6, 0, 0, 0), // r6 += r0
+      slot(EBPF_CLS_STX | 0x10, 6, 1, 0, 0), // *(u8*)(r6) = r1
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert!(
+      result.unresolved.is_empty(),
+      "unexpected unresolved: {:?}",
+      result.unresolved
+    );
+  }
+
+  #[test]
+  fn stack_byte_read_after_call_indexes_data_pointer() {
+    // Mirrors the inlined `zs_strcmp(buf, literal)` tail where `buf` was filled
+    // by a helper: a byte is loaded from a stack slot the call invalidated, used
+    // as the index into the literal. The fill must read back as a scalar (not a
+    // stale/invalidated pointer kind), keeping `literal[i]` routable to data.
+    let code = flatten(&[
+      slot(EBPF_CLS_STX | 0x10, 10, 6, -32, 0), // *(u8*)(r10-32) = r6  (spill a scalar)
+      slot(EBPF_OP_CALL, 0, 0, 0, 1),           // call helper -> invalidates slots
+      slot(EBPF_CLS_LDX | 0x10, 2, 10, -32, 0), // r2 = *(u8*)(r10-32)  [byte index]
+      slot(EBPF_OP_LDDW, 1, 0, 0, DATA_LO as i32), // r1 = <data literal>
+      slot(0, 0, 0, 0, 0),                      // lddw high half
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_ADD, 1, 2, 0, 0), // r1 += r2
+      slot(EBPF_CLS_LDX | 0x10, 0, 1, 0, 0),    // r0 = *(u8*)(r1)  [literal[i]]
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[6], REGION_DATA);
+    assert!(
+      result.unresolved.is_empty(),
+      "unexpected unresolved: {:?}",
+      result.unresolved
+    );
   }
 
   #[test]
