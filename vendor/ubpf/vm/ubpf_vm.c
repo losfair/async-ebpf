@@ -2341,6 +2341,13 @@ ubpf_set_jit_pointer_mask_and_offset(struct ubpf_vm* vm, int32_t mask, size_t of
     vm->jit_pointer_offset = offset;
 }
 
+void
+ubpf_set_region_hints(struct ubpf_vm* vm, const uint8_t* hints, size_t len)
+{
+    vm->region_hints = hints;
+    vm->region_hints_len = len;
+}
+
 int
 ubpf_set_instruction_limit(struct ubpf_vm* vm, uint32_t limit, uint32_t* previous_limit)
 {

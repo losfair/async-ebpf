@@ -597,6 +597,23 @@ extern "C"
     ubpf_set_jit_pointer_mask_and_offset(struct ubpf_vm* vm, int32_t mask, size_t offset);
 
     /**
+     * @brief Supply per-instruction load region hints for JIT compilation.
+     *
+     * Each entry corresponds to one eBPF instruction slot and routes a load to
+     * a single guest region (0 = unknown/probe both, 1 = stack, 2 = data). The
+     * hints are only an optimization: a single-region bounds check is always
+     * retained, so an incorrect hint can only cause a spurious fault. The
+     * pointer must remain valid until JIT translation completes; pass NULL to
+     * clear it.
+     *
+     * @param[in] vm The VM.
+     * @param[in] hints Pointer to the hint array (one byte per instruction slot).
+     * @param[in] len Number of entries in @p hints.
+     */
+    void
+    ubpf_set_region_hints(struct ubpf_vm* vm, const uint8_t* hints, size_t len);
+
+    /**
      * @brief Set a size for the buffer allocated to machine code generated during JIT compilation.
      * The JIT compiler allocates a buffer to store the code while it is being generated. The default
      * may be too big for some embedded platforms. Use this to customize the size of that buffer.

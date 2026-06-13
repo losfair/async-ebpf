@@ -377,6 +377,7 @@ pub struct ProgramLoader {
   helper_id_xor: u16,
   helpers: Arc<Vec<(u16, &'static str, Helper)>>,
   code_size_limit: usize,
+  require_static_regions: bool,
 }
 
 /// A loaded program that is not yet pinned to a thread.
@@ -981,7 +982,19 @@ impl ProgramLoader {
       helpers_inverse,
       event_listener,
       code_size_limit: DEFAULT_CODE_SIZE_LIMIT,
+      require_static_regions: false,
     }
+  }
+
+  /// Requires every guest memory access to be statically routable to a single
+  /// region (stack or read-only data). When enabled, loading fails if the
+  /// region analysis cannot classify any load, store, or atomic — i.e. no
+  /// access falls back to the dual-region runtime probe. Memory accesses
+  /// reached only through unmodeled control flow (e.g. an argument pointer in a
+  /// local function) count as unresolved and are rejected.
+  pub fn require_static_region_analysis(mut self, require: bool) -> Self {
+    self.require_static_regions = require;
+    self
   }
 
   /// Sets the maximum total size of JIT-compiled native code per program.
@@ -1133,6 +1146,31 @@ impl ProgramLoader {
           )));
         }
 
+        // Statically classify each load's pointer region so the JIT can emit a
+        // single-region bounds check instead of probing both. Misclassification
+        // is safe: the retained single-region check turns it into a spurious
+        // fault, never a cross-region access. The hint buffer must outlive the
+        // translate call below.
+        let region_analysis = crate::region_analysis::analyze(
+          code_bytes,
+          cage.data_bottom() as u64,
+          cage.data_top() as u64,
+        );
+        if self.require_static_regions && !region_analysis.unresolved.is_empty() {
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "static region analysis failed in {section_name}: {} memory access(es) could not be \
+             routed to a single region (instruction slots {:?})",
+            region_analysis.unresolved.len(),
+            region_analysis.unresolved,
+          )));
+        }
+        let region_hints = region_analysis.hints;
+        crate::ubpf::ubpf_set_region_hints(
+          vm.0.as_ptr(),
+          region_hints.as_ptr(),
+          region_hints.len(),
+        );
+
         let mut written_len = code_slice.len();
         let ret = crate::ubpf::ubpf_translate_ex(
           vm.0.as_ptr(),
@@ -1141,6 +1179,9 @@ impl ProgramLoader {
           &mut errmsg_ptr,
           crate::ubpf::JitMode_ExtendedJitMode,
         );
+        // Clear the borrowed pointer before `region_hints` is dropped so the VM
+        // never retains a dangling reference between sections.
+        crate::ubpf::ubpf_set_region_hints(vm.0.as_ptr(), std::ptr::null(), 0);
         if ret != 0 {
           let errmsg = if errmsg_ptr.is_null() {
             "".to_string()

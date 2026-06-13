@@ -97,6 +97,16 @@ static enum Registers VOLATILE_CTXT = R26;
 #define JIT_MEMORY_DATA_NATIVE_BASE 40
 #define JIT_MEMORY_FRAME_OFFSET -8
 
+// Per-load region routing hints (computed by the Rust region analysis and
+// supplied via ubpf_set_region_hints). A load whose pointer provably targets a
+// single region is bounds-checked and translated against only that region; an
+// UNKNOWN load falls back to probing both. Misrouting is safe: the two guest
+// ranges are disjoint and the single-region check is retained, so a wrong hint
+// can only produce a spurious fault, never a cross-region access.
+#define JIT_REGION_UNKNOWN 0
+#define JIT_REGION_STACK 1
+#define JIT_REGION_DATA 2
+
 // Number of eBPF registers
 #define REGISTER_MAP_SIZE 11
 
@@ -389,6 +399,60 @@ emit_checked_conditionalbranch_immediate(struct jit_state* state, uint32_t cond,
     return source_offset;
 }
 
+// CSEL Rd, Rn, Rm, cond (64-bit): Rd = cond ? Rn : Rm.
+static void
+emit_conditionalselect(struct jit_state* state, enum Registers rd, enum Registers rn, enum Registers rm, int cond)
+{
+    emit_instruction(state, 0x9a800000U | (rm << 16) | ((uint32_t)cond << 12) | (rn << 5) | rd);
+}
+
+// CCMP Rn, Rm, #nzcv, cond (64-bit): if cond holds, set the flags from Rn - Rm;
+// otherwise set the flags directly to nzcv. Used to AND a second comparison
+// onto a prior one without branching.
+static void
+emit_conditionalcompare(struct jit_state* state, enum Registers rn, enum Registers rm, uint32_t nzcv, int cond)
+{
+    emit_instruction(state, 0xfa400000U | (rm << 16) | ((uint32_t)cond << 12) | (rn << 5) | (nzcv & 0xf));
+}
+
+// Bounds-check [dst, dst+size) against a single guest region described by the
+// memory descriptor at [R29 + JIT_MEMORY_FRAME_OFFSET], then translate dst to
+// the corresponding native address. The check is branchless: the address is
+// translated unconditionally and a final CSEL replaces it with 0 (a guaranteed
+// faulting access) when out of range. This avoids a predictable branch whose
+// mis-speculation could perform a transient out-of-bounds access (Spectre-v1).
+// bottom_off / top_off / base_off are the descriptor offsets of the region.
+static void
+emit_single_region_address(
+    struct jit_state* state, enum Registers dst, enum Registers scratch, int size, int bottom_off, int top_off, int base_off)
+{
+    enum Registers translated = temp_register;
+    const int COND_HS = 2; // unsigned >= (carry set)
+
+    // translated = dst - bottom + base
+    emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+    emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, bottom_off);
+    emit_addsub_register(state, true, AS_SUB, translated, dst, scratch);
+    emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+    emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, base_off);
+    emit_addsub_register(state, true, AS_ADD, translated, translated, scratch);
+
+    // valid <=> (dst >= bottom) && (dst <= top - size). Checking dst against
+    // top - size (rather than dst + size against top) avoids a separate
+    // add-overflow test and needs no extra register.
+    emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+    emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, bottom_off);
+    emit_addsub_register(state, true, AS_SUBS, RZ, dst, scratch); // CMP dst, bottom -> HS iff dst >= bottom
+    emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_OFFSET);
+    emit_loadstore_immediate(state, LS_LDRX, scratch, scratch, top_off);
+    if (size != 0) {
+        emit_addsub_immediate(state, true, AS_SUB, scratch, scratch, (uint32_t)size); // limit = top - size (no flags)
+    }
+    emit_conditionalcompare(state, scratch, dst, 0, COND_HS); // iff prior HS: HS iff limit >= dst (dst <= limit)
+
+    emit_conditionalselect(state, dst, translated, RZ, COND_HS); // dst = valid ? translated : 0
+}
+
 static void
 emit_masked_address_with_offset(
     const struct ubpf_vm* vm,
@@ -398,7 +462,8 @@ emit_masked_address_with_offset(
     enum Registers scratch,
     int16_t offset,
     int size,
-    bool store)
+    bool store,
+    int region_hint)
 {
     assert(dst != scratch);
 
@@ -424,6 +489,21 @@ emit_masked_address_with_offset(
     }
 
     if (vm->jit_pointer_mask) {
+        // Stores are always confined to the active stack regardless of the
+        // hint, preserving the read-only guarantee for the data region. Loads
+        // with a confident hint check only their region; otherwise fall through
+        // to the dual-region probe below.
+        if (!store && region_hint == JIT_REGION_STACK) {
+            emit_single_region_address(
+                state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
+            return;
+        }
+        if (!store && region_hint == JIT_REGION_DATA) {
+            emit_single_region_address(
+                state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
+            return;
+        }
+
         enum Registers end = temp_register;
         emit_logical_register(state, true, LOG_ORR, end, RZ, dst);
         if (size != 0) {
@@ -538,10 +618,11 @@ emit_masked_loadstore(
     enum LoadStoreOpcode op,
     enum Registers rt,
     enum Registers rn,
-    int16_t offset)
+    int16_t offset,
+    int region_hint)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, rn, temp_div_register, offset_register, offset, loadstore_access_size(op), loadstore_is_store(op));
+        emit_masked_address_with_offset(vm, state, rn, temp_div_register, offset_register, offset, loadstore_access_size(op), loadstore_is_store(op), region_hint);
         emit_loadstore_immediate(state, op, rt, temp_div_register, 0);
         return;
     }
@@ -1007,7 +1088,7 @@ emit_atomic_operation(
     // Copy addr_reg into addr_temp so that the base register used by LDXR/STXR
     // is guaranteed not to alias status_reg.
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, addr_reg, addr_temp, scratch, offset, is_64bit ? 8 : 4, true);
+        emit_masked_address_with_offset(vm, state, addr_reg, addr_temp, scratch, offset, is_64bit ? 8 : 4, true, JIT_REGION_UNKNOWN);
     } else if (offset != 0) {
         // Use int32_t to avoid undefined behavior when negating INT16_MIN.
         int32_t abs_offset = offset;
@@ -1743,7 +1824,13 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_LDXWSX:
         case EBPF_OP_LDXHSX:
         case EBPF_OP_LDXBSX:
-            emit_masked_loadstore(vm, state, to_loadstore_opcode(opcode), dst, src, inst.offset);
+            {
+                int region_hint = JIT_REGION_UNKNOWN;
+                if (vm->region_hints && i < vm->region_hints_len) {
+                    region_hint = vm->region_hints[i];
+                }
+                emit_masked_loadstore(vm, state, to_loadstore_opcode(opcode), dst, src, inst.offset, region_hint);
+            }
             break;
 
         case EBPF_OP_ATOMIC_STORE: {

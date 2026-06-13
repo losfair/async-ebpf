@@ -10,6 +10,7 @@ pub mod error;
 pub mod helpers;
 mod linker;
 mod pointer_cage;
+mod region_analysis;
 /// Program loading and execution APIs.
 pub mod program;
 mod ubpf;
