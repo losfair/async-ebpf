@@ -32,7 +32,7 @@ use rand::prelude::SliceRandom;
 use crate::{
   error::{Error, RuntimeError},
   helpers::Helper,
-  linker::link_elf,
+  linker::{link_elf, validate_local_call_graph},
   pointer_cage::PointerCage,
   util::nonnull_bytes_overlap,
 };
@@ -1101,6 +1101,12 @@ impl ProgramLoader {
         let code = cage
           .safe_deref_for_read(code_vaddr_size.0, code_vaddr_size.1)
           .unwrap();
+        let code_bytes = std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len());
+        validate_local_call_graph(code_bytes).map_err(|err| {
+          RuntimeError::InvalidArgumentOwned(format!(
+            "local call graph validation failed in {section_name}: {err}"
+          ))
+        })?;
         let ret = {
           let validation_scope = LoaderValidationScope::new(self);
           let ret = crate::ubpf::ubpf_load(
