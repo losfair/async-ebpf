@@ -16,6 +16,7 @@ use std::{
     atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
     Arc, Once,
   },
+  task::{Context, Poll},
   thread::ThreadId,
   time::{Duration, Instant},
 };
@@ -24,7 +25,7 @@ use corosensei::{
   stack::{DefaultStack, Stack},
   Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
 };
-use futures::{Future, FutureExt};
+use futures::{task::noop_waker_ref, Future, FutureExt};
 use memmap2::{MmapOptions, MmapRaw};
 use parking_lot::{Condvar, Mutex};
 use rand::prelude::SliceRandom;
@@ -887,13 +888,29 @@ impl Program {
             self.unbound.event_listener.did_yield();
           }
 
-          // Now we have released all exclusive resources and can safely execute the async task
-          if let Some(pending_async_task) = pending_async_task {
-            let async_start = Instant::now();
-            prev_async_task_output = Some((helper_name, pending_async_task.await));
-            let async_dur = async_start.elapsed();
-            last_throttle_time += async_dur;
-            last_yield_time += async_dur;
+          // Now we have released all exclusive resources and can safely execute the async task.
+          if let Some(mut pending_async_task) = pending_async_task {
+            // Fast path: helpers that merely compute a value (the common case)
+            // complete on the first poll without ever suspending. Poll once and,
+            // if it's ready, skip the `Instant::now()` reads used for run-budget
+            // compensation below. This matters because `clock_gettime` can cost
+            // ~200ns on virtualized hosts, and this path runs on every async
+            // helper invocation.
+            let output =
+              match pending_async_task.poll_unpin(&mut Context::from_waker(noop_waker_ref())) {
+                Poll::Ready(output) => output,
+                Poll::Pending => {
+                  // The task genuinely suspended; account for the wall-clock time
+                  // it took so it isn't charged against the program's run budget.
+                  let async_start = Instant::now();
+                  let output = pending_async_task.await;
+                  let async_dur = async_start.elapsed();
+                  last_throttle_time += async_dur;
+                  last_yield_time += async_dur;
+                  output
+                }
+              };
+            prev_async_task_output = Some((helper_name, output));
           }
         }
       }

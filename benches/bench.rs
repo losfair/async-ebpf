@@ -37,7 +37,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
   });
 
-  let host_invoke_bench = |b: &mut Bencher<WallTime>, use_async: bool| {
+  let host_invoke_bench = |b: &mut Bencher<WallTime>, mode: InvokeMode| {
     let (rt, prog) = compile_and_load(
       r#"
   extern unsigned long long return_42(void);
@@ -48,15 +48,28 @@ fn criterion_benchmark(c: &mut Criterion) {
     return output;
   }
   "#,
-      &[if use_async {
-        &[("return_42", |scope, _, _, _, _, _| -> Result<u64, ()> {
-          scope.post_task(async { |_: &HelperScope| Ok(42) });
-          Ok(0)
-        })]
-      } else {
-        &[("return_42", |_, _, _, _, _, _| -> Result<u64, ()> {
+      &[match mode {
+        InvokeMode::Sync => &[("return_42", |_, _, _, _, _, _| -> Result<u64, ()> {
           Ok(42)
-        })]
+        })],
+        InvokeMode::AsyncReady => {
+          &[("return_42", |scope, _, _, _, _, _| -> Result<u64, ()> {
+            // Task completes on the first poll (no suspension).
+            scope.post_task(async { |_: &HelperScope| Ok(42) });
+            Ok(0)
+          })]
+        }
+        InvokeMode::AsyncSuspend => {
+          &[("return_42", |scope, _, _, _, _, _| -> Result<u64, ()> {
+            // Task yields once, so its first poll returns Poll::Pending and it
+            // actually suspends before producing a result.
+            scope.post_task(async {
+              tokio::task::yield_now().await;
+              |_: &HelperScope| Ok(42)
+            });
+            Ok(0)
+          })]
+        }
       }],
     );
     let mut b = b.to_async(&rt);
@@ -85,8 +98,24 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
   };
 
-  c.bench_function("host invoke", |b| host_invoke_bench(b, false));
-  c.bench_function("async host invoke", |b| host_invoke_bench(b, true));
+  c.bench_function("host invoke", |b| host_invoke_bench(b, InvokeMode::Sync));
+  c.bench_function("async host invoke", |b| {
+    host_invoke_bench(b, InvokeMode::AsyncReady)
+  });
+  c.bench_function("async host invoke (suspends)", |b| {
+    host_invoke_bench(b, InvokeMode::AsyncSuspend)
+  });
+}
+
+#[derive(Copy, Clone)]
+enum InvokeMode {
+  /// Helper returns synchronously.
+  Sync,
+  /// Helper posts an async task that completes on its first poll.
+  AsyncReady,
+  /// Helper posts an async task that suspends (returns Poll::Pending) before
+  /// completing.
+  AsyncSuspend,
 }
 
 criterion_group!(benches, criterion_benchmark);
