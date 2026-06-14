@@ -305,7 +305,7 @@ static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Copy, Clone, Debug)]
 enum PreemptionState {
   Inactive,
-  Active(usize),
+  Armed(usize),
   Shutdown,
 }
 
@@ -515,16 +515,25 @@ impl GlobalEnv {
               PreemptionState::Inactive => {
                 preemption_state.1.wait(&mut state);
               }
-              PreemptionState::Active(_) => {
+              PreemptionState::Armed(_) => {
                 let timeout = preemption_state.1.wait_while_for(
                   &mut state,
-                  |x| matches!(x, PreemptionState::Active(_)),
+                  |x| matches!(x, PreemptionState::Armed(_)),
                   async_preemption_interval,
                 );
                 if timeout.timed_out() {
-                  let ret = libc::syscall(libc::SYS_tgkill, tgid, tid, libc::SIGUSR1);
-                  if ret != 0 {
-                    break;
+                  match *state {
+                    PreemptionState::Armed(0) => {
+                      *state = PreemptionState::Inactive;
+                    }
+                    PreemptionState::Armed(_) => {
+                      let ret = libc::syscall(libc::SYS_tgkill, tgid, tid, libc::SIGUSR1);
+                      if ret != 0 {
+                        break;
+                      }
+                    }
+                    PreemptionState::Inactive => {}
+                    PreemptionState::Shutdown => break,
                   }
                 }
               }
@@ -567,9 +576,9 @@ impl PreemptionEnabled {
         let next = match *st {
           PreemptionState::Inactive => {
             notify = true;
-            PreemptionState::Active(1)
+            PreemptionState::Armed(1)
           }
-          PreemptionState::Active(n) => PreemptionState::Active(n + 1),
+          PreemptionState::Armed(n) => PreemptionState::Armed(n + 1),
           PreemptionState::Shutdown => unreachable!(),
         };
         *st = next;
@@ -588,10 +597,10 @@ impl Drop for PreemptionEnabled {
     PREEMPTION_STATE.with(|x| {
       let mut st = x.0.lock();
       let next = match *st {
-        PreemptionState::Active(1) => PreemptionState::Inactive,
-        PreemptionState::Active(n) => {
+        PreemptionState::Armed(1) => PreemptionState::Armed(0),
+        PreemptionState::Armed(n) => {
           assert!(n > 1);
-          PreemptionState::Active(n - 1)
+          PreemptionState::Armed(n - 1)
         }
         PreemptionState::Inactive | PreemptionState::Shutdown => unreachable!(),
       };
