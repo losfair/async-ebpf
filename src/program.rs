@@ -737,8 +737,8 @@ impl Program {
         },
       )));
 
-      let mut last_yield_time = Instant::now();
-      let mut last_throttle_time = Instant::now();
+      let mut last_yield_time: Option<Instant> = None;
+      let mut last_throttle_time: Option<Instant> = None;
       let mut yielder: Option<AssumeSend<NonNull<Yielder<u64, Dispatch>>>> = None;
       let mut resume_input: u64 = 0;
       let mut did_throttle = false;
@@ -870,10 +870,12 @@ impl Program {
         rust_tid_sigusr1_counter = new_rust_tid_sigusr1_counter;
 
         let now = Instant::now();
-        let should_throttle = now > last_throttle_time
-          && now.duration_since(last_throttle_time) >= timeslice.max_run_time_before_throttle;
-        let should_yield = now > last_yield_time
-          && now.duration_since(last_yield_time) >= timeslice.max_run_time_before_yield;
+        let last_throttle = last_throttle_time.get_or_insert(now);
+        let last_yield = last_yield_time.get_or_insert(now);
+        let should_throttle = now > *last_throttle
+          && now.duration_since(*last_throttle) >= timeslice.max_run_time_before_throttle;
+        let should_yield = now > *last_yield
+          && now.duration_since(*last_yield) >= timeslice.max_run_time_before_yield;
         if should_throttle || should_yield || pending_async_task.is_some() {
           // we are now free to give up control of current thread to other async tasks
 
@@ -884,8 +886,8 @@ impl Program {
             }
             timeslicer.sleep(timeslice.throttle_duration).await;
             let now = Instant::now();
-            last_throttle_time = now;
-            last_yield_time = now;
+            last_throttle_time = Some(now);
+            last_yield_time = Some(now);
             let task = self.unbound.event_listener.did_throttle(&mut helper_scope);
             if let Some(task) = task {
               task.await;
@@ -893,7 +895,7 @@ impl Program {
           } else if should_yield {
             timeslicer.yield_now().await;
             let now = Instant::now();
-            last_yield_time = now;
+            last_yield_time = Some(now);
             self.unbound.event_listener.did_yield();
           }
 
@@ -914,8 +916,12 @@ impl Program {
                   let async_start = Instant::now();
                   let output = pending_async_task.await;
                   let async_dur = async_start.elapsed();
-                  last_throttle_time += async_dur;
-                  last_yield_time += async_dur;
+                  if let Some(last_throttle_time) = &mut last_throttle_time {
+                    *last_throttle_time += async_dur;
+                  }
+                  if let Some(last_yield_time) = &mut last_yield_time {
+                    *last_yield_time += async_dur;
+                  }
                   output
                 }
               };
