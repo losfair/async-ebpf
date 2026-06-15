@@ -246,19 +246,15 @@ pub fn link_elf(
     input[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
   }
 
-  // Scan code section and reject unsafe instructions
-  for (cs_name, &(vaddr, len)) in code_sections.iter() {
+  // Each code section must be a whole number of 8-byte instruction slots.
+  // Per-instruction validation (control flow, local-call graph, region routing)
+  // is performed later by `function_analysis`/`region_analysis` once the section
+  // bytes are resolved.
+  for &(_, len) in code_sections.values() {
     if len % 8 != 0 {
       return Err(LinkerError::InvalidElf(
         "code section size is not multiple of 8",
       ));
-    }
-    for i in (0..len).step_by(8) {
-      let offset = vaddr - vbase + i;
-      let insn = u64::from_le_bytes(input[offset..offset + 8].try_into().unwrap());
-      let insn = EbpfInsn::from_u64(insn);
-
-      let _ = (cs_name, insn, offset);
     }
   }
 

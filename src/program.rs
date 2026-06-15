@@ -60,8 +60,8 @@ async_ebpf_entry_trampoline:
     push r13
     push r14
     push r15
-    mov r12, rcx
-    add r12, r8
+    mov r15, rcx
+    add r15, r8
     mov r11, rcx
     mov rdi, rsi
     mov rsi, rdx
@@ -849,6 +849,28 @@ impl Program {
     self.unbound.code_arena.borrow().used
   }
 
+  /// Number of successfully compiled variants per source function, flattened
+  /// across sections. One entry per function in the layout; a value > 1 means
+  /// that callee was specialized for multiple incoming pointer signatures.
+  #[cfg(test)]
+  pub(crate) fn function_variant_counts_for_tests(&self) -> Vec<usize> {
+    self
+      .unbound
+      .sections
+      .borrow()
+      .iter()
+      .flat_map(|section| {
+        section.functions.iter().map(|function| {
+          function
+            .compiled
+            .values()
+            .filter(|compilation| compilation.entrypoint().is_some())
+            .count()
+        })
+      })
+      .collect()
+  }
+
   fn compile_entrypoint(&self, section_index: usize) -> Result<Entrypoint, RuntimeError> {
     self.compile_function(section_index, 0, PointerSignature::entry())
   }
@@ -966,28 +988,34 @@ impl Program {
       return Err(err);
     }
 
+    // Allocate resolver ids and build their metadata locally. Nothing is
+    // committed to `next_resolver_id` or the shared `resolvers` map until the
+    // function has been fully compiled and protected, so a failed compilation
+    // does not leak resolver ids or orphan map entries.
     let mut resolver_ids = vec![0u32; code_bytes.len() / 8];
+    let mut pending_resolvers: Vec<(u32, ResolverInfo)> = Vec::new();
+    let mut next_resolver_id = self.unbound.next_resolver_id.get();
     for (&call_pc, &callee_signature) in &region_analysis.call_signatures {
       let target_pc = local_call_target(code_bytes, call_pc);
       let callee_index = section.layout.pc_to_func[target_pc];
-      let resolver_id = self.unbound.next_resolver_id.get();
-      let Some(next_resolver_id) = resolver_id.checked_add(1) else {
+      let resolver_id = next_resolver_id;
+      let Some(advanced) = resolver_id.checked_add(1) else {
         let err = RuntimeError::InvalidArgument("too many local call resolvers");
         section.functions[function_index]
           .compiled
           .insert(signature, FunctionCompilation::Failed(err.clone()));
         return Err(err);
       };
-      self.unbound.next_resolver_id.set(next_resolver_id);
+      next_resolver_id = advanced;
       resolver_ids[call_pc] = resolver_id;
-      self.unbound.resolvers.borrow_mut().insert(
+      pending_resolvers.push((
         resolver_id,
         ResolverInfo {
           section_index,
           function_index: callee_index,
           signature: callee_signature,
         },
-      );
+      ));
     }
 
     let mut arena = self.unbound.code_arena.borrow_mut();
@@ -1076,12 +1104,27 @@ impl Program {
       crate::ubpf::ubpf_clear_instruction_cache(code_ptr as *mut u8, written_len);
     }
 
-    arena.used += written_len;
-    if let Err(err) = self.protect_code_pages(arena.used) {
+    // Restore W^X protection covering the newly emitted function before
+    // advancing the arena. If protection cannot be restored the function is not
+    // executable, so leave `arena.used` unchanged (reclaiming the space, which
+    // the next compilation overwrites after making the region writable again)
+    // and do not register its resolvers.
+    let new_used = arena.used + written_len;
+    if let Err(err) = self.protect_code_pages(new_used) {
       section.functions[function_index]
         .compiled
         .insert(signature, FunctionCompilation::Failed(err.clone()));
       return Err(err);
+    }
+    arena.used = new_used;
+
+    // Compilation succeeded: commit the resolver ids and metadata.
+    self.unbound.next_resolver_id.set(next_resolver_id);
+    {
+      let mut resolvers = self.unbound.resolvers.borrow_mut();
+      for (resolver_id, info) in pending_resolvers {
+        resolvers.insert(resolver_id, info);
+      }
     }
 
     let entrypoint = Entrypoint { code_ptr };
@@ -1495,11 +1538,21 @@ impl ProgramLoader {
   }
 
   /// Requires every guest memory access to be statically routable to a single
-  /// region (stack or read-only data). When enabled, loading fails if the
+  /// region (stack or read-only data). When enabled, compilation fails if the
   /// region analysis cannot classify any load, store, or atomic — i.e. no
   /// access falls back to the dual-region runtime probe. Memory accesses
   /// reached only through unmodeled control flow (e.g. an argument pointer in a
   /// local function) count as unresolved and are rejected.
+  ///
+  /// Because functions are JIT-compiled lazily and per pointer-signature
+  /// specialization, this check runs when each function variant is first
+  /// compiled — at the start of [`Program::run`], not at load time. The error
+  /// is therefore surfaced through `Program::run`. A function variant that is
+  /// never reached is never compiled and never checked; the guarantee is "every
+  /// executed access is statically routable", scoped to the variants actually
+  /// invoked, rather than a whole-section load-time guarantee. (Soundness does
+  /// not depend on this flag: unclassified accesses still get the dual-region
+  /// runtime probe, so the flag only tightens strictness.)
   pub fn require_static_region_analysis(mut self, require: bool) -> Self {
     self.require_static_regions = require;
     self

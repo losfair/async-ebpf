@@ -1532,6 +1532,23 @@ translate_range(
         return -1;
     }
 
+    // In function-granular (sub-range) mode the emitted prologue/epilogue assume
+    // the range is exactly one local function: the per-function prologue is only
+    // emitted at a function entry, but the EXIT/epilogue always pops a frame. A
+    // start_pc that is not a function entry (or an end_pc that splits a function)
+    // would therefore unbalance the host stack. Reject it instead of generating
+    // corrupt code.
+    if (!whole_program) {
+        if (!(start_pc == 0 || vm->int_funcs[start_pc])) {
+            *errmsg = ubpf_error("Function range start %u is not a local function entry", start_pc);
+            return -1;
+        }
+        if (end_pc != vm->num_insts && !vm->int_funcs[end_pc]) {
+            *errmsg = ubpf_error("Function range end %u is not a local function boundary", end_pc);
+            return -1;
+        }
+    }
+
     if (whole_program) {
         emit_jit_prologue(state, UBPF_EBPF_STACK_SIZE);
     }
@@ -1596,6 +1613,28 @@ translate_range(
             target_pc_64 = (int64_t)i + (int64_t)inst.offset + 1;
         }
         uint32_t target_pc = (uint32_t)target_pc_64;
+
+        // A relative branch (JA/JA32 or any conditional jump) is resolved against
+        // pc_locs[target_pc]. In function-granular mode only entries inside
+        // [start_pc, end_pc) are ever written, so a target outside the range would
+        // resolve against a zero pc_locs slot and silently retarget the branch to
+        // the top of the emitted buffer. Reject such branches. (In whole-program
+        // mode start_pc==0 and end_pc==num_insts, so valid branches always pass.)
+        {
+            uint8_t branch_cls = inst.opcode & EBPF_CLS_MASK;
+            if ((branch_cls == EBPF_CLS_JMP || branch_cls == EBPF_CLS_JMP32) &&
+                inst.opcode != EBPF_OP_CALL && inst.opcode != EBPF_OP_EXIT &&
+                (target_pc < start_pc || target_pc >= end_pc)) {
+                state->jit_status = UnexpectedInstruction;
+                *errmsg = ubpf_error(
+                    "jump target %u at PC %d is outside the translation range [%u, %u)",
+                    target_pc,
+                    i,
+                    start_pc,
+                    end_pc);
+                break;
+            }
+        }
 
         DECLARE_PATCHABLE_REGULAR_EBPF_TARGET(tgt, target_pc);
 
@@ -1963,8 +2002,13 @@ translate_range(
             break;
         }
         case UnexpectedInstruction: {
-            // errmsg set at time the error was detected because the message requires
-            // information about the unexpected instruction.
+            // errmsg is normally set where the error was detected because the
+            // message requires information about the unexpected instruction.
+            // Provide a fallback for paths (e.g. the lazy local-call guard) that
+            // only set the status, so the caller never sees a NULL error message.
+            if (*errmsg == NULL) {
+                *errmsg = ubpf_error("Unexpected instruction or missing local-call resolver during JIT compilation");
+            }
             break;
         }
         case UnknownInstruction: {

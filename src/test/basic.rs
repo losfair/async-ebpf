@@ -213,6 +213,71 @@ async fn test_lazy_jit_compiles_local_functions_on_first_call() {
 
 #[tokio::test]
 #[tracing_test::traced_test]
+async fn test_lazy_jit_specializes_callee_per_pointer_signature() {
+  let (_, t_env) = gt_env();
+  // `first_byte` is called once with a stack pointer and once with a read-only
+  // data pointer. The two call sites produce different incoming pointer
+  // signatures (R1 = foreign-stack vs R1 = data), so the callee is JIT-compiled
+  // into two distinct specializations.
+  let binary = compile_ebpf(
+    r#"
+  static int __attribute__((noinline, section("test"))) first_byte(const char *p) {
+    return *p;
+  }
+
+  int __attribute__((section("test"))) entry(void) {
+    char buf[8];
+    buf[0] = 3;
+    const char *ro = "Z";
+    return first_byte(buf) + first_byte(ro);
+  }
+  "#
+    .as_bytes()
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let loader = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[&[]],
+  )
+  .require_static_region_analysis(true);
+  let prog = loader
+    .load(&mut rand::thread_rng(), &binary)
+    .unwrap()
+    .pin_to_current_thread(t_env);
+
+  let ret = prog
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 3 + 'Z' as i64);
+
+  // Two source functions (`entry`, `first_byte`); `first_byte` is specialized
+  // into two pointer-signature variants, so three native functions total.
+  let variant_counts = prog.function_variant_counts_for_tests();
+  assert_eq!(
+    variant_counts.len(),
+    2,
+    "expected exactly two source functions, got {variant_counts:?}"
+  );
+  assert!(
+    variant_counts.contains(&2),
+    "expected one callee specialized into two variants, got {variant_counts:?}"
+  );
+  assert_eq!(prog.compiled_function_count_for_tests(), 3);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
 async fn test_fault_write_rodata() {
   let ret = run_one_program(
     RunOpts::simple(vec![HELPERS], "test"),
