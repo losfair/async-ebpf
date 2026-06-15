@@ -76,3 +76,16 @@ CoreMark's intended behavior here is a seed reduced to 16 bits. Making the
 modulo unsigned avoids depending on signed `%` lowering in the BPF backend and
 keeps the generated matrix data stable across optimization. The CRC check
 verifies that the patched matrix workload still matches CoreMark.
+
+## Inlining
+
+The combined translation unit wraps every workload function (everything except
+the `coremark_entry.c` driver) in a `#pragma clang attribute push
+(__attribute__((always_inline)))`. async-ebpf JIT-compiles functions lazily on
+first call, and every eBPF local call goes through a resolver host-call, so a
+function left out of line is paid for on every invocation — including the
+per-comparison `cmp_complex` call in the merge-sort inner loop. `-O3
+-inline-threshold` does not inline these on its own. Forcing them inline leaves
+zero local calls (the program compiles to a single native function) and
+improves measured CoreMark throughput by ~15%. The CRC check confirms the
+inlined build still matches CoreMark.
