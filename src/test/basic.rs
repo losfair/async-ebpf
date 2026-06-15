@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::{
   error::{Error, RuntimeError},
   helpers::Helper,
-  program::HelperScope,
-  test_util::{run_one_program, RunOpts},
+  program::{DummyProgramEventListener, HelperScope, PreemptionEnabled, ProgramLoader},
+  test_util::{compile_ebpf, gt_env, run_one_program, timeslice_config, RunOpts, TokioTimeslicer},
 };
 
 static HELPERS: &'static [(&'static str, Helper)] = &[
@@ -81,6 +81,134 @@ async fn test_noinline_local_function_calls() {
   .await
   .unwrap();
   assert_eq!(ret, 22);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_lazy_jit_compiles_entry_on_first_run() {
+  let (_, t_env) = gt_env();
+  let binary = compile_ebpf(
+    r#"
+  int __attribute__((section("test"))) entry(void) {
+    return 42;
+  }
+  "#
+    .as_bytes()
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let loader = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[&[]],
+  )
+  .require_static_region_analysis(true);
+  let prog = loader
+    .load(&mut rand::thread_rng(), &binary)
+    .unwrap()
+    .pin_to_current_thread(t_env);
+
+  assert_eq!(prog.compiled_function_count_for_tests(), 0);
+  assert_eq!(prog.code_arena_used_for_tests(), 0);
+
+  let ret = prog
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 42);
+  assert_eq!(prog.compiled_function_count_for_tests(), 1);
+  let arena_used = prog.code_arena_used_for_tests();
+  assert!(arena_used > 0);
+
+  let ret = prog
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 42);
+  assert_eq!(prog.compiled_function_count_for_tests(), 1);
+  assert_eq!(prog.code_arena_used_for_tests(), arena_used);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_lazy_jit_compiles_local_functions_on_first_call() {
+  let (_, t_env) = gt_env();
+  let binary = compile_ebpf(
+    r#"
+  static int __attribute__((noinline, section("test"))) add_seven(int x) {
+    return x + 7;
+  }
+
+  static int __attribute__((noinline, section("test"))) twice_after_add(int x) {
+    return add_seven(x) * 2;
+  }
+
+  int __attribute__((section("test"))) entry(void) {
+    return twice_after_add(4);
+  }
+  "#
+    .as_bytes()
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let loader = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[&[]],
+  )
+  .require_static_region_analysis(true);
+  let prog = loader
+    .load(&mut rand::thread_rng(), &binary)
+    .unwrap()
+    .pin_to_current_thread(t_env);
+
+  assert_eq!(prog.compiled_function_count_for_tests(), 0);
+
+  let ret = prog
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 22);
+  assert_eq!(prog.compiled_function_count_for_tests(), 3);
+  let arena_used = prog.code_arena_used_for_tests();
+
+  let ret = prog
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 22);
+  assert_eq!(prog.compiled_function_count_for_tests(), 3);
+  assert_eq!(prog.code_arena_used_for_tests(), arena_used);
 }
 
 #[tokio::test]
@@ -174,13 +302,79 @@ async fn test_fault_read_null_ptr() {
   assert!(matches!(ret, Err(Error(RuntimeError::MemoryFault(_)))));
 }
 
-/// Asserts that loading `code` under the default (strict) region analysis is
-/// rejected because some access cannot be routed to a single region.
+/// Asserts that executing `code` under the default (strict) region analysis is
+/// rejected because some access cannot be routed to a single region for the
+/// concrete function specialization being compiled.
 fn assert_static_region_rejected(ret: Result<i64, Error>) {
   match ret {
-    Err(Error(RuntimeError::InvalidArgumentOwned(msg))) if msg.contains("static region analysis") => {}
+    Err(Error(RuntimeError::InvalidArgumentOwned(msg)))
+      if msg.contains("static region analysis") => {}
     other => panic!("expected static region rejection, got {other:?}"),
   }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_strict_region_validation_is_deferred_until_execution() {
+  let (_, t_env) = gt_env();
+  let binary = compile_ebpf(
+    r#"
+  extern char *return_5(void);
+  unsigned long long __attribute__((section("test"))) entry(void) {
+    char *p = return_5();
+    return *p;
+  }
+  "#
+    .as_bytes()
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let loader = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[HELPERS],
+  )
+  .require_static_region_analysis(true);
+  let prog = loader
+    .load(&mut rand::thread_rng(), &binary)
+    .unwrap()
+    .pin_to_current_thread(t_env);
+
+  assert_eq!(prog.compiled_function_count_for_tests(), 0);
+  assert_eq!(prog.failed_function_count_for_tests(), 0);
+  assert_eq!(prog.function_compile_attempt_count_for_tests(), 0);
+  let ret = prog
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await;
+  assert_static_region_rejected(ret);
+  assert_eq!(prog.compiled_function_count_for_tests(), 0);
+  assert_eq!(prog.failed_function_count_for_tests(), 1);
+  assert_eq!(prog.function_compile_attempt_count_for_tests(), 1);
+  assert_eq!(prog.code_arena_used_for_tests(), 0);
+
+  let ret = prog
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await;
+  assert_static_region_rejected(ret);
+  assert_eq!(prog.compiled_function_count_for_tests(), 0);
+  assert_eq!(prog.failed_function_count_for_tests(), 1);
+  assert_eq!(prog.function_compile_attempt_count_for_tests(), 1);
+  assert_eq!(prog.code_arena_used_for_tests(), 0);
 }
 
 #[tokio::test]
@@ -194,7 +388,9 @@ async fn test_reject_helper_returned_pointer() {
     return *p;
   }
   "#;
-  assert_static_region_rejected(run_one_program(RunOpts::simple(vec![HELPERS], "test"), code).await);
+  assert_static_region_rejected(
+    run_one_program(RunOpts::simple(vec![HELPERS], "test"), code).await,
+  );
 }
 
 #[tokio::test]
@@ -203,7 +399,7 @@ async fn test_reject_pointer_loaded_from_memory() {
   // `**pp` first loads a pointer out of memory (region not tracked through
   // memory), then dereferences it — the inner deref is unroutable. The same
   // program loads and faults at runtime once strict analysis is disabled,
-  // confirming the load-time rejection is the strict gate, not a bad program.
+  // confirming the lazy strict-region rejection is the gate, not a bad program.
   let code = r#"
   unsigned long long __attribute__((section("test"))) entry(unsigned long long **pp) {
     return **pp;
@@ -270,10 +466,11 @@ fn h_return_7_async(
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_custom_code_size_limit() {
-  use crate::program::{DummyProgramEventListener, ProgramLoader};
+  use crate::program::{DummyProgramEventListener, PreemptionEnabled, ProgramLoader};
   use crate::test_util::compile_ebpf;
   use std::sync::Arc;
 
+  let (_, t_env) = gt_env();
   let binary = compile_ebpf(
     br#"
   int __attribute__((section("test"))) entry(void) {
@@ -291,7 +488,22 @@ async fn test_custom_code_size_limit() {
     &[],
   )
   .with_code_size_limit(64 * 1024);
-  loader.load(&mut rand::thread_rng(), &binary).unwrap();
+  let prog = loader
+    .load(&mut rand::thread_rng(), &binary)
+    .unwrap()
+    .pin_to_current_thread(t_env);
+  let ret = prog
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 42);
 }
 
 #[test]

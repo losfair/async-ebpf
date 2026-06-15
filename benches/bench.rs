@@ -37,6 +37,66 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
   });
 
+  c.bench_function("local function call", |b| {
+    let (rt, prog) = compile_and_load(
+      r#"
+  static unsigned long long __attribute__((noinline, section("test"))) return_42(unsigned long long i) {
+    return i + 42;
+  }
+
+  int __attribute__((section("test"))) entry(unsigned long long *iter_p) {
+    unsigned long long iter = *iter_p;
+    unsigned long long output = 0;
+    for (unsigned long long i = 0; i < iter; i++) {
+      output += return_42(i) - i;
+    }
+    return output;
+  }
+  "#,
+      &[],
+    );
+    let mut b = b.to_async(&rt);
+    let preemption = PreemptionEnabled::new(prog.thread_env());
+
+    rt.block_on(async {
+      let calldata: [u8; 8] = 1u64.to_le_bytes();
+      let ret = prog
+        .run(
+          &timeslice_config(),
+          &TokioTimeslicer,
+          "test",
+          &mut [],
+          &calldata,
+          &preemption,
+        )
+        .await
+        .unwrap();
+      assert_eq!(ret, 42);
+    });
+
+    b.iter_custom(|iters| {
+      let prog = &prog;
+      let preemption = &preemption;
+      async move {
+        let start = Instant::now();
+        let calldata: [u8; 8] = iters.to_le_bytes();
+        let ret = prog
+          .run(
+            &timeslice_config(),
+            &TokioTimeslicer,
+            "test",
+            &mut [],
+            &calldata,
+            &preemption,
+          )
+          .await
+          .unwrap();
+        assert_eq!(ret as u64, iters * 42);
+        start.elapsed()
+      }
+    });
+  });
+
   let host_invoke_bench = |b: &mut Bencher<WallTime>, mode: InvokeMode| {
     let (rt, prog) = compile_and_load(
       r#"

@@ -42,9 +42,39 @@ ubpf_translate_ex(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, char** errm
 }
 
 int
+ubpf_translate_function_ex(
+    struct ubpf_vm* vm,
+    uint8_t* buffer,
+    size_t* size,
+    char** errmsg,
+    enum JitMode jit_mode,
+    uint32_t start_pc,
+    uint32_t end_pc)
+{
+    struct ubpf_jit_result jit_result =
+        vm->jit_translate_function(vm, buffer, size, jit_mode, start_pc, end_pc);
+    vm->jitted_result = jit_result;
+    if (jit_result.errmsg) {
+        *errmsg = jit_result.errmsg;
+    }
+    return jit_result.compile_result == UBPF_JIT_COMPILE_SUCCESS ? 0 : -1;
+}
+
+int
 ubpf_translate(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, char** errmsg)
 {
     return ubpf_translate_ex(vm, buffer, size, errmsg, BasicJitMode);
+}
+
+void
+ubpf_clear_instruction_cache(uint8_t* buffer, size_t size)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin___clear_cache((char*)buffer, (char*)buffer + size);
+#else
+    UNUSED_PARAMETER(buffer);
+    UNUSED_PARAMETER(size);
+#endif
 }
 
 struct ubpf_jit_result
@@ -60,6 +90,29 @@ ubpf_translate_null(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum JitM
     UNUSED_PARAMETER(size);
     UNUSED_PARAMETER(jit_mode);
     compile_result.errmsg = ubpf_error("Code can not be JITed on this target.");
+    return compile_result;
+}
+
+struct ubpf_jit_result
+ubpf_translate_function_null(
+    struct ubpf_vm* vm,
+    uint8_t* buffer,
+    size_t* size,
+    enum JitMode jit_mode,
+    uint32_t start_pc,
+    uint32_t end_pc)
+{
+    struct ubpf_jit_result compile_result;
+    compile_result.compile_result = UBPF_JIT_COMPILE_FAILURE;
+    compile_result.external_dispatcher_offset = 0;
+
+    UNUSED_PARAMETER(vm);
+    UNUSED_PARAMETER(buffer);
+    UNUSED_PARAMETER(size);
+    UNUSED_PARAMETER(jit_mode);
+    UNUSED_PARAMETER(start_pc);
+    UNUSED_PARAMETER(end_pc);
+    compile_result.errmsg = ubpf_error("Function-granular JIT is not available on this target.");
     return compile_result;
 }
 

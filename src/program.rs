@@ -32,9 +32,11 @@ use rand::prelude::SliceRandom;
 
 use crate::{
   error::{Error, RuntimeError},
+  function_analysis::{analyze_functions, FunctionLayout},
   helpers::Helper,
   linker::{link_elf, validate_local_call_graph},
   pointer_cage::PointerCage,
+  region_analysis::PointerSignature,
   util::nonnull_bytes_overlap,
 };
 
@@ -43,6 +45,98 @@ const SHADOW_STACK_SIZE: usize = 32768;
 const MAX_CALLDATA_SIZE: usize = 512;
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+std::arch::global_asm!(
+  r#"
+.global async_ebpf_entry_trampoline
+.type async_ebpf_entry_trampoline,@function
+async_ebpf_entry_trampoline:
+    mov r10, rdi
+    mov rax, [rsp + 8]
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rcx
+    add r12, r8
+    mov r11, rcx
+    mov rdi, rsi
+    mov rsi, rdx
+    mov rdx, r11
+    mov rcx, r8
+    mov r8, r9
+    mov r11, rdi
+    sub rsp, 8
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp - 8], rax
+    call r10
+    mov rsp, rbp
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+.size async_ebpf_entry_trampoline, . - async_ebpf_entry_trampoline
+"#
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+std::arch::global_asm!(
+  r#"
+.global async_ebpf_entry_trampoline
+.type async_ebpf_entry_trampoline,%function
+async_ebpf_entry_trampoline:
+    mov x17, x0
+    sub sp, sp, #16
+    stp x29, x30, [sp]
+    sub sp, sp, #64
+    stp x19, x20, [sp, #0]
+    stp x21, x22, [sp, #16]
+    stp x23, x24, [sp, #32]
+    stp x25, x26, [sp, #48]
+    mov x29, sp
+    add x23, x3, x4
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, x4
+    mov x4, x5
+    sub sp, sp, #16
+    str x6, [x29, #-8]
+    mov x26, x0
+    blr x17
+    mov x0, x5
+    mov sp, x29
+    ldp x19, x20, [sp, #0]
+    ldp x21, x22, [sp, #16]
+    ldp x23, x24, [sp, #32]
+    ldp x25, x26, [sp, #48]
+    add sp, sp, #64
+    ldp x29, x30, [sp]
+    add sp, sp, #16
+    ret
+.size async_ebpf_entry_trampoline, . - async_ebpf_entry_trampoline
+"#
+);
+
+extern "C" {
+  fn async_ebpf_entry_trampoline(
+    target: usize,
+    ctx: usize,
+    mem_len: usize,
+    stack: usize,
+    stack_len: usize,
+    reserved: usize,
+    memory: usize,
+  ) -> u64;
+}
 
 /// Per-invocation storage for helper state during a program run.
 pub struct InvokeScope {
@@ -319,6 +413,7 @@ thread_local! {
   static PENDING_ASYNC_TASK: RefCell<Option<PendingAsyncTask>> = RefCell::new(None);
   static PREEMPTION_STATE: Arc<PreemptionStateSignal> = Arc::new((Mutex::new(PreemptionState::Inactive), Condvar::new()));
   static LOADING_PROGRAM_LOADER: Cell<*const ProgramLoader> = const { Cell::new(std::ptr::null()) };
+  static ACTIVE_PROGRAM: Cell<*const Program> = const { Cell::new(std::ptr::null()) };
 }
 
 struct BorrowedExecContext {
@@ -385,11 +480,19 @@ pub struct ProgramLoader {
 pub struct UnboundProgram {
   id: u64,
   _code_mem: MmapRaw,
+  code_base: usize,
+  code_size: usize,
+  page_size: usize,
+  code_arena: RefCell<CodeArena>,
   cage: PointerCage,
   helper_id_xor: u16,
   helpers: Arc<Vec<(u16, &'static str, Helper)>>,
   event_listener: Arc<dyn ProgramEventListener>,
-  entrypoints: HashMap<String, Entrypoint>,
+  require_static_regions: bool,
+  entrypoints: HashMap<String, usize>,
+  sections: RefCell<Vec<Section>>,
+  resolvers: RefCell<HashMap<u32, ResolverInfo>>,
+  next_resolver_id: Cell<u32>,
 }
 
 /// A program pinned to a specific thread and ready to execute.
@@ -402,7 +505,54 @@ pub struct Program {
 #[derive(Copy, Clone)]
 struct Entrypoint {
   code_ptr: usize,
+}
+
+struct CodeArena {
+  used: usize,
+}
+
+struct Section {
+  vm: Vm,
+  code_vaddr: usize,
   code_len: usize,
+  layout: FunctionLayout,
+  functions: Vec<FunctionState>,
+}
+
+#[derive(Default)]
+struct FunctionState {
+  compiled: HashMap<PointerSignature, FunctionCompilation>,
+  #[cfg(test)]
+  compile_attempts: usize,
+}
+
+#[derive(Clone)]
+enum FunctionCompilation {
+  Succeeded(Entrypoint),
+  Failed(RuntimeError),
+}
+
+impl FunctionCompilation {
+  fn result(&self) -> Result<Entrypoint, RuntimeError> {
+    match self {
+      Self::Succeeded(entrypoint) => Ok(*entrypoint),
+      Self::Failed(err) => Err(err.clone()),
+    }
+  }
+
+  fn entrypoint(&self) -> Option<Entrypoint> {
+    match self {
+      Self::Succeeded(entrypoint) => Some(*entrypoint),
+      Self::Failed(_) => None,
+    }
+  }
+}
+
+#[derive(Clone, Copy)]
+struct ResolverInfo {
+  section_index: usize,
+  function_index: usize,
+  signature: PointerSignature,
 }
 
 /// Time limits used to yield or throttle execution.
@@ -631,6 +781,325 @@ impl Program {
     self.unbound.entrypoints.contains_key(name)
   }
 
+  #[cfg(test)]
+  pub(crate) fn compiled_function_count_for_tests(&self) -> usize {
+    self
+      .unbound
+      .sections
+      .borrow()
+      .iter()
+      .map(|section| {
+        section
+          .functions
+          .iter()
+          .map(|function| {
+            function
+              .compiled
+              .values()
+              .filter(|compilation| compilation.entrypoint().is_some())
+              .count()
+          })
+          .sum::<usize>()
+      })
+      .sum()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn failed_function_count_for_tests(&self) -> usize {
+    self
+      .unbound
+      .sections
+      .borrow()
+      .iter()
+      .map(|section| {
+        section
+          .functions
+          .iter()
+          .map(|function| {
+            function
+              .compiled
+              .values()
+              .filter(|compilation| compilation.entrypoint().is_none())
+              .count()
+          })
+          .sum::<usize>()
+      })
+      .sum()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn function_compile_attempt_count_for_tests(&self) -> usize {
+    self
+      .unbound
+      .sections
+      .borrow()
+      .iter()
+      .map(|section| {
+        section
+          .functions
+          .iter()
+          .map(|function| function.compile_attempts)
+          .sum::<usize>()
+      })
+      .sum()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn code_arena_used_for_tests(&self) -> usize {
+    self.unbound.code_arena.borrow().used
+  }
+
+  fn compile_entrypoint(&self, section_index: usize) -> Result<Entrypoint, RuntimeError> {
+    self.compile_function(section_index, 0, PointerSignature::entry())
+  }
+
+  fn compile_resolver(&self, resolver_id: u32) -> Result<Entrypoint, RuntimeError> {
+    let Some(info) = self.unbound.resolvers.borrow().get(&resolver_id).copied() else {
+      return Err(RuntimeError::InvalidArgument(
+        "local call resolver not found",
+      ));
+    };
+    self.compile_function(info.section_index, info.function_index, info.signature)
+  }
+
+  fn cached_resolver_target(&self, resolver_id: u32) -> Option<usize> {
+    let info = self.unbound.resolvers.borrow().get(&resolver_id).copied()?;
+    let sections = self.unbound.sections.borrow();
+    let section = sections.get(info.section_index)?;
+    section
+      .functions
+      .get(info.function_index)?
+      .compiled
+      .get(&info.signature)
+      .and_then(|compilation| compilation.entrypoint())
+      .map(|entrypoint| entrypoint.code_ptr)
+  }
+
+  fn protect_code_pages(&self, executable_len: usize) -> Result<(), RuntimeError> {
+    let executable_len =
+      (executable_len + self.unbound.page_size - 1) & !(self.unbound.page_size - 1);
+    unsafe {
+      if executable_len > 0
+        && libc::mprotect(
+          self.unbound.code_base as *mut _,
+          executable_len,
+          libc::PROT_READ | libc::PROT_EXEC,
+        ) != 0
+      {
+        return Err(RuntimeError::PlatformError(
+          "failed to protect executable code",
+        ));
+      }
+      if executable_len < self.unbound.code_size
+        && libc::mprotect(
+          (self.unbound.code_base + executable_len) as *mut _,
+          self.unbound.code_size - executable_len,
+          libc::PROT_NONE,
+        ) != 0
+      {
+        return Err(RuntimeError::PlatformError("failed to protect unused code"));
+      }
+    }
+    Ok(())
+  }
+
+  fn compile_function(
+    &self,
+    section_index: usize,
+    function_index: usize,
+    signature: PointerSignature,
+  ) -> Result<Entrypoint, RuntimeError> {
+    {
+      let sections = self.unbound.sections.borrow();
+      let Some(section) = sections.get(section_index) else {
+        return Err(RuntimeError::InvalidArgument("section not found"));
+      };
+      let Some(function) = section.functions.get(function_index) else {
+        return Err(RuntimeError::InvalidArgument("function not found"));
+      };
+      if let Some(compilation) = function.compiled.get(&signature) {
+        return compilation.result();
+      }
+    }
+
+    let mut sections = self.unbound.sections.borrow_mut();
+    let section = sections
+      .get_mut(section_index)
+      .ok_or(RuntimeError::InvalidArgument("section not found"))?;
+    if function_index >= section.functions.len() {
+      return Err(RuntimeError::InvalidArgument("function not found"));
+    }
+    if let Some(compilation) = section.functions[function_index].compiled.get(&signature) {
+      return compilation.result();
+    }
+    #[cfg(test)]
+    {
+      section.functions[function_index].compile_attempts += 1;
+    }
+    let function = section.layout.functions[function_index].clone();
+    let code = self
+      .unbound
+      .cage
+      .safe_deref_for_read(section.code_vaddr, section.code_len)
+      .unwrap();
+    let code_bytes = unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
+    let region_analysis = crate::region_analysis::analyze_function(
+      code_bytes,
+      function.start_pc,
+      function.end_pc,
+      signature,
+      self.unbound.cage.data_bottom() as u64,
+      self.unbound.cage.data_top() as u64,
+    );
+    if self.unbound.require_static_regions && !region_analysis.unresolved.is_empty() {
+      let err = RuntimeError::InvalidArgumentOwned(format!(
+        "static region analysis failed in function [{}, {}): {} memory access(es) could not be \
+         routed to a single region (instruction slots {:?})",
+        function.start_pc,
+        function.end_pc,
+        region_analysis.unresolved.len(),
+        region_analysis.unresolved,
+      ));
+      section.functions[function_index]
+        .compiled
+        .insert(signature, FunctionCompilation::Failed(err.clone()));
+      return Err(err);
+    }
+
+    let mut resolver_ids = vec![0u32; code_bytes.len() / 8];
+    for (&call_pc, &callee_signature) in &region_analysis.call_signatures {
+      let target_pc = local_call_target(code_bytes, call_pc);
+      let callee_index = section.layout.pc_to_func[target_pc];
+      let resolver_id = self.unbound.next_resolver_id.get();
+      let Some(next_resolver_id) = resolver_id.checked_add(1) else {
+        let err = RuntimeError::InvalidArgument("too many local call resolvers");
+        section.functions[function_index]
+          .compiled
+          .insert(signature, FunctionCompilation::Failed(err.clone()));
+        return Err(err);
+      };
+      self.unbound.next_resolver_id.set(next_resolver_id);
+      resolver_ids[call_pc] = resolver_id;
+      self.unbound.resolvers.borrow_mut().insert(
+        resolver_id,
+        ResolverInfo {
+          section_index,
+          function_index: callee_index,
+          signature: callee_signature,
+        },
+      );
+    }
+
+    let mut arena = self.unbound.code_arena.borrow_mut();
+    if arena.used >= self.unbound.code_size {
+      let err = RuntimeError::InvalidArgument("no space left for jit compilation");
+      section.functions[function_index]
+        .compiled
+        .insert(signature, FunctionCompilation::Failed(err.clone()));
+      return Err(err);
+    }
+
+    unsafe {
+      if libc::mprotect(
+        self.unbound.code_base as *mut _,
+        self.unbound.code_size,
+        libc::PROT_READ | libc::PROT_WRITE,
+      ) != 0
+      {
+        let err = RuntimeError::PlatformError("failed to make code writable");
+        section.functions[function_index]
+          .compiled
+          .insert(signature, FunctionCompilation::Failed(err.clone()));
+        return Err(err);
+      }
+    }
+
+    let code_ptr = self.unbound.code_base + arena.used;
+    let mut written_len = self.unbound.code_size - arena.used;
+    let mut errmsg_ptr = std::ptr::null_mut();
+
+    let ret = unsafe {
+      crate::ubpf::ubpf_set_region_hints(
+        section.vm.0.as_ptr(),
+        region_analysis.hints.as_ptr(),
+        region_analysis.hints.len(),
+      );
+      crate::ubpf::ubpf_set_lazy_local_call_resolver(
+        section.vm.0.as_ptr(),
+        Some(tls_local_call_resolver),
+        resolver_ids.as_ptr(),
+        resolver_ids.len(),
+      );
+      let ret = crate::ubpf::ubpf_translate_function_ex(
+        section.vm.0.as_ptr(),
+        code_ptr as *mut u8,
+        &mut written_len,
+        &mut errmsg_ptr,
+        crate::ubpf::JitMode_ExtendedJitMode,
+        function.start_pc as u32,
+        function.end_pc as u32,
+      );
+      crate::ubpf::ubpf_set_region_hints(section.vm.0.as_ptr(), std::ptr::null(), 0);
+      crate::ubpf::ubpf_set_lazy_local_call_resolver(
+        section.vm.0.as_ptr(),
+        None,
+        std::ptr::null(),
+        0,
+      );
+      ret
+    };
+
+    if ret != 0 {
+      let errmsg = unsafe {
+        if errmsg_ptr.is_null() {
+          "".to_string()
+        } else {
+          CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned()
+        }
+      };
+      if !errmsg_ptr.is_null() {
+        unsafe { libc::free(errmsg_ptr as _) };
+      }
+      let _ = self.protect_code_pages(arena.used);
+      let err =
+        RuntimeError::InvalidArgumentOwned(format!("ubpf: code translation failed: {errmsg}"));
+      section.functions[function_index]
+        .compiled
+        .insert(signature, FunctionCompilation::Failed(err.clone()));
+      return Err(err);
+    }
+    if !errmsg_ptr.is_null() {
+      unsafe { libc::free(errmsg_ptr as _) };
+    }
+
+    unsafe {
+      crate::ubpf::ubpf_clear_instruction_cache(code_ptr as *mut u8, written_len);
+    }
+
+    arena.used += written_len;
+    if let Err(err) = self.protect_code_pages(arena.used) {
+      section.functions[function_index]
+        .compiled
+        .insert(signature, FunctionCompilation::Failed(err.clone()));
+      return Err(err);
+    }
+
+    let entrypoint = Entrypoint { code_ptr };
+    section.functions[function_index]
+      .compiled
+      .insert(signature, FunctionCompilation::Succeeded(entrypoint));
+    tracing::debug!(
+      section_index,
+      function_index,
+      start_pc = function.start_pc,
+      end_pc = function.end_pc,
+      native_code_addr = ?(code_ptr as *const u8),
+      native_code_size = written_len,
+      "jit compiled function"
+    );
+    Ok(entrypoint)
+  }
+
   /// Runs the program entrypoint with the provided resources and calldata.
   pub async fn run(
     &self,
@@ -658,23 +1127,10 @@ impl Program {
     calldata: &[u8],
     _: &PreemptionEnabled,
   ) -> Result<i64, RuntimeError> {
-    let Some(entrypoint) = self.unbound.entrypoints.get(entrypoint).copied() else {
+    let Some(section_index) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));
     };
-
-    let entry = unsafe {
-      std::mem::transmute::<
-        _,
-        unsafe extern "C" fn(
-          ctx: usize,
-          mem_len: usize,
-          stack: usize,
-          stack_len: usize,
-          reserved: usize,
-          memory: usize,
-        ) -> u64,
-      >(entrypoint.code_ptr)
-    };
+    let entrypoint = self.compile_entrypoint(section_index)?;
     struct CoDropper<'a, Input, Yield, Return, DefaultStack: Stack>(
       ScopedCoroutine<'a, Input, Yield, Return, DefaultStack>,
     );
@@ -726,7 +1182,8 @@ impl Program {
           let calldata_start = guest_stack_top - calldata_len;
           let stack_top = calldata_start & !0x7;
           let stack_len = stack_top - guest_stack_bottom;
-          entry(
+          async_ebpf_entry_trampoline(
+            entrypoint.code_ptr,
             calldata_start,
             calldata_start,
             guest_stack_bottom,
@@ -751,14 +1208,15 @@ impl Program {
       loop {
         ACTIVE_JIT_CODE_ZONE.with(|x| {
           x.code_range.set((
-            entrypoint.code_ptr,
-            entrypoint.code_ptr + entrypoint.code_len,
+            self.unbound.code_base,
+            self.unbound.code_base + self.unbound.code_size,
           ));
           x.yielder.set(yielder.map(|x| x.0));
           x.pointer_cage_protected_range.set((0, 4096));
           compiler_fence(Ordering::Release);
           x.valid.store(true, Ordering::Relaxed);
         });
+        ACTIVE_PROGRAM.with(|x| x.set(self as *const _));
 
         // If the previous iteration wants to write back to machine state
         if let Some((helper_name, prev_async_task_output)) = prev_async_task_output.take() {
@@ -775,6 +1233,7 @@ impl Program {
         }
 
         let ret = co.0 .0.resume(resume_input);
+        ACTIVE_PROGRAM.with(|x| x.set(std::ptr::null()));
         ACTIVE_JIT_CODE_ZONE.with(|x| {
           x.valid.store(false, Ordering::Relaxed);
           compiler_fence(Ordering::Release);
@@ -808,6 +1267,11 @@ impl Program {
             0
           };
           return Err(RuntimeError::MemoryFault(vaddr));
+        }
+
+        if let Some(resolver_id) = dispatch.lazy_local_call {
+          resume_input = self.compile_resolver(resolver_id)?.code_ptr as u64;
+          continue;
         }
 
         // Clear pending task if something else has set it
@@ -936,6 +1400,7 @@ impl Program {
 }
 
 struct Vm(NonNull<crate::ubpf::ubpf_vm>);
+unsafe impl Send for Vm {}
 
 impl Vm {
   fn new(cage: &PointerCage) -> Self {
@@ -975,6 +1440,17 @@ impl Drop for LoaderValidationScope {
   fn drop(&mut self) {
     LOADING_PROGRAM_LOADER.with(|x| x.set(self.previous));
   }
+}
+
+fn local_call_target(code: &[u8], pc: usize) -> usize {
+  let offset = pc * 8;
+  let imm = i32::from_le_bytes([
+    code[offset + 4],
+    code[offset + 5],
+    code[offset + 6],
+    code[offset + 7],
+  ]);
+  (pc as i64 + imm as i64 + 1) as usize
 }
 
 impl ProgramLoader {
@@ -1062,13 +1538,8 @@ impl ProgramLoader {
   fn _load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, RuntimeError> {
     let start_time = Instant::now();
     let cage = PointerCage::new(rng, SHADOW_STACK_SIZE, elf.len())?;
-    let vm = Vm::new(&cage);
 
-    // Relocate ELF
     let code_sections = {
-      // XXX: Although we are writing to the data region, we need to use `safe_deref_for_read`
-      // here because the `_write` variant checks that the requested region is within the
-      // stack. It's safe here because `freeze_data` is not yet called.
       let mut data = cage
         .safe_deref_for_read(cage.data_bottom(), elf.len())
         .unwrap();
@@ -1085,9 +1556,8 @@ impl ProgramLoader {
     }
     let page_size = page_size as usize;
 
-    // Allocate code memory
     let guard_size_before = rng.gen_range(16..128) * page_size;
-    let mut guard_size_after = rng.gen_range(16..128) * page_size;
+    let guard_size_after = rng.gen_range(16..128) * page_size;
 
     let code_len_allocated = self.code_size_limit;
     let code_mem = MmapRaw::from(
@@ -1096,18 +1566,9 @@ impl ProgramLoader {
         .map_anon()
         .map_err(|_| RuntimeError::PlatformError("failed to allocate code memory"))?,
     );
+    let code_base = code_mem.as_ptr() as usize + guard_size_before;
 
     unsafe {
-      if crate::ubpf::ubpf_register_external_dispatcher(
-        vm.0.as_ptr(),
-        Some(tls_dispatcher),
-        Some(std_validator),
-      ) != 0
-      {
-        return Err(RuntimeError::PlatformError(
-          "ubpf: failed to register external dispatcher",
-        ));
-      }
       if libc::mprotect(
         code_mem.as_mut_ptr() as *mut _,
         guard_size_before,
@@ -1120,193 +1581,124 @@ impl ProgramLoader {
           guard_size_after,
           libc::PROT_NONE,
         ) != 0
-      {
-        return Err(RuntimeError::PlatformError("failed to protect guard pages"));
-      }
-    }
-
-    let mut entrypoints: HashMap<String, Entrypoint> = HashMap::new();
-
-    unsafe {
-      // Translate eBPF to native code
-      let mut code_slice = std::slice::from_raw_parts_mut(
-        code_mem.as_mut_ptr().offset(guard_size_before as isize),
-        code_len_allocated,
-      );
-      for (section_name, code_vaddr_size) in code_sections {
-        if code_slice.is_empty() {
-          return Err(RuntimeError::InvalidArgument(
-            "no space left for jit compilation",
-          ));
-        }
-
-        crate::ubpf::ubpf_unload_code(vm.0.as_ptr());
-
-        let mut errmsg_ptr = std::ptr::null_mut();
-        let code = cage
-          .safe_deref_for_read(code_vaddr_size.0, code_vaddr_size.1)
-          .unwrap();
-        let code_bytes = std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len());
-        validate_local_call_graph(code_bytes).map_err(|err| {
-          RuntimeError::InvalidArgumentOwned(format!(
-            "local call graph validation failed in {section_name}: {err}"
-          ))
-        })?;
-        let ret = {
-          let validation_scope = LoaderValidationScope::new(self);
-          let ret = crate::ubpf::ubpf_load(
-            vm.0.as_ptr(),
-            code.as_ptr() as *const _,
-            code.len() as u32,
-            &mut errmsg_ptr,
-          );
-          drop(validation_scope);
-          ret
-        };
-        if ret != 0 {
-          let errmsg = if errmsg_ptr.is_null() {
-            "".to_string()
-          } else {
-            CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned()
-          };
-          if !errmsg_ptr.is_null() {
-            libc::free(errmsg_ptr as _);
-          }
-          tracing::error!(section_name, error = errmsg, "failed to load code");
-          return Err(RuntimeError::InvalidArgumentOwned(format!(
-            "ubpf: code load failed: {errmsg}"
-          )));
-        }
-
-        // Statically classify each load's pointer region so the JIT can emit a
-        // single-region bounds check instead of probing both. Misclassification
-        // is safe: the retained single-region check turns it into a spurious
-        // fault, never a cross-region access. The hint buffer must outlive the
-        // translate call below.
-        let region_analysis = crate::region_analysis::analyze(
-          code_bytes,
-          cage.data_bottom() as u64,
-          cage.data_top() as u64,
-        );
-        if self.require_static_regions && !region_analysis.unresolved.is_empty() {
-          return Err(RuntimeError::InvalidArgumentOwned(format!(
-            "static region analysis failed in {section_name}: {} memory access(es) could not be \
-             routed to a single region (instruction slots {:?})",
-            region_analysis.unresolved.len(),
-            region_analysis.unresolved,
-          )));
-        }
-        let region_hints = region_analysis.hints;
-        crate::ubpf::ubpf_set_region_hints(
-          vm.0.as_ptr(),
-          region_hints.as_ptr(),
-          region_hints.len(),
-        );
-
-        let mut written_len = code_slice.len();
-        let ret = crate::ubpf::ubpf_translate_ex(
-          vm.0.as_ptr(),
-          code_slice.as_mut_ptr(),
-          &mut written_len,
-          &mut errmsg_ptr,
-          crate::ubpf::JitMode_ExtendedJitMode,
-        );
-        // Clear the borrowed pointer before `region_hints` is dropped so the VM
-        // never retains a dangling reference between sections.
-        crate::ubpf::ubpf_set_region_hints(vm.0.as_ptr(), std::ptr::null(), 0);
-        if ret != 0 {
-          let errmsg = if errmsg_ptr.is_null() {
-            "".to_string()
-          } else {
-            CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned()
-          };
-          if !errmsg_ptr.is_null() {
-            libc::free(errmsg_ptr as _);
-          }
-          tracing::error!(section_name, error = errmsg, "failed to translate code");
-          return Err(RuntimeError::InvalidArgumentOwned(format!(
-            "ubpf: code translation failed: {errmsg}"
-          )));
-        }
-
-        assert!(written_len <= code_slice.len());
-        entrypoints.insert(
-          section_name,
-          Entrypoint {
-            code_ptr: code_mem.as_ptr() as usize + guard_size_before + code_len_allocated
-              - code_slice.len(),
-            code_len: written_len,
-          },
-        );
-        code_slice = &mut code_slice[written_len..];
-      }
-
-      // Align up code_len to page size
-      let unpadded_code_len = code_len_allocated - code_slice.len();
-      if std::env::var("JIT_DUMP").is_ok() {
-        eprintln!(
-          "[JITSIZE] elf={} native_unpadded={} buffer={}",
-          elf.len(),
-          unpadded_code_len,
-          code_len_allocated
-        );
-        let native = std::slice::from_raw_parts(
-          code_mem.as_ptr().offset(guard_size_before as isize),
-          unpadded_code_len,
-        );
-        let mut hex = String::with_capacity(native.len() * 2);
-        for b in native {
-          hex.push_str(&format!("{b:02x}"));
-        }
-        eprintln!("[JITHEX] {hex}");
-      }
-      let code_len = (unpadded_code_len + page_size - 1) & !(page_size - 1);
-      assert!(code_len <= code_len_allocated);
-
-      // RW- -> R-X
-      // Also make the unused part of the pre-allocated code region PROT_NONE
-      if libc::mprotect(
-        code_mem.as_mut_ptr().offset(guard_size_before as isize) as *mut _,
-        code_len,
-        libc::PROT_READ | libc::PROT_EXEC,
-      ) != 0
-        || (code_len < code_len_allocated
-          && libc::mprotect(
-            code_mem
-              .as_mut_ptr()
-              .offset((guard_size_before + code_len) as isize) as *mut _,
-            code_len_allocated - code_len,
-            libc::PROT_NONE,
-          ) != 0)
+        || libc::mprotect(
+          code_mem.as_mut_ptr().offset(guard_size_before as isize) as *mut _,
+          code_len_allocated,
+          libc::PROT_NONE,
+        ) != 0
       {
         return Err(RuntimeError::PlatformError("failed to protect code memory"));
       }
-
-      guard_size_after += code_len_allocated - code_len;
-
-      tracing::info!(
-        elf_size = elf.len(),
-        native_code_addr = ?code_mem.as_ptr(),
-        native_code_size = code_len,
-        native_code_size_unpadded = unpadded_code_len,
-        guard_size_before,
-        guard_size_after,
-        duration = ?start_time.elapsed(),
-        cage_ptr = ?cage.region().as_ptr(),
-        cage_mapped_size = cage.region().len(),
-        "jit compiled program"
-      );
-
-      Ok(UnboundProgram {
-        id: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
-        _code_mem: code_mem,
-        cage,
-        helper_id_xor: self.helper_id_xor,
-        helpers: self.helpers.clone(),
-        event_listener: self.event_listener.clone(),
-        entrypoints,
-      })
     }
+
+    let mut entrypoints = HashMap::new();
+    let mut sections = Vec::new();
+    let resolvers = HashMap::new();
+    let next_resolver_id = 1u32;
+
+    for (section_name, code_vaddr_size) in code_sections {
+      let vm = Vm::new(&cage);
+      unsafe {
+        if crate::ubpf::ubpf_register_external_dispatcher(
+          vm.0.as_ptr(),
+          Some(tls_dispatcher),
+          Some(std_validator),
+        ) != 0
+        {
+          return Err(RuntimeError::PlatformError(
+            "ubpf: failed to register external dispatcher",
+          ));
+        }
+      }
+
+      let mut errmsg_ptr = std::ptr::null_mut();
+      let code = cage
+        .safe_deref_for_read(code_vaddr_size.0, code_vaddr_size.1)
+        .unwrap();
+      let code_bytes =
+        unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
+      validate_local_call_graph(code_bytes).map_err(|err| {
+        RuntimeError::InvalidArgumentOwned(format!(
+          "local call graph validation failed in {section_name}: {err}"
+        ))
+      })?;
+      let layout = analyze_functions(code_bytes).map_err(|err| {
+        RuntimeError::InvalidArgumentOwned(format!(
+          "local function analysis failed in {section_name}: {err}"
+        ))
+      })?;
+      let ret = unsafe {
+        let validation_scope = LoaderValidationScope::new(self);
+        let ret = crate::ubpf::ubpf_load(
+          vm.0.as_ptr(),
+          code.as_ptr() as *const _,
+          code.len() as u32,
+          &mut errmsg_ptr,
+        );
+        drop(validation_scope);
+        ret
+      };
+      if ret != 0 {
+        let errmsg = unsafe {
+          if errmsg_ptr.is_null() {
+            "".to_string()
+          } else {
+            CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned()
+          }
+        };
+        if !errmsg_ptr.is_null() {
+          unsafe { libc::free(errmsg_ptr as _) };
+        }
+        tracing::error!(section_name, error = errmsg, "failed to load code");
+        return Err(RuntimeError::InvalidArgumentOwned(format!(
+          "ubpf: code load failed: {errmsg}"
+        )));
+      }
+
+      let section_index = sections.len();
+
+      entrypoints.insert(section_name, section_index);
+      let functions = (0..layout.functions.len())
+        .map(|_| FunctionState::default())
+        .collect();
+      sections.push(Section {
+        vm,
+        code_vaddr: code_vaddr_size.0,
+        code_len: code_vaddr_size.1,
+        layout,
+        functions,
+      });
+    }
+
+    tracing::info!(
+      elf_size = elf.len(),
+      native_code_addr = ?code_mem.as_ptr(),
+      native_code_size_limit = code_len_allocated,
+      guard_size_before,
+      guard_size_after,
+      duration = ?start_time.elapsed(),
+      cage_ptr = ?cage.region().as_ptr(),
+      cage_mapped_size = cage.region().len(),
+      "loaded program for lazy jit"
+    );
+
+    Ok(UnboundProgram {
+      id: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
+      _code_mem: code_mem,
+      code_base,
+      code_size: code_len_allocated,
+      page_size,
+      code_arena: RefCell::new(CodeArena { used: 0 }),
+      cage,
+      helper_id_xor: self.helper_id_xor,
+      helpers: self.helpers.clone(),
+      event_listener: self.event_listener.clone(),
+      require_static_regions: self.require_static_regions,
+      entrypoints,
+      sections: RefCell::new(sections),
+      resolvers: RefCell::new(resolvers),
+      next_resolver_id: Cell::new(next_resolver_id),
+    })
   }
 }
 
@@ -1314,6 +1706,7 @@ impl ProgramLoader {
 struct Dispatch {
   async_preemption: bool,
   memory_access_error: Option<usize>,
+  lazy_local_call: Option<u32>,
 
   index: u32,
   arg1: u64,
@@ -1339,6 +1732,7 @@ unsafe extern "C" fn tls_dispatcher(
   let ret = yielder.suspend(Dispatch {
     async_preemption: false,
     memory_access_error: None,
+    lazy_local_call: None,
     index,
     arg1,
     arg2,
@@ -1347,6 +1741,24 @@ unsafe extern "C" fn tls_dispatcher(
     arg5,
   });
   ret
+}
+
+unsafe extern "C" fn tls_local_call_resolver(resolver_id: std::os::raw::c_uint) -> u64 {
+  let program = ACTIVE_PROGRAM.with(|x| x.get());
+  if !program.is_null() {
+    if let Some(ptr) = (*program).cached_resolver_target(resolver_id) {
+      return ptr as u64;
+    }
+  }
+
+  let yielder = ACTIVE_JIT_CODE_ZONE
+    .with(|x| x.yielder.get())
+    .expect("no yielder");
+  let yielder = yielder.as_ref();
+  yielder.suspend(Dispatch {
+    lazy_local_call: Some(resolver_id),
+    ..Default::default()
+  })
 }
 
 unsafe extern "C" fn std_validator(

@@ -126,14 +126,17 @@ ubpf_create(void)
 
 #if defined(__x86_64__) || defined(_M_X64)
     vm->jit_translate = ubpf_translate_x86_64;
+    vm->jit_translate_function = ubpf_translate_function_x86_64;
     vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_x86_64;
     vm->jit_update_helper = ubpf_jit_update_helper_x86_64;
 #elif defined(__aarch64__) || defined(_M_ARM64)
     vm->jit_translate = ubpf_translate_arm64;
+    vm->jit_translate_function = ubpf_translate_function_arm64;
     vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_arm64;
     vm->jit_update_helper = ubpf_jit_update_helper_arm64;
 #else
     vm->jit_translate = ubpf_translate_null;
+    vm->jit_translate_function = ubpf_translate_function_null;
     vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_null;
     vm->jit_update_helper = ubpf_jit_update_helper_null;
 #endif
@@ -2346,6 +2349,15 @@ ubpf_set_region_hints(struct ubpf_vm* vm, const uint8_t* hints, size_t len)
 {
     vm->region_hints = hints;
     vm->region_hints_len = len;
+}
+
+void
+ubpf_set_lazy_local_call_resolver(
+    struct ubpf_vm* vm, local_call_resolver_t resolver, const uint32_t* resolver_ids, size_t resolver_ids_len)
+{
+    vm->local_call_resolver = resolver;
+    vm->local_call_resolver_ids = resolver_ids;
+    vm->local_call_resolver_ids_len = resolver_ids_len;
 }
 
 int

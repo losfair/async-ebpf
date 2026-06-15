@@ -994,6 +994,53 @@ emit_local_call(struct jit_state* state, uint32_t target_pc)
     emit_addsub_register(state, true, AS_ADD, map_register(10), map_register(10), temp_register);
 }
 
+static void
+emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_pc)
+{
+    if (!vm->local_call_resolver || call_pc >= vm->local_call_resolver_ids_len) {
+        state->jit_status = UnexpectedInstruction;
+        return;
+    }
+
+    emit_loadstore_immediate(state, LS_LDRX, temp_register, SP, 0);
+    emit_addsub_register(state, true, AS_SUB, map_register(10), map_register(10), temp_register);
+
+    uint32_t stack_movement = align_to(48, 16);
+    emit_addsub_immediate(state, true, AS_SUB, SP, SP, stack_movement);
+
+    emit_loadstore_immediate(state, LS_STRX, R30, SP, 0);
+    emit_loadstore_immediate(state, LS_STRX, temp_register, SP, 8);
+    emit_loadstorepair_immediate(state, LSP_STPX, map_register(6), map_register(7), SP, 16);
+    emit_loadstorepair_immediate(state, LSP_STPX, map_register(8), map_register(9), SP, 32);
+
+    uint32_t arg_stack_movement = align_to(40, 16);
+    emit_addsub_immediate(state, true, AS_SUB, SP, SP, arg_stack_movement);
+    emit_loadstorepair_immediate(state, LSP_STPX, map_register(1), map_register(2), SP, 0);
+    emit_loadstorepair_immediate(state, LSP_STPX, map_register(3), map_register(4), SP, 16);
+    emit_loadstore_immediate(state, LS_STRX, map_register(5), SP, 32);
+
+    emit_movewide_immediate(state, true, R0, vm->local_call_resolver_ids[call_pc]);
+    emit_movewide_immediate(state, true, temp_register, (uint64_t)vm->local_call_resolver);
+    emit_unconditionalbranch_register(state, BR_BLR, temp_register);
+    emit_logical_register(state, true, LOG_ORR, R17, RZ, R0);
+
+    emit_loadstorepair_immediate(state, LSP_LDPX, map_register(1), map_register(2), SP, 0);
+    emit_loadstorepair_immediate(state, LSP_LDPX, map_register(3), map_register(4), SP, 16);
+    emit_loadstore_immediate(state, LS_LDRX, map_register(5), SP, 32);
+    emit_addsub_immediate(state, true, AS_ADD, SP, SP, arg_stack_movement);
+
+    emit_unconditionalbranch_register(state, BR_BLR, R17);
+
+    emit_loadstore_immediate(state, LS_LDRX, R30, SP, 0);
+    emit_loadstore_immediate(state, LS_LDRX, temp_register, SP, 8);
+    emit_loadstorepair_immediate(state, LSP_LDPX, map_register(6), map_register(7), SP, 16);
+    emit_loadstorepair_immediate(state, LSP_LDPX, map_register(8), map_register(9), SP, 32);
+
+    emit_addsub_immediate(state, true, AS_ADD, SP, SP, stack_movement);
+
+    emit_addsub_register(state, true, AS_ADD, map_register(10), map_register(10), temp_register);
+}
+
 /* Helper for emitting atomic operations using LDXR/STXR loop */
 static void
 emit_atomic_operation(
@@ -1469,13 +1516,27 @@ to_condition(int opcode)
  * 16-byte stack alignment.
  */
 static int
-translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
+translate_range(
+    struct ubpf_vm* vm,
+    struct jit_state* state,
+    char** errmsg,
+    uint32_t start_pc,
+    uint32_t end_pc,
+    bool whole_program,
+    bool lazy_local_calls)
 {
     int i;
 
-    emit_jit_prologue(state, UBPF_EBPF_STACK_SIZE);
+    if (end_pc > vm->num_insts || start_pc >= end_pc) {
+        *errmsg = ubpf_error("Invalid function range [%u, %u)", start_pc, end_pc);
+        return -1;
+    }
 
-    for (i = 0; i < vm->num_insts; i++) {
+    if (whole_program) {
+        emit_jit_prologue(state, UBPF_EBPF_STACK_SIZE);
+    }
+
+    for (i = start_pc; i < (int)end_pc; i++) {
 
         if (state->jit_status != NoError) {
             break;
@@ -1732,7 +1793,11 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
                 }
             } else if (inst.src == 1) {
                 uint32_t call_target = i + inst.imm + 1;
-                emit_local_call(state, call_target);
+                if (lazy_local_calls) {
+                    emit_lazy_local_call(vm, state, i);
+                } else {
+                    emit_local_call(state, call_target);
+                }
             } else {
                 emit_unconditionalbranch_immediate(state, UBR_B, exit_tgt);
             }
@@ -1922,12 +1987,24 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         return -1;
     }
 
-    emit_jit_epilogue(state);
+    if (whole_program) {
+        emit_jit_epilogue(state);
+    } else {
+        state->exit_loc = state->offset;
+        emit_addsub_immediate(state, true, AS_ADD, SP, SP, 16);
+        emit_unconditionalbranch_register(state, BR_RET, R30);
+    }
 
     state->dispatcher_loc = emit_dispatched_external_helper_address(state, (uint64_t)vm->dispatcher);
     state->helper_table_loc = emit_helper_table(state, vm);
 
     return 0;
+}
+
+static int
+translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
+{
+    return translate_range(vm, state, errmsg, 0, vm->num_insts, true, false);
 }
 
 static void
@@ -2185,6 +2262,48 @@ ubpf_translate_arm64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum Jit
     *size = state.offset;
     compile_result.external_dispatcher_offset = state.dispatcher_loc;
     compile_result.external_helper_offset = state.helper_table_loc;
+
+out:
+    release_jit_state_result(&state, &compile_result);
+    return compile_result;
+}
+
+struct ubpf_jit_result
+ubpf_translate_function_arm64(
+    struct ubpf_vm* vm,
+    uint8_t* buffer,
+    size_t* size,
+    enum JitMode jit_mode,
+    uint32_t start_pc,
+    uint32_t end_pc)
+{
+    struct jit_state state;
+    struct ubpf_jit_result compile_result;
+
+    if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+        goto out;
+    }
+
+    if (translate_range(vm, &state, &compile_result.errmsg, start_pc, end_pc, false, true) < 0) {
+        goto out;
+    }
+
+    if (!resolve_jumps(&state) || !resolve_loads(&state) || !resolve_leas(&state) || !resolve_local_calls(&state)) {
+        if (state.jit_status == RelocationOutOfRange) {
+            compile_result.errmsg = ubpf_error(
+                "Branch or load target out of range in the JIT'd code (the program is too large for arm64 "
+                "PC-relative addressing).");
+        } else {
+            compile_result.errmsg = ubpf_error("Could not patch the relative addresses in the JIT'd code.");
+        }
+        goto out;
+    }
+
+    compile_result.compile_result = UBPF_JIT_COMPILE_SUCCESS;
+    *size = state.offset;
+    compile_result.external_dispatcher_offset = state.dispatcher_loc;
+    compile_result.external_helper_offset = state.helper_table_loc;
+    compile_result.jit_mode = jit_mode;
 
 out:
     release_jit_state_result(&state, &compile_result);

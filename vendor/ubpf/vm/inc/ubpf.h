@@ -224,6 +224,14 @@ extern "C"
         uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, unsigned int index, void* cookie);
 
     /**
+     * @brief The type of a lazy local-call resolver function.
+     *
+     * The resolver returns the native address of the compiled callee variant
+     * for the supplied resolver id.
+     */
+    typedef uint64_t (*local_call_resolver_t)(unsigned int resolver_id);
+
+    /**
      * @brief The type of an external helper validation function.
      */
     typedef bool (*external_function_validate_t)(unsigned int index, const struct ubpf_vm* vm);
@@ -486,6 +494,32 @@ extern "C"
      */
     int
     ubpf_translate_ex(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, char** errmsg, enum JitMode jit_mode);
+
+    int
+    ubpf_translate_function_ex(
+        struct ubpf_vm* vm,
+        uint8_t* buffer,
+        size_t* size,
+        char** errmsg,
+        enum JitMode jit_mode,
+        uint32_t start_pc,
+        uint32_t end_pc);
+
+    void
+    ubpf_set_lazy_local_call_resolver(
+        struct ubpf_vm* vm, local_call_resolver_t resolver, const uint32_t* resolver_ids, size_t resolver_ids_len);
+
+    /**
+     * @brief Synchronize a newly written JIT code range with the instruction cache.
+     *
+     * Architectures with non-coherent data and instruction caches, such as
+     * aarch64, require this after writing native code and before executing it.
+     *
+     * @param[in] buffer The first byte of the emitted native code.
+     * @param[in] size The number of bytes emitted.
+     */
+    void
+    ubpf_clear_instruction_cache(uint8_t* buffer, size_t size);
 
     /**
      * @brief Instruct the uBPF runtime to apply unwind-on-success semantics to a helper function.

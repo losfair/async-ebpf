@@ -26,3 +26,10 @@ path = "fuzz_targets/host_pointer_escape.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "region_analysis"
+path = "fuzz_targets/region_analysis.rs"
+test = false
+doc = false
+bench = false

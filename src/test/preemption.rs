@@ -12,7 +12,10 @@ use crate::{
 };
 
 const LOOP_ITERS: u64 = 10_000_000;
+const LOCAL_CALL_LOOP_ITERS: u64 = 1_000_000;
 const EXPECTED_SUM: i64 = (LOOP_ITERS / 8 * 28) as i64;
+const EXPECTED_LOCAL_CALL_SUM: i64 =
+  (LOCAL_CALL_LOOP_ITERS / 8 * 28 + LOCAL_CALL_LOOP_ITERS * 11) as i64;
 
 const STATEFUL_LOOP: &str = r#"
 #define LOOP_ITERS 10000000ULL
@@ -25,6 +28,32 @@ unsigned long long __attribute__((section("test"))) entry(void) {
     sum += i & 7;
     guard ^= i | 1;
     guard ^= i | 1;
+  }
+
+  if (guard != 0x1122334455667788ULL) {
+    return 0xffffffffffffffffULL;
+  }
+
+  return sum;
+}
+"#;
+
+const LOCAL_CALL_LOOP: &str = r#"
+#define LOOP_ITERS 1000000ULL
+
+static unsigned long long __attribute__((noinline, section("test")))
+bump(unsigned long long i, volatile unsigned long long *guard) {
+  *guard ^= i | 1;
+  *guard ^= i | 1;
+  return (i & 7) + 11;
+}
+
+unsigned long long __attribute__((section("test"))) entry(void) {
+  volatile unsigned long long guard = 0x1122334455667788ULL;
+  unsigned long long sum = 0;
+
+  for (unsigned long long i = 0; i < LOOP_ITERS; i++) {
+    sum += bump(i, &guard);
   }
 
   if (guard != 0x1122334455667788ULL) {
@@ -81,6 +110,22 @@ fn test_async_preemption_yields_to_async_runtime() {
   assert!(events.async_preempts.load(Ordering::SeqCst) > 0);
   assert!(events.yields.load(Ordering::SeqCst) > 0);
   assert!(heartbeat_ticks > 0);
+}
+
+#[test]
+fn test_async_preemption_preserves_lazy_local_call_state() {
+  let timeslice = TimesliceConfig {
+    max_run_time_before_throttle: Duration::from_secs(60),
+    max_run_time_before_yield: Duration::from_secs(60),
+    throttle_duration: Duration::from_millis(1),
+  };
+
+  let (ret, events, compiled_functions) = run_preempted_local_call_program(timeslice);
+
+  assert_eq!(ret, EXPECTED_LOCAL_CALL_SUM);
+  assert!(events.async_preempts.load(Ordering::SeqCst) > 0);
+  assert_eq!(events.yields.load(Ordering::SeqCst), 0);
+  assert_eq!(compiled_functions, 2);
 }
 
 fn run_preempted_program(
@@ -142,6 +187,50 @@ fn run_preempted_program(
       }
 
       (ret, events, heartbeat_ticks.load(Ordering::SeqCst))
+    })
+  })
+  .join()
+  .unwrap()
+}
+
+fn run_preempted_local_call_program(
+  timeslice: TimesliceConfig,
+) -> (i64, Arc<CountingEventListener>, usize) {
+  std::thread::spawn(move || {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_io()
+      .enable_time()
+      .build()
+      .unwrap();
+
+    runtime.block_on(async move {
+      let binary = compile_ebpf(LOCAL_CALL_LOOP.as_bytes().to_vec())
+        .await
+        .unwrap();
+      let global = unsafe { GlobalEnv::new() };
+      let thread = global.init_thread(Duration::from_millis(1));
+      let events = Arc::new(CountingEventListener::default());
+      let loader = ProgramLoader::new(&mut rand::thread_rng(), events.clone(), &[]);
+      let program = loader
+        .load(&mut rand::thread_rng(), &binary)
+        .unwrap()
+        .pin_to_current_thread(thread);
+      let preemption = PreemptionEnabled::new(thread);
+
+      let mut resources: [&mut dyn std::any::Any; 0] = [];
+      let ret = program
+        .run(
+          &timeslice,
+          &TokioTimeslicer,
+          "test",
+          &mut resources,
+          &[],
+          &preemption,
+        )
+        .await
+        .unwrap();
+
+      (ret, events, program.compiled_function_count_for_tests())
     })
   })
   .join()

@@ -65,13 +65,19 @@ const EBPF_OP_EXIT: u8 = EBPF_CLS_JMP | 0x90; // JMP | EXIT
 /// Abstract value tracked per register. The lattice top is [`RegKind::Uninit`]
 /// (no information / unreachable); the meet of two distinct concrete kinds is
 /// [`RegKind::Unknown`] (bottom for routing purposes).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RegKind {
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub(crate) enum RegKind {
   Uninit,
-  Stack,
+  Stack(StackKind),
   Data,
   Scalar,
   Unknown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub(crate) enum StackKind {
+  Current(Option<i32>),
+  Foreign,
 }
 
 impl RegKind {
@@ -81,8 +87,46 @@ impl RegKind {
       (a, b) if a == b => a,
       (RegKind::Uninit, b) => b,
       (a, RegKind::Uninit) => a,
+      (RegKind::Stack(a), RegKind::Stack(b)) => match (a, b) {
+        (StackKind::Current(a), StackKind::Current(b)) => {
+          if a == b {
+            RegKind::Stack(StackKind::Current(a))
+          } else {
+            RegKind::Stack(StackKind::Current(None))
+          }
+        }
+        (StackKind::Foreign, StackKind::Foreign) => RegKind::Stack(StackKind::Foreign),
+        _ => RegKind::Stack(StackKind::Current(None)),
+      },
       _ => RegKind::Unknown,
     }
+  }
+
+  fn region(self) -> u8 {
+    match self {
+      RegKind::Stack(_) => REGION_STACK,
+      RegKind::Data => REGION_DATA,
+      _ => REGION_UNKNOWN,
+    }
+  }
+
+  fn is_pointer(self) -> bool {
+    matches!(self, RegKind::Stack(_) | RegKind::Data)
+  }
+
+  fn is_stack(self) -> bool {
+    matches!(self, RegKind::Stack(_))
+  }
+
+  fn foreign_for_call(self) -> Self {
+    match self {
+      RegKind::Stack(_) => RegKind::Stack(StackKind::Foreign),
+      other => other,
+    }
+  }
+
+  fn aliases_current_stack(self) -> bool {
+    !matches!(self, RegKind::Stack(StackKind::Foreign))
   }
 }
 
@@ -97,7 +141,7 @@ const R10: usize = 10;
 #[derive(Clone, PartialEq, Eq)]
 struct State {
   regs: [RegKind; NUM_REGS],
-  slots: std::collections::BTreeMap<i16, RegKind>,
+  slots: std::collections::BTreeMap<i32, RegKind>,
 }
 
 impl State {
@@ -138,6 +182,66 @@ impl State {
       *v = RegKind::Unknown;
     }
   }
+
+  /// Invalidates tracked R10-relative spill slots overlapped by a stack write.
+  /// If the write address is not a known frame-relative range, invalidate all
+  /// tracked slots because any spill may have been overwritten.
+  fn invalidate_stack_write(&mut self, start: Option<i32>, width: usize) {
+    let Some(start) = start else {
+      self.invalidate_slots();
+      return;
+    };
+    let Some(end) = start.checked_add(width as i32) else {
+      self.invalidate_slots();
+      return;
+    };
+
+    for (&slot_off, value) in self.slots.iter_mut() {
+      let slot_start = slot_off as i32;
+      let Some(slot_end) = slot_start.checked_add(8) else {
+        *value = RegKind::Unknown;
+        continue;
+      };
+      if start < slot_end && slot_start < end {
+        *value = RegKind::Unknown;
+      }
+    }
+  }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub(crate) struct PointerSignature {
+  regs: [RegKind; NUM_REGS],
+}
+
+impl PointerSignature {
+  pub(crate) fn entry() -> Self {
+    let mut regs = [RegKind::Uninit; NUM_REGS];
+    regs[1] = RegKind::Stack(StackKind::Current(None));
+    regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
+    Self { regs }
+  }
+
+  fn apply_to_state(self, state: &mut State) {
+    state.regs = self.regs;
+    state.regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
+  }
+
+  fn from_state(state: &State) -> Self {
+    let mut regs = state.regs;
+    for (reg, kind) in regs.iter_mut().enumerate() {
+      if reg != R10 {
+        *kind = kind.foreign_for_call();
+      }
+    }
+    regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
+    Self { regs }
+  }
+
+  #[cfg(any(test, feature = "testing"))]
+  pub(crate) fn from_regs_for_testing(regs: [RegKind; NUM_REGS]) -> Self {
+    Self { regs }
+  }
 }
 
 #[derive(Clone, Copy)]
@@ -159,10 +263,29 @@ fn decode(slot: &[u8]) -> Inst {
   }
 }
 
+fn access_width(opcode: u8) -> usize {
+  match opcode & 0x18 {
+    0x00 => 4, // W
+    0x08 => 2, // H
+    0x10 => 1, // B
+    0x18 => 8, // DW
+    _ => 8,
+  }
+}
+
+fn stack_access_start(base: RegKind, offset: i16) -> Option<i32> {
+  let RegKind::Stack(StackKind::Current(Some(base_off))) = base else {
+    return None;
+  };
+  base_off.checked_add(offset as i32)
+}
+
 /// Result of the region analysis for one code section.
+#[cfg(any(test, feature = "testing"))]
 pub struct RegionAnalysis {
   /// Per-instruction-slot load region hint for the JIT (`REGION_*`). Non-load
   /// slots are [`REGION_UNKNOWN`].
+  #[allow(dead_code)]
   pub hints: Vec<u8>,
   /// Slots of memory-access instructions (load, store, atomic) whose pointer
   /// could not be resolved to a single region. Empty iff every access is
@@ -170,11 +293,18 @@ pub struct RegionAnalysis {
   pub unresolved: Vec<usize>,
 }
 
+pub(crate) struct FunctionRegionAnalysis {
+  pub(crate) hints: Vec<u8>,
+  pub(crate) unresolved: Vec<usize>,
+  pub(crate) call_signatures: std::collections::HashMap<usize, PointerSignature>,
+}
+
 /// Analyzes the pointer region of every memory access in one code section.
 ///
 /// `code` is the relocated bytecode (8 bytes per slot, matching uBPF's
 /// `vm->insts` indexing; `lddw` occupies two slots). `data_lo`/`data_hi` are the
 /// guest data region bounds used to recognize relocated data pointers.
+#[cfg(any(test, feature = "testing"))]
 pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   let num_slots = code.len() / 8;
   let mut hints = vec![REGION_UNKNOWN; num_slots];
@@ -185,9 +315,11 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
 
   // Forward dataflow to a fixpoint over the instruction-slot CFG.
   let mut states: Vec<State> = (0..num_slots).map(|_| State::top()).collect();
+  let mut reached = vec![false; num_slots];
   // Entry: R1 holds ctx (points into the guest stack), R10 is the frame pointer.
-  states[0].regs[1] = RegKind::Stack;
-  states[0].regs[R10] = RegKind::Stack;
+  states[0].regs[1] = RegKind::Stack(StackKind::Current(None));
+  states[0].regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
+  reached[0] = true;
 
   let mut worklist: Vec<usize> = vec![0];
   let mut on_list = vec![false; num_slots];
@@ -200,7 +332,10 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
     let out = transfer(&states[pc], &inst, lddw_addr, data_lo, data_hi);
 
     for succ in successors(pc, &inst, num_slots) {
-      if states[succ].meet_from(&out) && !on_list[succ] {
+      let was_reached = reached[succ];
+      reached[succ] = true;
+      let changed = states[succ].meet_from(&out);
+      if (!was_reached || changed) && !on_list[succ] {
         on_list[succ] = true;
         worklist.push(succ);
       }
@@ -212,18 +347,17 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   // confined to the stack by the backend but are still checked for strict-mode
   // analyzability. The second slot of a `lddw` has opcode 0 and is skipped.
   for pc in 0..num_slots {
+    if !reached[pc] {
+      continue;
+    }
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
     let cls = inst.opcode & EBPF_CLS_MASK;
     let base = match cls {
-      EBPF_CLS_LDX => inst.src,                 // load: pointer is src
-      EBPF_CLS_ST | EBPF_CLS_STX => inst.dst,   // store/atomic: pointer is dst
+      EBPF_CLS_LDX => inst.src,               // load: pointer is src
+      EBPF_CLS_ST | EBPF_CLS_STX => inst.dst, // store/atomic: pointer is dst
       _ => continue,
     };
-    let region = match states[pc].regs[base] {
-      RegKind::Stack => REGION_STACK,
-      RegKind::Data => REGION_DATA,
-      _ => REGION_UNKNOWN,
-    };
+    let region = states[pc].regs[base].region();
     if cls == EBPF_CLS_LDX {
       hints[pc] = region;
     }
@@ -233,6 +367,82 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   }
 
   RegionAnalysis { hints, unresolved }
+}
+
+pub(crate) fn analyze_function(
+  code: &[u8],
+  start_pc: usize,
+  end_pc: usize,
+  incoming: PointerSignature,
+  data_lo: u64,
+  data_hi: u64,
+) -> FunctionRegionAnalysis {
+  let num_slots = code.len() / 8;
+  let mut hints = vec![REGION_UNKNOWN; num_slots];
+  let mut unresolved = Vec::new();
+  let mut call_signatures = std::collections::HashMap::new();
+  if start_pc >= end_pc || end_pc > num_slots {
+    return FunctionRegionAnalysis {
+      hints,
+      unresolved,
+      call_signatures,
+    };
+  }
+
+  let mut states: Vec<State> = (0..num_slots).map(|_| State::top()).collect();
+  let mut reached = vec![false; num_slots];
+  incoming.apply_to_state(&mut states[start_pc]);
+  reached[start_pc] = true;
+
+  let mut worklist = vec![start_pc];
+  let mut on_list = vec![false; num_slots];
+  on_list[start_pc] = true;
+
+  while let Some(pc) = worklist.pop() {
+    on_list[pc] = false;
+    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
+      call_signatures.insert(pc, PointerSignature::from_state(&states[pc]));
+    }
+    let lddw_addr = lddw_full_imm(code, pc, &inst);
+    let out = transfer(&states[pc], &inst, lddw_addr, data_lo, data_hi);
+
+    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+      let was_reached = reached[succ];
+      reached[succ] = true;
+      let changed = states[succ].meet_from(&out);
+      if (!was_reached || changed) && !on_list[succ] {
+        on_list[succ] = true;
+        worklist.push(succ);
+      }
+    }
+  }
+
+  for pc in start_pc..end_pc {
+    if !reached[pc] {
+      continue;
+    }
+    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    let cls = inst.opcode & EBPF_CLS_MASK;
+    let base = match cls {
+      EBPF_CLS_LDX => inst.src,
+      EBPF_CLS_ST | EBPF_CLS_STX => inst.dst,
+      _ => continue,
+    };
+    let region = states[pc].regs[base].region();
+    if cls == EBPF_CLS_LDX {
+      hints[pc] = region;
+    }
+    if region == REGION_UNKNOWN {
+      unresolved.push(pc);
+    }
+  }
+
+  FunctionRegionAnalysis {
+    hints,
+    unresolved,
+    call_signatures,
+  }
 }
 
 /// Full 64-bit immediate of a `lddw` (low half in `inst`, high half in the next
@@ -301,6 +511,27 @@ fn successors(pc: usize, inst: &Inst, num_slots: usize) -> Vec<usize> {
   out
 }
 
+fn function_successors(
+  pc: usize,
+  inst: &Inst,
+  num_slots: usize,
+  start_pc: usize,
+  end_pc: usize,
+) -> Vec<usize> {
+  let mut succs = successors(pc, inst, num_slots);
+  if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
+    let fallthrough = pc + 1;
+    succs.clear();
+    if fallthrough < num_slots {
+      succs.push(fallthrough);
+    }
+  }
+  succs
+    .into_iter()
+    .filter(|&succ| succ >= start_pc && succ < end_pc)
+    .collect()
+}
+
 /// Abstract transfer function: register/slot state after executing `inst`.
 fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi: u64) -> State {
   let mut s = in_state.clone();
@@ -334,8 +565,8 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
       // stack buffer after a helper call, which must not poison later pointer
       // arithmetic that uses it as an index.
       s.regs[inst.dst] = if inst.src == R10 {
-        match s.slots.get(&inst.offset).copied() {
-          Some(k @ (RegKind::Stack | RegKind::Data)) => k,
+        match s.slots.get(&(inst.offset as i32)).copied() {
+          Some(k) if k.is_pointer() => k,
           _ => RegKind::Scalar,
         }
       } else {
@@ -350,9 +581,17 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
       } else {
         s.regs[inst.src]
       };
-      if inst.dst == R10 {
-        // Spill to a known R10-relative slot. Atomics modify the slot in ways
-        // we do not model precisely, so mark it Unknown.
+      let width = access_width(inst.opcode);
+      let stack_base = if inst.dst == R10 {
+        RegKind::Stack(StackKind::Current(Some(0)))
+      } else {
+        s.regs[inst.dst]
+      };
+      if stack_base.is_stack() {
+        if stack_base.aliases_current_stack() {
+          let start = stack_access_start(stack_base, inst.offset);
+          s.invalidate_stack_write(start, width);
+        }
         let stored = if is_atomic {
           RegKind::Unknown
         } else if value == RegKind::Uninit {
@@ -360,10 +599,14 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
         } else {
           value
         };
-        s.slots.insert(inst.offset, stored);
+        if !is_atomic && width == 8 {
+          if let Some(start) = stack_access_start(stack_base, inst.offset) {
+            s.slots.insert(start, stored);
+          }
+        }
       } else if s.regs[inst.dst] != RegKind::Data {
-        // A store through anything not provably in the data region may alias an
-        // untracked stack slot; conservatively invalidate all tracked slots.
+        // A store through an unknown/scalar base may alias an untracked stack
+        // slot; conservatively invalidate all tracked slots.
         s.invalidate_slots();
       }
       if is_atomic {
@@ -393,14 +636,14 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
           s.regs[inst.dst] = if is_reg {
             add_kinds(s.regs[inst.dst], s.regs[inst.src])
           } else {
-            preserve_with_imm(s.regs[inst.dst])
+            add_imm_kind(s.regs[inst.dst], inst.imm)
           };
         }
         EBPF_ALU_OP_SUB => {
           s.regs[inst.dst] = if is_reg {
             sub_kinds(s.regs[inst.dst], s.regs[inst.src])
           } else {
-            preserve_with_imm(s.regs[inst.dst])
+            add_imm_kind(s.regs[inst.dst], inst.imm.wrapping_neg())
           };
         }
         // All other 64-bit ALU ops (mul/div/and/or/xor/shifts/neg/mod/end)
@@ -411,8 +654,12 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
     EBPF_CLS_JMP | EBPF_CLS_JMP32 => {
       if inst.opcode == EBPF_OP_CALL {
         // Helper/local call: R0 is the return value, R1-R5 are caller-saved and
-        // clobbered; R6-R10 are preserved. A callee may write through a stack
-        // pointer it was handed, so spilled slots can no longer be trusted.
+        // clobbered; R6-R10 are preserved. Keep tracked stack spill provenance
+        // across calls: generated code commonly spills stack/data pointers,
+        // calls a helper, then reloads those pointers for later buffer work.
+        // If a helper/callee actually overwrites a pointer spill, the emitted
+        // single-region bounds translation still protects the access; the worst
+        // case is a spurious fault from a stale region hint.
         //
         // The return value is treated as a scalar: helpers return handles,
         // lengths, and status codes, so a returned value commonly indexes a
@@ -424,7 +671,6 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
         for r in 1..=5 {
           s.regs[r] = RegKind::Unknown;
         }
-        s.invalidate_slots();
       }
     }
     _ => {}
@@ -436,7 +682,12 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
 /// `ptr + scalar` preserves the pointer's region; `scalar + scalar` is scalar.
 fn add_kinds(a: RegKind, b: RegKind) -> RegKind {
   match (a, b) {
-    (RegKind::Stack, RegKind::Scalar) | (RegKind::Scalar, RegKind::Stack) => RegKind::Stack,
+    (RegKind::Stack(_), RegKind::Scalar) | (RegKind::Scalar, RegKind::Stack(_)) => match (a, b) {
+      (RegKind::Stack(StackKind::Foreign), _) | (_, RegKind::Stack(StackKind::Foreign)) => {
+        RegKind::Stack(StackKind::Foreign)
+      }
+      _ => RegKind::Stack(StackKind::Current(None)),
+    },
     (RegKind::Data, RegKind::Scalar) | (RegKind::Scalar, RegKind::Data) => RegKind::Data,
     (RegKind::Scalar, RegKind::Scalar) => RegKind::Scalar,
     _ => RegKind::Unknown,
@@ -446,19 +697,24 @@ fn add_kinds(a: RegKind, b: RegKind) -> RegKind {
 /// `ptr - scalar` preserves the region; `ptr - ptr` (same region) is a scalar.
 fn sub_kinds(a: RegKind, b: RegKind) -> RegKind {
   match (a, b) {
-    (RegKind::Stack, RegKind::Scalar) => RegKind::Stack,
+    (RegKind::Stack(StackKind::Foreign), RegKind::Scalar) => RegKind::Stack(StackKind::Foreign),
+    (RegKind::Stack(_), RegKind::Scalar) => RegKind::Stack(StackKind::Current(None)),
     (RegKind::Data, RegKind::Scalar) => RegKind::Data,
-    (RegKind::Stack, RegKind::Stack) | (RegKind::Data, RegKind::Data) => RegKind::Scalar,
+    (RegKind::Stack(_), RegKind::Stack(_)) | (RegKind::Data, RegKind::Data) => RegKind::Scalar,
     (RegKind::Scalar, RegKind::Scalar) => RegKind::Scalar,
     _ => RegKind::Unknown,
   }
 }
 
-/// Adding an immediate preserves a known region/scalar; an undefined register
-/// stays undefined-for-routing (`Unknown`).
-fn preserve_with_imm(a: RegKind) -> RegKind {
+/// Adding an immediate preserves region; for known stack aliases, also update
+/// the frame-relative offset.
+fn add_imm_kind(a: RegKind, imm: i32) -> RegKind {
   match a {
-    RegKind::Stack => RegKind::Stack,
+    RegKind::Stack(StackKind::Current(Some(off))) => {
+      RegKind::Stack(StackKind::Current(off.checked_add(imm)))
+    }
+    RegKind::Stack(StackKind::Current(None)) => RegKind::Stack(StackKind::Current(None)),
+    RegKind::Stack(StackKind::Foreign) => RegKind::Stack(StackKind::Foreign),
     RegKind::Data => RegKind::Data,
     RegKind::Scalar => RegKind::Scalar,
     _ => RegKind::Unknown,
@@ -516,7 +772,7 @@ mod tests {
     let addr = (DATA_LO + 0x40) as i32;
     let code = flatten(&[
       slot(EBPF_OP_LDDW, 1, 0, 0, addr),
-      slot(0, 0, 0, 0, 0), // lddw high half
+      slot(0, 0, 0, 0, 0),                   // lddw high half
       slot(EBPF_CLS_LDX | 0x10, 0, 1, 0, 0), // LDXB
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
@@ -629,12 +885,12 @@ mod tests {
   #[test]
   fn stack_byte_read_after_call_indexes_data_pointer() {
     // Mirrors the inlined `zs_strcmp(buf, literal)` tail where `buf` was filled
-    // by a helper: a byte is loaded from a stack slot the call invalidated, used
-    // as the index into the literal. The fill must read back as a scalar (not a
-    // stale/invalidated pointer kind), keeping `literal[i]` routable to data.
+    // by a helper: a byte is loaded from a stack slot after the call and used as
+    // the index into the literal. A scalar stack spill must still read back as a
+    // scalar, keeping `literal[i]` routable to data.
     let code = flatten(&[
       slot(EBPF_CLS_STX | 0x10, 10, 6, -32, 0), // *(u8*)(r10-32) = r6  (spill a scalar)
-      slot(EBPF_OP_CALL, 0, 0, 0, 1),           // call helper -> invalidates slots
+      slot(EBPF_OP_CALL, 0, 0, 0, 1),           // call helper
       slot(EBPF_CLS_LDX | 0x10, 2, 10, -32, 0), // r2 = *(u8*)(r10-32)  [byte index]
       slot(EBPF_OP_LDDW, 1, 0, 0, DATA_LO as i32), // r1 = <data literal>
       slot(0, 0, 0, 0, 0),                      // lddw high half
@@ -644,6 +900,139 @@ mod tests {
     ]);
     let result = analyze(&code, DATA_LO, DATA_HI);
     assert_eq!(result.hints[6], REGION_DATA);
+    assert!(
+      result.unresolved.is_empty(),
+      "unexpected unresolved: {:?}",
+      result.unresolved
+    );
+  }
+
+  #[test]
+  fn spilled_stack_pointer_survives_helper_call() {
+    // Mirrors generated Caddy middleware: a stack buffer pointer is spilled,
+    // helper calls run, then the pointer is reloaded for later host matching.
+    let code = flatten(&[
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 6, 10, 0, 0), // r6 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 6, 0, 0, -64),               // r6 = &stack_buf
+      slot(EBPF_CLS_STX | 0x18, 10, 6, -8, 0),                            // spill stack pointer
+      slot(EBPF_OP_CALL, 0, 0, 0, 1),                                     // helper call
+      slot(EBPF_CLS_LDX | 0x18, 1, 10, -8, 0),                            // reload stack pointer
+      slot(EBPF_CLS_LDX | 0x10, 0, 1, 0, 0), // dereference stack buffer
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[5], REGION_STACK);
+    assert!(
+      result.unresolved.is_empty(),
+      "unexpected unresolved: {:?}",
+      result.unresolved
+    );
+  }
+
+  #[test]
+  fn spilled_stack_pointer_survives_stack_alias_store() {
+    // A write through `r7 = r10 - 64` is a stack-buffer write. It should not
+    // erase an unrelated pointer spill that later reloads the same stack buffer
+    // pointer.
+    let code = flatten(&[
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 6, 10, 0, 0), // r6 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 6, 0, 0, -64),               // r6 = &stack_buf
+      slot(EBPF_CLS_STX | 0x18, 10, 6, -8, 0),                            // spill stack pointer
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 7, 10, 0, 0), // r7 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 7, 0, 0, -64),               // r7 = &stack_buf
+      slot(EBPF_CLS_ST | 0x10, 7, 0, 0, 1),                               // *(u8*)r7 = 1
+      slot(EBPF_CLS_LDX | 0x18, 1, 10, -8, 0),                            // reload stack pointer
+      slot(EBPF_CLS_LDX | 0x10, 0, 1, 0, 0), // dereference stack buffer
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[7], REGION_STACK);
+    assert!(
+      result.unresolved.is_empty(),
+      "unexpected unresolved: {:?}",
+      result.unresolved
+    );
+  }
+
+  #[test]
+  fn stack_alias_store_invalidates_overlapping_pointer_spill() {
+    // The write through `r7 = r10 - 8` overlaps the tracked spill at `r10 - 8`,
+    // so reloading that slot must not recover the stale stack pointer.
+    let code = flatten(&[
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 6, 10, 0, 0), // r6 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 6, 0, 0, -64),               // r6 = &stack_buf
+      slot(EBPF_CLS_STX | 0x18, 10, 6, -8, 0),                            // spill stack pointer
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 7, 10, 0, 0), // r7 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 7, 0, 0, -8),                // r7 = &spill
+      slot(EBPF_CLS_ST | 0x18, 7, 0, 0, 0),                               // overwrite spill
+      slot(EBPF_CLS_LDX | 0x18, 1, 10, -8, 0),                            // reload overwritten slot
+      slot(EBPF_CLS_LDX | 0x10, 0, 1, 0, 0), // stale deref must be unresolved
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[7], REGION_UNKNOWN);
+    assert_eq!(result.unresolved, vec![7]);
+  }
+
+  #[test]
+  fn direct_partial_stack_store_invalidates_pointer_spill() {
+    let code = flatten(&[
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 6, 10, 0, 0), // r6 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 6, 0, 0, -64),               // r6 = &stack_buf
+      slot(EBPF_CLS_STX | 0x18, 10, 6, -8, 0),                            // spill stack pointer
+      slot(EBPF_CLS_ST | 0x10, 10, 0, -7, 0), // partial overwrite of spill
+      slot(EBPF_CLS_LDX | 0x18, 1, 10, -8, 0), // reload overwritten slot
+      slot(EBPF_CLS_LDX | 0x10, 0, 1, 0, 0),  // stale deref must be unresolved
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[5], REGION_UNKNOWN);
+    assert_eq!(result.unresolved, vec![5]);
+  }
+
+  #[test]
+  fn known_stack_alias_store_updates_pointer_spill() {
+    let code = flatten(&[
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 6, 10, 0, 0), // r6 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 6, 0, 0, -64),               // r6 = &stack_buf
+      slot(EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV, 7, 10, 0, 0), // r7 = r10
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 7, 0, 0, -8),                // r7 = &spill
+      slot(EBPF_CLS_STX | 0x18, 7, 6, 0, 0),                              // spill through alias
+      slot(EBPF_CLS_LDX | 0x18, 1, 10, -8, 0),                            // reload stack pointer
+      slot(EBPF_CLS_LDX | 0x10, 0, 1, 0, 0), // dereference stack buffer
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[6], REGION_STACK);
+    assert!(
+      result.unresolved.is_empty(),
+      "unexpected unresolved: {:?}",
+      result.unresolved
+    );
+  }
+
+  #[test]
+  fn foreign_stack_store_does_not_invalidate_current_frame_spill() {
+    let code = flatten(&[
+      slot(EBPF_CLS_STX | 0x18, 10, 1, -8, 0), // spill foreign stack pointer
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD, 1, 0, 0, 1), // r1 += 1
+      slot(EBPF_CLS_ST | 0x10, 1, 0, 0, 0),    // write through foreign stack
+      slot(EBPF_CLS_LDX | 0x18, 2, 10, -8, 0), // reload foreign stack pointer
+      slot(EBPF_CLS_LDX | 0x10, 0, 2, 0, 0),   // dereference it
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let mut regs = [RegKind::Uninit; NUM_REGS];
+    regs[1] = RegKind::Stack(StackKind::Foreign);
+    regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
+    let result = analyze_function(
+      &code,
+      0,
+      code.len() / 8,
+      PointerSignature { regs },
+      DATA_LO,
+      DATA_HI,
+    );
+    assert_eq!(result.hints[4], REGION_STACK);
     assert!(
       result.unresolved.is_empty(),
       "unexpected unresolved: {:?}",
@@ -662,7 +1051,7 @@ mod tests {
       slot(EBPF_OP_JA32, 0, 0, 0, 2), // goto slot 4 (pc+imm+1); offset=0 would target slot 2
       slot(EBPF_OP_LDDW, 6, 0, 0, DATA_LO as i32), // poison: r6 = <data> (only reached if offset is used)
       slot(0, 0, 0, 0, 0),                         // lddw high half
-      slot(EBPF_CLS_LDX | 0x18, 0, 6, 0, 0), // r0 = *(u64*)(r6)
+      slot(EBPF_CLS_LDX | 0x18, 0, 6, 0, 0),       // r0 = *(u64*)(r6)
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
     let hints = analyze(&code, DATA_LO, DATA_HI).hints;
@@ -682,5 +1071,15 @@ mod tests {
     ]);
     let result = analyze(&code, DATA_LO, DATA_HI);
     assert_eq!(result.unresolved, vec![3]);
+  }
+
+  #[test]
+  fn unreachable_memory_accesses_are_not_unresolved() {
+    let code = flatten(&[
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+      slot(EBPF_CLS_LDX | 0x18, 0, 4, 0, 0), // dead: r0 = *(u64*)(r4)
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert!(result.unresolved.is_empty());
   }
 }

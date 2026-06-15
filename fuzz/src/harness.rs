@@ -11,11 +11,14 @@ use std::{
 use async_ebpf::{
   helpers::Helper,
   program::{DummyProgramEventListener, GlobalEnv, HelperScope, PreemptionEnabled, ProgramLoader},
-  test_util::{timeslice_config, TokioTimeslicer},
+  test_util::{region_analysis as ra, timeslice_config, TokioTimeslicer},
 };
 use rand::{rngs::StdRng, SeedableRng};
 
 const MAX_INSNS: usize = 96;
+const MAX_REGION_INSNS: usize = 128;
+const REGION_DATA_LO: u64 = 0x10000;
+const REGION_DATA_HI: u64 = 0x20000;
 const SENTINEL_VALUE: u64 = 0x5147_494a_5f53_4146;
 const SENTINEL_ATTACK_VALUE: u64 = 0xa55a_0000_dead_beef;
 
@@ -32,6 +35,16 @@ pub fn run_host_pointer_escape_case(data: &[u8]) {
   let code = generated_program(data, true);
   let _ = run_program(&code, data);
   assert_eq!(HOST_SENTINEL.load(Ordering::SeqCst), SENTINEL_VALUE);
+}
+
+pub fn run_region_analysis_case(data: &[u8]) {
+  region_analysis_smoke(data);
+  region_unreachable_tail_is_ignored(data);
+  region_current_stack_alias_tracking(data);
+  region_current_stack_overwrite_invalidates(data);
+  region_foreign_stack_store_preserves_current_frame_spill(data);
+  region_local_call_signature_foreignizes_stack_args(data);
+  region_pointer_tag_polymorphism(data);
 }
 
 fn run_program(code: &[Insn], data: &[u8]) -> Option<i64> {
@@ -60,6 +73,379 @@ fn run_program(code: &[Insn], data: &[u8]) -> Option<i64> {
       &PreemptionEnabled::new(thread),
     ))
     .ok()
+}
+
+fn region_analysis_smoke(data: &[u8]) {
+  let code = insns_to_bytes(&generated_region_program(data));
+  let slots = code.len() / 8;
+  let section = ra::analyze_section(&code, REGION_DATA_LO, REGION_DATA_HI);
+  assert_region_result(&section.hints, &section.unresolved, slots);
+
+  if slots > 0 {
+    let start = data.first().copied().unwrap_or(0) as usize % slots;
+    let available = slots - start;
+    let len = 1 + data.get(1).copied().unwrap_or(0) as usize % available;
+    let function = ra::analyze_function(
+      &code,
+      start,
+      start + len,
+      ra::entry_signature(),
+      REGION_DATA_LO,
+      REGION_DATA_HI,
+    );
+    assert_region_result(&function.hints, &function.unresolved, slots);
+    for (pc, _) in function.call_signatures {
+      assert!(pc >= start && pc < start + len);
+    }
+  }
+}
+
+fn region_unreachable_tail_is_ignored(data: &[u8]) {
+  let mut code = vec![
+    Insn::exit(),
+    Insn::ldx_dw(0, 4, skew_i16(data, 0)),
+    Insn::stx_dw(5, 4, skew_i16(data, 1)),
+    Insn::mov64_reg(1, 4),
+    Insn::ldx_b(0, 1, skew_i16(data, 2)),
+  ];
+  append_random_dead_tail(&mut code, data);
+  let bytes = insns_to_bytes(&code);
+
+  let section = ra::analyze_section(&bytes, REGION_DATA_LO, REGION_DATA_HI);
+  assert!(
+    section.unresolved.is_empty(),
+    "unreachable section slots were reported unresolved: {:?}",
+    section.unresolved
+  );
+
+  let function = ra::analyze_function(
+    &bytes,
+    0,
+    code.len(),
+    ra::entry_signature(),
+    REGION_DATA_LO,
+    REGION_DATA_HI,
+  );
+  assert!(
+    function.unresolved.is_empty(),
+    "unreachable function slots were reported unresolved: {:?}",
+    function.unresolved
+  );
+}
+
+fn region_current_stack_alias_tracking(data: &[u8]) {
+  let buffer_off = -64 - ((byte(data, 0) % 32) as i32);
+  let write_off = (byte(data, 1) % 8) as i16;
+  let code = vec![
+    Insn::mov64_reg(6, 10),
+    Insn::add64_imm(6, buffer_off),
+    Insn::stx_dw(10, 6, -8),
+    Insn::call_helper(1),
+    Insn::mov64_reg(7, 10),
+    Insn::add64_imm(7, buffer_off),
+    Insn::st_b(7, write_off, byte(data, 2) as i32),
+    Insn::ldx_dw(1, 10, -8),
+    Insn::ldx_b(0, 1, write_off),
+    Insn::exit(),
+  ];
+  let bytes = insns_to_bytes(&code);
+  let result = ra::analyze_section(&bytes, REGION_DATA_LO, REGION_DATA_HI);
+  assert_eq!(result.hints[8], ra::STACK);
+  assert!(
+    result.unresolved.is_empty(),
+    "stack alias tracking lost a routable pointer: {:?}",
+    result.unresolved
+  );
+}
+
+fn region_current_stack_overwrite_invalidates(data: &[u8]) {
+  let code = vec![
+    Insn::mov64_reg(6, 10),
+    Insn::add64_imm(6, -64 - ((byte(data, 0) % 32) as i32)),
+    Insn::stx_dw(10, 6, -8),
+    Insn::mov64_reg(7, 10),
+    Insn::add64_imm(7, -8 + ((byte(data, 1) % 7) as i32)),
+    Insn::st_b(7, 0, byte(data, 2) as i32),
+    Insn::ldx_dw(1, 10, -8),
+    Insn::ldx_b(0, 1, 0),
+    Insn::exit(),
+  ];
+  let bytes = insns_to_bytes(&code);
+  let result = ra::analyze_section(&bytes, REGION_DATA_LO, REGION_DATA_HI);
+  assert_eq!(result.hints[7], ra::UNKNOWN);
+  assert!(
+    result.unresolved.contains(&7),
+    "overwritten pointer spill was still treated as routable: {:?}",
+    result.unresolved
+  );
+}
+
+fn region_foreign_stack_store_preserves_current_frame_spill(data: &[u8]) {
+  let code = vec![
+    Insn::stx_dw(10, 1, -8),
+    Insn::add64_imm(1, (byte(data, 0) % 8) as i32),
+    Insn::st_b(1, skew_i16(data, 1), byte(data, 2) as i32),
+    Insn::ldx_dw(2, 10, -8),
+    Insn::ldx_b(0, 2, skew_i16(data, 3)),
+    Insn::exit(),
+  ];
+  let bytes = insns_to_bytes(&code);
+  let result = ra::analyze_function(
+    &bytes,
+    0,
+    code.len(),
+    signature_with_r1(ra::PointerTag::ForeignStack),
+    REGION_DATA_LO,
+    REGION_DATA_HI,
+  );
+  assert_eq!(result.hints[4], ra::STACK);
+  assert!(
+    result.unresolved.is_empty(),
+    "foreign stack write invalidated a current-frame spill: {:?}",
+    result.unresolved
+  );
+}
+
+fn region_local_call_signature_foreignizes_stack_args(data: &[u8]) {
+  let callee_start = 5usize;
+  let call_imm = callee_start as i32 - 3;
+  let code = vec![
+    Insn::mov64_reg(1, 10),
+    Insn::add64_imm(1, -96 - ((byte(data, 0) % 32) as i32)),
+    Insn::call_local(call_imm),
+    Insn::mov64_imm(0, 0),
+    Insn::exit(),
+    Insn::stx_dw(10, 1, -8),
+    Insn::st_b(1, skew_i16(data, 1), byte(data, 2) as i32),
+    Insn::ldx_dw(2, 10, -8),
+    Insn::ldx_b(0, 2, skew_i16(data, 3)),
+    Insn::exit(),
+  ];
+  let bytes = insns_to_bytes(&code);
+  let caller = ra::analyze_function(
+    &bytes,
+    0,
+    callee_start,
+    ra::entry_signature(),
+    REGION_DATA_LO,
+    REGION_DATA_HI,
+  );
+  let Some((_, callee_signature)) = caller.call_signatures.first().copied() else {
+    panic!("local call signature was not recorded");
+  };
+  let callee = ra::analyze_function(
+    &bytes,
+    callee_start,
+    code.len(),
+    callee_signature,
+    REGION_DATA_LO,
+    REGION_DATA_HI,
+  );
+  assert_eq!(callee.hints[8], ra::STACK);
+  assert!(
+    callee.unresolved.is_empty(),
+    "callee lost caller-frame stack provenance: {:?}",
+    callee.unresolved
+  );
+}
+
+fn region_pointer_tag_polymorphism(data: &[u8]) {
+  let mut code = Vec::new();
+  push_lddw(&mut code, 6, REGION_DATA_LO + 0x40 + (byte(data, 0) as u64));
+  code.extend([
+    Insn::stx_dw(10, 1, -8),
+    Insn::ldx_dw(2, 10, -8),
+    Insn::add64_imm(2, (byte(data, 1) % 8) as i32),
+    Insn::ldx_b(0, 2, 0),
+    Insn::exit(),
+  ]);
+  let bytes = insns_to_bytes(&code);
+
+  let stack = ra::analyze_function(
+    &bytes,
+    2,
+    code.len(),
+    signature_with_r1(ra::PointerTag::ForeignStack),
+    REGION_DATA_LO,
+    REGION_DATA_HI,
+  );
+  assert_eq!(stack.hints[5], ra::STACK);
+  assert!(stack.unresolved.is_empty());
+
+  let data_region = ra::analyze_function(
+    &bytes,
+    2,
+    code.len(),
+    signature_with_r1(ra::PointerTag::Data),
+    REGION_DATA_LO,
+    REGION_DATA_HI,
+  );
+  assert_eq!(data_region.hints[5], ra::DATA);
+  assert!(data_region.unresolved.is_empty());
+}
+
+fn generated_region_program(data: &[u8]) -> Vec<Insn> {
+  let mut out = Vec::with_capacity(MAX_REGION_INSNS);
+  let mut chunks = data.chunks_exact(4);
+  for chunk in chunks.by_ref().take(MAX_REGION_INSNS - 2) {
+    match chunk[0] % 32 {
+      0 => out.push(Insn::mov64_imm(
+        chunk[1] % 11,
+        i16::from_le_bytes([chunk[2], chunk[3]]) as i32,
+      )),
+      1 => out.push(Insn::mov64_reg(chunk[1] % 11, chunk[2] % 11)),
+      2 => out.push(Insn::add64_imm(chunk[1] % 11, small_i32(chunk[2]))),
+      3 => out.push(Insn::sub64_imm(chunk[1] % 11, small_i32(chunk[2]))),
+      4 => out.push(Insn::ldx_dw(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 3),
+      )),
+      5 => out.push(Insn::ldx_b(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 3),
+      )),
+      6 => out.push(Insn::stx_dw(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 3),
+      )),
+      7 => out.push(Insn::st_b(
+        chunk[1] % 11,
+        skew_i16(chunk, 2),
+        chunk[3] as i32,
+      )),
+      8 => out.push(Insn::call_helper((chunk[1] % 7) as i32)),
+      9 => {
+        if out.len() + 2 < MAX_REGION_INSNS {
+          push_lddw(
+            &mut out,
+            chunk[1] % 11,
+            REGION_DATA_LO + ((chunk[2] as u64) << 4) + (chunk[3] as u64),
+          );
+        }
+      }
+      10 => out.push(Insn::jeq_imm(
+        chunk[1] % 11,
+        chunk[2] as i32,
+        bounded_branch(chunk[3]),
+      )),
+      11 => out.push(Insn::ja(bounded_branch(chunk[3]))),
+      12 => out.push(Insn::and64_imm(chunk[1] % 11, chunk[2] as i32)),
+      13 => out.push(Insn::or64_imm(chunk[1] % 11, chunk[2] as i32)),
+      14 => out.push(Insn::xor64_imm(chunk[1] % 11, chunk[2] as i32)),
+      15 => out.push(Insn::lsh64_imm(chunk[1] % 11, (chunk[2] & 63) as i32)),
+      16 => out.push(Insn::rsh64_imm(chunk[1] % 11, (chunk[2] & 63) as i32)),
+      17 => out.push(Insn::atomic_add_dw(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 3),
+        false,
+      )),
+      18 => out.push(Insn::atomic_add_dw(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 3),
+        true,
+      )),
+      19 => out.push(Insn::ldx_w_sx(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 3),
+      )),
+      20 => out.push(Insn::ldx_h_sx(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 3),
+      )),
+      21 => out.push(Insn::ldx_b_sx(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 3),
+      )),
+      22 => out.push(Insn::exit()),
+      _ => {
+        out.push(Insn::mov64_reg(6, 10));
+        out.push(Insn::add64_imm(6, -8 - ((chunk[1] % 64) as i32)));
+      }
+    }
+    if out.len() >= MAX_REGION_INSNS - 2 {
+      break;
+    }
+  }
+  out.truncate(MAX_REGION_INSNS - 1);
+  out.push(Insn::exit());
+  out
+}
+
+fn assert_region_result(hints: &[u8], unresolved: &[usize], slots: usize) {
+  assert_eq!(hints.len(), slots);
+  let mut previous = None;
+  for &pc in unresolved {
+    assert!(pc < slots);
+    if let Some(previous) = previous {
+      assert!(previous < pc, "unresolved slots are not sorted and unique");
+    }
+    previous = Some(pc);
+  }
+  for &hint in hints {
+    assert!(hint == ra::UNKNOWN || hint == ra::STACK || hint == ra::DATA);
+  }
+}
+
+fn signature_with_r1(tag: ra::PointerTag) -> ra::FunctionSignature {
+  let mut tags = [ra::PointerTag::Uninit; ra::NUM_REGS];
+  tags[1] = tag;
+  tags[10] = ra::PointerTag::CurrentStack(0);
+  ra::signature_from_tags(tags)
+}
+
+fn push_lddw(out: &mut Vec<Insn>, dst: u8, imm: u64) {
+  out.push(Insn::raw(0x18, dst, 0, 0, imm as u32 as i32));
+  out.push(Insn::raw(0, 0, 0, 0, (imm >> 32) as u32 as i32));
+}
+
+fn append_random_dead_tail(out: &mut Vec<Insn>, data: &[u8]) {
+  for chunk in data.chunks_exact(3).take(8) {
+    match chunk[0] % 4 {
+      0 => out.push(Insn::ldx_dw(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 0),
+      )),
+      1 => out.push(Insn::stx_dw(
+        chunk[1] % 11,
+        chunk[2] % 11,
+        skew_i16(chunk, 0),
+      )),
+      2 => out.push(Insn::call_helper(chunk[1] as i32)),
+      _ => out.push(Insn::exit()),
+    }
+  }
+}
+
+fn insns_to_bytes(insns: &[Insn]) -> Vec<u8> {
+  insns
+    .iter()
+    .flat_map(|insn| insn.value.to_le_bytes())
+    .collect()
+}
+
+fn byte(data: &[u8], index: usize) -> u8 {
+  data.get(index).copied().unwrap_or(0)
+}
+
+fn small_i32(byte: u8) -> i32 {
+  (byte as i32 % 33) - 16
+}
+
+fn skew_i16(data: &[u8], index: usize) -> i16 {
+  (byte(data, index) as i16 % 33) - 16
+}
+
+fn bounded_branch(byte: u8) -> i16 {
+  (byte as i16 % 5) - 2
 }
 
 fn generated_program(data: &[u8], include_host_pointer_attack: bool) -> Vec<Insn> {
@@ -225,6 +611,10 @@ impl Insn {
     Self::raw(0x07, dst, 0, 0, imm)
   }
 
+  fn sub64_imm(dst: u8, imm: i32) -> Self {
+    Self::raw(0x17, dst, 0, 0, imm)
+  }
+
   fn and64_imm(dst: u8, imm: i32) -> Self {
     Self::raw(0x57, dst, 0, 0, imm)
   }
@@ -247,6 +637,18 @@ impl Insn {
 
   fn jeq_imm(dst: u8, imm: i32, offset: i16) -> Self {
     Self::raw(0x15, dst, 0, offset, imm)
+  }
+
+  fn ja(offset: i16) -> Self {
+    Self::raw(0x05, 0, 0, offset, 0)
+  }
+
+  fn call_helper(imm: i32) -> Self {
+    Self::raw(0x85, 0, 0, 0, imm)
+  }
+
+  fn call_local(imm: i32) -> Self {
+    Self::raw(0x85, 0, 1, 0, imm)
   }
 
   fn ldx_dw(dst: u8, src: u8, offset: i16) -> Self {

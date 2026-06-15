@@ -6,13 +6,14 @@ compile_error!("only x86_64/aarch64 linux is supported");
 
 /// Error types returned by the runtime.
 pub mod error;
+mod function_analysis;
 /// Helper definitions and utilities for eBPF programs.
 pub mod helpers;
 mod linker;
 mod pointer_cage;
-mod region_analysis;
 /// Program loading and execution APIs.
 pub mod program;
+mod region_analysis;
 mod ubpf;
 mod util;
 

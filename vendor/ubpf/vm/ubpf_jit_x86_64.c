@@ -1697,6 +1697,76 @@ emit_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t ebpf_targe
     emit1(state, 0x24); // Scale: 00b Index: 100b Base: 100b
 }
 
+static inline void
+emit_indirect_call_rax(struct jit_state* state)
+{
+    emit1(state, 0xff);
+    emit1(state, 0xd0);
+}
+
+static inline void
+emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_pc)
+{
+    if (!vm->local_call_resolver || call_pc >= vm->local_call_resolver_ids_len) {
+        state->jit_status = UnexpectedInstruction;
+        return;
+    }
+
+    // Match the normal local-call frame setup: move R10 down by the current
+    // function's stack usage and preserve callee-saved BPF registers.
+    emit1(state, 0x4c);
+    emit1(state, 0x2B);
+    emit1(state, 0x3C);
+    emit1(state, 0x24);
+
+    emit_push(state, map_register(BPF_REG_6));
+    emit_push(state, map_register(BPF_REG_7));
+    emit_push(state, map_register(BPF_REG_8));
+    emit_push(state, map_register(BPF_REG_9));
+
+    // The resolver is a host call. Preserve BPF argument registers across it so
+    // the lazily compiled callee sees the same R1-R5 values the original local
+    // call would have passed.
+    emit_push(state, map_register(BPF_REG_1));
+    emit_push(state, map_register(BPF_REG_2));
+    emit_push(state, map_register(BPF_REG_3));
+    emit_push(state, map_register(BPF_REG_4));
+    emit_push(state, map_register(BPF_REG_5));
+    emit_push(state, VOLATILE_CTXT);
+
+#if defined(_WIN32)
+    emit_alu64_imm32(state, 0x81, 5, RSP, 4 * sizeof(uint64_t));
+#endif
+
+    emit_load_imm(state, platform_parameter_registers[0], vm->local_call_resolver_ids[call_pc]);
+    emit_load_imm(state, RAX, (uint64_t)vm->local_call_resolver);
+    emit_indirect_call_rax(state);
+
+#if defined(_WIN32)
+    emit_alu64_imm32(state, 0x81, 0, RSP, 4 * sizeof(uint64_t));
+#endif
+
+    emit_pop(state, VOLATILE_CTXT);
+    emit_pop(state, map_register(BPF_REG_5));
+    emit_pop(state, map_register(BPF_REG_4));
+    emit_pop(state, map_register(BPF_REG_3));
+    emit_pop(state, map_register(BPF_REG_2));
+    emit_pop(state, map_register(BPF_REG_1));
+
+    // RAX still holds the compiled callee pointer returned by the resolver.
+    emit_indirect_call_rax(state);
+
+    emit_pop(state, map_register(BPF_REG_9));
+    emit_pop(state, map_register(BPF_REG_8));
+    emit_pop(state, map_register(BPF_REG_7));
+    emit_pop(state, map_register(BPF_REG_6));
+
+    emit1(state, 0x4c);
+    emit1(state, 0x03);
+    emit1(state, 0x3C);
+    emit1(state, 0x24);
+}
+
 static uint32_t
 emit_dispatched_external_helper_address(struct jit_state* state, struct ubpf_vm* vm)
 {
@@ -1898,10 +1968,23 @@ emit_masked_store_imm32(
 }
 
 static int
-translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
+translate_range(
+    struct ubpf_vm* vm,
+    struct jit_state* state,
+    char** errmsg,
+    uint32_t start_pc,
+    uint32_t end_pc,
+    bool whole_program,
+    bool lazy_local_calls)
 {
     int i;
 
+    if (end_pc > vm->num_insts || start_pc >= end_pc) {
+        *errmsg = ubpf_error("Invalid function range [%u, %u)", start_pc, end_pc);
+        return -1;
+    }
+
+    if (whole_program) {
     (void)platform_volatile_registers;
     /* Save platform non-volatile registers */
     for (i = 0; i < _countof(platform_nonvolatile_registers); i++) {
@@ -1978,8 +2061,9 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
 
     DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit)
     emit_jmp(state, exit_tgt);
+    }
 
-    for (i = 0; i < vm->num_insts; i++) {
+    for (i = start_pc; i < (int)end_pc; i++) {
         if (state->jit_status != NoError) {
             break;
         }
@@ -2484,7 +2568,11 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
                 }
             } else if (inst.src == 1) {
                 target_pc = i + inst.imm + 1;
-                emit_local_call(vm, state, target_pc);
+                if (lazy_local_calls) {
+                    emit_lazy_local_call(vm, state, i);
+                } else {
+                    emit_local_call(vm, state, target_pc);
+                }
             }
             break;
         case EBPF_OP_EXIT:
@@ -2709,33 +2797,45 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         return -1;
     }
 
-    /* Epilogue */
-    state->exit_loc = state->offset;
+    if (whole_program) {
+      /* Epilogue */
+      state->exit_loc = state->offset;
 
-    /* Move register 0 into rax */
-    if (map_register(BPF_REG_0) != RAX) {
-        emit_mov(state, map_register(BPF_REG_0), RAX);
+      /* Move register 0 into rax */
+      if (map_register(BPF_REG_0) != RAX) {
+          emit_mov(state, map_register(BPF_REG_0), RAX);
+      }
+
+      /* Deallocate stack space by restoring RSP from RBP. */
+      emit_mov(state, RBP, RSP);
+
+      if (!(_countof(platform_nonvolatile_registers) % 2)) {
+          emit_alu64_imm32(state, 0x81, 0, RSP, 0x8);
+      }
+
+      /* Restore platform non-volatile registers */
+      for (i = 0; i < _countof(platform_nonvolatile_registers); i++) {
+          emit_pop(state, platform_nonvolatile_registers[_countof(platform_nonvolatile_registers) - i - 1]);
+      }
+
+      emit1(state, 0xc3); /* ret */
+    } else {
+      state->exit_loc = state->offset;
+      emit_alu64_imm32(state, 0x81, 0, RSP, 8);
+      emit_ret(state);
     }
-
-    /* Deallocate stack space by restoring RSP from RBP. */
-    emit_mov(state, RBP, RSP);
-
-    if (!(_countof(platform_nonvolatile_registers) % 2)) {
-        emit_alu64_imm32(state, 0x81, 0, RSP, 0x8);
-    }
-
-    /* Restore platform non-volatile registers */
-    for (i = 0; i < _countof(platform_nonvolatile_registers); i++) {
-        emit_pop(state, platform_nonvolatile_registers[_countof(platform_nonvolatile_registers) - i - 1]);
-    }
-
-    emit1(state, 0xc3); /* ret */
 
     state->retpoline_loc = emit_retpoline(state);
     state->dispatcher_loc = emit_dispatched_external_helper_address(state, vm);
     state->helper_table_loc = emit_helper_table(state, vm);
 
     return 0;
+}
+
+static int
+translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
+{
+    return translate_range(vm, state, errmsg, 0, vm->num_insts, true, false);
 }
 
 static bool
@@ -2861,6 +2961,42 @@ ubpf_translate_x86_64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum Ji
     }
 
     if (translate(vm, &state, &compile_result.errmsg) < 0) {
+        goto out;
+    }
+
+    if (!resolve_patchable_relatives(&state)) {
+        compile_result.errmsg = ubpf_error("Could not patch the relative addresses in the JIT'd code");
+        goto out;
+    }
+
+    compile_result.compile_result = UBPF_JIT_COMPILE_SUCCESS;
+    compile_result.external_dispatcher_offset = state.dispatcher_loc;
+    compile_result.external_helper_offset = state.helper_table_loc;
+    compile_result.jit_mode = jit_mode;
+    *size = state.offset;
+
+out:
+    release_jit_state_result(&state, &compile_result);
+    return compile_result;
+}
+
+struct ubpf_jit_result
+ubpf_translate_function_x86_64(
+    struct ubpf_vm* vm,
+    uint8_t* buffer,
+    size_t* size,
+    enum JitMode jit_mode,
+    uint32_t start_pc,
+    uint32_t end_pc)
+{
+    struct jit_state state;
+    struct ubpf_jit_result compile_result;
+
+    if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+        goto out;
+    }
+
+    if (translate_range(vm, &state, &compile_result.errmsg, start_pc, end_pc, false, true) < 0) {
         goto out;
     }
 

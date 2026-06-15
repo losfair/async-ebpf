@@ -210,3 +210,118 @@ pub async fn run_one_program(opts: RunOpts<'_, '_>, code: &str) -> Result<i64, E
     )
     .await
 }
+
+/// Testing-only accessors for fuzzing the static region analyzer.
+///
+/// This module is intentionally gated behind the `testing` feature through
+/// `test_util`; it is not part of the runtime's stable public API.
+pub mod region_analysis {
+  use crate::region_analysis::{
+    self as analyzer, PointerSignature, RegKind, StackKind, REGION_DATA, REGION_STACK,
+    REGION_UNKNOWN,
+  };
+
+  /// Number of eBPF general-purpose registers modeled by the analyzer.
+  pub const NUM_REGS: usize = 11;
+  /// Unknown/unroutable memory region.
+  pub const UNKNOWN: u8 = REGION_UNKNOWN;
+  /// Guest stack memory region.
+  pub const STACK: u8 = REGION_STACK;
+  /// Read-only data memory region.
+  pub const DATA: u8 = REGION_DATA;
+
+  /// Register provenance tag used to build fuzz-time function signatures.
+  #[derive(Clone, Copy, Debug)]
+  pub enum PointerTag {
+    /// No information is known for this register.
+    Uninit,
+    /// Pointer into the current eBPF stack frame, with a known frame offset.
+    CurrentStack(i32),
+    /// Pointer into the current eBPF stack frame, with an unknown frame offset.
+    CurrentStackUnknown,
+    /// Pointer into a caller/ancestor eBPF stack frame.
+    ForeignStack,
+    /// Pointer into the relocated read-only data region.
+    Data,
+    /// Non-pointer scalar value.
+    Scalar,
+    /// Conflicting or otherwise unroutable value.
+    Unknown,
+  }
+
+  /// Opaque region-analysis function signature.
+  #[derive(Clone, Copy)]
+  pub struct FunctionSignature(PointerSignature);
+
+  /// Result returned by the whole-section analyzer.
+  pub struct SectionAnalysis {
+    /// Per-instruction-slot load region hint.
+    pub hints: Vec<u8>,
+    /// Memory-access slots that could not be statically routed.
+    pub unresolved: Vec<usize>,
+  }
+
+  /// Result returned by the per-function analyzer.
+  pub struct FunctionAnalysis {
+    /// Per-instruction-slot load region hint.
+    pub hints: Vec<u8>,
+    /// Memory-access slots that could not be statically routed.
+    pub unresolved: Vec<usize>,
+    /// Local-call sites and the pointer signature inferred for the callee.
+    pub call_signatures: Vec<(usize, FunctionSignature)>,
+  }
+
+  /// Entry function signature used by normal program invocations.
+  pub fn entry_signature() -> FunctionSignature {
+    FunctionSignature(PointerSignature::entry())
+  }
+
+  /// Builds a signature from explicit per-register provenance tags.
+  pub fn signature_from_tags(tags: [PointerTag; NUM_REGS]) -> FunctionSignature {
+    let mut regs = [RegKind::Uninit; NUM_REGS];
+    for (index, tag) in tags.into_iter().enumerate() {
+      regs[index] = match tag {
+        PointerTag::Uninit => RegKind::Uninit,
+        PointerTag::CurrentStack(offset) => RegKind::Stack(StackKind::Current(Some(offset))),
+        PointerTag::CurrentStackUnknown => RegKind::Stack(StackKind::Current(None)),
+        PointerTag::ForeignStack => RegKind::Stack(StackKind::Foreign),
+        PointerTag::Data => RegKind::Data,
+        PointerTag::Scalar => RegKind::Scalar,
+        PointerTag::Unknown => RegKind::Unknown,
+      };
+    }
+    FunctionSignature(PointerSignature::from_regs_for_testing(regs))
+  }
+
+  /// Runs whole-section static region analysis.
+  pub fn analyze_section(code: &[u8], data_lo: u64, data_hi: u64) -> SectionAnalysis {
+    let result = analyzer::analyze(code, data_lo, data_hi);
+    SectionAnalysis {
+      hints: result.hints,
+      unresolved: result.unresolved,
+    }
+  }
+
+  /// Runs per-function static region analysis.
+  pub fn analyze_function(
+    code: &[u8],
+    start_pc: usize,
+    end_pc: usize,
+    signature: FunctionSignature,
+    data_lo: u64,
+    data_hi: u64,
+  ) -> FunctionAnalysis {
+    let result = analyzer::analyze_function(code, start_pc, end_pc, signature.0, data_lo, data_hi);
+    let mut call_signatures: Vec<_> = result
+      .call_signatures
+      .into_iter()
+      .map(|(pc, sig)| (pc, FunctionSignature(sig)))
+      .collect();
+    call_signatures.sort_by_key(|(pc, _)| *pc);
+    FunctionAnalysis {
+      hints: result.hints,
+      unresolved: result.unresolved,
+      call_signatures,
+    }
+  }
+}

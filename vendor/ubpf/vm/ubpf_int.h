@@ -91,6 +91,13 @@ struct ubpf_vm
     bool constant_blinding_enabled;
     int (*error_printf)(FILE* stream, const char* format, ...);
     struct ubpf_jit_result (*jit_translate)(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum JitMode jit_mode);
+    struct ubpf_jit_result (*jit_translate_function)(
+        struct ubpf_vm* vm,
+        uint8_t* buffer,
+        size_t* size,
+        enum JitMode jit_mode,
+        uint32_t start_pc,
+        uint32_t end_pc);
     bool (*jit_update_dispatcher)(
         struct ubpf_vm* vm,
         external_function_dispatcher_t new_dispatcher,
@@ -114,6 +121,9 @@ struct ubpf_vm
     size_t jit_pointer_offset;
     const uint8_t* region_hints; ///< Per-instruction load region hints (0=unknown, 1=stack, 2=data); indexed by instruction slot. NULL disables.
     size_t region_hints_len;     ///< Number of valid entries in region_hints.
+    local_call_resolver_t local_call_resolver;
+    const uint32_t* local_call_resolver_ids;
+    size_t local_call_resolver_ids_len;
     int instruction_limit;
     void* debug_function_context; ///< Context pointer that is passed to the debug function.
     ubpf_debug_fn debug_function; ///< Debug function that is called before each instruction.
@@ -145,6 +155,14 @@ ubpf_is_valid_instruction(const struct ebpf_inst insts, char ** errmsg);
 // arm64
 struct ubpf_jit_result
 ubpf_translate_arm64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum JitMode jit_mode);
+struct ubpf_jit_result
+ubpf_translate_function_arm64(
+    struct ubpf_vm* vm,
+    uint8_t* buffer,
+    size_t* size,
+    enum JitMode jit_mode,
+    uint32_t start_pc,
+    uint32_t end_pc);
 bool
 ubpf_jit_update_dispatcher_arm64(
     struct ubpf_vm* vm, external_function_dispatcher_t new_dispatcher, uint8_t* buffer, size_t size, uint32_t offset);
@@ -160,6 +178,14 @@ ubpf_jit_update_helper_arm64(
 // x86_64
 struct ubpf_jit_result
 ubpf_translate_x86_64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum JitMode jit_mode);
+struct ubpf_jit_result
+ubpf_translate_function_x86_64(
+    struct ubpf_vm* vm,
+    uint8_t* buffer,
+    size_t* size,
+    enum JitMode jit_mode,
+    uint32_t start_pc,
+    uint32_t end_pc);
 bool
 ubpf_jit_update_dispatcher_x86_64(
     struct ubpf_vm* vm, external_function_dispatcher_t new_dispatcher, uint8_t* buffer, size_t size, uint32_t offset);
@@ -175,6 +201,14 @@ ubpf_jit_update_helper_x86_64(
 // uhm, hello?
 struct ubpf_jit_result
 ubpf_translate_null(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum JitMode jit_mode);
+struct ubpf_jit_result
+ubpf_translate_function_null(
+    struct ubpf_vm* vm,
+    uint8_t* buffer,
+    size_t* size,
+    enum JitMode jit_mode,
+    uint32_t start_pc,
+    uint32_t end_pc);
 bool
 ubpf_jit_update_dispatcher_null(
     struct ubpf_vm* vm, external_function_dispatcher_t new_dispatcher, uint8_t* buffer, size_t size, uint32_t offset);
