@@ -106,7 +106,10 @@ jobs:
           echo "cpu_mhz_source: $cpu_mhz_source"
 
       - name: Run async-ebpf CoreMark
-        run: COREMARK_DIR=/tmp/coremark cargo run --release --features testing --example coremark -- 10 "$CPU_MHZ"
+        # Functions are JIT-compiled lazily on first call, so the first
+        # iterations pay a one-time compilation cost. Run enough iterations to
+        # amortize it and measure steady-state throughput.
+        run: COREMARK_DIR=/tmp/coremark cargo run --release --features testing --example coremark -- 10000 "$CPU_MHZ"
 
       - name: Run native CoreMark
         run: |
