@@ -1,8 +1,8 @@
 #[cfg(not(all(
-  target_os = "linux",
+  any(target_os = "linux", target_os = "openbsd"),
   any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
-compile_error!("only x86_64/aarch64 linux is supported");
+compile_error!("only x86_64/aarch64 Linux and OpenBSD are supported");
 
 /// Error types returned by the runtime.
 pub mod error;

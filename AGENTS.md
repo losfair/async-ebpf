@@ -27,5 +27,5 @@
 - PRs should include: a brief change summary, testing commands run (or “not run”), and any platform constraints (Linux x86_64/aarch64 only).
 
 ## Platform & Environment Notes
-- The crate is Linux-only for `x86_64` and `aarch64` (enforced at compile time).
+- The crate supports Linux and OpenBSD on `x86_64` and `aarch64` (enforced at compile time).
 - Changes touching `vendor/ubpf/` or `build.rs` should note external toolchain requirements (CMake, bindgen/clang).

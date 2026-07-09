@@ -330,6 +330,51 @@ async fn test_fault_read_past_stack() {
   assert!(matches!(ret, Err(Error(RuntimeError::MemoryFault(_)))));
 }
 
+#[cfg(target_os = "openbsd")]
+#[tokio::test]
+async fn test_openbsd_repeated_memory_fault_stress() {
+  const ITERATIONS: usize = 512;
+
+  let (_, thread) = gt_env();
+  let binary = compile_ebpf(
+    r#"
+  unsigned long long __attribute__((section("test"))) entry(unsigned long long *bad) {
+    return *bad;
+  }
+  "#
+      .as_bytes()
+      .to_vec(),
+  )
+  .await
+  .unwrap();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(thread);
+  let preemption = PreemptionEnabled::new(thread);
+
+  for iteration in 0..ITERATIONS {
+    let ret = program
+      .run(
+        &timeslice_config(),
+        &TokioTimeslicer,
+        "test",
+        &mut [],
+        &[],
+        &preemption,
+      )
+      .await;
+    assert!(
+      matches!(ret, Err(Error(RuntimeError::MemoryFault(_)))),
+      "stress iteration {iteration} returned {ret:?}"
+    );
+  }
+}
+
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_fault_write_past_stack() {

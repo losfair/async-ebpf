@@ -6,7 +6,7 @@
 # the LICENSE file found in the root directory of this source tree.
 #
 
-if(PLATFORM_LINUX OR PLATFORM_MACOS)
+if(PLATFORM_LINUX OR PLATFORM_MACOS OR PLATFORM_OPENBSD)
   option(UBPF_ENABLE_COVERAGE "Set to true to enable coverage flags")
   option(UBPF_ENABLE_SANITIZERS "Set to true to enable the address and undefined sanitizers")
   option(UBPF_ENABLE_LIBFUZZER "Set to true to enable the libfuzzer")

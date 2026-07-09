@@ -1,7 +1,7 @@
 use std::{
   sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
   },
   time::Duration,
 };
@@ -12,10 +12,15 @@ use crate::{
 };
 
 const LOOP_ITERS: u64 = 10_000_000;
-const LOCAL_CALL_LOOP_ITERS: u64 = 1_000_000;
+const LOCAL_CALL_LOOP_ITERS: u64 = 10_000_000;
 const EXPECTED_SUM: i64 = (LOOP_ITERS / 8 * 28) as i64;
 const EXPECTED_LOCAL_CALL_SUM: i64 =
   (LOCAL_CALL_LOOP_ITERS / 8 * 28 + LOCAL_CALL_LOOP_ITERS * 11) as i64;
+
+// These tests intentionally depend on watcher scheduling within a short JIT
+// workload. Running several of them concurrently can starve a watcher on small
+// CI machines and turn the "was preempted" assertion into a scheduler test.
+static PREEMPTION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 const STATEFUL_LOOP: &str = r#"
 #define LOOP_ITERS 10000000ULL
@@ -39,7 +44,7 @@ unsigned long long __attribute__((section("test"))) entry(void) {
 "#;
 
 const LOCAL_CALL_LOOP: &str = r#"
-#define LOOP_ITERS 1000000ULL
+#define LOOP_ITERS 10000000ULL
 
 static unsigned long long __attribute__((noinline, section("test")))
 bump(unsigned long long i, volatile unsigned long long *guard) {
@@ -82,6 +87,7 @@ impl ProgramEventListener for CountingEventListener {
 
 #[test]
 fn test_async_preemption_preserves_guest_state() {
+  let _guard = PREEMPTION_TEST_LOCK.lock().unwrap();
   let timeslice = TimesliceConfig {
     max_run_time_before_throttle: Duration::from_secs(60),
     max_run_time_before_yield: Duration::from_secs(60),
@@ -98,6 +104,7 @@ fn test_async_preemption_preserves_guest_state() {
 
 #[test]
 fn test_async_preemption_yields_to_async_runtime() {
+  let _guard = PREEMPTION_TEST_LOCK.lock().unwrap();
   let timeslice = TimesliceConfig {
     max_run_time_before_throttle: Duration::from_secs(60),
     max_run_time_before_yield: Duration::ZERO,
@@ -114,6 +121,7 @@ fn test_async_preemption_yields_to_async_runtime() {
 
 #[test]
 fn test_async_preemption_preserves_lazy_local_call_state() {
+  let _guard = PREEMPTION_TEST_LOCK.lock().unwrap();
   let timeslice = TimesliceConfig {
     max_run_time_before_throttle: Duration::from_secs(60),
     max_run_time_before_yield: Duration::from_secs(60),
@@ -126,6 +134,67 @@ fn test_async_preemption_preserves_lazy_local_call_state() {
   assert!(events.async_preempts.load(Ordering::SeqCst) > 0);
   assert_eq!(events.yields.load(Ordering::SeqCst), 0);
   assert_eq!(compiled_functions, 2);
+}
+
+#[cfg(target_os = "openbsd")]
+#[test]
+fn test_openbsd_preemption_thread_lifecycle_stress() {
+  let _guard = PREEMPTION_TEST_LOCK.lock().unwrap();
+  const ITERATIONS: usize = 128;
+
+  let compiler_runtime = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    .build()
+    .unwrap();
+  let binary = Arc::new(
+    compiler_runtime
+      .block_on(compile_ebpf(STATEFUL_LOOP.as_bytes().to_vec()))
+      .unwrap(),
+  );
+  let global = unsafe { GlobalEnv::new() };
+
+  for iteration in 0..ITERATIONS {
+    let binary = binary.clone();
+    std::thread::spawn(move || {
+      let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+      runtime.block_on(async move {
+        let thread = global.init_thread(Duration::from_millis(1));
+        let events = Arc::new(CountingEventListener::default());
+        let program = ProgramLoader::new(&mut rand::thread_rng(), events.clone(), &[])
+          .load(&mut rand::thread_rng(), &binary)
+          .unwrap()
+          .pin_to_current_thread(thread);
+        let preemption = PreemptionEnabled::new(thread);
+        let timeslice = TimesliceConfig {
+          max_run_time_before_throttle: Duration::from_secs(60),
+          max_run_time_before_yield: Duration::from_secs(60),
+          throttle_duration: Duration::from_millis(1),
+        };
+
+        let ret = program
+          .run(
+            &timeslice,
+            &TokioTimeslicer,
+            "test",
+            &mut [],
+            &[],
+            &preemption,
+          )
+          .await
+          .unwrap();
+        assert_eq!(ret, EXPECTED_SUM, "stress iteration {iteration}");
+        assert!(
+          events.async_preempts.load(Ordering::SeqCst) > 0,
+          "stress iteration {iteration} was not preempted"
+        );
+      });
+    })
+    .join()
+    .unwrap();
+  }
 }
 
 fn run_preempted_program(

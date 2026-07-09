@@ -40,3 +40,8 @@ cmake = "0.1"
 async-ebpf = { path = ".", features = ["testing"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 tracing-test = "0.2"
+
+[patch.crates-io]
+# OpenBSD requires MAP_STACK mappings to be writable when created and BTI
+# landing pads on arm64 coroutine trampolines.
+corosensei = { path = "vendor/corosensei" }
