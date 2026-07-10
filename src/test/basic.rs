@@ -342,8 +342,8 @@ async fn test_openbsd_repeated_memory_fault_stress() {
     return *bad;
   }
   "#
-      .as_bytes()
-      .to_vec(),
+    .as_bytes()
+    .to_vec(),
   )
   .await
   .unwrap();

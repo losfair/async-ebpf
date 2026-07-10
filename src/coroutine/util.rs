@@ -16,24 +16,24 @@ pub type EncodedValue = usize;
 /// argument. This function logically takes ownership of the value, so it should
 /// not be dropped afterwards.
 pub unsafe fn encode_val<T>(val: &mut ManuallyDrop<T>) -> EncodedValue {
-    if mem::size_of::<T>() <= mem::size_of::<EncodedValue>() {
-        let mut out = 0;
-        ptr::write_unaligned(
-            &mut out as *mut EncodedValue as *mut T,
-            ManuallyDrop::take(val),
-        );
-        out
-    } else {
-        val as *const ManuallyDrop<T> as EncodedValue
-    }
+  if mem::size_of::<T>() <= mem::size_of::<EncodedValue>() {
+    let mut out = 0;
+    ptr::write_unaligned(
+      &mut out as *mut EncodedValue as *mut T,
+      ManuallyDrop::take(val),
+    );
+    out
+  } else {
+    val as *const ManuallyDrop<T> as EncodedValue
+  }
 }
 
 // Decodes a value produced by `encode_usize` either by converting it directly
 // or by treating the `usize` as a pointer and dereferencing it.
 pub unsafe fn decode_val<T>(val: EncodedValue) -> T {
-    if mem::size_of::<T>() <= mem::size_of::<EncodedValue>() {
-        ptr::read_unaligned(&val as *const EncodedValue as *const T)
-    } else {
-        ptr::read(val as *const T)
-    }
+  if mem::size_of::<T>() <= mem::size_of::<EncodedValue>() {
+    ptr::read_unaligned(&val as *const EncodedValue as *const T)
+  } else {
+    ptr::read(val as *const T)
+  }
 }

@@ -21,16 +21,16 @@ use std::{
   time::{Duration, Instant},
 };
 
-use corosensei::{
-  stack::{DefaultStack, Stack},
-  Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
-};
 use futures::{task::noop_waker_ref, Future, FutureExt};
 use memmap2::{MmapOptions, MmapRaw};
 use parking_lot::{Condvar, Mutex};
 use rand::prelude::SliceRandom;
 
 use crate::{
+  coroutine::{
+    stack::{DefaultStack, Stack},
+    Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
+  },
   error::{Error, RuntimeError},
   function_analysis::{analyze_functions, FunctionLayout},
   helpers::Helper,
@@ -691,11 +691,13 @@ impl GlobalEnv {
 
     unsafe {
       let target_thread = current_native_thread();
+      let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
 
       std::thread::Builder::new()
         .name("preempt-watcher".to_string())
         .spawn(move || {
           let mut state = preemption_state.0.lock();
+          let _ = ready_tx.send(());
           loop {
             match *state {
               PreemptionState::Shutdown => break,
@@ -727,6 +729,9 @@ impl GlobalEnv {
           }
         })
         .expect("failed to spawn preemption watcher");
+      ready_rx
+        .recv()
+        .expect("preemption watcher stopped during startup");
 
       WATCHER.with(|x| {
         x.borrow_mut()

@@ -4,6 +4,7 @@
 )))]
 compile_error!("only x86_64/aarch64 Linux and OpenBSD are supported");
 
+mod coroutine;
 /// Error types returned by the runtime.
 pub mod error;
 mod function_analysis;

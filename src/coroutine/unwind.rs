@@ -15,8 +15,8 @@
 
 #![allow(unused_macros)]
 
-use crate::stack::StackPointer;
-use crate::util::EncodedValue;
+use crate::coroutine::stack::StackPointer;
+use crate::coroutine::util::EncodedValue;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "unwind")] {
@@ -72,7 +72,7 @@ cfg_if::cfg_if! {
         }
         macro_rules! cfi_reset_args_size_root {
             () => {
-                crate::unwind::cfi_reset_args_size!()
+                crate::coroutine::unwind::cfi_reset_args_size!()
             }
         }
 
@@ -284,7 +284,7 @@ cfg_if::cfg_if! {
         }
         macro_rules! cfi_reset_args_size_yield {
             () => {
-                crate::unwind::cfi_reset_args_size!()
+                crate::coroutine::unwind::cfi_reset_args_size!()
             }
         }
     } else {
@@ -340,6 +340,6 @@ cfg_if::cfg_if! {
 
 #[allow(unused_imports)]
 pub(crate) use {
-    asm_may_unwind_root, asm_may_unwind_yield, cfi_reset_args_size, cfi_reset_args_size_root,
-    cfi_reset_args_size_yield, initial_func_abi,
+  asm_may_unwind_root, asm_may_unwind_yield, cfi_reset_args_size, cfi_reset_args_size_root,
+  cfi_reset_args_size_yield, initial_func_abi,
 };
