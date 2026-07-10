@@ -294,7 +294,7 @@ pub unsafe fn init_stack<T>(stack: &impl Stack, func: InitialFunc<T>, obj: T) ->
 
   // Place the address of the initial function to execute at the top of the
   // stack. This is read by stack_init_trampoline() and jumped to.
-  push(&mut sp, Some(func as StackWord));
+  push(&mut sp, Some(func as *const () as StackWord));
 
   // Placeholder for the stack pointer value of the parent context. This is
   // filled in every time switch_and_link() is called.
@@ -306,7 +306,10 @@ pub unsafe fn init_stack<T>(stack: &impl Stack, func: InitialFunc<T>, obj: T) ->
 
   // Set up an address at the top of the stack which is called by
   // switch_and_link() during the initial context switch.
-  push(&mut sp, Some(stack_init_trampoline as StackWord));
+  push(
+    &mut sp,
+    Some(stack_init_trampoline as *const () as StackWord),
+  );
 
   StackPointer::new_unchecked(sp)
 }
@@ -423,7 +426,7 @@ pub unsafe fn switch_yield(arg: EncodedValue, parent_link: *mut StackPointer) ->
 
       // Push a return address on the stack. This is the address that will be
       // called by switch_and_link() the next time this context is resumed.
-      "lea rax, [rip + 0f]",
+      "lea rax, [rip + 2f]",
       "push rax",
 
       // Save our stack pointer to RSI, which is then returned out of
@@ -458,7 +461,7 @@ pub unsafe fn switch_yield(arg: EncodedValue, parent_link: *mut StackPointer) ->
       // - RDX points to the top of our stack, including the return address.
       // - RSI points to the base of our stack.
       // - RDI contains the argument passed from switch_and_link.
-      "0:",
+      "2:",
 
       // Save the RBP of the parent context to the parent stack. When combined
       // with the return address this forms a valid frame record (RBP & RIP)
@@ -554,7 +557,7 @@ pub unsafe fn switch_and_throw(
       "push rbx",
 
       // Push a return address to the stack.
-      "lea rax, [rip + 0f]",
+      "lea rax, [rip + 2f]",
       "push rax",
 
       // Save RBP of the parent context.
@@ -589,7 +592,7 @@ pub unsafe fn switch_and_throw(
 
       // Upon returning, our register state is just like a normal return into
       // switch_and_link().
-      "0:",
+      "2:",
 
       // Restore registers just like the second half of switch_and_link.
       "pop rbx",
@@ -672,7 +675,10 @@ pub unsafe fn setup_trap_trampoline<T>(
   // Set up a return address which returns to stack_init_trampoline. This has
   // the necessary unwinding metadata to switch back to the primary stack when
   // unwinding.
-  push(&mut sp, Some(stack_init_trampoline_return as StackWord));
+  push(
+    &mut sp,
+    Some(stack_init_trampoline_return as *const () as StackWord),
+  );
 
   // Set up registers for entry into the function.
   TrapHandlerRegs {
