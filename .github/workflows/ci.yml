@@ -55,11 +55,16 @@ jobs:
             pkg_add cmake llvm rust
           run: |
             set -eux
-            LLVM_PREFIX="$(dirname "$(dirname "$(find /usr/local -path '*/bin/llvm-link' | head -n 1)")")"
-            export PATH="$LLVM_PREFIX/bin:$PATH"
-            export LIBCLANG_PATH="$LLVM_PREFIX/lib"
+            LLVM_LINK="$(find /usr/local -type f -path '*/bin/llvm-link' | head -n 1)"
+            LIBCLANG="$(find /usr/local -type f -name 'libclang.so*' | head -n 1)"
+            test -n "$LLVM_LINK"
+            test -n "$LIBCLANG"
+            export PATH="$(dirname "$LLVM_LINK"):$PATH"
+            export LIBCLANG_PATH="$(dirname "$LIBCLANG")"
 
             uname -a
+            echo "LLVM tools: $LLVM_LINK"
+            echo "libclang: $LIBCLANG"
             rustc -vV
             clang --version
             cargo test --locked --features testing -- --test-threads=1
