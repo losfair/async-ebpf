@@ -28,6 +28,42 @@ jobs:
       - name: Run unit tests
         run: cargo test --features testing
 
+  openbsd-tests:
+    name: OpenBSD unit tests (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tests in OpenBSD
+        uses: vmactions/openbsd-vm@v1.4.4
+        with:
+          release: "7.9"
+          arch: ${{ matrix.arch }}
+          cpu: 2
+          mem: 6144
+          usesh: true
+          copyback: false
+          prepare: |
+            pkg_add cmake llvm rust
+          run: |
+            set -eux
+            LLVM_PREFIX="$(dirname "$(dirname "$(find /usr/local -path '*/bin/llvm-link' | head -n 1)")")"
+            export PATH="$LLVM_PREFIX/bin:$PATH"
+            export LIBCLANG_PATH="$LLVM_PREFIX/lib"
+
+            uname -a
+            rustc -vV
+            clang --version
+            cargo test --locked --features testing -- --test-threads=1
+
   coremark:
     name: CoreMark (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
