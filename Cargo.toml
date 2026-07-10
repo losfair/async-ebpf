@@ -18,9 +18,7 @@ testing = ["anyhow", "tokio", "rand/default"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
-corosensei = { version = "0.1", default-features = false, features = [
-  "default-stack",
-] }
+cfg-if = "1"
 elf = "0.7"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 libc = "0.2"

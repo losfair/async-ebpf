@@ -831,6 +831,8 @@ emit_movewide_immediate_blinded(struct jit_state* state, bool sixty_four, enum R
 static void
 emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
 {
+    /* Indirect call target. Required by OpenBSD BTI and a no-op elsewhere. */
+    emit_instruction(state, 0xd503245fU); /* bti c */
     emit_addsub_immediate(state, true, AS_SUB, SP, SP, 16);
     emit_loadstorepair_immediate(state, LSP_STPX, R29, R30, SP, 0);
 
@@ -1551,6 +1553,9 @@ translate_range(
 
     if (whole_program) {
         emit_jit_prologue(state, UBPF_EBPF_STACK_SIZE);
+    } else {
+        /* Lazy functions are entered through an indirect call. */
+        emit_instruction(state, 0xd503245fU); /* bti c */
     }
 
     for (i = start_pc; i < (int)end_pc; i++) {

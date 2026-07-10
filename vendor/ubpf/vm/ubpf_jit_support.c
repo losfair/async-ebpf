@@ -162,7 +162,7 @@ emit_jump_target(struct jit_state* state, uint32_t jump_src)
  * This function uses platform-specific secure random number generators:
  * - Windows: BCryptGenRandom with BCRYPT_USE_SYSTEM_PREFERRED_RNG
  * - Linux: getrandom() system call
- * - macOS: arc4random()
+ * - macOS and OpenBSD: arc4random()
  *
  * Thread safety: This function is thread-safe. Platform RNGs are thread-safe,
  * and fallback rand() uses thread-safe initialization where available.
@@ -191,8 +191,8 @@ ubpf_generate_blinding_constant(void)
         // Seed is initialized at program start via constructor
         random_value = ((uint64_t)rand() << 32) | (uint64_t)rand();
     }
-#elif defined(__APPLE__)
-    // macOS: Use arc4random_buf which is available and doesn't need seeding
+#elif defined(__APPLE__) || defined(__OpenBSD__)
+    // macOS/OpenBSD: arc4random_buf is available and doesn't need seeding.
     arc4random_buf(&random_value, sizeof(random_value));
 #else
     // Generic fallback: use standard rand (not cryptographically secure)

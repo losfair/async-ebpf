@@ -21,16 +21,16 @@ use std::{
   time::{Duration, Instant},
 };
 
-use corosensei::{
-  stack::{DefaultStack, Stack},
-  Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
-};
 use futures::{task::noop_waker_ref, Future, FutureExt};
 use memmap2::{MmapOptions, MmapRaw};
 use parking_lot::{Condvar, Mutex};
 use rand::prelude::SliceRandom;
 
 use crate::{
+  coroutine::{
+    stack::{DefaultStack, Stack},
+    Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
+  },
   error::{Error, RuntimeError},
   function_analysis::{analyze_functions, FunctionLayout},
   helpers::Helper,
@@ -46,7 +46,10 @@ const MAX_CALLDATA_SIZE: usize = 512;
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(
+  target_arch = "x86_64",
+  any(target_os = "linux", target_os = "openbsd")
+))]
 std::arch::global_asm!(
   r#"
 .global async_ebpf_entry_trampoline
@@ -87,12 +90,16 @@ async_ebpf_entry_trampoline:
 "#
 );
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[cfg(all(
+  target_arch = "aarch64",
+  any(target_os = "linux", target_os = "openbsd")
+))]
 std::arch::global_asm!(
   r#"
 .global async_ebpf_entry_trampoline
 .type async_ebpf_entry_trampoline,%function
 async_ebpf_entry_trampoline:
+    bti c
     mov x17, x0
     sub sp, sp, #16
     stp x29, x30, [sp]
@@ -584,6 +591,31 @@ pub struct ThreadEnv {
   _not_send_sync: std::marker::PhantomData<*const ()>,
 }
 
+#[cfg(target_os = "linux")]
+type NativeThread = (libc::pid_t, libc::pid_t);
+#[cfg(target_os = "openbsd")]
+type NativeThread = libc::pthread_t;
+
+#[cfg(target_os = "linux")]
+unsafe fn current_native_thread() -> NativeThread {
+  (libc::getpid(), libc::gettid())
+}
+
+#[cfg(target_os = "openbsd")]
+unsafe fn current_native_thread() -> NativeThread {
+  libc::pthread_self()
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn signal_native_thread(thread: NativeThread, signal: i32) -> i32 {
+  libc::syscall(libc::SYS_tgkill, thread.0, thread.1, signal) as i32
+}
+
+#[cfg(target_os = "openbsd")]
+unsafe fn signal_native_thread(thread: NativeThread, signal: i32) -> i32 {
+  libc::pthread_kill(thread, signal)
+}
+
 impl GlobalEnv {
   /// Initializes global state and installs signal handlers.
   ///
@@ -613,12 +645,10 @@ impl GlobalEnv {
         (libc::SIGUSR1, sigusr1_handler as *const () as usize),
         (libc::SIGSEGV, sigsegv_handler as *const () as usize),
       ] {
-        let act = libc::sigaction {
-          sa_sigaction: handler,
-          sa_flags: libc::SA_SIGINFO,
-          sa_mask,
-          sa_restorer: None,
-        };
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = handler;
+        act.sa_flags = libc::SA_SIGINFO;
+        act.sa_mask = sa_mask;
         if libc::sigaction(sig, &act, std::ptr::null_mut()) != 0 {
           panic!("failed to setup handler for signal {}", sig);
         }
@@ -630,6 +660,14 @@ impl GlobalEnv {
 
   /// Initializes per-thread state and starts the async preemption watcher.
   pub fn init_thread(self, async_preemption_interval: Duration) -> ThreadEnv {
+    // Signal handlers must never trigger lazy TLS initialization. In
+    // particular, OpenBSD aborts if a signal recursively enters the runtime's
+    // TLS initialization path. Initialize every slot touched by SIGUSR1 before
+    // the watcher can send its first signal.
+    RUST_TID.with(|_| {});
+    SIGUSR1_COUNTER.with(|_| {});
+    ACTIVE_JIT_CODE_ZONE.with(|_| {});
+
     struct DeferDrop(Arc<PreemptionStateSignal>);
     impl Drop for DeferDrop {
       fn drop(&mut self) {
@@ -652,13 +690,14 @@ impl GlobalEnv {
     let preemption_state = PREEMPTION_STATE.with(|x| x.clone());
 
     unsafe {
-      let tgid = libc::getpid();
-      let tid = libc::gettid();
+      let target_thread = current_native_thread();
+      let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
 
       std::thread::Builder::new()
         .name("preempt-watcher".to_string())
         .spawn(move || {
           let mut state = preemption_state.0.lock();
+          let _ = ready_tx.send(());
           loop {
             match *state {
               PreemptionState::Shutdown => break,
@@ -677,8 +716,7 @@ impl GlobalEnv {
                       *state = PreemptionState::Inactive;
                     }
                     PreemptionState::Armed(_) => {
-                      let ret = libc::syscall(libc::SYS_tgkill, tgid, tid, libc::SIGUSR1);
-                      if ret != 0 {
+                      if signal_native_thread(target_thread, libc::SIGUSR1) != 0 {
                         break;
                       }
                     }
@@ -691,6 +729,9 @@ impl GlobalEnv {
           }
         })
         .expect("failed to spawn preemption watcher");
+      ready_rx
+        .recv()
+        .expect("preemption watcher stopped during startup");
 
       WATCHER.with(|x| {
         x.borrow_mut()
@@ -1838,6 +1879,16 @@ unsafe fn program_counter(uctx: *mut libc::ucontext_t) -> usize {
   (*uctx).uc_mcontext.pc as usize
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "openbsd"))]
+unsafe fn program_counter(uctx: *mut libc::ucontext_t) -> usize {
+  (*uctx).sc_rip as usize
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "openbsd"))]
+unsafe fn program_counter(uctx: *mut libc::ucontext_t) -> usize {
+  (*uctx).sc_elr as usize
+}
+
 unsafe extern "C" fn sigsegv_handler(
   _sig: i32,
   siginfo: *mut libc::siginfo_t,
@@ -1905,20 +1956,21 @@ unsafe extern "C" fn sigusr1_handler(
     return;
   }
 
-  let yielder = yielder.expect("no yielder").as_ref();
-  yielder.suspend(Dispatch {
+  // A signal can arrive after the active zone is published but before the
+  // coroutine has installed its yielder on its first resume.
+  let Some(yielder) = yielder else {
+    return;
+  };
+  yielder.as_ref().suspend(Dispatch {
     async_preemption: true,
     ..Default::default()
   });
 }
 
 unsafe fn restore_default_signal_handler(signum: i32) {
-  let act = libc::sigaction {
-    sa_sigaction: libc::SIG_DFL,
-    sa_flags: libc::SA_SIGINFO,
-    sa_mask: std::mem::zeroed(),
-    sa_restorer: None,
-  };
+  let mut act: libc::sigaction = std::mem::zeroed();
+  act.sa_sigaction = libc::SIG_DFL;
+  act.sa_flags = libc::SA_SIGINFO;
   if libc::sigaction(signum, &act, std::ptr::null_mut()) != 0 {
     libc::abort();
   }

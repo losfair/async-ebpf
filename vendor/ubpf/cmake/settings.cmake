@@ -13,7 +13,7 @@ add_library("ubpf_settings_libfuzzer" INTERFACE)
 # If we are being used as a submodule, give a chance to the parent
 # project to use the settings they want.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  if(PLATFORM_LINUX OR PLATFORM_MACOS)
+  if(PLATFORM_LINUX OR PLATFORM_MACOS OR PLATFORM_OPENBSD)
     target_compile_options("ubpf_settings" INTERFACE
       -Wall
       -Werror

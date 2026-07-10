@@ -40,6 +40,10 @@
 
 #define MAX_SECTIONS 32
 
+#ifndef ELFOSABI_NONE
+#define ELFOSABI_NONE ELFOSABI_SYSV
+#endif
+
 #ifndef EM_BPF
 #define EM_BPF 247
 #endif
