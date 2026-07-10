@@ -60,6 +60,7 @@ jobs:
             test -f "$LLVM_PREFIX/lib/libclang.so.0.0"
             export PATH="$LLVM_PREFIX/bin:$PATH"
             export LIBCLANG_PATH="$LLVM_PREFIX/lib"
+            export LD_LIBRARY_PATH="$LLVM_PREFIX/lib"
 
             uname -a
             echo "LLVM prefix: $LLVM_PREFIX"
