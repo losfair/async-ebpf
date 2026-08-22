@@ -449,7 +449,19 @@ impl ProgramEventListener for NestingListener {
 /// outer guest suspended.
 #[test]
 fn a_nested_invocation_leaves_the_outer_frame_intact() {
-  const OUTER_ITERS: i32 = 2_000_000;
+  /// Iterations of the outer loop.
+  ///
+  /// Nesting happens when the outer program throttles, and it can only throttle
+  /// at a dispatch - which here means an asynchronous preemption, since the
+  /// yield budget is disabled. So this needs the guest to stay in JIT code long
+  /// enough for the watcher thread to be scheduled *and* for the throttle budget
+  /// to be exceeded at that point. Both are wall-clock conditions, which makes
+  /// the iteration count a hostage to how fast the JIT is: at two million it
+  /// managed six to eight nested runs on a fast machine and none at all under
+  /// CI's emulation.
+  ///
+  /// Raise this rather than weakening the assertion if it ever goes quiet.
+  const OUTER_ITERS: i32 = 40_000_000;
 
   let outer_elf = build_elf(&mixed_access_loop(OUTER_ITERS), &RODATA);
   let inner_elf = build_elf(&mixed_access_loop(NESTED_ITERS), &RODATA);
