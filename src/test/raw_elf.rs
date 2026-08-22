@@ -117,7 +117,7 @@ pub(crate) async fn run_raw(
     .await
 }
 
-fn build_elf(code: &[Insn], rodata: &[u8]) -> Vec<u8> {
+pub(crate) fn build_elf(code: &[Insn], rodata: &[u8]) -> Vec<u8> {
   const SHT_PROGBITS: u32 = 1;
   const SHT_SYMTAB: u32 = 2;
   const SHT_STRTAB: u32 = 3;
