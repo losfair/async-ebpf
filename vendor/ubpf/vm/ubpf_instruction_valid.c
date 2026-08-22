@@ -438,7 +438,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_LDXW,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -447,7 +447,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_LDXH,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -456,7 +456,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_LDXB,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -465,7 +465,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_LDXDW,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -474,7 +474,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_LDXWSX,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -483,7 +483,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_LDXHSX,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -492,7 +492,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_LDXBSX,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -573,7 +573,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_LDDW,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         // specific valid source values are checked in validate.
         .source_lower_bound = 0,
         .source_upper_bound = 6,
@@ -588,7 +588,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JEQ_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -597,7 +597,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JEQ_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -606,7 +606,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JGT_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -615,7 +615,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JGT_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -624,7 +624,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JGE_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -633,7 +633,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JGE_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -642,7 +642,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSET_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -651,7 +651,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSET_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -660,7 +660,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JNE_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -669,7 +669,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JNE_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -678,7 +678,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSGT_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -687,7 +687,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSGT_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -696,7 +696,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSGE_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -705,7 +705,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSGE_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -724,7 +724,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JLT_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -733,7 +733,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JLT_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -742,7 +742,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JLE_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -751,7 +751,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JLE_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -760,7 +760,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSLT_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -769,7 +769,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSLT_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -778,7 +778,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSLE_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -787,7 +787,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSLE_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -801,7 +801,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JEQ32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -810,7 +810,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JEQ32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -819,7 +819,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JGT32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -828,7 +828,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JGT32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -837,7 +837,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JGE32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -846,7 +846,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JGE32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -855,7 +855,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSET32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -864,7 +864,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSET32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -873,7 +873,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JNE32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -882,7 +882,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JNE32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -891,7 +891,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSGT32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -900,7 +900,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSGT32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -909,7 +909,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSGE32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -918,7 +918,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSGE32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -927,7 +927,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JLT32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -936,7 +936,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JLT32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -945,7 +945,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JLE32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -954,7 +954,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JLE32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -963,7 +963,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSLT32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -972,7 +972,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSLT32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -981,7 +981,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSLE32_IMM,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .immediate_lower_bound = INT32_MIN,
         .immediate_upper_bound = INT32_MAX,
         .offset_lower_bound = INT16_MIN,
@@ -990,7 +990,7 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     {
         .opcode = EBPF_OP_JSLE32_REG,
         .destination_lower_bound = BPF_REG_0,
-        .destination_upper_bound = BPF_REG_10,
+        .destination_upper_bound = BPF_REG_9,
         .source_lower_bound = BPF_REG_0,
         .source_upper_bound = BPF_REG_10,
         .offset_lower_bound = INT16_MIN,
@@ -1034,6 +1034,18 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
     },
 };
 
+/* R10 is the frame pointer and is read-only. Only the opcodes that use their
+ * destination as a *memory base* - the ST/STX forms and the two atomics - may
+ * name it; for everything else the bound above is BPF_REG_9.
+ *
+ * validate() enforces the same rule by a different route, and that redundancy is
+ * the point. Frame-relative addressing emits `[r10 + k]` with no runtime bounds
+ * check at all, so "the guest never assigned R10" is the one premise the backend
+ * cannot re-derive for itself. It should not rest on a single line in a single
+ * function: `lddw r10, <imm64>` would hand the guest the native frame base
+ * outright, and `jeq r10, imm` would compare against it, which is a
+ * host-address oracle a bit at a time.
+ */
 static ubpf_inst_filter_t* _ubpf_filter_instruction_lookup_table[256];
 
 /**

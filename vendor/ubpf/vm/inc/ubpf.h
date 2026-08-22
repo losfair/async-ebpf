@@ -731,6 +731,17 @@ extern "C"
      * parks the translated base in the frame; each later **member** reads that
      * base back and accesses it at a constant displacement.
      */
+/**
+ * @brief Widest window one access group may cover.
+ *
+ * A failed check leaves the parked base at 0, so a member then dereferences
+ * `[0 + delta]`. That has to land inside the embedder's guard window - the range
+ * its fault handler claims as a guest fault rather than a host crash - which
+ * bounds delta, and with it the span, at one page. An embedder whose guard
+ * window is smaller than this must not enable access plans.
+ */
+#define UBPF_MAX_GROUP_SPAN 4096
+
     struct ubpf_access_plan_entry
     {
         uint8_t role;       ///< 0 = ordinary checked access, 1 = leader, 2 = member.

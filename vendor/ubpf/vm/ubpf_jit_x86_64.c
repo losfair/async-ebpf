@@ -911,13 +911,8 @@ emit_masked_address_with_offset(
     }
 }
 
-/* Widest window an access group may cover.
- *
- * A failed check leaves the parked base at 0, so a member then dereferences
- * [0 + delta]. That has to land inside the embedder's guard window - the range
- * its fault handler claims as a guest fault rather than a host crash - which
- * bounds delta, and with it the span, at one page. */
-#define JIT_MAX_GROUP_SPAN 4096
+/* Widest window an access group may cover; see ubpf.h for why it is a page. */
+#define JIT_MAX_GROUP_SPAN UBPF_MAX_GROUP_SPAN
 
 #define JIT_PLAN_ROLE_NONE 0
 #define JIT_PLAN_ROLE_LEADER 1
@@ -2469,6 +2464,20 @@ translate_range(
 
     if (end_pc > vm->num_insts || start_pc >= end_pc) {
         *errmsg = ubpf_error("Invalid function range [%u, %u)", start_pc, end_pc);
+        return -1;
+    }
+
+    // Both of these are promises about a frame the *embedder's* entry code sets
+    // up: a native base in R10, and the derived bounds-check constants below
+    // RBP. The prologue emitted for a whole program builds its own frame and
+    // fills in only the descriptor pointer, so code translated that way would
+    // bounds-check against uninitialised host stack and treat a guest R10 as a
+    // native address. Nothing else ties the two together, so tie them here
+    // rather than rely on every caller reaching this through a trampoline.
+    if (whole_program && (vm->native_frame_base || vm->frame_constants)) {
+        *errmsg = ubpf_error(
+            "ubpf_set_native_frame_base/ubpf_set_frame_constants describe a frame the embedder's "
+            "entry code establishes, which the whole-program prologue does not");
         return -1;
     }
 

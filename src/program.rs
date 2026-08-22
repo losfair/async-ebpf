@@ -79,6 +79,31 @@ const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 /// exercises exactly this corner at run time.
 pub(crate) const FRAME_WINDOW: usize = crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
 
+/// Guest addresses the SIGSEGV handler claims as a guest fault rather than a
+/// host crash: `(0, POINTER_CAGE_PROTECTED_WINDOW)`.
+///
+/// A bounds check that fails substitutes address 0, so this is the window every
+/// failed access has to land in. An access group makes that load-bearing at a
+/// distance: a failed leader parks base 0 and its members then dereference
+/// `[0 + delta]`, so the group span has to fit here too. Three constants in
+/// three files have to agree about that page - this one, `MAX_GROUP_SPAN` in
+/// the analysis, and `JIT_MAX_GROUP_SPAN` in the backend - and if they ever
+/// drift apart the symptom is a legitimate guest aborting the process rather
+/// than taking a fault. The assertion below ties the first two together.
+pub(crate) const POINTER_CAGE_PROTECTED_WINDOW: usize = 4096;
+
+const _: () = {
+  assert!(
+    crate::region_analysis::MAX_GROUP_SPAN as usize <= POINTER_CAGE_PROTECTED_WINDOW,
+    "an access group can span further than the guard window the fault handler \
+     claims, so a group off a bad base would abort the process instead of faulting"
+  );
+  assert!(
+    crate::region_analysis::MAX_GROUP_SPAN == crate::ubpf::UBPF_MAX_GROUP_SPAN as i32,
+    "the analysis and the backend disagree about how wide an access group may be"
+  );
+};
+
 const _: () = {
   // What the window has left below the deepest frame pointer the loader accepts.
   let headroom = SHADOW_STACK_SIZE
@@ -576,15 +601,22 @@ impl JitMemory {
   /// check that reloads and re-derives them every time and one that reads two
   /// frame slots.
   fn fill_derived(&mut self) {
-    // A region narrower than the widest access would make `(top - w) - bottom`
-    // wrap, and the unsigned comparison would then accept everything. Neither
-    // region can be that small - the data region is page-rounded and the guest
-    // stack is tens of kilobytes - but the check below is what says so.
-    let widest = *ACCESS_WIDTHS.last().unwrap();
-    assert!(
-      self.stack_guest_top - self.stack_guest_bottom >= widest
-        && self.data_guest_top - self.data_guest_bottom >= widest,
-      "a guest region is narrower than the widest access"
+    // A region narrower than the width being checked makes `(top - w) - bottom`
+    // wrap, and the single unsigned comparison would then accept *every* address
+    // for that region - a complete bypass of the cage, not a near miss.
+    //
+    // The width that matters is not the widest single access. A group leader
+    // checks its whole window at once, so `w` reaches `MAX_GROUP_SPAN`. Both
+    // regions are comfortably larger than that and `PointerCage::new` refuses to
+    // build one that is not, so this is a restatement of a load-time invariant
+    // rather than a live check - which is why it is a debug assertion here and
+    // an error there.
+    debug_assert!(
+      self.stack_guest_top - self.stack_guest_bottom
+        >= crate::region_analysis::MAX_GROUP_SPAN as usize
+        && self.data_guest_top - self.data_guest_bottom
+          >= crate::region_analysis::MAX_GROUP_SPAN as usize,
+      "a guest region is narrower than the widest window a bounds check can be asked for"
     );
 
     let mut slot = 0;
@@ -1565,7 +1597,8 @@ impl Program {
             self.unbound.code_base + self.unbound.code_size,
           ));
           x.yielder.set(yielder.map(|x| x.0));
-          x.pointer_cage_protected_range.set((0, 4096));
+          x.pointer_cage_protected_range
+            .set((0, POINTER_CAGE_PROTECTED_WINDOW));
           compiler_fence(Ordering::Release);
           x.valid.store(true, Ordering::Relaxed);
         });
