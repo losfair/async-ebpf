@@ -248,14 +248,8 @@ impl PointerSignature {
     Self { regs }
   }
 
-  /// Drops every register the callee cannot observe, so two call sites that
-  /// differ only in the caller's incidental live state share one specialization.
-  ///
-  /// A register outside `mask` is not live-in to the callee (see
-  /// [`function_live_in`]), meaning it is overwritten before any read on every
-  /// path. Replacing it with `Unknown` therefore changes no hint, no unresolved
-  /// access and no signature the callee passes on - it only collapses
-  /// signatures that would have produced identical analyses.
+  /// Drops every register outside `mask`, i.e. every register the callee cannot
+  /// observe. See [`function_live_in`] for why that costs no precision.
   fn masked(mut self, mask: RegMask) -> Self {
     for (reg, kind) in self.regs.iter_mut().enumerate() {
       if reg != R10 && mask & (1 << reg) == 0 {
@@ -504,17 +498,15 @@ fn reg_bit(reg: usize) -> RegMask {
 
 /// Registers `inst` reads and writes.
 ///
-/// `uses` is taken from the instruction encoding — every register the opcode
-/// reads, whether or not [`transfer`] happens to consult its kind. That is more
-/// than strictly necessary (a 32-bit ALU op or a comparison cannot change a
-/// register's region), but it keeps this sound under any future change to
-/// `transfer` that starts reading a register the instruction names.
+/// `uses` comes from the instruction encoding - every register the opcode
+/// reads, whether or not [`transfer`] consults its kind. That is more than
+/// strictly necessary, but it stays sound if `transfer` later starts reading a
+/// register the instruction names.
 ///
-/// `defs` must be a *subset* of what the instruction actually overwrites: a def
-/// kills liveness, so over-claiming one would drop a register from the mask
-/// that the callee can still observe. Fetching atomics write `src` (and
-/// CMPXCHG writes `R0`) conditionally on the operation selector, so they claim
-/// no definition at all.
+/// `defs` must be a *subset* of what the instruction overwrites: a def kills
+/// liveness, so over-claiming one would drop a register the callee can still
+/// observe. Fetching atomics write `src` (and CMPXCHG writes `R0`) conditionally
+/// on the operation selector, so they claim no definition at all.
 fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
   match inst.opcode & EBPF_CLS_MASK {
     // Only LDDW reaches here; it materializes a constant into dst.
@@ -577,17 +569,18 @@ fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
 /// Registers whose incoming kind the function `[start_pc, end_pc)` can observe,
 /// i.e. those it may read before writing, transitively through its callees.
 ///
-/// This is what makes per-signature specialization affordable. A signature is
-/// the caller's whole abstract register file at the call site, so without a
-/// mask a callee gets a fresh specialization every time the caller's incidental
-/// live state differs - a stale `R2` from an earlier helper call, or a pointer
-/// the caller happens to be holding in `R6` - even when the callee's own
-/// analysis could not possibly differ. Masking a register that is not live-in
-/// to `Unknown` is free: it is overwritten before any read on every path, so no
-/// hint, no unresolved access and no callee signature can depend on it.
+/// This is the mask [`PointerSignature::masked`] applies, and it is what keeps
+/// per-signature specialization affordable. A signature is the caller's whole
+/// abstract register file, so without it a callee is split every time the
+/// caller's incidental live state differs - a stale `R2` from an earlier helper
+/// call, a pointer the caller happens to be holding in `R6` - and because those
+/// registers survive calls, the splits compound down the graph. Masking a
+/// register that is not live-in costs no precision: it is overwritten before
+/// any read on every path, so no hint, no unresolved access and no onward
+/// signature can depend on it.
 ///
 /// `callee_live_in` maps a local call's target PC to that callee's mask, so
-/// callers must compute masks bottom-up over the call graph (which is a DAG -
+/// callers must compute masks bottom-up over the call graph (a DAG, since
 /// recursion is rejected at load).
 pub(crate) fn function_live_in(
   code: &[u8],

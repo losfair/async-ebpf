@@ -1396,13 +1396,12 @@ impl Program {
         };
 
         // A lazy local call JIT-compiles a function on this thread before the
-        // guest can continue. That is guest-triggered work of unbounded size -
-        // a program chooses how many (function, pointer signature) pairs exist,
-        // and every one of them is a separate compilation - so it has to reach
-        // the run-budget check below like any other dispatch. Async preemption
-        // cannot substitute for that: the SIGUSR1 handler only acts on a PC
-        // inside the JIT code range, and during compilation the PC is in the
-        // compiler.
+        // guest can continue - guest-triggered work whose size the program
+        // chooses, since every (function, pointer signature) pair is a separate
+        // compilation. So it has to reach the run-budget check below like any
+        // other dispatch. Async preemption cannot substitute: the SIGUSR1
+        // handler only acts on a PC inside the JIT code range, and during
+        // compilation the PC is in the compiler.
         let compiled_lazily = if let Some(resolver_id) = dispatch.lazy_local_call {
           resume_input = self.compile_resolver(resolver_id)?.code_ptr as u64;
           true
@@ -1444,9 +1443,8 @@ impl Program {
         let pending_async_task = PENDING_ASYNC_TASK.with(|x| x.borrow_mut().take());
 
         // Fast path: do not read timestamp if no thread migration or async preemption happened.
-        // A lazy compilation always takes the slow path - the fast path exists so that a helper
-        // call does not pay for a clock read, which is not a trade worth making against a JIT
-        // compilation.
+        // A lazy compilation always takes the slow path: the fast path exists to spare a helper
+        // call a clock read, which is not worth trading against a JIT compilation.
         let new_rust_tid_sigusr1_counter =
           (RUST_TID.with(|x| *x), SIGUSR1_COUNTER.with(|x| x.get()));
         if !compiled_lazily

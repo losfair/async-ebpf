@@ -126,11 +126,18 @@ The outgoing state at a local-call site determines the callee's specialization
 key. For example, the same callee may be compiled once for `R1=stack` and once
 for `R1=data`.
 
+The key is masked to the registers the callee can observe — those it may read
+before writing, transitively through its own callees (`function_live_in`). A
+register outside that set is overwritten before any read on every path, so no
+hint, unresolved access, or onward signature can depend on it; masking it costs
+no precision and keeps a callee from being split over the caller's incidental
+live state, which would otherwise compound down the call graph.
+
 For a section entrypoint, the initial signature is:
 
 - `R1 = Stack`, because calldata lives on the guest stack;
 - `R10 = Stack`;
-- other registers start according to the existing analysis model.
+- every other register `Scalar`, because the entry trampoline zeroes them.
 
 ## Local-call resolver stubs
 

@@ -155,9 +155,8 @@ struct jit_state
     int num_loads;
     int num_leas;
     int num_local_calls;
-    /* Allocated entry counts for the four patch tables above. The tables start
-     * out sized for the range being translated and grow on demand; see
-     * reserve_patchable_relatives.
+    /* Allocated entry counts for the four patch tables above. They start empty
+     * and grow on demand; see reserve_patchable_relatives.
      */
     uint32_t jumps_capacity;
     uint32_t loads_capacity;

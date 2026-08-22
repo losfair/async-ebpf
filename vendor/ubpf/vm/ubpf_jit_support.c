@@ -119,12 +119,11 @@ initialize_jit_state_result(
     state->buf = buffer;
     /* pc_locs is indexed by absolute eBPF PC and must be zeroed, so it is sized
      * for the whole program. The four patch tables below are append-only and
-     * only ever hold entries for the range actually being translated, so they
-     * start empty and grow as they are used. Sizing all five for a
-     * maximum-length program - which is what this used to do - allocates and
-     * zeroes several megabytes of scratch space, a cost the function-granular
-     * JIT would otherwise pay once per compiled function rather than once per
-     * loaded program.
+     * only ever hold entries for the range being translated, so they start
+     * empty and grow as they are used. Sizing all five for a maximum-length
+     * program allocates and zeroes several megabytes of scratch space, which
+     * the function-granular JIT would pay once per compiled function rather
+     * than once per loaded program.
      */
     state->pc_locs_capacity = num_insts + 1;
     state->pc_locs = calloc(state->pc_locs_capacity, sizeof(state->pc_locs[0]));
