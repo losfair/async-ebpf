@@ -1001,7 +1001,12 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
         .destination_lower_bound = BPF_REG_0,
         .destination_upper_bound = BPF_REG_10,
         .source_lower_bound = BPF_REG_0,
-        .source_upper_bound = BPF_REG_10,
+        // An atomic with BPF_FETCH writes the previous memory contents back into
+        // its *source* register, so the source is a destination too. Allowing
+        // BPF_REG_10 here would let a program overwrite the frame pointer with a
+        // value it chose - the one write to R10 that neither this table nor
+        // validate() would otherwise refuse. See the comment on EBPF_OP_ATOMIC_STORE.
+        .source_upper_bound = BPF_REG_9,
         .immediate_lower_bound = 0x0,
         .immediate_upper_bound = 0xff,
         .offset_lower_bound = INT16_MIN,
@@ -1012,7 +1017,16 @@ static ubpf_inst_filter_t _ubpf_instruction_filter[] = {
         .destination_lower_bound = BPF_REG_0,
         .destination_upper_bound = BPF_REG_10,
         .source_lower_bound = BPF_REG_0,
-        .source_upper_bound = BPF_REG_10,
+        // The frame pointer is read-only, and every other way of writing it is
+        // already refused - but a fetching atomic writes its source register, and
+        // both validation layers used to bound this at BPF_REG_10. On x86-64
+        // emit_atomic_fetch_alu ends with `mov <src>, rax` and emit_atomic_exchange
+        // is a bare `lock xchg [dst], src`, so `atomic_fetch_add [r1], r10` really
+        // did assign R15. The non-fetch forms do not write the source, so this is
+        // stricter than strictly necessary - but no compiler emits an atomic whose
+        // operand is the frame pointer, and a source bound that depends on the
+        // immediate's FETCH bit would be a sharper edge than the one it removes.
+        .source_upper_bound = BPF_REG_9,
         .immediate_enumerated = ebpf_atomic_store_immediate_enumerated,
         .immediate_enumerated_length = 10,
         .offset_lower_bound = INT16_MIN,

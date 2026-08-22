@@ -61,6 +61,39 @@ const SHADOW_STACK_SIZE: usize = LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.nex
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 
+/// Displacement below `R10` that a frame access may use without a runtime bounds
+/// check.
+///
+/// This is the one place the runtime trades a per-access check for a static
+/// argument, so the argument is worth spelling out. `R10` starts at
+/// `stack_top - calldata`, rounded down to 8, and drops one
+/// `UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE` frame per local call. The loader accepts
+/// at most [`MAX_LOCAL_CALL_DEPTH`] frames, so the deepest reachable frame
+/// pointer sits `(MAX_LOCAL_CALL_DEPTH - 1)` frames below entry, and what is
+/// left of the window below *that* is the displacement any frame is allowed to
+/// reach. `[r10 + k]` with `-FRAME_WINDOW <= k` and `k + width <= 0` is therefore
+/// inside `[stack_bottom, stack_top)` at every call depth, for every accepted
+/// program - which is what lets the backend emit it as a plain native access.
+///
+/// `src/test/lazy_local_call.rs::the_deepest_accepted_call_chain_fits_alongside_calldata`
+/// exercises exactly this corner at run time.
+pub(crate) const FRAME_WINDOW: usize = crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+
+const _: () = {
+  // What the window has left below the deepest frame pointer the loader accepts.
+  let headroom = SHADOW_STACK_SIZE
+    - MAX_CALLDATA_SIZE.next_multiple_of(8)
+    - (MAX_LOCAL_CALL_DEPTH - 1) * crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+  // Tight today - headroom is exactly one frame. Raising MAX_CALLDATA_SIZE,
+  // shrinking SHADOW_STACK_SIZE or charging local functions more than one frame
+  // would each silently invalidate Tier F's proof, so fail the build instead.
+  assert!(
+    headroom >= FRAME_WINDOW,
+    "the guest stack window no longer covers FRAME_WINDOW below the deepest \
+     accepted frame pointer; Tier F frame addressing would be unsound"
+  );
+};
+
 #[cfg(all(
   target_arch = "x86_64",
   any(target_os = "linux", target_os = "openbsd")
@@ -359,9 +392,78 @@ impl<'a, 'b> HelperScope<'a, 'b> {
 struct AssumeSend<T>(T);
 unsafe impl<T> Send for AssumeSend<T> {}
 
+/// Native backing for one invocation's guest stack, in its own mapping with a
+/// `PROT_NONE` page on each side.
+///
+/// The guest stack used to be a plain heap allocation, which was fine while
+/// every guest access carried a runtime bounds check: an out-of-range address
+/// was rejected before it was ever dereferenced. Tier F frame accesses are
+/// emitted without that check, on the static argument recorded at
+/// [`FRAME_WINDOW`]. Guard pages are what turns a mistake in that argument - or
+/// in the backend test that enforces it - into a fault instead of a silent read
+/// or write of whatever the allocator happened to place next to the stack.
+///
+/// The window is laid out flush against the *low* guard, because that is the
+/// direction frame addressing runs: `R10` descends with call depth and every
+/// frame displacement is negative.
+struct GuardedStack {
+  region: MmapRaw,
+  offset: usize,
+}
+
+impl GuardedStack {
+  fn new() -> Result<Self, RuntimeError> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+      return Err(RuntimeError::PlatformError("failed to query page size"));
+    }
+    let page_size = page_size as usize;
+    let len = SHADOW_STACK_SIZE.next_multiple_of(page_size);
+    let total = len + 2 * page_size;
+
+    let region = MmapRaw::from(
+      MmapOptions::new()
+        .len(total)
+        .map_anon()
+        .map_err(|_| RuntimeError::PlatformError("failed to allocate guest stack"))?,
+    );
+    unsafe {
+      if libc::mprotect(region.as_ptr() as *mut _, total, libc::PROT_NONE) != 0
+        || libc::mprotect(
+          region.as_ptr().add(page_size) as *mut _,
+          len,
+          libc::PROT_READ | libc::PROT_WRITE,
+        ) != 0
+      {
+        return Err(RuntimeError::PlatformError(
+          "failed to protect guest stack guard pages",
+        ));
+      }
+    }
+
+    Ok(Self {
+      region,
+      offset: page_size,
+    })
+  }
+
+  fn as_mut_slice(&mut self) -> &mut [u8] {
+    unsafe {
+      std::slice::from_raw_parts_mut(
+        self.region.as_ptr().add(self.offset) as *mut u8,
+        SHADOW_STACK_SIZE,
+      )
+    }
+  }
+
+  fn as_mut_ptr(&mut self) -> *mut u8 {
+    unsafe { self.region.as_ptr().add(self.offset) as *mut u8 }
+  }
+}
+
 struct ExecContext {
   native_stack: DefaultStack,
-  guest_stack: Box<[u8; SHADOW_STACK_SIZE]>,
+  guest_stack: GuardedStack,
 }
 
 impl ExecContext {
@@ -369,7 +471,7 @@ impl ExecContext {
     Self {
       native_stack: DefaultStack::new(NATIVE_STACK_SIZE)
         .expect("failed to initialize native stack"),
-      guest_stack: Box::new([0u8; SHADOW_STACK_SIZE]),
+      guest_stack: GuardedStack::new().expect("failed to initialize guest stack"),
     }
   }
 }
@@ -476,7 +578,7 @@ impl BorrowedExecContext {
         EXEC_CONTEXT_POOL.with(|x| x.borrow_mut().pop().unwrap_or_else(ExecContext::new)),
       ),
     };
-    me.ctx.guest_stack.fill(0x8e);
+    me.ctx.guest_stack.as_mut_slice().fill(0x8e);
     me
   }
 }
@@ -1277,7 +1379,7 @@ impl Program {
     if calldata.len() > MAX_CALLDATA_SIZE {
       return Err(RuntimeError::InvalidArgument("calldata too large"));
     }
-    ectx.ctx.guest_stack[SHADOW_STACK_SIZE - calldata.len()..].copy_from_slice(calldata);
+    ectx.ctx.guest_stack.as_mut_slice()[SHADOW_STACK_SIZE - calldata.len()..].copy_from_slice(calldata);
     let calldata_len = calldata.len();
 
     let program_ret: u64 = {
