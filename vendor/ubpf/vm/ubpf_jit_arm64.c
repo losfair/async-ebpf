@@ -82,6 +82,16 @@ static enum Registers callee_saved_registers[] = {R19, R20, R21, R22, R23, R24, 
 // static enum Registers caller_saved_registers[] = {R0, R1, R2, R3, R4};
 // Temp register for immediate generation
 static enum Registers temp_register = R24;
+
+// Value register for a store-immediate lowered to a store-register.
+//
+// It must not be temp_register: emit_single_region_address uses that to hold the
+// translated address, so the address computation would overwrite the value on
+// its way to memory - and what the guest then stored was the *native* address of
+// its own stack slot, which it could read straight back. R9 is a caller-saved
+// temporary the backend uses nowhere else, and the value is live only from the
+// lowering below to the store itself, with no call in between.
+static enum Registers temp_store_value_register = R9;
 // Temp register for division results
 static enum Registers temp_div_register = R25;
 // Temp register for load/store offsets
@@ -1681,8 +1691,13 @@ translate_range(
             opcode != EBPF_OP_MOV_IMM &&
             opcode != EBPF_OP_MOV64_IMM &&
             (!is_simple_imm(&inst) || vm->constant_blinding_enabled)) {
-            EMIT_MOVEWIDE_IMMEDIATE(vm, state, sixty_four, temp_register, (int64_t)inst.imm);
-            src = temp_register;
+            // A store's value has to survive the address computation, which uses
+            // temp_register for the translated address; everything else here is
+            // consumed before any address is formed.
+            enum Registers imm_register =
+                (opcode & EBPF_CLS_MASK) == EBPF_CLS_ST ? temp_store_value_register : temp_register;
+            EMIT_MOVEWIDE_IMMEDIATE(vm, state, sixty_four, imm_register, (int64_t)inst.imm);
+            src = imm_register;
             opcode = to_reg_op(opcode);
         }
 

@@ -12,3 +12,4 @@ mod jit_limits;
 mod preemption;
 mod raw_elf;
 mod runtime_state;
+mod stores;
