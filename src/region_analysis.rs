@@ -216,7 +216,9 @@ pub(crate) struct PointerSignature {
 
 impl PointerSignature {
   pub(crate) fn entry() -> Self {
-    let mut regs = [RegKind::Uninit; NUM_REGS];
+    // The entry trampoline zeroes every eBPF register except `R1` (the ctx) and
+    // `R10` (the frame pointer), so everything else provably holds the scalar 0.
+    let mut regs = [RegKind::Scalar; NUM_REGS];
     regs[1] = RegKind::Stack(StackKind::Current(None));
     regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
     Self { regs }
@@ -316,7 +318,9 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   // Forward dataflow to a fixpoint over the instruction-slot CFG.
   let mut states: Vec<State> = (0..num_slots).map(|_| State::top()).collect();
   let mut reached = vec![false; num_slots];
-  // Entry: R1 holds ctx (points into the guest stack), R10 is the frame pointer.
+  // Entry: R1 holds ctx (points into the guest stack), R10 is the frame pointer,
+  // and the entry trampoline zeroed everything else.
+  states[0].regs = [RegKind::Scalar; NUM_REGS];
   states[0].regs[1] = RegKind::Stack(StackKind::Current(None));
   states[0].regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
   reached[0] = true;

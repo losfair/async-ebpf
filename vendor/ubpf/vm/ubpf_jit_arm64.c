@@ -1015,11 +1015,15 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
     emit_loadstorepair_immediate(state, LSP_STPX, map_register(6), map_register(7), SP, 16);
     emit_loadstorepair_immediate(state, LSP_STPX, map_register(8), map_register(9), SP, 32);
 
-    uint32_t arg_stack_movement = align_to(40, 16);
+    // BPF r0 is mapped to a caller-saved host register, so the resolver would
+    // otherwise leave host residue in it for the callee to read. Preserve it
+    // alongside r1-r5 (as the non-lazy emit_local_call does); the 48-byte slot
+    // rounded up from 40 already has room for it.
+    uint32_t arg_stack_movement = align_to(48, 16);
     emit_addsub_immediate(state, true, AS_SUB, SP, SP, arg_stack_movement);
     emit_loadstorepair_immediate(state, LSP_STPX, map_register(1), map_register(2), SP, 0);
     emit_loadstorepair_immediate(state, LSP_STPX, map_register(3), map_register(4), SP, 16);
-    emit_loadstore_immediate(state, LS_STRX, map_register(5), SP, 32);
+    emit_loadstorepair_immediate(state, LSP_STPX, map_register(5), map_register(0), SP, 32);
 
     emit_movewide_immediate(state, true, R0, vm->local_call_resolver_ids[call_pc]);
     emit_movewide_immediate(state, true, temp_register, (uint64_t)vm->local_call_resolver);
@@ -1028,7 +1032,7 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
 
     emit_loadstorepair_immediate(state, LSP_LDPX, map_register(1), map_register(2), SP, 0);
     emit_loadstorepair_immediate(state, LSP_LDPX, map_register(3), map_register(4), SP, 16);
-    emit_loadstore_immediate(state, LS_LDRX, map_register(5), SP, 32);
+    emit_loadstorepair_immediate(state, LSP_LDPX, map_register(5), map_register(0), SP, 32);
     emit_addsub_immediate(state, true, AS_ADD, SP, SP, arg_stack_movement);
 
     emit_unconditionalbranch_register(state, BR_BLR, R17);

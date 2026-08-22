@@ -1704,6 +1704,17 @@ emit_indirect_call_rax(struct jit_state* state)
     emit1(state, 0xd0);
 }
 
+/* call *reg */
+static inline void
+emit_indirect_call_reg(struct jit_state* state, int reg)
+{
+    if (reg & 8) {
+        emit1(state, 0x41); /* REX.B */
+    }
+    emit1(state, 0xff);
+    emit1(state, 0xd0 | (reg & 7));
+}
+
 static inline void
 emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_pc)
 {
@@ -1734,6 +1745,15 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
     emit_push(state, map_register(BPF_REG_5));
     emit_push(state, VOLATILE_CTXT);
 
+    // BPF r0 is mapped to RAX, which is also the host ABI return register, so
+    // the resolver's return value would otherwise be visible to the callee as a
+    // host code pointer. Preserve r0 across the resolver call (as the non-lazy
+    // emit_local_call does) and hand the callee address over in a register that
+    // is not mapped to any eBPF register. Pushed twice to keep the host stack
+    // 16-byte aligned for the resolver call.
+    emit_push(state, map_register(BPF_REG_0));
+    emit_push(state, map_register(BPF_REG_0));
+
 #if defined(_WIN32)
     emit_alu64_imm32(state, 0x81, 5, RSP, 4 * sizeof(uint64_t));
 #endif
@@ -1746,6 +1766,12 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
     emit_alu64_imm32(state, 0x81, 0, RSP, 4 * sizeof(uint64_t));
 #endif
 
+    // Stash the resolved callee address in RCX (not mapped to any eBPF register
+    // on either platform register map) and restore BPF r0.
+    emit_mov(state, RAX, RCX);
+    emit_pop(state, map_register(BPF_REG_0));
+    emit_pop(state, map_register(BPF_REG_0));
+
     emit_pop(state, VOLATILE_CTXT);
     emit_pop(state, map_register(BPF_REG_5));
     emit_pop(state, map_register(BPF_REG_4));
@@ -1753,8 +1779,7 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
     emit_pop(state, map_register(BPF_REG_2));
     emit_pop(state, map_register(BPF_REG_1));
 
-    // RAX still holds the compiled callee pointer returned by the resolver.
-    emit_indirect_call_rax(state);
+    emit_indirect_call_reg(state, RCX);
 
     emit_pop(state, map_register(BPF_REG_9));
     emit_pop(state, map_register(BPF_REG_8));

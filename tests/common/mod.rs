@@ -47,6 +47,9 @@ impl Insn {
   pub fn add64_reg(dst: u8, src: u8) -> Self {
     Self::raw(0x0f, dst, src, 0, 0)
   }
+  pub fn or64_reg(dst: u8, src: u8) -> Self {
+    Self::raw(0x4f, dst, src, 0, 0)
+  }
   pub fn sub64_imm(dst: u8, imm: i32) -> Self {
     Self::raw(0x17, dst, 0, 0, imm)
   }

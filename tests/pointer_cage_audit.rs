@@ -44,159 +44,110 @@ fn baseline_rodata_load() {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 1 — host pointers are readable from the guest at program entry.
+// Finding 1 (fixed) — host pointers were readable from the guest at entry.
 // ---------------------------------------------------------------------------
 
-/// Classifies a host address using /proc/self/maps while the program (and thus
-/// its JIT code mapping) is still alive. Returns 0 = unmapped, 1 = executable
-/// mapping, 2 = some other mapping.
-fn h_classify(
-  _: &async_ebpf::program::HelperScope,
-  addr: u64,
-  tag: u64,
-  _: u64,
-  _: u64,
-  _: u64,
-) -> Result<u64, ()> {
-  let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-  for line in maps.lines() {
-    let (range, rest) = line.split_once(' ').unwrap();
-    let (lo, hi) = range.split_once('-').unwrap();
-    let lo = u64::from_str_radix(lo, 16).unwrap();
-    let hi = u64::from_str_radix(hi, 16).unwrap();
-    if addr >= lo && addr < hi {
-      println!("  r{tag} = {addr:#018x}  in {line}");
-      return Ok(if rest.starts_with("r-xp") { 1 } else { 2 });
-    }
+/// FINDING 1, now fixed: `async_ebpf_entry_trampoline` used to set up only the
+/// registers the guest ABI defines (`r1` = ctx, `r10` = frame pointer) and left
+/// every other eBPF-visible register holding host state — `r0` = the `JitMemory`
+/// descriptor, `r4` = the entrypoint's own native code address, `r6`-`r9` = the
+/// Rust caller's callee-saved registers. uBPF's uninitialized-register check is
+/// disabled, so the guest could simply read them, which broke ASLR for the JIT
+/// code mapping that `_load` randomizes on purpose.
+///
+/// The trampoline now zeroes every guest-visible register except `r1` and
+/// `r10`, on both x86-64 and aarch64. This guards that.
+#[test]
+fn entry_scrubs_every_guest_visible_register() {
+  // Registers other than r1 (ctx) and r10 (frame pointer) must all read zero.
+  const PROBED: [u8; 9] = [0, 2, 3, 4, 5, 6, 7, 8, 9];
+
+  let mut code = Vec::new();
+  // Spill first: any instruction that computes into a register would destroy
+  // the value we are trying to observe.
+  for (i, r) in PROBED.iter().enumerate() {
+    code.push(Insn::stx_dw(10, *r, -8 - 8 * (i as i16)));
   }
-  println!("  r{tag} = {addr:#018x}  [not a mapped host address]");
-  Ok(0)
-}
+  code.push(Insn::mov64_imm(0, 0));
+  for i in 0..PROBED.len() {
+    code.push(Insn::ldx_dw(1, 10, -8 - 8 * (i as i16)));
+    code.push(Insn::or64_reg(0, 1));
+  }
+  code.push(Insn::exit());
 
-static CLASSIFY: &[(&str, async_ebpf::helpers::Helper)] = &[("classify", h_classify)];
-
-/// FINDING 1: at the first guest instruction, several eBPF registers still hold
-/// raw host values left there by `async_ebpf_entry_trampoline` and by the Rust
-/// caller. uBPF's uninitialized-register check (`undefined_behavior_check`) is
-/// left disabled, so the guest may simply read them.
-///
-/// On x86-64 the trampoline maps BPF r0 -> RAX, r4 -> x86 r10, r6..r9 ->
-/// RBX/R12/R13/R14, and does `mov r10, rdi` (entrypoint code pointer) and
-/// `mov rax, [rsp + 8]` (the `JitMemory` descriptor pointer) before `call r10`,
-/// without clearing them. RBX/R12/R13/R14 are merely saved, not zeroed.
-///
-/// A sound sandbox would zero every eBPF register that is not part of the guest
-/// ABI (r1 = ctx, r10 = frame pointer) before entering guest code.
-#[test]
-fn finding1_host_pointers_readable_at_entry() {
-  // r4 is the entrypoint's own native code address.
-  let code = vec![
-    Insn::mov64_reg(2, 4), // 0: save r4 before the helper call clobbers r1-r5
-    Insn::stx_dw(10, 2, -8),
-    Insn::ldx_dw(1, 10, -8),
-    Insn::mov64_imm(2, 4),
-    Insn::call("classify"),
-    Insn::exit(),
-  ];
-  let class = run_program_with(&code, CLASSIFY, &[], false, 33).unwrap();
-  // FIXME(audit): should be 0 (r4 zeroed at entry).
+  let observed = run_program_with(&code, NO_HELPERS, &[], true, 33).unwrap();
   assert_eq!(
-    class, 1,
-    "r4 at entry is a host address in an executable mapping"
-  );
-
-  // r0 is the JitMemory descriptor pointer (host stack).
-  let code = vec![
-    Insn::mov64_reg(2, 0),
-    Insn::stx_dw(10, 2, -8),
-    Insn::ldx_dw(1, 10, -8),
-    Insn::mov64_imm(2, 0),
-    Insn::call("classify"),
-    Insn::exit(),
-  ];
-  let class = run_program_with(&code, CLASSIFY, &[], false, 33).unwrap();
-  // FIXME(audit): should be 0 (r0 zeroed at entry).
-  assert_eq!(
-    class, 2,
-    "r0 at entry is a live host (non-executable) address"
+    observed, 0,
+    "r{PROBED:?} must all be zero at entry; observed OR = {observed:#x}"
   );
 }
 
-/// FINDING 1 (cont.): the guest can also read the randomized pointer-cage
-/// layout out of r2/r3, which the trampoline leaves holding
-/// `calldata_start` and `guest_stack_bottom`. `guest_stack_bottom` *is* the
-/// randomized `guard_size_1` chosen in `PointerCage::new`, so the guard-size
-/// randomization is fully disclosed to the guest.
+/// FINDING 1, now fixed: the trampoline also used to leave `r2` and `r3`
+/// holding `calldata_start` and `guest_stack_bottom`. `guest_stack_bottom` *is*
+/// the randomized `guard_size_1` that `PointerCage::new` picks, so the guest
+/// learned the cage layout — and could dereference `r3` to confirm it.
 #[test]
-fn finding1_cage_layout_disclosed_at_entry() {
-  // Return r3 (== guest_stack_bottom == PointerCage guard_size_1).
-  let code = vec![Insn::mov64_reg(0, 3), Insn::exit()];
-  let bottom = run_program_with(&code, NO_HELPERS, &[], false, 33).unwrap() as u64;
-  println!("  leaked guest_stack_bottom / guard_size_1 = {bottom:#x}");
-  // guard_size_1 = rng.gen_range(16..128) * page_size
-  let page = 4096u64;
-  // FIXME(audit): should be 0 (r3 zeroed at entry).
-  assert!(
-    bottom % page == 0 && (16..128).contains(&(bottom / page)),
-    "r3 exposes the randomized guard size: {bottom:#x}"
-  );
+fn entry_does_not_disclose_the_cage_layout() {
+  for reg in [2u8, 3] {
+    let code = vec![Insn::mov64_reg(0, reg), Insn::exit()];
+    assert_eq!(
+      run_program_with(&code, NO_HELPERS, &[], true, 33).unwrap(),
+      0,
+      "r{reg} must not carry a guest address derived from the cage layout"
+    );
+  }
 
-  // A guest-visible confirmation that this really is the live stack base: the
-  // very first byte of the guest stack region is readable at that address.
-  let code = vec![Insn::mov64_reg(1, 3), Insn::ldx_b(0, 1, 0), Insn::exit()];
+  // The ctx pointer is still usable, so the entry ABI is intact.
+  let code = vec![Insn::ldx_dw(0, 1, 0), Insn::exit()];
   assert_eq!(
-    run_program_with(&code, NO_HELPERS, &[], false, 33).unwrap(),
-    0x8e,
-    "r3 points at the live guest stack bottom"
+    run_program_with(&code, NO_HELPERS, &0x5eed_u64.to_le_bytes(), true, 33).unwrap(),
+    0x5eed
   );
 }
 
 // ---------------------------------------------------------------------------
-// Finding 2 — lazy local calls leak the callee's native code address in r0.
+// Finding 2 (fixed) — lazy local calls leaked the callee's code address in r0.
 // ---------------------------------------------------------------------------
 
-/// FINDING 2: every local eBPF call is compiled as a *lazy* call
-/// (`emit_lazy_local_call`): the resolver is invoked, and its return value —
-/// the callee's native code address — is left in RAX, which is BPF r0, when the
-/// callee is entered. r0 is not saved/restored around the call, so the callee
-/// (and, on return, the caller) observes a host code pointer.
+/// FINDING 2, now fixed: every local eBPF call is compiled lazily, and
+/// `emit_lazy_local_call` left the resolver's return value — the callee's
+/// native code address — in the host ABI return register, which is BPF `r0`.
+/// The callee saw a host code pointer, and a caller that then `exit`ed handed
+/// it to the host embedder as the program's result. It also contradicted the
+/// region analysis, which models `r0` as preserved across a local call.
 ///
-/// This also contradicts the region analysis, which models r0 as preserved
-/// across a local call (`PointerSignature::from_state` copies the caller's r0
-/// kind into the callee signature).
-///
-/// A sound implementation would spill/restore r0 around the resolver call, or
-/// return the callee address in a register that is not mapped to an eBPF
-/// register.
+/// The lazy sequence now saves and restores `r0` around the resolver call and
+/// enters the callee through a register that is not mapped to any eBPF
+/// register, matching the non-lazy `emit_local_call`.
 #[test]
-fn finding2_local_call_leaks_callee_code_address() {
+fn local_call_preserves_r0_and_hides_the_callee_address() {
   let code = vec![
-    Insn::mov64_imm(0, 0), // 0: r0 = 0
-    Insn::call_local(4),   // 1: call func1 @6
-    Insn::mov64_reg(1, 0), // 2: r1 = whatever the callee left in r0
-    Insn::mov64_imm(2, 0),
-    Insn::call("classify"), // 3
-    Insn::exit(),           // 5
-    Insn::exit(),           // 6: func1 — does not touch r0
+    Insn::mov64_imm(0, 0x5eed), // 0: r0 = sentinel
+    Insn::call_local(1),        // 1: call func1 @3
+    Insn::exit(),               // 2: return r0
+    Insn::exit(),               // 3: func1 — does not touch r0
   ];
-  let class = run_program_with(&code, CLASSIFY, &[], false, 21).unwrap();
-  // FIXME(audit): should be 0 (r0 preserved across the local call).
   assert_eq!(
-    class, 1,
-    "r0 after a local call is a host executable address"
+    run_program_with(&code, NO_HELPERS, &[], true, 21).unwrap(),
+    0x5eed,
+    "r0 must survive a lazily resolved local call unchanged"
   );
 
-  // The same value is handed straight back to the host embedder as the
-  // program's return value.
+  // Same, but observed from inside the callee rather than after the return.
   let code = vec![
-    Insn::mov64_imm(0, 0),
+    Insn::mov64_imm(0, 0x5eed),
     Insn::call_local(1),
     Insn::exit(),
+    // func1: r6 = r0 (as seen on entry), r0 = r6, exit
+    Insn::mov64_reg(6, 0),
+    Insn::mov64_reg(0, 6),
     Insn::exit(),
   ];
-  let leaked = run_program_with(&code, NO_HELPERS, &[], false, 21).unwrap() as u64;
-  println!("  leaked JIT code address returned to the host: {leaked:#x}");
-  assert!(leaked > 0x1000, "guest returned a host code address");
+  assert_eq!(
+    run_program_with(&code, NO_HELPERS, &[], true, 21).unwrap(),
+    0x5eed,
+    "the callee must not observe a host code pointer in r0"
+  );
 }
 
 // ---------------------------------------------------------------------------

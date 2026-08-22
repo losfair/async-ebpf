@@ -8,7 +8,8 @@ the static pointer-region analysis in `src/region_analysis.rs`.
 Every finding below is reproduced in `tests/pointer_cage_audit.rs` using only
 the safe public API (`ProgramLoader::load` + `Program::run`); the test helper in
 `tests/common/mod.rs` assembles a BPF relocatable ELF, which the loader accepts
-like any other program. Run with:
+like any other program. For the fixed findings the reproducer has been flipped
+into a regression test asserting the corrected behaviour. Run with:
 
 ```
 cargo test --features testing --test pointer_cage_audit -- --nocapture
@@ -18,13 +19,19 @@ Host used for the reproductions: Linux x86-64, 4 KiB pages.
 
 ## Summary
 
-| # | Finding | Class | Severity |
-|---|---------|-------|----------|
-| 1 | Host pointers and the randomized cage layout are readable from eBPF registers at program entry | Information disclosure | High |
-| 2 | Lazy local calls hand the callee's native code address to the guest in `r0` | Information disclosure | High |
-| 3 | `StackKind::Foreign` is wrongly assumed not to alias the current frame | Analysis unsoundness | Medium |
-| 4 | Spill slots are assumed to survive calls, but helpers/callees can overwrite them | Analysis unsoundness | Medium |
-| 5 | `BPF_ATOMIC \| CMPXCHG` clobbers `r0`; the analysis does not model it | Analysis unsoundness | Medium |
+| # | Finding | Class | Severity | Status |
+|---|---------|-------|----------|--------|
+| 1 | Host pointers and the randomized cage layout are readable from eBPF registers at program entry | Information disclosure | High | Fixed |
+| 2 | Lazy local calls hand the callee's native code address to the guest in `r0` | Information disclosure | High | Fixed |
+| 3 | `StackKind::Foreign` is wrongly assumed not to alias the current frame | Analysis unsoundness | Medium | Open |
+| 4 | Spill slots are assumed to survive calls, but helpers/callees can overwrite them | Analysis unsoundness | Medium | Open |
+| 5 | `BPF_ATOMIC \| CMPXCHG` clobbers `r0`; the analysis does not model it | Analysis unsoundness | Medium | Open |
+
+Findings 1 and 2 are fixed in this branch; their reproducers were flipped into
+regression tests (`entry_scrubs_every_guest_visible_register`,
+`entry_does_not_disclose_the_cage_layout`,
+`local_call_preserves_r0_and_hides_the_callee_address`). Findings 3-5 are still
+open and their reproducers still assert the buggy behaviour.
 
 What held up under the audit is described in
 [What the cage does get right](#what-the-cage-does-get-right) — in particular,
@@ -88,12 +95,18 @@ still alive) and asserts `r4` lands in an `r-xp` mapping and `r0` in a live
 `gen_range(16..128) * page_size` shape, and then dereferences it to show it
 really is the live guest stack bottom.
 
-**Suggested fix.** Zero every eBPF register except `r1` and `r10` in the entry
-trampoline (both architectures) before transferring control, rather than relying
-on the guest not to read them. Enabling
-`ubpf_toggle_undefined_behavior_check` would also reject such reads at load
-time, but that is a load-time policy, not a confinement guarantee — clearing the
-registers is the robust fix.
+**Fix.** `async_ebpf_entry_trampoline` now zeroes every eBPF-visible register
+except `r1` (ctx) and `r10` (frame pointer) immediately before entering guest
+code, on both x86-64 and aarch64. The entry target is staged through a register
+that is not part of uBPF's register map (`rcx` / `x17`) so it can be called
+after the scrub, and the `JitMemory` descriptor is written to its frame slot
+before `rax` / `x6` is cleared. This is a confinement guarantee rather than a
+load-time policy, so it holds regardless of whether uBPF's uninitialized-register
+check is enabled.
+
+Because those registers now provably hold zero, `PointerSignature::entry()` and
+the whole-section analyzer model them as `Scalar` instead of `Uninit`, which is
+both truthful and slightly more precise.
 
 ## Finding 2 — lazy local calls leak the callee's native code address in `r0`
 
@@ -127,10 +140,21 @@ Reproducer: `finding2_local_call_leaks_callee_code_address` — classifies the
 value as living in an `r-xp` mapping, and separately shows it flowing out
 through `Program::run`'s return value.
 
-**Suggested fix.** Save and restore BPF `r0` around the resolver call (push/pop
-`RAX` alongside `r1..r5`), or have the resolver return the target in a register
-that is not mapped to an eBPF register. Whichever is chosen, `region_analysis`
-must model `r0` the same way.
+**Fix.** `emit_lazy_local_call` now preserves BPF `r0` across the resolver call
+alongside `r1`-`r5` and enters the callee through a register that is not mapped
+to any eBPF register (`rcx` on x86-64; aarch64 already staged the target in
+`x17` but did not preserve `r0`, which is caller-saved there too). Lazy and
+non-lazy local calls therefore have identical register semantics, which is what
+`PointerSignature::from_state` already assumed — so the analysis needed no
+change.
+
+This one could not be fixed from the Rust side: the leak lives in the two
+instructions between the resolver's `ret` and the callee's first guest
+instruction, so only the emitted call sequence can close it. The change is
+confined to `emit_lazy_local_call`, which is this project's own addition to the
+vendored uBPF rather than upstream code. On x86-64 `r0` is pushed twice to keep
+the host stack 16-byte aligned at the resolver call, matching the idiom the
+helper-call sequence already uses.
 
 ## Finding 3 — `StackKind::Foreign` may alias the current frame
 
@@ -279,21 +303,28 @@ bugs rather than sandbox escapes.
 
 These are not exploitable as far as this audit found, but are worth recording.
 
-* **The cage's stack region is allocated, `mprotect`ed and randomized, but never
-  used.** `PointerCage::new` reserves `stack_size` bytes of RW mapping between
-  two guard regions, yet the live guest stack is
-  `ExecContext::guest_stack: Box<[u8; SHADOW_STACK_SIZE]>` — ordinary heap
-  memory with no guard pages, which `JitMemory::stack_native_base` points at.
-  The cage's guard pages therefore protect only the data region; for the stack
-  the exact bounds check is the *only* line of defense, with no defense in depth
-  behind it. `PointerCage::safe_deref_for_read` still accepts stack offsets and
-  would hand back a pointer into the unused mapping — a live footgun for future
-  callers, even though today it is only called with data offsets.
-* **`PointerCage::new` panics on 64 KiB-page kernels.** It asserts
+* **The cage's stack region was allocated, `mprotect`ed and randomized, but
+  never used** — the live guest stack is
+  `ExecContext::guest_stack: Box<[u8; SHADOW_STACK_SIZE]>`, ordinary heap
+  memory, which `JitMemory::stack_native_base` points at. *Addressed in this
+  branch*: the cage now only *reserves* the guest stack address window (it stays
+  `PROT_NONE`, so it costs address space and nothing else) and maps only the
+  data region. Reserving the window keeps the guest stack and data ranges
+  disjoint with a randomized distance between them, which is what the JIT's
+  single-region checks rely on. `PointerCage::safe_deref_for_read` — which used
+  to hand back pointers into the unused mapping — is now `data_slice` and
+  rejects everything outside the data region.
+
+  This does not change the fact that for the guest stack the exact bounds check
+  is the only line of defense, with no guard pages behind it. Backing the guest
+  stack with its own guarded mapping would be a separate change.
+* **`PointerCage::new` used to panic on 64 KiB-page kernels.** It asserted
   `stack_size % page_size == 0`, and `stack_size` is `SHADOW_STACK_SIZE`
-  (32768). On aarch64 Linux built with `CONFIG_ARM64_64K_PAGES`, `page_size` is
-  65536 and the assertion fails, panicking inside the safe `ProgramLoader::load`.
-  Not reproducible on the x86-64 host used here.
+  (32768), so on aarch64 Linux built with `CONFIG_ARM64_64K_PAGES` the
+  assertion failed inside the safe `ProgramLoader::load`. *Fixed by the same
+  change*: the stack window is address space, not a mapping, so it no longer has
+  to be page-sized; only its layout slot is rounded up to keep the data region
+  page-aligned for `mprotect`.
 * **`PointerCage::mask()` panics on very large images.** It asserts
   `addressable_len <= 0x8000_0000`; an ELF of roughly 2 GiB or more makes the
   rounded-up cage exceed that and panics inside `load` rather than returning

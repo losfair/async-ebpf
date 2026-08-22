@@ -55,7 +55,11 @@ std::arch::global_asm!(
 .global async_ebpf_entry_trampoline
 .type async_ebpf_entry_trampoline,@function
 async_ebpf_entry_trampoline:
-    mov r10, rdi
+    // rdi = target, rsi = ctx, rcx = guest stack bottom, r8 = guest stack len,
+    // [rsp + 8] = JitMemory descriptor. The entry target is staged through r9
+    // and then rcx, neither of which uBPF maps to an eBPF register, so it can
+    // be called after the register scrub below. r11 is uBPF's VOLATILE_CTXT.
+    mov r9, rdi
     mov rax, [rsp + 8]
     push rbp
     push rbx
@@ -65,18 +69,28 @@ async_ebpf_entry_trampoline:
     push r15
     mov r15, rcx
     add r15, r8
-    mov r11, rcx
     mov rdi, rsi
-    mov rsi, rdx
-    mov rdx, r11
-    mov rcx, r8
-    mov r8, r9
-    mov r11, rdi
     sub rsp, 8
     mov rbp, rsp
     sub rsp, 32
     mov [rbp - 8], rax
-    call r10
+    mov rcx, r9
+    mov r11, rdi
+    // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
+    // rax/rdi/rsi/rdx/r10/r8/rbx/r12/r13/r14/r15) except r1 (ctx) and r10
+    // (frame pointer). Without this the guest reads host addresses left behind
+    // by this trampoline and by our caller's callee-saved registers.
+    xor eax, eax
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    xor ebx, ebx
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    call rcx
     mov rsp, rbp
     add rsp, 8
     pop r15
@@ -99,6 +113,9 @@ std::arch::global_asm!(
 .global async_ebpf_entry_trampoline
 .type async_ebpf_entry_trampoline,%function
 async_ebpf_entry_trampoline:
+    // x0 = target, x1 = ctx, x3 = guest stack bottom, x4 = guest stack len,
+    // x6 = JitMemory descriptor. x17 is not mapped to any eBPF register, so the
+    // entry target is staged through it.
     bti c
     mov x17, x0
     sub sp, sp, #16
@@ -111,13 +128,23 @@ async_ebpf_entry_trampoline:
     mov x29, sp
     add x23, x3, x4
     mov x0, x1
-    mov x1, x2
-    mov x2, x3
-    mov x3, x4
-    mov x4, x5
     sub sp, sp, #16
     str x6, [x29, #-8]
     mov x26, x0
+    // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
+    // x5/x0-x4/x19-x23) except r1 (ctx) and r10 (frame pointer), plus the
+    // descriptor still held in x6. Without this the guest reads host addresses
+    // left behind by our caller's callee-saved registers.
+    mov x1, xzr
+    mov x2, xzr
+    mov x3, xzr
+    mov x4, xzr
+    mov x5, xzr
+    mov x6, xzr
+    mov x19, xzr
+    mov x20, xzr
+    mov x21, xzr
+    mov x22, xzr
     blr x17
     mov x0, x5
     mov sp, x29
@@ -1003,7 +1030,7 @@ impl Program {
     let code = self
       .unbound
       .cage
-      .safe_deref_for_read(section.code_vaddr, section.code_len)
+      .data_slice(section.code_vaddr, section.code_len)
       .unwrap();
     let code_bytes = unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
     let region_analysis = crate::region_analysis::analyze_function(
@@ -1634,9 +1661,7 @@ impl ProgramLoader {
     let cage = PointerCage::new(rng, SHADOW_STACK_SIZE, elf.len())?;
 
     let code_sections = {
-      let mut data = cage
-        .safe_deref_for_read(cage.data_bottom(), elf.len())
-        .unwrap();
+      let mut data = cage.data_slice(cage.data_bottom(), elf.len()).unwrap();
       let data = unsafe { data.as_mut() };
       data.copy_from_slice(elf);
 
@@ -1707,7 +1732,7 @@ impl ProgramLoader {
 
       let mut errmsg_ptr = std::ptr::null_mut();
       let code = cage
-        .safe_deref_for_read(code_vaddr_size.0, code_vaddr_size.1)
+        .data_slice(code_vaddr_size.0, code_vaddr_size.1)
         .unwrap();
       let code_bytes =
         unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
