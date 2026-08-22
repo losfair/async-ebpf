@@ -36,5 +36,7 @@ cmake = "0.1"
 
 [dev-dependencies]
 async-ebpf = { path = ".", features = ["testing"] }
+rand = { version = "0.8", features = ["default"] }
+tokio = { version = "1", features = ["full"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 tracing-test = "0.2"
