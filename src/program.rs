@@ -1040,6 +1040,7 @@ impl Program {
       signature,
       self.unbound.cage.data_bottom() as u64,
       self.unbound.cage.data_top() as u64,
+      &section.layout,
     );
     if self.unbound.require_static_regions && !region_analysis.unresolved.is_empty() {
       let err = RuntimeError::InvalidArgumentOwned(format!(

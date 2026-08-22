@@ -18,9 +18,9 @@ ordinary tests in `src/test/lazy_local_call.rs`:
 cargo test --features testing lazy_local_call
 ```
 
-Findings 1 and 3 are fixed in this branch; their reproducers now assert the
-fixed behaviour, and the numbers quoted for them below are from before and after
-the fix.
+Findings 1 and 3 are fixed in this branch and finding 2 is mitigated; their
+reproducers now assert the fixed behaviour, and the numbers quoted for them
+below are from before and after the fix.
 
 Host used for the reproductions and timings: Linux x86-64, 4 KiB pages,
 `cargo test --release` unless stated otherwise.
@@ -46,15 +46,17 @@ the callee, `mprotect`s the whole code arena writable, translates, restores
 `PROT_READ | PROT_EXEC`, and resumes the guest with the new address.
 
 The specialisation key is the caller's abstract register state at the call site,
-mapped through `RegKind::foreign_for_call()`. Two call sites that reach the same
-callee with different signatures produce two independent native copies.
+mapped through `RegKind::foreign_for_call()` and then masked to the registers
+the callee can actually observe (`function_live_in`, see finding 2). Two call
+sites that reach the same callee with signatures that differ in a register it
+reads produce two independent native copies.
 
 ## Summary
 
 | # | Finding | Class | Severity | Status |
 |---|---------|-------|----------|--------|
 | 1 | Time spent JIT-compiling is never charged to the timeslice, and cannot be preempted | Availability | Medium | Fixed |
-| 2 | Callee specialisation is exponential in call depth | Availability | Medium | Open |
+| 2 | Callee specialisation is exponential in call depth | Availability | Low | Mitigated |
 | 3 | Each compiled function pays a fixed ~5.5 MiB / ~2 ms cost independent of its size | Availability | Medium | Fixed |
 | 4 | Arena exhaustion surfaces as an opaque uBPF error and permanently poisons the program | Robustness | Low | Open |
 | 5 | `require_static_region_analysis` does not gate a callee until the entry function has already run | Robustness | Low | Open |
@@ -68,12 +70,11 @@ checked and how. Findings 1–3 compose: 2 and 3 are the multipliers that turn 1
 from a design remark into several seconds of unyielding CPU from a program of a
 few hundred bytes.
 
-Findings 1 and 3 are fixed in this branch, and their reproducers are now
-regression tests asserting the fixed behaviour. Together they take the worst
-case measured here — 1112 compilations forced by a 576-byte program — from
-2.33 s of unyielding CPU to 23 ms spread across about 1100 yields to the async
-runtime. Findings 2, 4, 5 and 6 remain open; the fix for 3 removes most of their
-practical bite but none of them is closed by it.
+Findings 1 and 3 are fixed in this branch and finding 2 is mitigated; their
+reproducers are now regression tests asserting the fixed behaviour. Together
+they take the worst case measured here — 1112 compilations forced by a 576-byte
+program — from 2.33 s of unyielding CPU to 8 compilations and under a
+millisecond. Findings 4, 5 and 6 remain open.
 
 ## Finding 1 — compilation time is invisible to the timeslice (fixed)
 
@@ -141,42 +142,99 @@ asserts the end-to-end property the finding was really about: the 1112-compilati
 program yields over a hundred times and a 1 ms heartbeat task alongside it
 actually runs.
 
-## Finding 2 — specialisation is exponential in call depth
+## Finding 2 — specialisation is exponential in call depth (mitigated)
 
-`PointerSignature::from_state` snapshots all eleven registers at the call site,
-and the callee inherits it. Registers `R6`–`R9` are callee-saved, so a
-distinction a caller introduces survives into its grandchildren's signatures.
-A function with `k` call sites that each give a callee-saved register a
-different `RegKind` therefore produces `k` specialisations of its callee, `k²`
+`PointerSignature::from_state` snapshotted all eleven registers at the call site,
+and the callee inherited them. Registers `R6`–`R9` are callee-saved, so a
+distinction a caller introduced survived into its grandchildren's signatures.
+A function with `k` call sites that each gave a callee-saved register a
+different `RegKind` therefore produced `k` specialisations of its callee, `k²`
 of the callee's callee, and so on.
 
 Only four `RegKind`s are reachable from a loaded program (`Data`,
 `Stack(Foreign)`, `Scalar`, `Unknown`), so `k = 4` per level, and the loader
 allows a depth of 8.
 
-**Reproduction** — `callee_specialisation_is_exponential_in_call_depth`. Five
-functions, 42 instructions total:
+**Original behaviour.** Five functions, 42 instructions, `[1, 4, 16, 64, 256]`
+variants:
 
 ```
 levels=4 arity=4 insns=42 -> Ok(0) in 723ms; compiled=341 arena=220300
-```
-
-(That wall clock is from before Finding 3 was fixed; the same run now takes
-4.8 ms. The compilation count is unchanged — this finding is about the count.)
-
-`function_variant_counts_for_tests()` is `[1, 4, 16, 64, 256]`. Extending to the
-maximum depth:
-
-```
 levels=5 insns=52  -> compiled=598  arena=441035
 levels=6 insns=62  -> compiled=855  arena=662055
 levels=7 insns=72  -> compiled=1112 arena=883075
 ```
 
 1112 native copies and 863 KiB of the 1 MiB default budget, from 576 bytes of
-eBPF. The count is a static property of the program — signatures come from the
-analysis, not from runtime data — so it is fully determined at load time and
-could be bounded there.
+eBPF.
+
+**What was actually wrong.** The signature is the caller's *whole* abstract
+register file, but the eBPF calling convention only makes `R1`–`R5` arguments.
+`R0` and `R6`–`R9` at a call site are the caller's incidental live state — a
+stale value from an earlier helper call, a pointer the caller happens to be
+holding across the call — and a callee that has not written them yet is looking
+at data that is not its own. Keying specialisation on them splits a callee for
+reasons it cannot observe, and because they survive calls, those splits compound
+down the graph. That is the part ordinary compiler output hits by accident: `f`
+calling `g(buf)` twice with identical arguments still gets two copies of `g` if
+its own `R6` differs between the two sites.
+
+**Fix.** `analyze_functions` now computes, per function, the set of registers
+whose incoming kind it can observe — a **live-in** mask: registers it may read
+before writing, transitively through its callees. It is a backward liveness pass
+per function, ordered bottom-up over the call graph (already a DAG, since
+recursion is rejected at load), and `from_state` masks every register outside
+that set to `Unknown` in the signature it hands the callee.
+
+Masking a register that is not live-in is free rather than a coarsening: it is
+overwritten before any read on every path, so no hint, no unresolved access and
+no signature passed further down can depend on it. Concretely that means
+`require_static_region_analysis` behaviour is bit-identical — nothing that loads
+today is rejected, nothing rejected today starts loading — and only the variant
+count changes. Every pre-existing test passes unaltered.
+
+Two rules in the mask are worth stating because they are where it could go
+wrong:
+
+- Uses are taken from the instruction *encoding* — every register the opcode
+  reads, even where `transfer` happens to ignore its kind (32-bit ALU ops,
+  comparisons). Defs are the opposite: a subset of what is actually written,
+  since a def kills liveness and over-claiming one would drop a register the
+  callee can still see. Fetching atomics therefore claim no definition at all.
+- `exit` does **not** count `R0` as a use. A callee that returns without
+  assigning `R0` hands its caller's value back, but the caller models any call's
+  result as a fresh scalar, so the incoming kind is unobservable through a
+  return. Counting it would put `R0` — the most incidental register of all — in
+  nearly every mask. `region_analysis::tests::exit_does_not_make_r0_live_in`
+  pins this.
+
+**After the fix.** The reproducer collapses completely, because none of its
+carriers is ever read:
+
+```
+levels=4 -> compiled=5   variants=[1, 1, 1, 1, 1]
+levels=7 -> compiled=8   variants=[1, 1, 1, 1, 1, 1, 1, 1]
+```
+
+341 → 5 and 1112 → 8. The same programs with the leaf dereferencing each carrier
+on a statically reachable path specialise exactly as before —
+`[1, 4, 16, 64, 256]`, 341 copies — which is the other half of the property:
+masking must not collapse a distinction a callee can see. Both directions are
+pinned by `unobserved_signature_registers_do_not_multiply_specialisations` and
+`observed_signature_registers_still_specialise`.
+
+**Why this is a mitigation and not a bound.** A program that genuinely
+dereferences each carrier still gets the full exponent, so the count is still
+formally unbounded in the depth. That is accepted rather than capped. With
+finding 3 fixed a compilation costs ~21 µs and at minimum ~646 bytes of arena,
+so a 1 MiB code budget caps a program at roughly 1620 compilations and ~35 ms of
+CPU that finding 1's fix now charges to the timeslice — both resources the
+embedder already bounds, and the blast radius is the one program instance.
+Capping it explicitly would need a budget calibrated against real workloads, and
+the workloads say the exponent is not what bites: CoreMark at `-O3` inlines to a
+single function with no local calls at all, and the deliberate two-kind test
+produces two variants. What bites is the accidental compounding above, and the
+mask removes that at the root.
 
 ## Finding 3 — per-compilation cost is O(`UBPF_MAX_INSTS`), not O(function size) (fixed)
 
@@ -277,19 +335,25 @@ permanently unable to complete — and because the entry function is still
 compiled and still runs, every later invocation re-executes the whole prefix
 (helper side effects included) before failing identically.
 
-**Reproduction** — `specialisation_can_exhaust_the_code_arena_mid_run`. A
-2112-byte eBPF program against the default `DEFAULT_CODE_SIZE_LIMIT`:
+**Reproduction** — `arena_exhaustion_is_reported_mid_run_and_is_permanent`.
+Three consecutive runs all reach the same point and fail the same way, with the
+arena pinned at the limit and not growing on the repeats.
+
+Before finding 2 was mitigated this was reachable from a 2112-byte program
+against the default 1 MiB budget:
 
 ```
 pad=24 insns=264 -> Err("ubpf: code translation failed: Target buffer too small")
-                    in 2.39s; compiled=1091 failed=1 arena=1048303
+                    compiled=1091 failed=1 arena=1048303
 ```
 
-(Again a pre-Finding-3 wall clock; the arena still fills at the same point, it
-just gets there in about 30 ms now.)
-
-and with `with_code_size_limit(64 * 1024)`, three consecutive runs all reach the
-same point and fail the same way, with `arena` pinned at 65530 of 65536.
+The live-in mask raises that bar a long way — the same fan-out now produces 344
+compilations and about 300 KiB — so the reproducer sets
+`with_code_size_limit(64 * 1024)` instead. That keeps the finding pointed at
+what is actually wrong with it: not that the budget can be reached, but that
+reaching it is reported as an internal uBPF message with nothing naming the code
+budget, and that the cached failure makes the program permanently unable to
+complete while still re-running its whole prefix on every invocation.
 
 ## Finding 5 — strict region analysis does not gate a callee until the entry has run
 

@@ -248,6 +248,23 @@ impl PointerSignature {
     Self { regs }
   }
 
+  /// Drops every register the callee cannot observe, so two call sites that
+  /// differ only in the caller's incidental live state share one specialization.
+  ///
+  /// A register outside `mask` is not live-in to the callee (see
+  /// [`function_live_in`]), meaning it is overwritten before any read on every
+  /// path. Replacing it with `Unknown` therefore changes no hint, no unresolved
+  /// access and no signature the callee passes on - it only collapses
+  /// signatures that would have produced identical analyses.
+  fn masked(mut self, mask: RegMask) -> Self {
+    for (reg, kind) in self.regs.iter_mut().enumerate() {
+      if reg != R10 && mask & (1 << reg) == 0 {
+        *kind = RegKind::Unknown;
+      }
+    }
+    self
+  }
+
   #[cfg(any(test, feature = "testing"))]
   pub(crate) fn from_regs_for_testing(regs: [RegKind; NUM_REGS]) -> Self {
     Self { regs }
@@ -388,6 +405,7 @@ pub(crate) fn analyze_function(
   incoming: PointerSignature,
   data_lo: u64,
   data_hi: u64,
+  layout: &crate::function_analysis::FunctionLayout,
 ) -> FunctionRegionAnalysis {
   let num_slots = code.len() / 8;
   let mut hints = vec![REGION_UNKNOWN; num_slots];
@@ -414,7 +432,13 @@ pub(crate) fn analyze_function(
     on_list[pc] = false;
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
     if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
-      call_signatures.insert(pc, PointerSignature::from_state(&states[pc]));
+      let target = (pc as i64 + 1 + inst.imm as i64) as usize;
+      let mask = layout
+        .pc_to_func
+        .get(target)
+        .and_then(|&callee| layout.arg_masks.get(callee).copied())
+        .unwrap_or(ALL_SIGNATURE_REGS);
+      call_signatures.insert(pc, PointerSignature::from_state(&states[pc]).masked(mask));
     }
     let lddw_addr = lddw_full_imm(code, pc, &inst);
     let out = transfer(&states[pc], &inst, lddw_addr, data_lo, data_hi);
@@ -455,6 +479,174 @@ pub(crate) fn analyze_function(
     unresolved,
     call_signatures,
   }
+}
+
+/// Mask over the registers a [`PointerSignature`] can carry (`R0`-`R9`). `R10`
+/// is never included: it is the frame pointer, fixed to
+/// `Stack(Current(Some(0)))` at every function entry regardless of the caller.
+pub(crate) type RegMask = u16;
+
+/// Every register a signature can carry.
+pub(crate) const ALL_SIGNATURE_REGS: RegMask = 0x03ff;
+
+/// Registers a helper call reads (`R1`-`R5`) and the ones any call leaves
+/// clobbered (`R0`-`R5`), matching how [`transfer`] models `EBPF_OP_CALL`.
+const HELPER_ARG_REGS: RegMask = 0b011_1110;
+const CALL_CLOBBERED_REGS: RegMask = 0b011_1111;
+
+fn reg_bit(reg: usize) -> RegMask {
+  if reg < R10 {
+    1 << reg
+  } else {
+    0
+  }
+}
+
+/// Registers `inst` reads and writes.
+///
+/// `uses` is taken from the instruction encoding — every register the opcode
+/// reads, whether or not [`transfer`] happens to consult its kind. That is more
+/// than strictly necessary (a 32-bit ALU op or a comparison cannot change a
+/// register's region), but it keeps this sound under any future change to
+/// `transfer` that starts reading a register the instruction names.
+///
+/// `defs` must be a *subset* of what the instruction actually overwrites: a def
+/// kills liveness, so over-claiming one would drop a register from the mask
+/// that the callee can still observe. Fetching atomics write `src` (and
+/// CMPXCHG writes `R0`) conditionally on the operation selector, so they claim
+/// no definition at all.
+fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
+  match inst.opcode & EBPF_CLS_MASK {
+    // Only LDDW reaches here; it materializes a constant into dst.
+    EBPF_CLS_LD => (0, reg_bit(inst.dst)),
+    EBPF_CLS_LDX => (reg_bit(inst.src), reg_bit(inst.dst)),
+    EBPF_CLS_ST => (reg_bit(inst.dst), 0),
+    EBPF_CLS_STX => {
+      let is_atomic = (inst.opcode & 0xe0) == 0xc0;
+      let mut uses = reg_bit(inst.dst) | reg_bit(inst.src);
+      if is_atomic {
+        uses |= reg_bit(0);
+      }
+      (uses, 0)
+    }
+    EBPF_CLS_ALU | EBPF_CLS_ALU64 => {
+      let src = if inst.opcode & EBPF_SRC_REG != 0 {
+        reg_bit(inst.src)
+      } else {
+        0
+      };
+      if inst.opcode & EBPF_ALU_OP_MASK == EBPF_ALU_OP_MOV {
+        (src, reg_bit(inst.dst))
+      } else {
+        (src | reg_bit(inst.dst), reg_bit(inst.dst))
+      }
+    }
+    EBPF_CLS_JMP | EBPF_CLS_JMP32 => {
+      if inst.opcode == EBPF_OP_EXIT {
+        // `exit` hands the callee's R0 back to its caller, but the caller
+        // models the result of any call as a fresh scalar (see `transfer`), so
+        // an incoming R0 kind is never observable through a return. Counting R0
+        // as a use here would make it live-in for every function with a path
+        // that does not assign it - which is exactly the incidental caller
+        // state this mask exists to drop.
+        (0, 0)
+      } else if inst.opcode == EBPF_OP_CALL {
+        match inst.src {
+          0 => (HELPER_ARG_REGS, CALL_CLOBBERED_REGS),
+          // A local callee sees the caller's whole register file: R1-R5 are
+          // passed, R6-R9 are preserved across the call by the caller's stub,
+          // and R0 survives it. So the call reads whatever the callee reads.
+          1 => (callee_live_in, CALL_CLOBBERED_REGS),
+          _ => (0, 0),
+        }
+      } else if inst.opcode == EBPF_OP_JA || inst.opcode == EBPF_OP_JA32 {
+        (0, 0)
+      } else {
+        let src = if inst.opcode & EBPF_SRC_REG != 0 {
+          reg_bit(inst.src)
+        } else {
+          0
+        };
+        (src | reg_bit(inst.dst), 0)
+      }
+    }
+    _ => (0, 0),
+  }
+}
+
+/// Registers whose incoming kind the function `[start_pc, end_pc)` can observe,
+/// i.e. those it may read before writing, transitively through its callees.
+///
+/// This is what makes per-signature specialization affordable. A signature is
+/// the caller's whole abstract register file at the call site, so without a
+/// mask a callee gets a fresh specialization every time the caller's incidental
+/// live state differs - a stale `R2` from an earlier helper call, or a pointer
+/// the caller happens to be holding in `R6` - even when the callee's own
+/// analysis could not possibly differ. Masking a register that is not live-in
+/// to `Unknown` is free: it is overwritten before any read on every path, so no
+/// hint, no unresolved access and no callee signature can depend on it.
+///
+/// `callee_live_in` maps a local call's target PC to that callee's mask, so
+/// callers must compute masks bottom-up over the call graph (which is a DAG -
+/// recursion is rejected at load).
+pub(crate) fn function_live_in(
+  code: &[u8],
+  start_pc: usize,
+  end_pc: usize,
+  callee_live_in: &dyn Fn(usize) -> RegMask,
+) -> RegMask {
+  let num_slots = code.len() / 8;
+  if start_pc >= end_pc || end_pc > num_slots {
+    return ALL_SIGNATURE_REGS;
+  }
+
+  // Only reachable instructions can read anything; walking dead code would add
+  // uses that no execution can perform.
+  let mut reachable = vec![false; num_slots];
+  let mut pending = vec![start_pc];
+  reachable[start_pc] = true;
+  while let Some(pc) = pending.pop() {
+    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+      if !reachable[succ] {
+        reachable[succ] = true;
+        pending.push(succ);
+      }
+    }
+  }
+
+  // Backward liveness to a fixpoint. Reverse instruction order converges in a
+  // couple of passes for the reducible CFGs the loader accepts.
+  let mut live = vec![0 as RegMask; num_slots];
+  loop {
+    let mut changed = false;
+    for pc in (start_pc..end_pc).rev() {
+      if !reachable[pc] {
+        continue;
+      }
+      let inst = decode(&code[pc * 8..pc * 8 + 8]);
+      let mut live_out = 0;
+      for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+        live_out |= live[succ];
+      }
+      let callee = if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
+        callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize)
+      } else {
+        0
+      };
+      let (uses, defs) = uses_and_defs(&inst, callee);
+      let next = uses | (live_out & !defs);
+      if next != live[pc] {
+        live[pc] = next;
+        changed = true;
+      }
+    }
+    if !changed {
+      break;
+    }
+  }
+
+  live[start_pc]
 }
 
 /// Full 64-bit immediate of a `lddw` (low half in `inst`, high half in the next
@@ -762,6 +954,86 @@ mod tests {
   const DATA_LO: u64 = 0x10000;
   const DATA_HI: u64 = 0x20000;
 
+  /// `function_live_in` over a whole fragment, with callees reporting `callee`.
+  fn live_in(code: &[u8], callee: RegMask) -> RegMask {
+    function_live_in(code, 0, code.len() / 8, &|_| callee)
+  }
+
+  #[test]
+  fn a_register_read_before_it_is_written_is_live_in() {
+    let code = flatten(&[
+      slot(EBPF_CLS_LDX | 0x18, 0, 6, 0, 0), // r0 = *(u64*)(r6)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(live_in(&code, 0), 1 << 6);
+  }
+
+  #[test]
+  fn a_register_overwritten_before_every_read_is_not_live_in() {
+    let code = flatten(&[
+      slot(EBPF_CLS_ALU64 | EBPF_ALU_OP_MOV, 6, 0, 0, 0), // r6 = 0
+      slot(EBPF_CLS_LDX | 0x18, 0, 6, 0, 0),              // r0 = *(u64*)(r6)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(live_in(&code, 0), 0);
+  }
+
+  #[test]
+  fn a_register_a_previous_call_clobbered_is_not_live_in() {
+    // The load reads R1, but the local call ahead of it leaves R0-R5 clobbered,
+    // so the caller's incoming R1 can never reach it. The callee here reads
+    // nothing.
+    let code = flatten(&[
+      slot(EBPF_OP_CALL, 0, 1, 0, 2),        // call -> slot 3
+      slot(EBPF_CLS_LDX | 0x18, 0, 1, 0, 0), // r0 = *(u64*)(r1)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0), // callee
+    ]);
+    assert_eq!(function_live_in(&code, 0, 3, &|_| 0), 0);
+  }
+
+  #[test]
+  fn a_call_contributes_whatever_its_callee_reads() {
+    let code = flatten(&[
+      slot(EBPF_OP_CALL, 0, 1, 0, 1), // call -> slot 2
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0), // callee, reported as reading r7
+    ]);
+    assert_eq!(function_live_in(&code, 0, 2, &|_| 1 << 7), 1 << 7);
+  }
+
+  #[test]
+  fn exit_does_not_make_r0_live_in() {
+    // A function that returns without assigning R0 hands its caller's R0 back,
+    // but the caller models any call's result as a fresh scalar - so the
+    // incoming kind is not observable and must not force a specialization.
+    // Counting R0 here would put it in the mask of nearly every function.
+    let code = flatten(&[slot(EBPF_OP_EXIT, 0, 0, 0, 0)]);
+    assert_eq!(live_in(&code, 0), 0);
+  }
+
+  #[test]
+  fn a_dead_read_does_not_make_a_register_live_in() {
+    // The load is unreachable, so no execution can observe r6.
+    let code = flatten(&[
+      slot(EBPF_OP_JA, 0, 0, 1, 0),          // goto slot 2
+      slot(EBPF_CLS_LDX | 0x18, 0, 6, 0, 0), // r0 = *(u64*)(r6)  (dead)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(live_in(&code, 0), 0);
+  }
+
+  #[test]
+  fn a_read_on_either_branch_makes_a_register_live_in() {
+    let code = flatten(&[
+      slot(EBPF_CLS_JMP | 0x50, 0, 0, 1, 0), // jset r0, 0 -> slot 2
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+      slot(EBPF_CLS_LDX | 0x18, 0, 8, 0, 0), // r0 = *(u64*)(r8)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(live_in(&code, 0), 1 << 8 | 1);
+  }
+
   #[test]
   fn stack_load_via_r10_is_routed_to_stack() {
     // r2 = r10; r2 += -8; r0 = *(u64*)(r2 + 0); exit
@@ -1051,6 +1323,7 @@ mod tests {
       PointerSignature { regs },
       DATA_LO,
       DATA_HI,
+      &crate::function_analysis::FunctionLayout::unmasked(code.len() / 8),
     );
     assert_eq!(result.hints[4], REGION_STACK);
     assert!(

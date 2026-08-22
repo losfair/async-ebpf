@@ -171,14 +171,25 @@ async fn a_callee_is_region_checked_only_after_the_entry_has_taken_effect() {
   }
 }
 
+/// Whether the fan-out's leaf actually reads the carrier registers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carriers {
+  /// Set but never read, so no callee can observe them.
+  Ignored,
+  /// Dereferenced on a statically reachable but never-taken path, so they are
+  /// live-in all the way up the chain.
+  Observed,
+}
+
 /// Builds `levels` nested functions, each of which calls the next once per
-/// distinct pointer signature it can hand it. Level `i` is therefore compiled
-/// `arity^i` times.
+/// distinct pointer signature it can hand it, so level `i` sees up to `arity^i`
+/// distinct incoming signatures.
 ///
 /// The carrier register is callee-saved (`R6`-`R9`) so the choice a level makes
-/// survives into the grandchild's signature; `R1`-`R5` are clobbered by the
-/// call and would collapse the branching.
-fn signature_fanout(levels: usize, arity: usize, tail_pad: usize) -> Vec<Insn> {
+/// survives into the grandchild's signature; `R1`-`R5` are clobbered by the call
+/// and would collapse the branching. Whether those signatures actually turn into
+/// separate specializations depends on [`Carriers`].
+fn signature_fanout(levels: usize, arity: usize, tail_pad: usize, carriers: Carriers) -> Vec<Insn> {
   fn setup(kind: usize, carrier: u8) -> Vec<Insn> {
     match kind {
       // A relocated data pointer, a frame pointer, a plain scalar, and a value
@@ -214,20 +225,51 @@ fn signature_fanout(levels: usize, arity: usize, tail_pad: usize) -> Vec<Insn> {
     code.extend(std::iter::repeat_n(Insn::mov64_imm(0, 0), tail_pad));
     code.push(Insn::exit());
   }
+
+  // Leaf.
   code.extend(std::iter::repeat_n(Insn::mov64_imm(0, 0), tail_pad));
+  if carriers == Carriers::Observed {
+    // `r0 = 0; if (r0 == 0) goto tail;` then a dereference of each carrier. The
+    // branch is always taken, so the loads never execute - but they are on a
+    // statically reachable path, which is what liveness (and the region
+    // analysis) look at. Executing them would fault for the scalar carriers.
+    let carriers: Vec<u8> = (0..4u8).map(|i| 6 + i).collect();
+    code.push(Insn::mov64_imm(0, 0));
+    code.push(Insn::raw(0x15, 0, 0, carriers.len() as i16, 0));
+    for carrier in carriers {
+      code.push(Insn::ldx_dw(0, carrier, 0));
+    }
+  }
   code.push(Insn::mov64_imm(0, 0));
   code.push(Insn::exit());
   code
 }
 
-/// A callee is compiled once per incoming pointer signature, and a signature is
-/// carried down the call graph, so the number of native copies is exponential
-/// in the call depth rather than linear in the program size.
+/// A signature is the caller's whole abstract register file, but a callee is
+/// only specialized on the registers it can actually observe. Here every level
+/// hands its callee four distinct signatures and none of the carriers is ever
+/// read, so all four collapse to one specialization.
 #[tokio::test]
-async fn callee_specialisation_is_exponential_in_call_depth() {
-  let code = signature_fanout(4, 4, 0);
-  assert_eq!(code.len(), 42, "the program is 42 instructions");
+async fn unobserved_signature_registers_do_not_multiply_specialisations() {
+  let code = signature_fanout(4, 4, 0, Carriers::Ignored);
+  let program = load_raw(&code, &[0u8; 8]);
+  assert_eq!(run(&program, &[]).await.unwrap(), 0);
 
+  assert_eq!(
+    program.function_variant_counts_for_tests(),
+    vec![1, 1, 1, 1, 1],
+    "no callee reads a carrier, so every incoming signature masks to the same thing"
+  );
+  assert_eq!(program.compiled_function_count_for_tests(), 5);
+}
+
+/// The other half of the same property: masking must not collapse a
+/// distinction a callee can see. The identical fan-out, with the leaf
+/// dereferencing each carrier on a statically reachable path, specializes fully
+/// - one native copy per distinct incoming signature, exponential in the depth.
+#[tokio::test]
+async fn observed_signature_registers_still_specialise() {
+  let code = signature_fanout(4, 4, 0, Carriers::Observed);
   let program = load_raw(&code, &[0u8; 8]);
   assert_eq!(run(&program, &[]).await.unwrap(), 0);
 
@@ -239,29 +281,41 @@ async fn callee_specialisation_is_exponential_in_call_depth() {
   assert_eq!(program.compiled_function_count_for_tests(), 341);
 }
 
-/// The same fan-out at the maximum call depth exhausts the default 1 MiB code
-/// budget part way through a run, from an eBPF program of about two kilobytes.
+/// Running out of code budget part way through a run is reported as an opaque
+/// uBPF error rather than as a budget problem, and the failure is cached, so
+/// every later invocation replays the same prefix and fails identically.
+///
+/// The `arena.used >= code_size` guard in `compile_function` only fires on
+/// exact equality, which essentially never happens; what an embedder actually
+/// sees is the next translation being handed a short output buffer.
 #[tokio::test]
-async fn specialisation_can_exhaust_the_code_arena_mid_run() {
-  let code = signature_fanout(7, 4, 24);
-  assert!(
-    code.len() * 8 < 4096,
-    "the source program is small: {} bytes",
-    code.len() * 8
-  );
+async fn arena_exhaustion_is_reported_mid_run_and_is_permanent() {
+  let code = signature_fanout(7, 4, 0, Carriers::Observed);
+  let (_, t_env) = gt_env();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_code_size_limit(64 * 1024)
+  .load(&mut rand::thread_rng(), &build_elf(&code, &[0u8; 8]))
+  .unwrap()
+  .pin_to_current_thread(t_env);
 
-  let program = load_raw(&code, &[0u8; 8]);
-  let ret = run(&program, &[]).await;
-  match ret {
-    Err(Error(RuntimeError::InvalidArgumentOwned(ref msg)))
-      if msg.contains("code translation failed") || msg.contains("no space left") => {}
-    other => panic!("expected the code arena to run out, got {other:?}"),
+  let mut arena = 0;
+  for attempt in 0..3 {
+    match run(&program, &[]).await {
+      Err(Error(RuntimeError::InvalidArgumentOwned(ref msg)))
+        if msg.contains("code translation failed") || msg.contains("no space left") => {}
+      other => panic!("expected the code arena to run out, got {other:?}"),
+    }
+    let used = program.code_arena_used_for_tests();
+    assert!(used > 64 * 1024 - 4096, "the arena should be full: {used}");
+    if attempt > 0 {
+      assert_eq!(used, arena, "a cached failure must not consume more arena");
+    }
+    arena = used;
   }
-  assert!(
-    program.code_arena_used_for_tests() > DEFAULT_CODE_SIZE_LIMIT - 4096,
-    "the arena should be full: {}",
-    program.code_arena_used_for_tests()
-  );
 }
 
 #[derive(Default)]
@@ -333,8 +387,11 @@ async fn count_events(code: &[Insn], timeslice: TimesliceConfig) -> (Program, us
 async fn lazy_compilation_is_charged_to_the_timeslice() {
   // Three functions, seven specialisations: one is compiled eagerly as the
   // entry point and the other six are lazy-call dispatches.
-  let (program, yields, throttles) =
-    count_events(&signature_fanout(2, 2, 0), ZERO_YIELD_BUDGET).await;
+  let (program, yields, throttles) = count_events(
+    &signature_fanout(2, 2, 0, Carriers::Observed),
+    ZERO_YIELD_BUDGET,
+  )
+  .await;
   assert_eq!(program.compiled_function_count_for_tests(), 7);
   assert!(
     yields >= 4,
@@ -344,7 +401,11 @@ async fn lazy_compilation_is_charged_to_the_timeslice() {
 
   // The throttle budget is checked first, so the same program on a zero
   // throttle budget throttles instead of yielding.
-  let (_, yields, throttles) = count_events(&signature_fanout(2, 2, 0), ZERO_THROTTLE_BUDGET).await;
+  let (_, yields, throttles) = count_events(
+    &signature_fanout(2, 2, 0, Carriers::Observed),
+    ZERO_THROTTLE_BUDGET,
+  )
+  .await;
   assert!(
     throttles >= 4,
     "expected the throttle budget to bite, got {yields} yields and {throttles} throttles"
@@ -368,11 +429,15 @@ async fn a_compilation_storm_does_not_starve_the_async_runtime() {
   tokio::time::sleep(Duration::from_millis(5)).await;
   let before = ticks.load(Ordering::SeqCst);
 
-  let (program, yields, _) = count_events(&signature_fanout(7, 4, 0), ZERO_YIELD_BUDGET).await;
+  let (program, yields, _) = count_events(
+    &signature_fanout(7, 4, 0, Carriers::Observed),
+    ZERO_YIELD_BUDGET,
+  )
+  .await;
   let during = ticks.load(Ordering::SeqCst) - before;
   heartbeat.abort();
 
-  assert_eq!(program.compiled_function_count_for_tests(), 1112);
+  assert_eq!(program.compiled_function_count_for_tests(), 344);
   assert!(
     yields > 100,
     "expected the run to yield repeatedly, got {yields}"
