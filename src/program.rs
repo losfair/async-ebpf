@@ -32,7 +32,7 @@ use crate::{
     Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
   },
   error::{Error, RuntimeError},
-  function_analysis::{analyze_functions, FunctionLayout},
+  function_analysis::{analyze_functions, FunctionLayout, MAX_LOCAL_CALL_DEPTH},
   helpers::Helper,
   linker::{link_elf, validate_local_call_graph},
   pointer_cage::PointerCage,
@@ -41,8 +41,23 @@ use crate::{
 };
 
 const NATIVE_STACK_SIZE: usize = 16384;
-const SHADOW_STACK_SIZE: usize = 32768;
-const MAX_CALLDATA_SIZE: usize = 512;
+pub(crate) const MAX_CALLDATA_SIZE: usize = 512;
+
+/// Guest stack the deepest accepted local call chain can consume below the entry
+/// frame: every local function is charged one uBPF frame, and the loader caps
+/// the call graph at [`MAX_LOCAL_CALL_DEPTH`] frames.
+const LOCAL_CALL_FRAME_BUDGET: usize =
+  MAX_LOCAL_CALL_DEPTH * crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+
+/// The guest stack window.
+///
+/// Calldata is copied into the top of this window and `R10` starts at the first
+/// 8-aligned address below it, so the window has to cover the frame budget *and*
+/// the largest calldata a caller can pass. Sizing it to the frame budget alone
+/// leaves no slack: the deepest call chain the loader accepts would then run off
+/// the bottom of the stack by as much calldata as was passed, and a program that
+/// works with none would fault with any.
+const SHADOW_STACK_SIZE: usize = LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8);
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 
@@ -55,7 +70,11 @@ std::arch::global_asm!(
 .global async_ebpf_entry_trampoline
 .type async_ebpf_entry_trampoline,@function
 async_ebpf_entry_trampoline:
-    mov r10, rdi
+    // rdi = target, rsi = ctx, rcx = guest stack bottom, r8 = guest stack len,
+    // [rsp + 8] = JitMemory descriptor. The entry target is staged through r9
+    // and then rcx, neither of which uBPF maps to an eBPF register, so it can
+    // be called after the register scrub below. r11 is uBPF's VOLATILE_CTXT.
+    mov r9, rdi
     mov rax, [rsp + 8]
     push rbp
     push rbx
@@ -65,18 +84,28 @@ async_ebpf_entry_trampoline:
     push r15
     mov r15, rcx
     add r15, r8
-    mov r11, rcx
     mov rdi, rsi
-    mov rsi, rdx
-    mov rdx, r11
-    mov rcx, r8
-    mov r8, r9
-    mov r11, rdi
     sub rsp, 8
     mov rbp, rsp
     sub rsp, 32
     mov [rbp - 8], rax
-    call r10
+    mov rcx, r9
+    mov r11, rdi
+    // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
+    // rax/rdi/rsi/rdx/r10/r8/rbx/r12/r13/r14/r15) except r1 (ctx) and r10
+    // (frame pointer). Without this the guest reads host addresses left behind
+    // by this trampoline and by our caller's callee-saved registers.
+    xor eax, eax
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    xor ebx, ebx
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    call rcx
     mov rsp, rbp
     add rsp, 8
     pop r15
@@ -99,6 +128,9 @@ std::arch::global_asm!(
 .global async_ebpf_entry_trampoline
 .type async_ebpf_entry_trampoline,%function
 async_ebpf_entry_trampoline:
+    // x0 = target, x1 = ctx, x3 = guest stack bottom, x4 = guest stack len,
+    // x6 = JitMemory descriptor. x17 is not mapped to any eBPF register, so the
+    // entry target is staged through it.
     bti c
     mov x17, x0
     sub sp, sp, #16
@@ -111,13 +143,23 @@ async_ebpf_entry_trampoline:
     mov x29, sp
     add x23, x3, x4
     mov x0, x1
-    mov x1, x2
-    mov x2, x3
-    mov x3, x4
-    mov x4, x5
     sub sp, sp, #16
     str x6, [x29, #-8]
     mov x26, x0
+    // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
+    // x5/x0-x4/x19-x23) except r1 (ctx) and r10 (frame pointer), plus the
+    // descriptor still held in x6. Without this the guest reads host addresses
+    // left behind by our caller's callee-saved registers.
+    mov x1, xzr
+    mov x2, xzr
+    mov x3, xzr
+    mov x4, xzr
+    mov x5, xzr
+    mov x6, xzr
+    mov x19, xzr
+    mov x20, xzr
+    mov x21, xzr
+    mov x22, xzr
     blr x17
     mov x0, x5
     mov sp, x29
@@ -500,6 +542,12 @@ pub struct UnboundProgram {
   sections: RefCell<Vec<Section>>,
   resolvers: RefCell<HashMap<u32, ResolverInfo>>,
   next_resolver_id: Cell<u32>,
+  /// Set once the code budget runs out. Unlike a per-variant compilation
+  /// failure, this is terminal for the whole program: the arena never shrinks,
+  /// so no further function can ever be compiled. Recorded here so later runs
+  /// fail immediately instead of re-executing everything up to the call that
+  /// cannot be resolved.
+  code_exhausted: RefCell<Option<RuntimeError>>,
 }
 
 /// A program pinned to a specific thread and ready to execute.
@@ -1003,7 +1051,7 @@ impl Program {
     let code = self
       .unbound
       .cage
-      .safe_deref_for_read(section.code_vaddr, section.code_len)
+      .data_slice(section.code_vaddr, section.code_len)
       .unwrap();
     let code_bytes = unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
     let region_analysis = crate::region_analysis::analyze_function(
@@ -1013,6 +1061,7 @@ impl Program {
       signature,
       self.unbound.cage.data_bottom() as u64,
       self.unbound.cage.data_top() as u64,
+      &section.layout,
     );
     if self.unbound.require_static_regions && !region_analysis.unresolved.is_empty() {
       let err = RuntimeError::InvalidArgumentOwned(format!(
@@ -1060,13 +1109,6 @@ impl Program {
     }
 
     let mut arena = self.unbound.code_arena.borrow_mut();
-    if arena.used >= self.unbound.code_size {
-      let err = RuntimeError::InvalidArgument("no space left for jit compilation");
-      section.functions[function_index]
-        .compiled
-        .insert(signature, FunctionCompilation::Failed(err.clone()));
-      return Err(err);
-    }
 
     unsafe {
       if libc::mprotect(
@@ -1084,62 +1126,50 @@ impl Program {
     }
 
     let code_ptr = self.unbound.code_base + arena.used;
-    let mut written_len = self.unbound.code_size - arena.used;
-    let mut errmsg_ptr = std::ptr::null_mut();
-
-    let ret = unsafe {
-      crate::ubpf::ubpf_set_region_hints(
-        section.vm.0.as_ptr(),
-        region_analysis.hints.as_ptr(),
-        region_analysis.hints.len(),
-      );
-      crate::ubpf::ubpf_set_lazy_local_call_resolver(
-        section.vm.0.as_ptr(),
-        Some(tls_local_call_resolver),
-        resolver_ids.as_ptr(),
-        resolver_ids.len(),
-      );
-      let ret = crate::ubpf::ubpf_translate_function_ex(
-        section.vm.0.as_ptr(),
+    let remaining = self.unbound.code_size - arena.used;
+    let vm = section.vm.0.as_ptr();
+    let outcome = unsafe {
+      translate_function_into(
+        vm,
+        &region_analysis.hints,
+        &resolver_ids,
+        function.start_pc,
+        function.end_pc,
         code_ptr as *mut u8,
-        &mut written_len,
-        &mut errmsg_ptr,
-        crate::ubpf::JitMode_ExtendedJitMode,
-        function.start_pc as u32,
-        function.end_pc as u32,
-      );
-      crate::ubpf::ubpf_set_region_hints(section.vm.0.as_ptr(), std::ptr::null(), 0);
-      crate::ubpf::ubpf_set_lazy_local_call_resolver(
-        section.vm.0.as_ptr(),
-        None,
-        std::ptr::null(),
-        0,
-      );
-      ret
+        remaining,
+      )
     };
 
-    if ret != 0 {
-      let errmsg = unsafe {
-        if errmsg_ptr.is_null() {
-          "".to_string()
-        } else {
-          CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned()
-        }
-      };
-      if !errmsg_ptr.is_null() {
-        unsafe { libc::free(errmsg_ptr as _) };
+    let written_len = match outcome {
+      Ok(written_len) => written_len,
+      Err(reason) => {
+        let _ = self.protect_code_pages(arena.used);
+
+        let err = match reason {
+          // The function translates; there was just no room left for it. That is
+          // terminal for the whole program, not for this variant: the arena never
+          // shrinks, so nothing can be compiled from here on.
+          TranslateError::OutOfSpace => {
+            let err = RuntimeError::InvalidArgumentOwned(format!(
+              "jit code budget exhausted: function [{}, {}) did not fit in the {remaining} bytes \
+               left of the {} byte code budget ({} already in use). Raise \
+               ProgramLoader::with_code_size_limit if the program needs more.",
+              function.start_pc, function.end_pc, self.unbound.code_size, arena.used,
+            ));
+            *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
+            err
+          }
+          TranslateError::Failed(errmsg) => RuntimeError::InvalidArgumentOwned(format!(
+            "ubpf: code translation failed for function [{}, {}): {errmsg}",
+            function.start_pc, function.end_pc,
+          )),
+        };
+        section.functions[function_index]
+          .compiled
+          .insert(signature, FunctionCompilation::Failed(err.clone()));
+        return Err(err);
       }
-      let _ = self.protect_code_pages(arena.used);
-      let err =
-        RuntimeError::InvalidArgumentOwned(format!("ubpf: code translation failed: {errmsg}"));
-      section.functions[function_index]
-        .compiled
-        .insert(signature, FunctionCompilation::Failed(err.clone()));
-      return Err(err);
-    }
-    if !errmsg_ptr.is_null() {
-      unsafe { libc::free(errmsg_ptr as _) };
-    }
+    };
 
     unsafe {
       crate::ubpf::ubpf_clear_instruction_cache(code_ptr as *mut u8, written_len);
@@ -1211,6 +1241,13 @@ impl Program {
     calldata: &[u8],
     _: &PreemptionEnabled,
   ) -> Result<i64, RuntimeError> {
+    // Once the code budget is gone nothing can ever be compiled again, so fail
+    // before running anything rather than replaying the program up to the call
+    // that cannot be resolved - side effects included - on every invocation.
+    if let Some(err) = self.unbound.code_exhausted.borrow().clone() {
+      return Err(err);
+    }
+
     let Some(section_index) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));
     };
@@ -1353,11 +1390,6 @@ impl Program {
           return Err(RuntimeError::MemoryFault(vaddr));
         }
 
-        if let Some(resolver_id) = dispatch.lazy_local_call {
-          resume_input = self.compile_resolver(resolver_id)?.code_ptr as u64;
-          continue;
-        }
-
         // Clear pending task if something else has set it
         PENDING_ASYNC_TASK.with(|x| x.borrow_mut().take());
         let mut helper_name: &'static str = "";
@@ -1372,11 +1404,22 @@ impl Program {
           can_post_task: false,
         };
 
-        if dispatch.async_preemption {
+        // A lazy local call JIT-compiles a function on this thread before the
+        // guest can continue - guest-triggered work whose size the program
+        // chooses, since every (function, pointer signature) pair is a separate
+        // compilation. So it has to reach the run-budget check below like any
+        // other dispatch. Async preemption cannot substitute: the SIGUSR1
+        // handler only acts on a PC inside the JIT code range, and during
+        // compilation the PC is in the compiler.
+        let compiled_lazily = if let Some(resolver_id) = dispatch.lazy_local_call {
+          resume_input = self.compile_resolver(resolver_id)?.code_ptr as u64;
+          true
+        } else if dispatch.async_preemption {
           self
             .unbound
             .event_listener
             .did_async_preempt(&mut helper_scope);
+          false
         } else {
           // validator should ensure all helper indexes are present in the table
           let Some((_, got_helper_name, helper)) = self
@@ -1403,14 +1446,19 @@ impl Program {
           )
           .map_err(|()| RuntimeError::HelperError(helper_name))?;
           helper_scope.can_post_task = false;
-        }
+          false
+        };
 
         let pending_async_task = PENDING_ASYNC_TASK.with(|x| x.borrow_mut().take());
 
-        // Fast path: do not read timestamp if no thread migration or async preemption happened
+        // Fast path: do not read timestamp if no thread migration or async preemption happened.
+        // A lazy compilation always takes the slow path: the fast path exists to spare a helper
+        // call a clock read, which is not worth trading against a JIT compilation.
         let new_rust_tid_sigusr1_counter =
           (RUST_TID.with(|x| *x), SIGUSR1_COUNTER.with(|x| x.get()));
-        if new_rust_tid_sigusr1_counter == rust_tid_sigusr1_counter && pending_async_task.is_none()
+        if !compiled_lazily
+          && new_rust_tid_sigusr1_counter == rust_tid_sigusr1_counter
+          && pending_async_task.is_none()
         {
           continue;
         }
@@ -1526,6 +1574,66 @@ impl Drop for LoaderValidationScope {
   }
 }
 
+/// Why a translation failed.
+enum TranslateError {
+  /// The function translates; `capacity` was not enough to hold it.
+  OutOfSpace,
+  /// The function does not translate at all.
+  Failed(String),
+}
+
+/// Translates `[start_pc, end_pc)` into `buffer`, returning the number of bytes
+/// emitted.
+///
+/// # Safety
+/// `vm` must be a live VM whose loaded code contains the range, and `buffer`
+/// must be writable for `capacity` bytes.
+unsafe fn translate_function_into(
+  vm: *mut crate::ubpf::ubpf_vm,
+  hints: &[u8],
+  resolver_ids: &[u32],
+  start_pc: usize,
+  end_pc: usize,
+  buffer: *mut u8,
+  capacity: usize,
+) -> Result<usize, TranslateError> {
+  let mut written_len = capacity;
+  let mut errmsg_ptr = std::ptr::null_mut();
+
+  crate::ubpf::ubpf_set_region_hints(vm, hints.as_ptr(), hints.len());
+  crate::ubpf::ubpf_set_lazy_local_call_resolver(
+    vm,
+    Some(tls_local_call_resolver),
+    resolver_ids.as_ptr(),
+    resolver_ids.len(),
+  );
+  let ret = crate::ubpf::ubpf_translate_function_ex(
+    vm,
+    buffer,
+    &mut written_len,
+    &mut errmsg_ptr,
+    crate::ubpf::JitMode_ExtendedJitMode,
+    start_pc as u32,
+    end_pc as u32,
+  );
+  crate::ubpf::ubpf_set_region_hints(vm, std::ptr::null(), 0);
+  crate::ubpf::ubpf_set_lazy_local_call_resolver(vm, None, std::ptr::null(), 0);
+
+  let errmsg = if errmsg_ptr.is_null() {
+    String::new()
+  } else {
+    let msg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+    libc::free(errmsg_ptr as _);
+    msg
+  };
+
+  match ret {
+    0 => Ok(written_len),
+    crate::ubpf::UBPF_TRANSLATE_OUT_OF_SPACE => Err(TranslateError::OutOfSpace),
+    _ => Err(TranslateError::Failed(errmsg)),
+  }
+}
+
 fn local_call_target(code: &[u8], pc: usize) -> usize {
   let offset = pc * 8;
   let imm = i32::from_le_bytes([
@@ -1634,9 +1742,7 @@ impl ProgramLoader {
     let cage = PointerCage::new(rng, SHADOW_STACK_SIZE, elf.len())?;
 
     let code_sections = {
-      let mut data = cage
-        .safe_deref_for_read(cage.data_bottom(), elf.len())
-        .unwrap();
+      let mut data = cage.data_slice(cage.data_bottom(), elf.len()).unwrap();
       let data = unsafe { data.as_mut() };
       data.copy_from_slice(elf);
 
@@ -1707,7 +1813,7 @@ impl ProgramLoader {
 
       let mut errmsg_ptr = std::ptr::null_mut();
       let code = cage
-        .safe_deref_for_read(code_vaddr_size.0, code_vaddr_size.1)
+        .data_slice(code_vaddr_size.0, code_vaddr_size.1)
         .unwrap();
       let code_bytes =
         unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
@@ -1792,6 +1898,7 @@ impl ProgramLoader {
       sections: RefCell::new(sections),
       resolvers: RefCell::new(resolvers),
       next_resolver_id: Cell::new(next_resolver_id),
+      code_exhausted: RefCell::new(None),
     })
   }
 }

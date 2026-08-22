@@ -216,7 +216,7 @@ emit_4byte_offset_placeholder(struct jit_state* state)
 static uint32_t
 emit_jump_address_reloc(struct jit_state* state, struct PatchableTarget target)
 {
-    if (state->num_jumps == UBPF_MAX_INSTS) {
+    if (!reserve_patchable_relatives(&state->jumps, &state->jumps_capacity, state->num_jumps + 1)) {
         state->jit_status = TooManyJumps;
         return 0;
     }
@@ -229,7 +229,8 @@ emit_jump_address_reloc(struct jit_state* state, struct PatchableTarget target)
 static uint32_t
 emit_local_call_address_reloc(struct jit_state* state, struct PatchableTarget target)
 {
-    if (state->num_local_calls == UBPF_MAX_INSTS) {
+    if (!reserve_patchable_relatives(
+            &state->local_calls, &state->local_calls_capacity, state->num_local_calls + 1)) {
         state->jit_status = TooManyLocalCalls;
         return 0;
     }
@@ -876,7 +877,7 @@ emit_store_imm32_blinded(struct jit_state* state, enum operand_size size, int ds
 static uint32_t
 emit_rip_relative_load(struct jit_state* state, int dst, struct PatchableTarget load_tgt)
 {
-    if (state->num_loads == UBPF_MAX_INSTS) {
+    if (!reserve_patchable_relatives(&state->loads, &state->loads_capacity, state->num_loads + 1)) {
         state->jit_status = TooManyLoads;
         return 0;
     }
@@ -895,7 +896,7 @@ emit_rip_relative_load(struct jit_state* state, int dst, struct PatchableTarget 
 static void
 emit_rip_relative_lea(struct jit_state* state, int lea_dst_reg, struct PatchableTarget lea_tgt)
 {
-    if (state->num_leas == UBPF_MAX_INSTS) {
+    if (!reserve_patchable_relatives(&state->leas, &state->leas_capacity, state->num_leas + 1)) {
         state->jit_status = TooManyLeas;
         return;
     }
@@ -1704,6 +1705,17 @@ emit_indirect_call_rax(struct jit_state* state)
     emit1(state, 0xd0);
 }
 
+/* call *reg */
+static inline void
+emit_indirect_call_reg(struct jit_state* state, int reg)
+{
+    if (reg & 8) {
+        emit1(state, 0x41); /* REX.B */
+    }
+    emit1(state, 0xff);
+    emit1(state, 0xd0 | (reg & 7));
+}
+
 static inline void
 emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_pc)
 {
@@ -1734,6 +1746,15 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
     emit_push(state, map_register(BPF_REG_5));
     emit_push(state, VOLATILE_CTXT);
 
+    // BPF r0 is mapped to RAX, which is also the host ABI return register, so
+    // the resolver's return value would otherwise be visible to the callee as a
+    // host code pointer. Preserve r0 across the resolver call (as the non-lazy
+    // emit_local_call does) and hand the callee address over in a register that
+    // is not mapped to any eBPF register. Pushed twice to keep the host stack
+    // 16-byte aligned for the resolver call.
+    emit_push(state, map_register(BPF_REG_0));
+    emit_push(state, map_register(BPF_REG_0));
+
 #if defined(_WIN32)
     emit_alu64_imm32(state, 0x81, 5, RSP, 4 * sizeof(uint64_t));
 #endif
@@ -1746,6 +1767,12 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
     emit_alu64_imm32(state, 0x81, 0, RSP, 4 * sizeof(uint64_t));
 #endif
 
+    // Stash the resolved callee address in RCX (not mapped to any eBPF register
+    // on either platform register map) and restore BPF r0.
+    emit_mov(state, RAX, RCX);
+    emit_pop(state, map_register(BPF_REG_0));
+    emit_pop(state, map_register(BPF_REG_0));
+
     emit_pop(state, VOLATILE_CTXT);
     emit_pop(state, map_register(BPF_REG_5));
     emit_pop(state, map_register(BPF_REG_4));
@@ -1753,8 +1780,7 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
     emit_pop(state, map_register(BPF_REG_2));
     emit_pop(state, map_register(BPF_REG_1));
 
-    // RAX still holds the compiled callee pointer returned by the resolver.
-    emit_indirect_call_rax(state);
+    emit_indirect_call_reg(state, RCX);
 
     emit_pop(state, map_register(BPF_REG_9));
     emit_pop(state, map_register(BPF_REG_8));
@@ -3000,11 +3026,15 @@ ubpf_translate_x86_64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum Ji
     struct jit_state state;
     struct ubpf_jit_result compile_result;
 
-    if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+    if (initialize_jit_state_result(
+            &state, &compile_result, buffer, *size, jit_mode, vm->num_insts, &compile_result.errmsg) < 0) {
         goto out;
     }
 
     if (translate(vm, &state, &compile_result.errmsg) < 0) {
+        if (state.jit_status == NotEnoughSpace) {
+            compile_result.compile_result = UBPF_JIT_COMPILE_OUT_OF_SPACE;
+        }
         goto out;
     }
 
@@ -3036,11 +3066,15 @@ ubpf_translate_function_x86_64(
     struct jit_state state;
     struct ubpf_jit_result compile_result;
 
-    if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+    if (initialize_jit_state_result(
+            &state, &compile_result, buffer, *size, jit_mode, vm->num_insts, &compile_result.errmsg) < 0) {
         goto out;
     }
 
     if (translate_range(vm, &state, &compile_result.errmsg, start_pc, end_pc, false, true) < 0) {
+        if (state.jit_status == NotEnoughSpace) {
+            compile_result.compile_result = UBPF_JIT_COMPILE_OUT_OF_SPACE;
+        }
         goto out;
     }
 

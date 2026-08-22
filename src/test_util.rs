@@ -311,7 +311,20 @@ pub mod region_analysis {
     data_lo: u64,
     data_hi: u64,
   ) -> FunctionAnalysis {
-    let result = analyzer::analyze_function(code, start_pc, end_pc, signature.0, data_lo, data_hi);
+    // Derive the callee argument masks the same way the loader does, so this
+    // helper reports the specialization signatures a real program would get.
+    // A fragment that is not a valid call graph falls back to masking nothing.
+    let layout = crate::function_analysis::analyze_functions(code)
+      .unwrap_or_else(|_| crate::function_analysis::FunctionLayout::unmasked(code.len() / 8));
+    let result = analyzer::analyze_function(
+      code,
+      start_pc,
+      end_pc,
+      signature.0,
+      data_lo,
+      data_hi,
+      &layout,
+    );
     let mut call_signatures: Vec<_> = result
       .call_signatures
       .into_iter()

@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use crate::region_analysis::{function_live_in, RegMask};
+
 const EBPF_OP_CALL: u8 = 0x05u8 | 0x80u8;
 const EBPF_OP_LDDW: u8 = 0x18;
 const EBPF_OP_EXIT: u8 = 0x95;
@@ -8,12 +10,33 @@ const EBPF_CLS_JMP: u8 = 0x05;
 const EBPF_CLS_JMP32: u8 = 0x06;
 const EBPF_OP_JA: u8 = 0x05;
 const EBPF_OP_JA32: u8 = 0x06;
-const MAX_LOCAL_CALL_DEPTH: usize = 8;
+/// Maximum depth of the local call graph, in frames. uBPF charges every local
+/// function one `UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE` frame, so this also bounds
+/// how far below its entry `R10` a program can push the guest stack.
+pub(crate) const MAX_LOCAL_CALL_DEPTH: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct FunctionLayout {
   pub(crate) functions: Vec<FunctionInfo>,
   pub(crate) pc_to_func: Vec<usize>,
+  /// Per function, the registers whose incoming kind it can observe. Used to
+  /// mask the pointer signature a call site hands its callee, so specialization
+  /// keys off what the callee actually reads rather than the caller's whole
+  /// register file. See [`function_live_in`].
+  pub(crate) arg_masks: Vec<RegMask>,
+}
+
+impl FunctionLayout {
+  /// A single-function layout that masks nothing, for callers that only have a
+  /// code fragment and no call graph to derive masks from.
+  #[cfg(any(test, feature = "testing"))]
+  pub(crate) fn unmasked(num_insns: usize) -> Self {
+    Self {
+      functions: Vec::new(),
+      pc_to_func: vec![0; num_insns],
+      arg_masks: vec![crate::region_analysis::ALL_SIGNATURE_REGS],
+    }
+  }
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +241,26 @@ fn visit_local_call_graph(
   Ok(max_depth)
 }
 
+/// Depth-first post-order over the call DAG, so a function is emitted after
+/// every function it calls. Cycles are impossible here: `visit_local_call_graph`
+/// has already rejected recursion, and it caps the depth at
+/// `MAX_LOCAL_CALL_DEPTH`, so this recursion is bounded too.
+fn call_graph_post_order(
+  edges: &[Vec<usize>],
+  func_index: usize,
+  seen: &mut [bool],
+  out: &mut Vec<usize>,
+) {
+  if seen[func_index] {
+    return;
+  }
+  seen[func_index] = true;
+  for &callee in &edges[func_index] {
+    call_graph_post_order(edges, callee, seen, out);
+  }
+  out.push(func_index);
+}
+
 pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
   if code.len() % 8 != 0 {
     return Err("code length is not a multiple of 8".to_string());
@@ -228,6 +271,7 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
     return Ok(FunctionLayout {
       functions: Vec::new(),
       pc_to_func: Vec::new(),
+      arg_masks: Vec::new(),
     });
   }
 
@@ -254,6 +298,29 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
     visit_local_call_graph(&edges, &starts, &mut states, &mut depths, func_index)?;
   }
 
+  // Live-in masks, bottom-up: a caller's mask depends on its callees'.
+  let mut order = Vec::with_capacity(starts.len());
+  let mut seen = vec![false; starts.len()];
+  for func_index in 0..starts.len() {
+    call_graph_post_order(&edges, func_index, &mut seen, &mut order);
+  }
+  let mut arg_masks = vec![0 as RegMask; starts.len()];
+  for &func_index in &order {
+    let start = starts[func_index];
+    let end = starts.get(func_index + 1).copied().unwrap_or(num_insns);
+    let mask = {
+      let arg_masks = &arg_masks;
+      let pc_to_func = &pc_to_func;
+      function_live_in(code, start, end, &|target| {
+        pc_to_func
+          .get(target)
+          .and_then(|&callee| arg_masks.get(callee).copied())
+          .unwrap_or(crate::region_analysis::ALL_SIGNATURE_REGS)
+      })
+    };
+    arg_masks[func_index] = mask;
+  }
+
   let mut callers = vec![Vec::new(); starts.len()];
   for (caller, callees) in edges.iter().enumerate() {
     for &callee in callees {
@@ -275,6 +342,7 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
   Ok(FunctionLayout {
     functions,
     pc_to_func,
+    arg_masks,
   })
 }
 

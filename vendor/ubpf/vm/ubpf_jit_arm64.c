@@ -613,14 +613,23 @@ emit_unconditionalbranch_immediate(
     struct jit_state* state, enum UnconditionalBranchImmediateOpcode op, struct PatchableTarget target)
 {
     uint32_t source_offset = state->offset;
-    struct patchable_relative* table = state->jumps;
+    struct patchable_relative** table = &state->jumps;
+    uint32_t* capacity = &state->jumps_capacity;
     int* num_jumps = &state->num_jumps;
+    enum JitProgress overflow_status = TooManyJumps;
     if (op == UBR_BL && !target.is_special) {
-        table = state->local_calls;
+        table = &state->local_calls;
+        capacity = &state->local_calls_capacity;
         num_jumps = &state->num_local_calls;
+        overflow_status = TooManyLocalCalls;
     }
 
-    emit_patchable_relative(table, state->offset, target, (*num_jumps)++);
+    if (!reserve_patchable_relatives(table, capacity, *num_jumps + 1)) {
+        state->jit_status = overflow_status;
+        return source_offset;
+    }
+
+    emit_patchable_relative(*table, state->offset, target, (*num_jumps)++);
     emit_instruction(state, op);
 
     return source_offset;
@@ -658,6 +667,10 @@ static uint32_t
 emit_conditionalbranch_immediate(struct jit_state* state, enum Condition cond, struct PatchableTarget target)
 {
     uint32_t source_offset = state->offset;
+    if (!reserve_patchable_relatives(&state->jumps, &state->jumps_capacity, state->num_jumps + 1)) {
+        state->jit_status = TooManyJumps;
+        return source_offset;
+    }
     emit_patchable_relative(state->jumps, state->offset, target, state->num_jumps++);
     emit_instruction(state, BR_Bcond | (0 << 5) | cond);
     return source_offset;
@@ -1015,11 +1028,15 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
     emit_loadstorepair_immediate(state, LSP_STPX, map_register(6), map_register(7), SP, 16);
     emit_loadstorepair_immediate(state, LSP_STPX, map_register(8), map_register(9), SP, 32);
 
-    uint32_t arg_stack_movement = align_to(40, 16);
+    // BPF r0 is mapped to a caller-saved host register, so the resolver would
+    // otherwise leave host residue in it for the callee to read. Preserve it
+    // alongside r1-r5 (as the non-lazy emit_local_call does); the 48-byte slot
+    // rounded up from 40 already has room for it.
+    uint32_t arg_stack_movement = align_to(48, 16);
     emit_addsub_immediate(state, true, AS_SUB, SP, SP, arg_stack_movement);
     emit_loadstorepair_immediate(state, LSP_STPX, map_register(1), map_register(2), SP, 0);
     emit_loadstorepair_immediate(state, LSP_STPX, map_register(3), map_register(4), SP, 16);
-    emit_loadstore_immediate(state, LS_STRX, map_register(5), SP, 32);
+    emit_loadstorepair_immediate(state, LSP_STPX, map_register(5), map_register(0), SP, 32);
 
     emit_movewide_immediate(state, true, R0, vm->local_call_resolver_ids[call_pc]);
     emit_movewide_immediate(state, true, temp_register, (uint64_t)vm->local_call_resolver);
@@ -1028,7 +1045,7 @@ emit_lazy_local_call(struct ubpf_vm* vm, struct jit_state* state, uint32_t call_
 
     emit_loadstorepair_immediate(state, LSP_LDPX, map_register(1), map_register(2), SP, 0);
     emit_loadstorepair_immediate(state, LSP_LDPX, map_register(3), map_register(4), SP, 16);
-    emit_loadstore_immediate(state, LS_LDRX, map_register(5), SP, 32);
+    emit_loadstorepair_immediate(state, LSP_LDPX, map_register(5), map_register(0), SP, 32);
     emit_addsub_immediate(state, true, AS_ADD, SP, SP, arg_stack_movement);
 
     emit_unconditionalbranch_register(state, BR_BLR, R17);
@@ -2288,11 +2305,15 @@ ubpf_translate_arm64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum Jit
     struct jit_state state;
     struct ubpf_jit_result compile_result;
 
-    if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+    if (initialize_jit_state_result(
+            &state, &compile_result, buffer, *size, jit_mode, vm->num_insts, &compile_result.errmsg) < 0) {
         goto out;
     }
 
     if (translate(vm, &state, &compile_result.errmsg) < 0) {
+        if (state.jit_status == NotEnoughSpace) {
+            compile_result.compile_result = UBPF_JIT_COMPILE_OUT_OF_SPACE;
+        }
         goto out;
     }
 
@@ -2329,11 +2350,15 @@ ubpf_translate_function_arm64(
     struct jit_state state;
     struct ubpf_jit_result compile_result;
 
-    if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+    if (initialize_jit_state_result(
+            &state, &compile_result, buffer, *size, jit_mode, vm->num_insts, &compile_result.errmsg) < 0) {
         goto out;
     }
 
     if (translate_range(vm, &state, &compile_result.errmsg, start_pc, end_pc, false, true) < 0) {
+        if (state.jit_status == NotEnoughSpace) {
+            compile_result.compile_result = UBPF_JIT_COMPILE_OUT_OF_SPACE;
+        }
         goto out;
     }
 
