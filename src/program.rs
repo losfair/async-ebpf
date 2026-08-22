@@ -542,6 +542,12 @@ pub struct UnboundProgram {
   sections: RefCell<Vec<Section>>,
   resolvers: RefCell<HashMap<u32, ResolverInfo>>,
   next_resolver_id: Cell<u32>,
+  /// Set once the code budget runs out. Unlike a per-variant compilation
+  /// failure, this is terminal for the whole program: the arena never shrinks,
+  /// so no further function can ever be compiled. Recorded here so later runs
+  /// fail immediately instead of re-executing everything up to the call that
+  /// cannot be resolved.
+  code_exhausted: RefCell<Option<RuntimeError>>,
 }
 
 /// A program pinned to a specific thread and ready to execute.
@@ -1103,13 +1109,6 @@ impl Program {
     }
 
     let mut arena = self.unbound.code_arena.borrow_mut();
-    if arena.used >= self.unbound.code_size {
-      let err = RuntimeError::InvalidArgument("no space left for jit compilation");
-      section.functions[function_index]
-        .compiled
-        .insert(signature, FunctionCompilation::Failed(err.clone()));
-      return Err(err);
-    }
 
     unsafe {
       if libc::mprotect(
@@ -1127,62 +1126,76 @@ impl Program {
     }
 
     let code_ptr = self.unbound.code_base + arena.used;
-    let mut written_len = self.unbound.code_size - arena.used;
-    let mut errmsg_ptr = std::ptr::null_mut();
-
-    let ret = unsafe {
-      crate::ubpf::ubpf_set_region_hints(
-        section.vm.0.as_ptr(),
-        region_analysis.hints.as_ptr(),
-        region_analysis.hints.len(),
-      );
-      crate::ubpf::ubpf_set_lazy_local_call_resolver(
-        section.vm.0.as_ptr(),
-        Some(tls_local_call_resolver),
-        resolver_ids.as_ptr(),
-        resolver_ids.len(),
-      );
-      let ret = crate::ubpf::ubpf_translate_function_ex(
-        section.vm.0.as_ptr(),
+    let remaining = self.unbound.code_size - arena.used;
+    let vm = section.vm.0.as_ptr();
+    let outcome = unsafe {
+      translate_function_into(
+        vm,
+        &region_analysis.hints,
+        &resolver_ids,
+        function.start_pc,
+        function.end_pc,
         code_ptr as *mut u8,
-        &mut written_len,
-        &mut errmsg_ptr,
-        crate::ubpf::JitMode_ExtendedJitMode,
-        function.start_pc as u32,
-        function.end_pc as u32,
-      );
-      crate::ubpf::ubpf_set_region_hints(section.vm.0.as_ptr(), std::ptr::null(), 0);
-      crate::ubpf::ubpf_set_lazy_local_call_resolver(
-        section.vm.0.as_ptr(),
-        None,
-        std::ptr::null(),
-        0,
-      );
-      ret
+        remaining,
+      )
     };
 
-    if ret != 0 {
-      let errmsg = unsafe {
-        if errmsg_ptr.is_null() {
-          "".to_string()
-        } else {
-          CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned()
-        }
-      };
-      if !errmsg_ptr.is_null() {
-        unsafe { libc::free(errmsg_ptr as _) };
+    let written_len = match outcome {
+      Ok(written_len) => written_len,
+      Err(errmsg) => {
+        let _ = self.protect_code_pages(arena.used);
+
+        // uBPF reports a short output buffer the same way it reports a bad
+        // instruction, so the only way to tell "the code budget ran out" from a
+        // real translation failure is to translate again somewhere with room.
+        // This path is terminal either way, so the extra work costs nothing that
+        // matters.
+        let needed = measure_translated_size(
+          vm,
+          &region_analysis.hints,
+          &resolver_ids,
+          function.start_pc,
+          function.end_pc,
+          self.unbound.code_size,
+        );
+
+        let err = match needed {
+          // The function translates given enough room, so the budget is what
+          // stopped it. That is terminal for the whole program: the arena never
+          // shrinks, so nothing can be compiled from here on.
+          Some(needed) => {
+            let detail = if needed > self.unbound.code_size {
+              format!(
+                "needs {needed} bytes, more than the whole {} byte budget",
+                self.unbound.code_size
+              )
+            } else {
+              format!(
+                "needs {needed} bytes but only {remaining} of the {} byte budget are left \
+                 ({} already in use)",
+                self.unbound.code_size, arena.used,
+              )
+            };
+            let err = RuntimeError::InvalidArgumentOwned(format!(
+              "jit code budget exhausted: function [{}, {}) {detail}. Raise \
+               ProgramLoader::with_code_size_limit if the program needs more.",
+              function.start_pc, function.end_pc,
+            ));
+            *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
+            err
+          }
+          None => RuntimeError::InvalidArgumentOwned(format!(
+            "ubpf: code translation failed for function [{}, {}), with {} of the {} byte code \
+             budget in use: {errmsg}",
+            function.start_pc, function.end_pc, arena.used, self.unbound.code_size,
+          )),
+        };
+        section.functions[function_index]
+          .compiled
+          .insert(signature, FunctionCompilation::Failed(err.clone()));
+        return Err(err);
       }
-      let _ = self.protect_code_pages(arena.used);
-      let err =
-        RuntimeError::InvalidArgumentOwned(format!("ubpf: code translation failed: {errmsg}"));
-      section.functions[function_index]
-        .compiled
-        .insert(signature, FunctionCompilation::Failed(err.clone()));
-      return Err(err);
-    }
-    if !errmsg_ptr.is_null() {
-      unsafe { libc::free(errmsg_ptr as _) };
-    }
+    };
 
     unsafe {
       crate::ubpf::ubpf_clear_instruction_cache(code_ptr as *mut u8, written_len);
@@ -1254,6 +1267,13 @@ impl Program {
     calldata: &[u8],
     _: &PreemptionEnabled,
   ) -> Result<i64, RuntimeError> {
+    // Once the code budget is gone nothing can ever be compiled again, so fail
+    // before running anything rather than replaying the program up to the call
+    // that cannot be resolved - side effects included - on every invocation.
+    if let Some(err) = self.unbound.code_exhausted.borrow().clone() {
+      return Err(err);
+    }
+
     let Some(section_index) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));
     };
@@ -1580,6 +1600,102 @@ impl Drop for LoaderValidationScope {
   }
 }
 
+/// Smallest and largest scratch buffer [`measure_translated_size`] will try. The
+/// ceiling only has to exceed what any loadable program can emit: uBPF caps a
+/// program at `UBPF_MAX_INSTS` instructions, and no instruction expands to
+/// anything near a kilobyte of native code.
+const MIN_SCRATCH_SIZE: usize = 1 << 20;
+const MAX_SCRATCH_SIZE: usize = 1 << 26;
+
+/// Number of bytes `[start_pc, end_pc)` translates to, or `None` if it does not
+/// translate at any size - i.e. the failure was not about running out of room.
+///
+/// The scratch buffer is ordinary memory. Emitted code is position-independent
+/// within its buffer and the host addresses baked into it are absolute, so
+/// translating there measures the function without the result having to be
+/// runnable.
+fn measure_translated_size(
+  vm: *mut crate::ubpf::ubpf_vm,
+  hints: &[u8],
+  resolver_ids: &[u32],
+  start_pc: usize,
+  end_pc: usize,
+  code_size: usize,
+) -> Option<usize> {
+  let mut capacity = code_size.max(MIN_SCRATCH_SIZE);
+  while capacity <= MAX_SCRATCH_SIZE {
+    let mut scratch = vec![0u8; capacity];
+    let translated = unsafe {
+      translate_function_into(
+        vm,
+        hints,
+        resolver_ids,
+        start_pc,
+        end_pc,
+        scratch.as_mut_ptr(),
+        capacity,
+      )
+    };
+    match translated {
+      Ok(len) => return Some(len),
+      Err(_) => capacity *= 2,
+    }
+  }
+  None
+}
+
+/// Translates `[start_pc, end_pc)` into `buffer`, returning the number of bytes
+/// emitted or uBPF's error message.
+///
+/// # Safety
+/// `vm` must be a live VM whose loaded code contains the range, and `buffer`
+/// must be writable for `capacity` bytes.
+unsafe fn translate_function_into(
+  vm: *mut crate::ubpf::ubpf_vm,
+  hints: &[u8],
+  resolver_ids: &[u32],
+  start_pc: usize,
+  end_pc: usize,
+  buffer: *mut u8,
+  capacity: usize,
+) -> Result<usize, String> {
+  let mut written_len = capacity;
+  let mut errmsg_ptr = std::ptr::null_mut();
+
+  crate::ubpf::ubpf_set_region_hints(vm, hints.as_ptr(), hints.len());
+  crate::ubpf::ubpf_set_lazy_local_call_resolver(
+    vm,
+    Some(tls_local_call_resolver),
+    resolver_ids.as_ptr(),
+    resolver_ids.len(),
+  );
+  let ret = crate::ubpf::ubpf_translate_function_ex(
+    vm,
+    buffer,
+    &mut written_len,
+    &mut errmsg_ptr,
+    crate::ubpf::JitMode_ExtendedJitMode,
+    start_pc as u32,
+    end_pc as u32,
+  );
+  crate::ubpf::ubpf_set_region_hints(vm, std::ptr::null(), 0);
+  crate::ubpf::ubpf_set_lazy_local_call_resolver(vm, None, std::ptr::null(), 0);
+
+  let errmsg = if errmsg_ptr.is_null() {
+    String::new()
+  } else {
+    let msg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+    libc::free(errmsg_ptr as _);
+    msg
+  };
+
+  if ret == 0 {
+    Ok(written_len)
+  } else {
+    Err(errmsg)
+  }
+}
+
 fn local_call_target(code: &[u8], pc: usize) -> usize {
   let offset = pc * 8;
   let imm = i32::from_le_bytes([
@@ -1844,6 +1960,7 @@ impl ProgramLoader {
       sections: RefCell::new(sections),
       resolvers: RefCell::new(resolvers),
       next_resolver_id: Cell::new(next_resolver_id),
+      code_exhausted: RefCell::new(None),
     })
   }
 }

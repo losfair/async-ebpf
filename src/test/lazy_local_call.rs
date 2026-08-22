@@ -18,13 +18,14 @@ use std::{
 };
 
 use crate::{
-  error::Error,
+  error::{Error, RuntimeError},
+  helpers::Helper,
   program::{
     DummyProgramEventListener, HelperScope, PreemptionEnabled, Program, ProgramEventListener,
     ProgramLoader, TimesliceConfig, MAX_CALLDATA_SIZE,
   },
   test::raw_elf::{build_elf, Insn},
-  test_util::{gt_env, timeslice_config, TokioTimeslicer},
+  test_util::{compile_ebpf, gt_env, timeslice_config, TokioTimeslicer},
 };
 
 fn load_raw(code: &[Insn], rodata: &[u8]) -> Program {
@@ -339,6 +340,102 @@ async fn lazy_compilation_is_charged_to_the_timeslice() {
   assert!(
     throttles >= 4,
     "expected the throttle budget to bite, got {yields} yields and {throttles} throttles"
+  );
+}
+
+/// Running out of code budget names the budget, rather than surfacing uBPF's
+/// internal "target buffer too small" with nothing pointing at the cause.
+#[tokio::test]
+async fn code_budget_exhaustion_names_the_budget() {
+  let (_, t_env) = gt_env();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_code_size_limit(64 * 1024)
+  .load(
+    &mut rand::thread_rng(),
+    &build_elf(&signature_fanout(7, 4, Carriers::Observed), &[0u8; 8]),
+  )
+  .unwrap()
+  .pin_to_current_thread(t_env);
+
+  match run(&program, &[]).await {
+    Err(Error(RuntimeError::InvalidArgumentOwned(ref msg)))
+      if msg.contains("code budget exhausted")
+        && msg.contains("65536 byte budget")
+        && msg.contains("with_code_size_limit") => {}
+    other => panic!("expected a code budget error, got {other:?}"),
+  }
+  assert!(program.compiled_function_count_for_tests() > 0);
+}
+
+static BUDGET_HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn h_bump(_: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+  BUDGET_HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+  Ok(0)
+}
+
+static BUDGET_HELPERS: &[(&str, Helper)] = &[("bump", h_bump)];
+
+/// Exhausting the budget is terminal for the whole program - the arena never
+/// shrinks, so nothing can be compiled from there on. Later runs must fail
+/// without replaying the program up to the call that cannot be resolved.
+#[tokio::test]
+async fn code_budget_exhaustion_is_terminal() {
+  // A small entry that calls a helper, then a callee too big for the budget.
+  let mut body = String::new();
+  for i in 0..1200u64 {
+    body.push_str(&format!("  acc ^= acc << {}; acc += {i};\n", (i % 13) + 1));
+  }
+  let source = format!(
+    r#"
+  extern int bump(void);
+  static unsigned long long __attribute__((noinline, section("test")))
+  big(unsigned long long acc) {{
+    volatile unsigned long long sink = 0;
+  {body}
+    sink = acc;
+    return sink;
+  }}
+  unsigned long long __attribute__((section("test"))) entry(void) {{
+    bump();
+    return big(1);
+  }}
+  "#
+  );
+
+  let (_, t_env) = gt_env();
+  let binary = compile_ebpf(source.into_bytes()).await.unwrap();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[BUDGET_HELPERS],
+  )
+  .with_code_size_limit(64 * 1024)
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(t_env);
+
+  let before = BUDGET_HELPER_CALLS.load(Ordering::SeqCst);
+  match run(&program, &[]).await {
+    Err(Error(RuntimeError::InvalidArgumentOwned(ref msg)))
+      if msg.contains("code budget exhausted") => {}
+    other => panic!("expected a code budget error, got {other:?}"),
+  }
+  assert_eq!(
+    BUDGET_HELPER_CALLS.load(Ordering::SeqCst),
+    before + 1,
+    "the first run should get as far as the helper call"
+  );
+
+  assert!(run(&program, &[]).await.is_err());
+  assert_eq!(
+    BUDGET_HELPER_CALLS.load(Ordering::SeqCst),
+    before + 1,
+    "a terminal budget failure must not re-execute the program"
   );
 }
 
