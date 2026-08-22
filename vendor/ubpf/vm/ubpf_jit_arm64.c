@@ -106,6 +106,14 @@ static enum Registers VOLATILE_CTXT = R26;
 #define JIT_REGION_UNKNOWN 0
 #define JIT_REGION_STACK 1
 #define JIT_REGION_DATA 2
+// A frame access. This backend does not implement ubpf_set_native_frame_base(),
+// so it has no native frame base to address off and cannot drop the check the
+// way the x86-64 backend does. A frame access is still a stack access, though,
+// so routing it to the single-region stack check keeps it as fast as it was
+// before the hint existed. Implementing it here is a matter of teaching the
+// entry code to hand over a native x23 and adding the fast path; until then this
+// mapping is what keeps the two backends interchangeable.
+#define JIT_REGION_FRAME 3
 
 // Number of eBPF registers
 #define REGISTER_MAP_SIZE 11
@@ -476,7 +484,7 @@ emit_masked_address_with_offset(
         // with a confident hint check only their region. All of these are
         // single-region and use the branchless emit_single_region_address
         // directly.
-        if (store || region_hint == JIT_REGION_STACK) {
+        if (store || region_hint == JIT_REGION_STACK || region_hint == JIT_REGION_FRAME) {
             emit_single_region_address(
                 state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
             return;

@@ -2356,6 +2356,12 @@ ubpf_set_region_hints(struct ubpf_vm* vm, const uint8_t* hints, size_t len)
 }
 
 void
+ubpf_set_native_frame_base(struct ubpf_vm* vm, bool native)
+{
+    vm->native_frame_base = native;
+}
+
+void
 ubpf_set_lazy_local_call_resolver(
     struct ubpf_vm* vm, local_call_resolver_t resolver, const uint32_t* resolver_ids, size_t resolver_ids_len)
 {

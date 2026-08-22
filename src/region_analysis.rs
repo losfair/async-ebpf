@@ -36,6 +36,9 @@
 pub const REGION_UNKNOWN: u8 = 0;
 pub const REGION_STACK: u8 = 1;
 pub const REGION_DATA: u8 = 2;
+/// A displacement off an unmodified frame pointer that provably stays inside
+/// the guest stack. See [`frame_access`].
+pub const REGION_FRAME: u8 = 3;
 
 const NUM_REGS: usize = 11;
 
@@ -294,6 +297,38 @@ fn access_width(opcode: u8) -> usize {
   }
 }
 
+/// Whether `inst`, whose pointer operand is register `base`, is a frame access
+/// the JIT may emit with no bounds check at all.
+///
+/// This is the one hint that removes a runtime check rather than narrowing one,
+/// so the conditions are worth stating in full:
+///
+///  * **The base is `R10` itself**, not a register derived from it. A derived
+///    register holds a *guest* address at run time - the backend hands programs
+///    the guest frame pointer wherever they read `R10` as a value - so its
+///    displacement is not the one a native frame access would use.
+///  * **`R10` still holds the frame pointer.** No instruction can assign it and
+///    the loader refuses every program that tries, but an assignment would show
+///    up here as `Unknown`, so check rather than assume. This is the only part
+///    of the claim the backend cannot re-derive for itself.
+///  * **The access lies in `[R10 - FRAME_WINDOW, R10)`.** That window is inside
+///    the guest stack at every call depth the loader accepts; see
+///    [`crate::program::FRAME_WINDOW`] for the derivation.
+///
+/// Atomics are excluded: a fetching atomic writes its source register, so it is
+/// not purely an access, and the loader refuses the frame-pointer cases anyway.
+fn frame_access(state: &State, inst: &Inst, base: usize) -> bool {
+  if base != R10 || state.regs[R10] != RegKind::Stack(StackKind::Current(Some(0))) {
+    return false;
+  }
+  if inst.opcode & EBPF_CLS_MASK == EBPF_CLS_STX && inst.opcode & 0xe0 == 0xc0 {
+    return false;
+  }
+  let width = access_width(inst.opcode) as i32;
+  let offset = inst.offset as i32;
+  offset >= -(crate::program::FRAME_WINDOW as i32) && offset <= -width
+}
+
 fn stack_access_start(base: RegKind, offset: i16) -> Option<i32> {
   let RegKind::Stack(StackKind::Current(Some(base_off))) = base else {
     return None;
@@ -381,8 +416,16 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
       _ => continue,
     };
     let region = states[pc].regs[base].region();
-    if cls == EBPF_CLS_LDX {
-      hints[pc] = region;
+    let hint = if frame_access(&states[pc], &inst, base) {
+      REGION_FRAME
+    } else {
+      region
+    };
+    // Loads route by region. Stores are confined to the stack by the backend
+    // whatever the hint says, so the only hint that changes anything for them is
+    // the frame one.
+    if cls == EBPF_CLS_LDX || hint == REGION_FRAME {
+      hints[pc] = hint;
     }
     if region == REGION_UNKNOWN {
       unresolved.push(pc);
@@ -460,8 +503,16 @@ pub(crate) fn analyze_function(
       _ => continue,
     };
     let region = states[pc].regs[base].region();
-    if cls == EBPF_CLS_LDX {
-      hints[pc] = region;
+    let hint = if frame_access(&states[pc], &inst, base) {
+      REGION_FRAME
+    } else {
+      region
+    };
+    // Loads route by region. Stores are confined to the stack by the backend
+    // whatever the hint says, so the only hint that changes anything for them is
+    // the frame one.
+    if cls == EBPF_CLS_LDX || hint == REGION_FRAME {
+      hints[pc] = hint;
     }
     if region == REGION_UNKNOWN {
       unresolved.push(pc);

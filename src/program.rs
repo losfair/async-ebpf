@@ -115,13 +115,30 @@ async_ebpf_entry_trampoline:
     push r13
     push r14
     push r15
+    // r15 carries eBPF r10, and it carries the *native* frame pointer rather
+    // than the guest one - see ubpf_set_native_frame_base(). Guest-to-native
+    // translation for the stack region is the affine shift
+    // `native_base - guest_bottom`, so applying it once here to the entry frame
+    // is enough: the backend only ever adds and subtracts frame sizes from r10,
+    // and that commutes with the shift. What it buys is a frame access emitted
+    // as one native instruction instead of a bounds check and a translation.
+    //
+    // rdx is free by here (the guest sees it scrubbed below), so use it to
+    // carry the delta into the frame slot the backend reads when a program
+    // needs the guest value of r10 back. [rax + 16] is
+    // JitMemory::stack_native_base and [rbp - 40] is the backend's
+    // JIT_MEMORY_FRAME_DELTA_OFFSET; both are asserted below.
+    mov rdx, [rax + 16]
+    sub rdx, rcx
     mov r15, rcx
     add r15, r8
+    add r15, rdx
     mov rdi, rsi
     sub rsp, 8
     mov rbp, rsp
-    sub rsp, 32
+    sub rsp, 48
     mov [rbp - 8], rax
+    mov [rbp - 40], rdx
     mov rcx, r9
     mov r11, rdi
     // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
@@ -485,6 +502,18 @@ struct JitMemory {
   data_guest_top: usize,
   data_native_base: usize,
 }
+
+/// The entry trampoline reaches into this layout with literal displacements,
+/// and so does the JIT backend (`JIT_MEMORY_*` in `ubpf_jit_x86_64.c`). Nothing
+/// else ties the three together, so tie them here.
+const _: () = {
+  assert!(std::mem::offset_of!(JitMemory, stack_guest_bottom) == 0);
+  assert!(std::mem::offset_of!(JitMemory, stack_guest_top) == 8);
+  assert!(std::mem::offset_of!(JitMemory, stack_native_base) == 16);
+  assert!(std::mem::offset_of!(JitMemory, data_guest_bottom) == 24);
+  assert!(std::mem::offset_of!(JitMemory, data_guest_top) == 32);
+  assert!(std::mem::offset_of!(JitMemory, data_native_base) == 40);
+};
 
 impl JitMemory {
   fn checked_region(
@@ -1642,6 +1671,11 @@ impl Vm {
     unsafe {
       crate::ubpf::ubpf_toggle_bounds_check(vm.as_ptr(), false);
       crate::ubpf::ubpf_set_jit_pointer_mask_and_offset(vm.as_ptr(), cage.mask(), cage.offset());
+      // Only the x86-64 entry trampoline hands the backend a native frame base;
+      // the arm64 one still starts `x23` at a guest address, and its backend
+      // routes a frame hint to the ordinary single-region stack check.
+      #[cfg(target_arch = "x86_64")]
+      crate::ubpf::ubpf_set_native_frame_base(vm.as_ptr(), true);
     }
     Self(vm)
   }

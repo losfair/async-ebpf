@@ -639,14 +639,25 @@ extern "C"
     ubpf_set_jit_pointer_mask_and_offset(struct ubpf_vm* vm, int32_t mask, size_t offset);
 
     /**
-     * @brief Supply per-instruction load region hints for JIT compilation.
+     * @brief Supply per-instruction memory region hints for JIT compilation.
      *
-     * Each entry corresponds to one eBPF instruction slot and routes a load to
-     * a single guest region (0 = unknown/probe both, 1 = stack, 2 = data). The
-     * hints are only an optimization: a single-region bounds check is always
-     * retained, so an incorrect hint can only cause a spurious fault. The
-     * pointer must remain valid until JIT translation completes; pass NULL to
-     * clear it.
+     * Each entry corresponds to one eBPF instruction slot and routes an access
+     * to a single guest region (0 = unknown/probe both, 1 = stack, 2 = data,
+     * 3 = current frame). Hints 1 and 2 are only an optimization: a
+     * single-region bounds check is always retained, so an incorrect hint can
+     * only cause a spurious fault.
+     *
+     * Hint 3 is different. It asserts that the access is a displacement off an
+     * unmodified frame pointer that provably stays inside the guest stack, and
+     * the backend emits it with *no* bounds check at all. The backend
+     * re-derives the conditions it can see for itself - the base really is R10,
+     * and the displacement lies in [-UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE, -width]
+     * - and falls back to a checked access if any of them fails, so a hint that
+     * is merely wrong about provenance still cannot escape the frame. It is
+     * only honoured when ubpf_set_native_frame_base() is in effect.
+     *
+     * The pointer must remain valid until JIT translation completes; pass NULL
+     * to clear it.
      *
      * @param[in] vm The VM.
      * @param[in] hints Pointer to the hint array (one byte per instruction slot).
@@ -654,6 +665,33 @@ extern "C"
      */
     void
     ubpf_set_region_hints(struct ubpf_vm* vm, const uint8_t* hints, size_t len);
+
+    /**
+     * @brief Declare that the embedder's entry code puts a *native* frame base
+     * in the eBPF R10 register, rather than a guest address.
+     *
+     * Off by default, and meaningful only together with
+     * ubpf_set_jit_pointer_mask_and_offset(). When enabled, the embedder
+     * promises that at entry to JIT-compiled code:
+     *
+     *  - the register mapped to eBPF R10 holds the *native* address of the
+     *    frame, not the guest address; and
+     *  - the frame slot at JIT_MEMORY_FRAME_DELTA_OFFSET below the established
+     *    frame pointer holds `native_base - guest_bottom` for the stack region,
+     *    so the guest value of R10 can be recovered where a program reads it as
+     *    a value rather than as a memory base.
+     *
+     * Guest-to-native translation for the stack is an affine shift, and the
+     * backend's own frame bookkeeping only ever adds and subtracts frame sizes,
+     * so it commutes with translation and needs no changes. What this buys is
+     * region hint 3: a frame access becomes a single native instruction instead
+     * of a bounds check and a translation.
+     *
+     * @param[in] vm The VM.
+     * @param[in] native True if R10 carries a native frame base.
+     */
+    void
+    ubpf_set_native_frame_base(struct ubpf_vm* vm, bool native);
 
     /**
      * @brief Set a size for the buffer allocated to machine code generated during JIT compilation.

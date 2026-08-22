@@ -68,21 +68,33 @@
 // descriptor pointer). SPILL is the transient slot used by
 // emit_single_region_address; ADDR_SPILL / ACC_SPILL hold the guest address and
 // the first region's translated candidate across the branchless dual-region
-// probe. All four (descriptor + three scratch) fit in the 32 bytes reserved
-// below RBP by the prologue.
+// probe.
 #define JIT_MEMORY_SPILL_OFFSET -16
 #define JIT_MEMORY_ADDR_SPILL_OFFSET -24
 #define JIT_MEMORY_ACC_SPILL_OFFSET -32
+// Under ubpf_set_native_frame_base(), the stack region's guest-to-native delta
+// (native_base - guest_bottom), written once by the embedder's entry code. It
+// recovers the guest value of R10 for the instructions that read the frame
+// pointer as a value rather than as a memory base.
+#define JIT_MEMORY_FRAME_DELTA_OFFSET -40
+// Bytes the prologue reserves below RBP for the slots above, rounded up to keep
+// the host stack 16-byte aligned.
+#define JIT_MEMORY_FRAME_RESERVED 48
 
-// Per-load region routing hints (computed by the Rust region analysis and
-// supplied via ubpf_set_region_hints). A load whose pointer provably targets a
-// single region is bounds-checked and translated against only that region; an
-// UNKNOWN load falls back to probing both. Misrouting is safe: the two guest
-// ranges are disjoint and the single-region check is retained, so a wrong hint
-// can only produce a spurious fault, never a cross-region access.
+// Per-access region routing hints (computed by the Rust region analysis and
+// supplied via ubpf_set_region_hints). An access whose pointer provably targets
+// a single region is bounds-checked and translated against only that region; an
+// UNKNOWN access falls back to probing both. Misrouting between STACK and DATA
+// is safe: the two guest ranges are disjoint and the single-region check is
+// retained, so a wrong hint can only produce a spurious fault, never a
+// cross-region access.
+//
+// FRAME is the one hint that removes the check rather than narrowing it, so the
+// backend does not take it on trust - see emit_frame_access_ok.
 #define JIT_REGION_UNKNOWN 0
 #define JIT_REGION_STACK 1
 #define JIT_REGION_DATA 2
+#define JIT_REGION_FRAME 3
 
 enum operand_size
 {
@@ -550,6 +562,100 @@ emit_single_region_address(
     emit_cmov(state, 0x42, dst, scratch); // CMOVB dst, 0
 }
 
+static inline bool
+native_frame_base_active(const struct ubpf_vm* vm)
+{
+    return vm->jit_pointer_mask && vm->native_frame_base;
+}
+
+/* True when `[base + offset]`, `size` bytes wide, is a frame access the backend
+ * can emit with no bounds check at all.
+ *
+ * This is the one place a runtime check is traded for a static argument, so it
+ * is deliberately not a matter of trusting the hint. Three of the four
+ * conditions are re-derived here from the instruction itself:
+ *
+ *  - the embedder declared that R10 carries a native frame base, so `[R15 + k]`
+ *    is a real address rather than a guest one (ubpf_set_native_frame_base);
+ *  - the base register really is the one mapped to eBPF R10 - no other eBPF
+ *    register maps to it, so this is exact;
+ *  - the access ends at or below R10, and starts no more than one local frame
+ *    below it.
+ *
+ * The last two bound the access to [R10 - UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE,
+ * R10). R10 descends exactly one such frame per local call and the loader caps
+ * the call graph at UBPF_MAX_CALL_DEPTH frames, so the embedder sizing its guest
+ * stack to cover that depth plus its calldata is what makes the range provably
+ * mapped at every depth.
+ *
+ * Only the hint's *provenance* claim is taken on faith - that R10 was never
+ * assigned - and a program cannot assign it: every write to R10 is refused at
+ * load. A hint that is wrong anyway still cannot reach outside the frame.
+ */
+static inline bool
+emit_frame_access_ok(const struct ubpf_vm* vm, int region_hint, int base, int32_t offset, int size)
+{
+    if (!native_frame_base_active(vm) || region_hint != JIT_REGION_FRAME) {
+        return false;
+    }
+    if (base != map_register(BPF_REG_10)) {
+        return false;
+    }
+    /* offset + size <= 0 */
+    if (offset > -size) {
+        return false;
+    }
+    if (offset < -(int32_t)UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE) {
+        return false;
+    }
+    return true;
+}
+
+/* Materialize the *guest* value of eBPF R10 into `dst`.
+ *
+ * Under ubpf_set_native_frame_base() the register mapped to R10 holds a native
+ * address, which is what makes a frame access a single instruction - but a
+ * program that reads R10 as a value (`r1 = r10`, `stx [r2], r10`, a comparison)
+ * must still see a guest address, or it would observe a host pointer and could
+ * hand one to a helper. Translation is an affine shift, so undoing it is a
+ * single subtraction from a slot the entry code filled in.
+ */
+static inline void
+emit_guest_frame_pointer(struct jit_state* state, int dst)
+{
+    emit_mov(state, map_register(BPF_REG_10), dst);
+    emit_alu64_mem(state, 0x2B, dst, RBP, JIT_MEMORY_FRAME_DELTA_OFFSET);
+}
+
+/* True when `inst` reads its source register as a value, rather than as a
+ * memory base or as an opcode mode selector.
+ *
+ * Only these need the guest frame pointer materialized: a memory base wants the
+ * native value, which is the whole point of carrying one. `STX` is deliberately
+ * absent even though it does read a value source - emit_masked_store handles it
+ * itself, because the address computation it performs first would clobber the
+ * scratch register the value would be sitting in. */
+static inline bool
+reads_src_as_value(const struct ebpf_inst* inst)
+{
+    switch (inst->opcode & EBPF_CLS_MASK) {
+    case EBPF_CLS_ALU:
+    case EBPF_CLS_ALU64:
+        return (inst->opcode & EBPF_SRC_REG) == EBPF_SRC_REG;
+    case EBPF_CLS_JMP:
+    case EBPF_CLS_JMP32:
+        // CALL and EXIT put a mode selector in the source field rather than a
+        // register number, and JA has no source operand at all.
+        if (inst->opcode == EBPF_OP_CALL || inst->opcode == EBPF_OP_EXIT || inst->opcode == EBPF_OP_JA ||
+            inst->opcode == EBPF_OP_JA32) {
+            return false;
+        }
+        return (inst->opcode & EBPF_SRC_REG) == EBPF_SRC_REG;
+    default:
+        return false;
+    }
+}
+
 static inline void
 emit_masked_address_with_offset(
     const struct ubpf_vm* vm,
@@ -564,7 +670,17 @@ emit_masked_address_with_offset(
 {
     assert(dst != scratch);
 
-    if (src != dst) {
+    if (native_frame_base_active(vm) && src == map_register(BPF_REG_10)) {
+        // Everything below works in guest space: it compares against the guest
+        // bounds and only then translates. Under a native frame base R10 holds a
+        // host address, so recover the guest frame pointer before starting.
+        //
+        // This is the path a frame access takes when Tier F cannot claim it -
+        // a displacement outside the provable window, or an atomic, which is
+        // not purely an access. Two extra instructions on accesses that were
+        // already paying for a full bounds check.
+        emit_guest_frame_pointer(state, dst);
+    } else if (src != dst) {
         emit_mov(state, src, dst);
     }
 
@@ -611,8 +727,14 @@ static inline void
 emit_masked_load(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset, int region_hint)
 {
-    if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, false, region_hint);
+    int width = size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1;
+    /* A proven frame access needs neither a check nor a translation: the base
+     * register already holds a native address and the guest's own displacement
+     * is the native one. */
+    if (emit_frame_access_ok(vm, region_hint, src, offset, width)) {
+        emit_load(state, size, src, dst, offset);
+    } else if (vm->jit_pointer_mask) {
+        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, width, false, region_hint);
         emit_load(state, size, R11, dst, 0);
     } else {
         emit_load(state, size, src, dst, offset);
@@ -623,8 +745,11 @@ static inline void
 emit_masked_load_sx(
     const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset, int region_hint)
 {
-    if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, false, region_hint);
+    int width = size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1;
+    if (emit_frame_access_ok(vm, region_hint, src, offset, width)) {
+        emit_load_sx(state, size, src, dst, offset);
+    } else if (vm->jit_pointer_mask) {
+        emit_masked_address_with_offset(vm, state, src, R11, RCX, offset, width, false, region_hint);
         emit_load_sx(state, size, R11, dst, 0);
     } else {
         emit_load_sx(state, size, src, dst, offset);
@@ -926,10 +1051,32 @@ emit_store(struct jit_state* state, enum operand_size size, int src, int dst, in
 
 static inline void
 emit_masked_store(
-    const struct ubpf_vm* vm, struct jit_state* state, enum operand_size size, int src, int dst, int32_t offset)
+    const struct ubpf_vm* vm,
+    struct jit_state* state,
+    enum operand_size size,
+    int src,
+    int dst,
+    int32_t offset,
+    int region_hint)
 {
-    if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, dst, R11, RCX, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, true, JIT_REGION_UNKNOWN);
+    int width = size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1;
+    /* A program storing R10 stores a pointer, and under a native frame base the
+     * register holds the host one. Recover the guest value - but only after the
+     * address computation below, which uses RCX as its scratch. */
+    bool store_guest_frame_pointer = native_frame_base_active(vm) && src == map_register(BPF_REG_10);
+
+    if (emit_frame_access_ok(vm, region_hint, dst, offset, width)) {
+        if (store_guest_frame_pointer) {
+            emit_guest_frame_pointer(state, RCX);
+            src = RCX;
+        }
+        emit_store(state, size, src, dst, offset);
+    } else if (vm->jit_pointer_mask) {
+        emit_masked_address_with_offset(vm, state, dst, R11, RCX, offset, width, true, region_hint);
+        if (store_guest_frame_pointer) {
+            emit_guest_frame_pointer(state, RCX);
+            src = RCX;
+        }
         emit_store(state, size, src, R11, 0);
     } else {
         emit_store(state, size, src, dst, offset);
@@ -1978,10 +2125,16 @@ emit_masked_store_imm32(
     enum operand_size size,
     int dst,
     int32_t offset,
-    int32_t imm)
+    int32_t imm,
+    int region_hint)
 {
+    int width = size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1;
+    if (emit_frame_access_ok(vm, region_hint, dst, offset, width)) {
+        EMIT_STORE_IMM32(vm, state, size, dst, offset, imm);
+        return;
+    }
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, dst, RCX, R11, offset, size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1, true, JIT_REGION_UNKNOWN);
+        emit_masked_address_with_offset(vm, state, dst, RCX, R11, offset, width, true, JIT_REGION_UNKNOWN);
         if (vm->constant_blinding_enabled) {
             emit_store_imm32_blinded(state, size, RCX, 0, imm);
         } else {
@@ -2076,9 +2229,9 @@ translate_range(
         /* Use given eBPF program stack space */
         emit_mov(state, platform_parameter_registers[2], map_register(BPF_REG_10));
         emit_alu64(state, 0x01, platform_parameter_registers[3], map_register(BPF_REG_10));
-        // Reserve 32 bytes (16-byte aligned) for the descriptor pointer at
-        // [RBP-8] and the three scratch spill slots [RBP-16/-24/-32].
-        emit_alu64_imm32(state, 0x81, 5, RSP, 32);
+        // Reserve space for the descriptor pointer at [RBP-8], the three
+        // scratch spill slots [RBP-16/-24/-32] and the frame delta [RBP-40].
+        emit_alu64_imm32(state, 0x81, 5, RSP, JIT_MEMORY_FRAME_RESERVED);
         emit_store(state, S64, platform_parameter_registers[5], RBP, JIT_MEMORY_FRAME_OFFSET);
     }
 
@@ -2208,6 +2361,20 @@ translate_range(
                 state->jumps, state->num_jumps, fallthrough_jump_source, fallthrough_jump_tgt);
         }
         state->pc_locs[i] = state->offset;
+
+        // Under a native frame base the register mapped to eBPF R10 holds a host
+        // address, so an instruction that reads R10 as a value - an ALU operand,
+        // a comparison, an argument being marshalled for a helper - must see the
+        // guest address instead. Rewrite the operand once, here, rather than at
+        // every site that could name it.
+        //
+        // This has to come *after* pc_locs[i] is recorded: a branch landing on
+        // this instruction has to run the materialization too, or it would read
+        // whatever the scratch register happened to hold.
+        if (native_frame_base_active(vm) && inst.src == BPF_REG_10 && reads_src_as_value(&inst)) {
+            emit_guest_frame_pointer(state, RCX);
+            src = RCX;
+        }
 
         switch (inst.opcode) {
         case EBPF_OP_ADD_IMM:
@@ -2675,29 +2842,29 @@ translate_range(
             break;
 
         case EBPF_OP_STW:
-            emit_masked_store_imm32(vm, state, S32, dst, inst.offset, inst.imm);
+            emit_masked_store_imm32(vm, state, S32, dst, inst.offset, inst.imm, region_hint);
             break;
         case EBPF_OP_STH:
-            emit_masked_store_imm32(vm, state, S16, dst, inst.offset, inst.imm);
+            emit_masked_store_imm32(vm, state, S16, dst, inst.offset, inst.imm, region_hint);
             break;
         case EBPF_OP_STB:
-            emit_masked_store_imm32(vm, state, S8, dst, inst.offset, inst.imm);
+            emit_masked_store_imm32(vm, state, S8, dst, inst.offset, inst.imm, region_hint);
             break;
         case EBPF_OP_STDW:
-            emit_masked_store_imm32(vm, state, S64, dst, inst.offset, inst.imm);
+            emit_masked_store_imm32(vm, state, S64, dst, inst.offset, inst.imm, region_hint);
             break;
 
         case EBPF_OP_STXW:
-            emit_masked_store(vm, state, S32, src, dst, inst.offset);
+            emit_masked_store(vm, state, S32, src, dst, inst.offset, region_hint);
             break;
         case EBPF_OP_STXH:
-            emit_masked_store(vm, state, S16, src, dst, inst.offset);
+            emit_masked_store(vm, state, S16, src, dst, inst.offset, region_hint);
             break;
         case EBPF_OP_STXB:
-            emit_masked_store(vm, state, S8, src, dst, inst.offset);
+            emit_masked_store(vm, state, S8, src, dst, inst.offset, region_hint);
             break;
         case EBPF_OP_STXDW:
-            emit_masked_store(vm, state, S64, src, dst, inst.offset);
+            emit_masked_store(vm, state, S64, src, dst, inst.offset, region_hint);
             break;
 
         case EBPF_OP_LDDW: {
