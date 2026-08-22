@@ -155,10 +155,27 @@ struct jit_state
     int num_loads;
     int num_leas;
     int num_local_calls;
+    /* Allocated entry counts for the four patch tables above. The tables start
+     * out sized for the range being translated and grow on demand; see
+     * reserve_patchable_relatives.
+     */
+    uint32_t jumps_capacity;
+    uint32_t loads_capacity;
+    uint32_t leas_capacity;
+    uint32_t local_calls_capacity;
+    /* Allocated entry count of pc_locs, which is indexed by absolute eBPF PC. */
+    uint32_t pc_locs_capacity;
     uint32_t stack_size;
     size_t bpf_function_prolog_size; // Count of bytes emitted at the start of the function.
 };
 
+/**
+ * @brief Prepare the scratch state for one translation.
+ *
+ * @param[in] num_insts Length in instructions of the eBPF program being
+ * translated. pc_locs is indexed by absolute eBPF PC, so it is sized from this;
+ * the patch tables start empty and grow as they are appended to.
+ */
 int
 initialize_jit_state_result(
     struct jit_state* state,
@@ -166,7 +183,17 @@ initialize_jit_state_result(
     uint8_t* buffer,
     uint32_t size,
     enum JitMode jit_mode,
+    uint32_t num_insts,
     char** errmsg);
+
+/**
+ * @brief Ensure a patch table can hold @p needed entries, growing it if not.
+ *
+ * @retval true The table has room for @p needed entries.
+ * @retval false @p needed exceeds UBPF_MAX_INSTS, or the table could not grow.
+ */
+bool
+reserve_patchable_relatives(struct patchable_relative** table, uint32_t* capacity, int needed);
 
 void
 release_jit_state_result(struct jit_state* state, struct ubpf_jit_result* compile_result);

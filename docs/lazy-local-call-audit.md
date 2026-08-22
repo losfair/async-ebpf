@@ -18,6 +18,10 @@ ordinary tests in `src/test/lazy_local_call.rs`:
 cargo test --features testing lazy_local_call
 ```
 
+Findings 1 and 3 are fixed in this branch; their reproducers now assert the
+fixed behaviour, and the numbers quoted for them below are from before and after
+the fix.
+
 Host used for the reproductions and timings: Linux x86-64, 4 KiB pages,
 `cargo test --release` unless stated otherwise.
 
@@ -47,14 +51,14 @@ callee with different signatures produce two independent native copies.
 
 ## Summary
 
-| # | Finding | Class | Severity |
-|---|---------|-------|----------|
-| 1 | Time spent JIT-compiling is never charged to the timeslice, and cannot be preempted | Availability | Medium |
-| 2 | Callee specialisation is exponential in call depth | Availability | Medium |
-| 3 | Each compiled function pays a fixed ~5.5 MiB / ~2 ms cost independent of its size | Availability | Medium |
-| 4 | Arena exhaustion surfaces as an opaque uBPF error and permanently poisons the program | Robustness | Low |
-| 5 | `require_static_region_analysis` does not gate a callee until the entry function has already run | Robustness | Low |
-| 6 | The call-depth limit does not account for calldata, so the deepest accepted frame under-runs the stack | Robustness | Low |
+| # | Finding | Class | Severity | Status |
+|---|---------|-------|----------|--------|
+| 1 | Time spent JIT-compiling is never charged to the timeslice, and cannot be preempted | Availability | Medium | Fixed |
+| 2 | Callee specialisation is exponential in call depth | Availability | Medium | Open |
+| 3 | Each compiled function pays a fixed ~5.5 MiB / ~2 ms cost independent of its size | Availability | Medium | Fixed |
+| 4 | Arena exhaustion surfaces as an opaque uBPF error and permanently poisons the program | Robustness | Low | Open |
+| 5 | `require_static_region_analysis` does not gate a callee until the entry function has already run | Robustness | Low | Open |
+| 6 | The call-depth limit does not account for calldata, so the deepest accepted frame under-runs the stack | Robustness | Low | Open |
 
 **No memory-safety or confidentiality defect was found in the lazy call
 mechanism itself.** The register discipline, frame accounting, stack alignment,
@@ -64,9 +68,16 @@ checked and how. Findings 1–3 compose: 2 and 3 are the multipliers that turn 1
 from a design remark into several seconds of unyielding CPU from a program of a
 few hundred bytes.
 
-## Finding 1 — compilation time is invisible to the timeslice
+Findings 1 and 3 are fixed in this branch, and their reproducers are now
+regression tests asserting the fixed behaviour. Together they take the worst
+case measured here — 1112 compilations forced by a 576-byte program — from
+2.33 s of unyielding CPU to 23 ms spread across about 1100 yields to the async
+runtime. Findings 2, 4, 5 and 6 remain open; the fix for 3 removes most of their
+practical bite but none of them is closed by it.
 
-`_run` handles a lazy-call dispatch and immediately restarts the loop:
+## Finding 1 — compilation time is invisible to the timeslice (fixed)
+
+`_run` handled a lazy-call dispatch and immediately restarted the loop:
 
 ```rust
 if let Some(resolver_id) = dispatch.lazy_local_call {
@@ -96,13 +107,10 @@ During compilation the PC is in Rust and uBPF's C, so every signal is counted
 and discarded. `strace -c` over a compilation storm shows 325 `tgkill`s
 delivered and no resulting suspension.
 
-**Reproduction** — `lazy_compilation_is_not_charged_to_the_timeslice`. A program
-whose only dispatches are lazy compilations reports zero `did_yield` and zero
-`did_throttle` calls with *both* budgets set to `Duration::ZERO`. An async
-helper call under the same configuration does reach them, which is the contrast.
-
-The scale is what makes this matter. Driving the fan-out of Finding 2 with a
-1 ms tokio heartbeat task running alongside:
+**Original behaviour.** A program whose only dispatches were lazy compilations
+reported zero `did_yield` and zero `did_throttle` calls with *both* budgets set
+to `Duration::ZERO`. Driving the fan-out of Finding 2 with a 1 ms tokio
+heartbeat task running alongside:
 
 ```
 run -> Ok(0) in 720.406943ms; heartbeat ticks during run = 0
@@ -110,12 +118,28 @@ run -> Ok(0) in 720.406943ms; heartbeat ticks during run = 0
 
 720 ms of a `current_thread` runtime, from a 336-byte eBPF program, with the
 heartbeat starved for the whole duration. At the maximum call depth the same
-shape holds the thread for ~2.4 s.
+shape held the thread for ~2.4 s.
 
-Worth noting for anyone reading this as "just make the loop check the budget":
-the check alone is not sufficient. `compile_function` is a single synchronous
-call with no suspension point, so a *single* compilation is still atomic with
-respect to the runtime. Finding 3 is what sets that atom's cost.
+**Fix.** The lazy-call branch no longer short-circuits the loop. It now sits
+alongside the async-preemption and helper branches and falls through to the same
+budget block, and it opts out of the timestamp-free fast path — that fast path
+exists so a helper call does not pay for a `clock_gettime`, which is not a trade
+worth making against a JIT compilation.
+
+Note that the budget check alone would not have been sufficient.
+`compile_function` is a single synchronous call with no suspension point, so one
+compilation is still atomic with respect to the runtime; the budget can only
+interpose *between* compilations. Finding 3 is what sets the size of that atom,
+which is why the two were fixed together.
+
+**Reproduction, now a regression test** —
+`lazy_compilation_is_charged_to_the_timeslice` asserts that the same
+compilation-only program yields roughly once per lazy compilation on a zero
+yield budget, and throttles instead on a zero throttle budget (the throttle
+branch is checked first). `a_compilation_storm_does_not_starve_the_async_runtime`
+asserts the end-to-end property the finding was really about: the 1112-compilation
+program yields over a hundred times and a 1 ms heartbeat task alongside it
+actually runs.
 
 ## Finding 2 — specialisation is exponential in call depth
 
@@ -137,6 +161,9 @@ functions, 42 instructions total:
 levels=4 arity=4 insns=42 -> Ok(0) in 723ms; compiled=341 arena=220300
 ```
 
+(That wall clock is from before Finding 3 was fixed; the same run now takes
+4.8 ms. The compilation count is unchanged — this finding is about the count.)
+
 `function_variant_counts_for_tests()` is `[1, 4, 16, 64, 256]`. Extending to the
 maximum depth:
 
@@ -151,9 +178,9 @@ eBPF. The count is a static property of the program — signatures come from the
 analysis, not from runtime data — so it is fully determined at load time and
 could be bounded there.
 
-## Finding 3 — per-compilation cost is O(`UBPF_MAX_INSTS`), not O(function size)
+## Finding 3 — per-compilation cost is O(`UBPF_MAX_INSTS`), not O(function size) (fixed)
 
-`initialize_jit_state_result` allocates uBPF's scratch tables sized for the
+`initialize_jit_state_result` allocated uBPF's scratch tables sized for the
 maximum program length on *every* translation:
 
 ```c
@@ -170,8 +197,8 @@ function. That design is unremarkable for a whole-program JIT that runs once per
 load. Under the lazy JIT it runs once per `(function, signature)` pair — 1112
 times for the program above.
 
-The cost is measurable and dominant. Same program, same 341 compilations, only
-`UBPF_MAX_INSTS` changed:
+The cost is measurable and dominant. Rebuilding with a smaller
+`UBPF_MAX_INSTS`, same program, same 341 compilations:
 
 | `UBPF_MAX_INSTS` | wall clock |
 |---|---|
@@ -179,17 +206,51 @@ The cost is measurable and dominant. Same program, same 341 compilations, only
 | 4096 | 30 ms |
 
 A 24× difference — about 96% of lazy-compilation time. The remainder is not the
-Rust dataflow analysis (release and debug builds are within 5% of each other,
-2.33 s vs 2.45 s for the depth-7 program) and it is not the `mprotect` pair
+Rust dataflow analysis (release and debug builds were within 5% of each other,
+2.33 s vs 2.45 s for the depth-7 program) and it was not the `mprotect` pair
 either: holding the program fixed and varying `with_code_size_limit` from
-256 KiB to 16 MiB moves the total by less than 5%, and `strace -c` attributes
+256 KiB to 16 MiB moved the total by less than 5%, and `strace -c` attributed
 64 ms to 4164 `mprotect` calls across four runs.
 
-Two smaller allocations scale the same way and are worth mentioning alongside
-it: `compile_function` allocates `vec![0u32; code_bytes.len() / 8]` of resolver
-ids per compilation, and `analyze_function` allocates `Vec<State>`, `reached`
-and `on_list` over the whole *section* rather than the function's range. All
-three are sized by something other than the function actually being compiled.
+**Fix.** `pc_locs` is indexed by absolute eBPF PC and has to be zeroed, so it is
+now sized from `vm->num_insts` rather than `UBPF_MAX_INSTS` — the validator
+already guarantees every branch and call target is below that, so the indexing
+is unchanged. The four patch tables are append-only and only ever hold entries
+for the range being translated, so they now start empty and grow by doubling as
+they are appended to, with `UBPF_MAX_INSTS` kept as the hard ceiling so the
+`TooManyJumps` / `TooManyLoads` / `TooManyLeas` / `TooManyLocalCalls` errors fire
+for exactly the programs they used to.
+
+The growth check also closes a latent hole in the arm64 backend, which appended
+to `state->jumps` and `state->local_calls` with no capacity check at all and
+relied entirely on `UBPF_MAX_INSTS` entries being more than any program could
+need. It is not reachable from this crate — under the function-granular JIT the
+table only ever holds entries for one function — but the bound was load-bearing
+and unenforced, and an over-capacity append is now a clean compile error on both
+backends instead of a heap write.
+
+Measured after the fix, same programs:
+
+| compilations | before | after |
+|---|---|---|
+| 341 (42-instruction program) | 730 ms | 4.8 ms |
+| 1112 (72-instruction program) | 2.33 s | 23.3 ms |
+
+Per compilation that is ~21 µs, down from ~2.1 ms.
+
+None of this touches an emit path, so the generated code is unchanged. CoreMark
+is the end-to-end check: it is large, branch-heavy and full of local calls, so
+it exercises the growth path well past the initial capacity, and its CRCs verify
+every patched branch target. Before and after the fix it reports the same
+`crclist 0xe714 / crcmatrix 0x1fd7 / crcstate 0x8e3a` and the same steady-state
+throughput (5272 vs 5288 iterations/s over three runs each, i.e. noise).
+
+Two smaller allocations still scale with something other than the function being
+compiled, and are left alone for now: `compile_function` allocates
+`vec![0u32; code_bytes.len() / 8]` of resolver ids per compilation, and
+`analyze_function` allocates `Vec<State>`, `reached` and `on_list` over the whole
+*section* rather than the function's range. Both are O(section) rather than
+O(`UBPF_MAX_INSTS`), so they no longer dominate.
 
 ## Finding 4 — arena exhaustion is opaque and permanent
 
@@ -223,6 +284,9 @@ compiled and still runs, every later invocation re-executes the whole prefix
 pad=24 insns=264 -> Err("ubpf: code translation failed: Target buffer too small")
                     in 2.39s; compiled=1091 failed=1 arena=1048303
 ```
+
+(Again a pre-Finding-3 wall clock; the arena still fills at the same point, it
+just gets there in about 30 ms now.)
 
 and with `with_code_size_limit(64 * 1024)`, three consecutive runs all reach the
 same point and fail the same way, with `arena` pinned at 65530 of 65536.

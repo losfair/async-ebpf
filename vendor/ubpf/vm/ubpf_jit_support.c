@@ -61,6 +61,44 @@ static void ensure_seed_initialized(void)
 }
 #endif
 
+/* Entry count a patch table jumps to on its first growth. */
+#define UBPF_PATCH_TABLE_MIN_ENTRIES 16
+
+bool
+reserve_patchable_relatives(struct patchable_relative** table, uint32_t* capacity, int needed)
+{
+    if (needed <= 0) {
+        return true;
+    }
+    if ((uint32_t)needed <= *capacity) {
+        return true;
+    }
+    /* UBPF_MAX_INSTS was the fixed size of these tables before they grew on
+     * demand; keeping it as the ceiling means the "too many ..." errors still
+     * trigger for exactly the programs they used to.
+     */
+    if ((uint32_t)needed > UBPF_MAX_INSTS) {
+        return false;
+    }
+
+    uint32_t next = *capacity ? *capacity : UBPF_PATCH_TABLE_MIN_ENTRIES;
+    while (next < (uint32_t)needed) {
+        next *= 2;
+    }
+    if (next > UBPF_MAX_INSTS) {
+        next = UBPF_MAX_INSTS;
+    }
+
+    struct patchable_relative* grown = realloc(*table, (size_t)next * sizeof(**table));
+    if (!grown) {
+        return false;
+    }
+    memset(grown + *capacity, 0, ((size_t)next - *capacity) * sizeof(**table));
+    *table = grown;
+    *capacity = next;
+    return true;
+}
+
 int
 initialize_jit_state_result(
     struct jit_state* state,
@@ -68,6 +106,7 @@ initialize_jit_state_result(
     uint8_t* buffer,
     uint32_t size,
     enum JitMode jit_mode,
+    uint32_t num_insts,
     char** errmsg)
 {
     compile_result->compile_result = UBPF_JIT_COMPILE_FAILURE;
@@ -78,11 +117,25 @@ initialize_jit_state_result(
     state->offset = 0;
     state->size = size;
     state->buf = buffer;
-    state->pc_locs = calloc(UBPF_MAX_INSTS + 1, sizeof(state->pc_locs[0]));
-    state->jumps = calloc(UBPF_MAX_INSTS, sizeof(state->jumps[0]));
-    state->loads = calloc(UBPF_MAX_INSTS, sizeof(state->loads[0]));
-    state->leas = calloc(UBPF_MAX_INSTS, sizeof(state->leas[0]));
-    state->local_calls = calloc(UBPF_MAX_INSTS, sizeof(state->local_calls[0]));
+    /* pc_locs is indexed by absolute eBPF PC and must be zeroed, so it is sized
+     * for the whole program. The four patch tables below are append-only and
+     * only ever hold entries for the range actually being translated, so they
+     * start empty and grow as they are used. Sizing all five for a
+     * maximum-length program - which is what this used to do - allocates and
+     * zeroes several megabytes of scratch space, a cost the function-granular
+     * JIT would otherwise pay once per compiled function rather than once per
+     * loaded program.
+     */
+    state->pc_locs_capacity = num_insts + 1;
+    state->pc_locs = calloc(state->pc_locs_capacity, sizeof(state->pc_locs[0]));
+    state->jumps = NULL;
+    state->loads = NULL;
+    state->leas = NULL;
+    state->local_calls = NULL;
+    state->jumps_capacity = 0;
+    state->loads_capacity = 0;
+    state->leas_capacity = 0;
+    state->local_calls_capacity = 0;
     state->num_jumps = 0;
     state->num_loads = 0;
     state->num_leas = 0;
@@ -91,7 +144,7 @@ initialize_jit_state_result(
     state->jit_mode = jit_mode;
     state->bpf_function_prolog_size = 0;
 
-    if (!state->pc_locs || !state->jumps || !state->loads || !state->leas) {
+    if (!state->pc_locs) {
         *errmsg = ubpf_error("Could not allocate space needed to JIT compile eBPF program");
         return -1;
     }
@@ -113,6 +166,11 @@ release_jit_state_result(struct jit_state* state, struct ubpf_jit_result* compil
     state->leas = NULL;
     free(state->local_calls);
     state->local_calls = NULL;
+    state->pc_locs_capacity = 0;
+    state->jumps_capacity = 0;
+    state->loads_capacity = 0;
+    state->leas_capacity = 0;
+    state->local_calls_capacity = 0;
 }
 
 void
@@ -127,12 +185,20 @@ emit_patchable_relative(struct patchable_relative* table,
 void
 note_load(struct jit_state* state, struct PatchableTarget target)
 {
+    if (!reserve_patchable_relatives(&state->loads, &state->loads_capacity, state->num_loads + 1)) {
+        state->jit_status = TooManyLoads;
+        return;
+    }
     emit_patchable_relative(state->loads, state->offset, target, state->num_loads++);
 }
 
 void
 note_lea(struct jit_state* state, struct PatchableTarget target)
 {
+    if (!reserve_patchable_relatives(&state->leas, &state->leas_capacity, state->num_leas + 1)) {
+        state->jit_status = TooManyLeas;
+        return;
+    }
     emit_patchable_relative(state->leas, state->offset, target, state->num_leas++);
 }
 

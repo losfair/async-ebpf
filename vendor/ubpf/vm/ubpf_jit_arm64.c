@@ -613,14 +613,23 @@ emit_unconditionalbranch_immediate(
     struct jit_state* state, enum UnconditionalBranchImmediateOpcode op, struct PatchableTarget target)
 {
     uint32_t source_offset = state->offset;
-    struct patchable_relative* table = state->jumps;
+    struct patchable_relative** table = &state->jumps;
+    uint32_t* capacity = &state->jumps_capacity;
     int* num_jumps = &state->num_jumps;
+    enum JitProgress overflow_status = TooManyJumps;
     if (op == UBR_BL && !target.is_special) {
-        table = state->local_calls;
+        table = &state->local_calls;
+        capacity = &state->local_calls_capacity;
         num_jumps = &state->num_local_calls;
+        overflow_status = TooManyLocalCalls;
     }
 
-    emit_patchable_relative(table, state->offset, target, (*num_jumps)++);
+    if (!reserve_patchable_relatives(table, capacity, *num_jumps + 1)) {
+        state->jit_status = overflow_status;
+        return source_offset;
+    }
+
+    emit_patchable_relative(*table, state->offset, target, (*num_jumps)++);
     emit_instruction(state, op);
 
     return source_offset;
@@ -658,6 +667,10 @@ static uint32_t
 emit_conditionalbranch_immediate(struct jit_state* state, enum Condition cond, struct PatchableTarget target)
 {
     uint32_t source_offset = state->offset;
+    if (!reserve_patchable_relatives(&state->jumps, &state->jumps_capacity, state->num_jumps + 1)) {
+        state->jit_status = TooManyJumps;
+        return source_offset;
+    }
     emit_patchable_relative(state->jumps, state->offset, target, state->num_jumps++);
     emit_instruction(state, BR_Bcond | (0 << 5) | cond);
     return source_offset;
@@ -2292,7 +2305,8 @@ ubpf_translate_arm64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum Jit
     struct jit_state state;
     struct ubpf_jit_result compile_result;
 
-    if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+    if (initialize_jit_state_result(
+            &state, &compile_result, buffer, *size, jit_mode, vm->num_insts, &compile_result.errmsg) < 0) {
         goto out;
     }
 
@@ -2333,7 +2347,8 @@ ubpf_translate_function_arm64(
     struct jit_state state;
     struct ubpf_jit_result compile_result;
 
-    if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+    if (initialize_jit_state_result(
+            &state, &compile_result, buffer, *size, jit_mode, vm->num_insts, &compile_result.errmsg) < 0) {
         goto out;
     }
 

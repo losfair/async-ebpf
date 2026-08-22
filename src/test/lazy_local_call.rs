@@ -284,22 +284,30 @@ impl ProgramEventListener for CountingEventListener {
   }
 }
 
-async fn count_events(
-  binary: &[u8],
-  helpers: &[&'static [(&'static str, Helper)]],
-) -> (usize, usize) {
+/// Yield at every opportunity; never throttle.
+const ZERO_YIELD_BUDGET: TimesliceConfig = TimesliceConfig {
+  max_run_time_before_yield: Duration::ZERO,
+  max_run_time_before_throttle: Duration::from_secs(3600),
+  throttle_duration: Duration::from_millis(1),
+};
+
+/// Throttle at every opportunity. The throttle branch is checked first, so this
+/// wins over the yield branch.
+const ZERO_THROTTLE_BUDGET: TimesliceConfig = TimesliceConfig {
+  max_run_time_before_yield: Duration::ZERO,
+  max_run_time_before_throttle: Duration::ZERO,
+  throttle_duration: Duration::ZERO,
+};
+
+/// Runs `code` under `timeslice`, reporting how many times the run loop yielded
+/// and throttled alongside the program itself.
+async fn count_events(code: &[Insn], timeslice: TimesliceConfig) -> (Program, usize, usize) {
   let (_, t_env) = gt_env();
   let events = Arc::new(CountingEventListener::default());
-  let program = ProgramLoader::new(&mut rand::thread_rng(), events.clone(), helpers)
-    .load(&mut rand::thread_rng(), binary)
+  let program = ProgramLoader::new(&mut rand::thread_rng(), events.clone(), &[])
+    .load(&mut rand::thread_rng(), &build_elf(code, &[0u8; 8]))
     .unwrap()
     .pin_to_current_thread(t_env);
-  // Zero budgets: the run loop should yield and throttle at every opportunity.
-  let timeslice = TimesliceConfig {
-    max_run_time_before_yield: Duration::ZERO,
-    max_run_time_before_throttle: Duration::ZERO,
-    throttle_duration: Duration::from_millis(1),
-  };
   let mut resources: [&mut dyn Any; 0] = [];
   program
     .run(
@@ -312,61 +320,68 @@ async fn count_events(
     )
     .await
     .unwrap();
-  (
-    events.yields.load(Ordering::SeqCst),
-    events.throttles.load(Ordering::SeqCst),
-  )
+  let yields = events.yields.load(Ordering::SeqCst);
+  let throttles = events.throttles.load(Ordering::SeqCst);
+  (program, yields, throttles)
 }
 
-/// Time spent JIT-compiling a callee is never charged to the timeslice: the
-/// run loop resumes the guest directly after a lazy compilation instead of
-/// falling through to the yield and throttle checks. An async helper call on
-/// the same zero budgets does reach them, which is the contrast.
+/// Time spent JIT-compiling a callee is guest-triggered work of unbounded size,
+/// so it is charged to the run budget like any other dispatch. It also has to
+/// bypass the timestamp-free fast path, which exists so that a helper call does
+/// not pay for a clock read - not a trade worth making against a compilation.
 #[tokio::test]
-async fn lazy_compilation_is_not_charged_to_the_timeslice() {
-  let lazy = build_elf(&signature_fanout(2, 2, 0), &[0u8; 8]);
-  let (yields, throttles) = count_events(&lazy, &[]).await;
-  assert_eq!(
-    (yields, throttles),
-    (0, 0),
-    "lazy compilations bypass the timeslice accounting entirely"
-  );
-
-  let helper = compile_ebpf(
-    br#"
-  extern int return_7_async(void);
-  int __attribute__((section("test"))) entry(void) {
-    // The first dispatch only seeds the budget clocks; later ones can expire.
-    return return_7_async() + return_7_async() + return_7_async();
-  }
-  "#
-    .to_vec(),
-  )
-  .await
-  .unwrap();
-  let (yields, throttles) = count_events(&helper, &[ASYNC_HELPERS]).await;
+async fn lazy_compilation_is_charged_to_the_timeslice() {
+  // Three functions, seven specialisations: one is compiled eagerly as the
+  // entry point and the other six are lazy-call dispatches.
+  let (program, yields, throttles) =
+    count_events(&signature_fanout(2, 2, 0), ZERO_YIELD_BUDGET).await;
+  assert_eq!(program.compiled_function_count_for_tests(), 7);
   assert!(
-    yields > 0 || throttles > 0,
-    "a helper dispatch on a zero budget should yield or throttle"
+    yields >= 4,
+    "expected roughly one yield per lazy compilation, got {yields} yields and \
+     {throttles} throttles"
+  );
+
+  // The throttle budget is checked first, so the same program on a zero
+  // throttle budget throttles instead of yielding.
+  let (_, yields, throttles) = count_events(&signature_fanout(2, 2, 0), ZERO_THROTTLE_BUDGET).await;
+  assert!(
+    throttles >= 4,
+    "expected the throttle budget to bite, got {yields} yields and {throttles} throttles"
   );
 }
 
-fn h_return_7_async(
-  scope: &HelperScope,
-  _: u64,
-  _: u64,
-  _: u64,
-  _: u64,
-  _: u64,
-) -> Result<u64, ()> {
-  scope.post_task(async move {
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    |_: &HelperScope| Ok(7)
+/// The end-to-end property: a program that forces a long chain of compilations
+/// no longer holds the thread for the whole chain. Before compilation was
+/// charged to the budget, a 1 ms heartbeat task alongside this run was starved
+/// for its entire duration.
+#[tokio::test(flavor = "current_thread")]
+async fn a_compilation_storm_does_not_starve_the_async_runtime() {
+  let ticks = Arc::new(AtomicUsize::new(0));
+  let counter = ticks.clone();
+  let heartbeat = tokio::spawn(async move {
+    loop {
+      tokio::time::sleep(Duration::from_millis(1)).await;
+      counter.fetch_add(1, Ordering::SeqCst);
+    }
   });
-  Ok(0)
-}
+  tokio::time::sleep(Duration::from_millis(5)).await;
+  let before = ticks.load(Ordering::SeqCst);
 
-static ASYNC_HELPERS: &[(&str, Helper)] = &[("return_7_async", h_return_7_async)];
+  let (program, yields, _) = count_events(&signature_fanout(7, 4, 0), ZERO_YIELD_BUDGET).await;
+  let during = ticks.load(Ordering::SeqCst) - before;
+  heartbeat.abort();
+
+  assert_eq!(program.compiled_function_count_for_tests(), 1112);
+  assert!(
+    yields > 100,
+    "expected the run to yield repeatedly, got {yields}"
+  );
+  assert!(
+    during > 0,
+    "the heartbeat task was starved for the whole run"
+  );
+}
 
 /// The resolver is a full host call - it suspends the guest, runs the region
 /// analysis and re-`mprotect`s the code arena - and the callee is entered from
@@ -409,4 +424,28 @@ async fn a_lazy_call_leaks_nothing_into_the_callees_registers() {
     vec![1, 1],
     "both call sites must share one specialisation, so one call is cached"
   );
+}
+
+/// The JIT's jump/load/lea patch tables are no longer preallocated for a
+/// maximum-length program; they start empty and grow as a function is
+/// translated. A function with far more branches than the initial capacity
+/// exercises that growth, and a table that moved without its entries following
+/// would land a branch somewhere other than the instruction after it.
+#[tokio::test]
+async fn a_branch_heavy_function_grows_the_jit_patch_tables() {
+  const BRANCHES: usize = 300;
+
+  // Each `jeq r0, 0` is taken (R0 is zero at entry) and skips the `exit` behind
+  // it, so control reaches the tail only if every one of the 300 branch targets
+  // was patched correctly. Any mispatch lands on an `exit` and returns 0.
+  let mut code: Vec<Insn> = Vec::new();
+  for _ in 0..BRANCHES {
+    code.push(Insn::raw(0x15, 0, 0, 1, 0));
+    code.push(Insn::exit());
+  }
+  code.push(Insn::mov64_imm(0, 42));
+  code.push(Insn::exit());
+
+  let program = load_raw(&code, &[]);
+  assert_eq!(run(&program, &[]).await.unwrap(), 42);
 }
