@@ -241,10 +241,43 @@ async_ebpf_entry_trampoline:
     stp x23, x24, [sp, #32]
     stp x25, x26, [sp, #48]
     mov x29, sp
+    // x23 carries eBPF r10, and it carries the *native* frame pointer rather
+    // than the guest one - see ubpf_set_native_frame_base(). Guest-to-native
+    // translation for the stack region is the affine shift
+    // `native_base - guest_bottom`, so applying it once here to the entry frame
+    // is enough: the backend only ever adds and subtracts frame sizes from r10,
+    // and that commutes with the shift.
+    ldr x7, [x6, #16]
+    sub x7, x7, x3
     add x23, x3, x4
+    add x23, x23, x7
     mov x0, x1
-    sub sp, sp, #16
+    sub sp, sp, #160
     str x6, [x29, #-8]
+    // The delta that recovers the guest value of r10 where a program reads it
+    // as a value rather than as a memory base.
+    str x7, [x29, #-40]
+    // The twelve derived bounds-check constants, copied from JitMemory::derived
+    // into [x29-136, x29-40) where the backend reads them off the frame pointer
+    // without a descriptor load. See ubpf_set_frame_constants().
+    ldp x7, x16, [x6, #48]
+    stp x7, x16, [x29, #-136]
+    ldp x7, x16, [x6, #64]
+    stp x7, x16, [x29, #-120]
+    ldp x7, x16, [x6, #80]
+    stp x7, x16, [x29, #-104]
+    ldp x7, x16, [x6, #96]
+    stp x7, x16, [x29, #-88]
+    ldp x7, x16, [x6, #112]
+    stp x7, x16, [x29, #-72]
+    ldp x7, x16, [x6, #128]
+    stp x7, x16, [x29, #-56]
+    // The access-group base slot. The backend only reads it after emitting the
+    // leader that writes it; zeroing turns any hole in that reasoning into a
+    // fault at page 0 rather than a dereference of stale host stack.
+    str xzr, [x29, #-144]
+    mov x7, xzr
+    mov x16, xzr
     mov x26, x0
     // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
     // x5/x0-x4/x19-x23) except r1 (ctx) and r10 (frame pointer), plus the
@@ -1805,10 +1838,8 @@ impl Vm {
     unsafe {
       crate::ubpf::ubpf_toggle_bounds_check(vm.as_ptr(), false);
       crate::ubpf::ubpf_set_jit_pointer_mask_and_offset(vm.as_ptr(), cage.mask(), cage.offset());
-      // Only the x86-64 entry trampoline hands the backend a native frame base;
-      // the arm64 one still starts `x23` at a guest address, and its backend
-      // routes a frame hint to the ordinary single-region stack check.
-      #[cfg(target_arch = "x86_64")]
+      // Both entry trampolines establish the frame these describe.
+      #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
       {
         crate::ubpf::ubpf_set_native_frame_base(vm.as_ptr(), true);
         crate::ubpf::ubpf_set_frame_constants(vm.as_ptr(), true);

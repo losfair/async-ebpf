@@ -107,6 +107,32 @@ static enum Registers VOLATILE_CTXT = R26;
 #define JIT_MEMORY_DATA_NATIVE_BASE 40
 #define JIT_MEMORY_FRAME_OFFSET -8
 
+// Scratch slots in the reserved frame area, mirroring the x86-64 backend so the
+// embedder's entry code lays out one frame for both.
+#define JIT_MEMORY_ADDR_SPILL_OFFSET -24
+#define JIT_MEMORY_ACC_SPILL_OFFSET -32
+// Under ubpf_set_native_frame_base(), the stack region's guest-to-native delta
+// (native_base - guest_bottom), written once by the embedder's entry code. It
+// recovers the guest value of R10 for the instructions that read the frame
+// pointer as a value rather than as a memory base.
+#define JIT_MEMORY_FRAME_DELTA_OFFSET -40
+// Under ubpf_set_frame_constants(), the twelve derived bounds-check values; see
+// ubpf_set_frame_constants() for the order.
+#define JIT_DERIVED_SLOTS 12
+#define JIT_DERIVED_SLOT(i) (-136 + (i) * 8)
+#define JIT_DERIVED_STACK_BOTTOM JIT_DERIVED_SLOT(0)
+#define JIT_DERIVED_STACK_DELTA JIT_DERIVED_SLOT(1)
+#define JIT_DERIVED_STACK_SPAN JIT_DERIVED_SLOT(2)
+#define JIT_DERIVED_DATA_BOTTOM JIT_DERIVED_SLOT(6)
+#define JIT_DERIVED_DATA_DELTA JIT_DERIVED_SLOT(7)
+#define JIT_DERIVED_DATA_SPAN JIT_DERIVED_SLOT(8)
+// Under ubpf_set_access_plan(), the native base an access group's leader
+// checked, which its members address off.
+#define JIT_MEMORY_GROUP_BASE_OFFSET -144
+// Bytes the embedder's entry code reserves below the frame pointer for all of
+// the above. A multiple of 16, as AArch64 requires of SP.
+#define JIT_MEMORY_FRAME_RESERVED 160
+
 // Per-load region routing hints (computed by the Rust region analysis and
 // supplied via ubpf_set_region_hints). A load whose pointer provably targets a
 // single region is bounds-checked and translated against only that region; an
@@ -116,13 +142,8 @@ static enum Registers VOLATILE_CTXT = R26;
 #define JIT_REGION_UNKNOWN 0
 #define JIT_REGION_STACK 1
 #define JIT_REGION_DATA 2
-// A frame access. This backend does not implement ubpf_set_native_frame_base(),
-// so it has no native frame base to address off and cannot drop the check the
-// way the x86-64 backend does. A frame access is still a stack access, though,
-// so routing it to the single-region stack check keeps it as fast as it was
-// before the hint existed. Implementing it here is a matter of teaching the
-// entry code to hand over a native x23 and adding the fast path; until then this
-// mapping is what keeps the two backends interchangeable.
+// A displacement off an unmodified frame pointer that provably stays inside the
+// guest stack. Emitted with no bounds check at all; see emit_frame_access_ok.
 #define JIT_REGION_FRAME 3
 
 // Number of eBPF registers
@@ -160,6 +181,20 @@ map_register(int r)
 {
     assert(r < REGISTER_MAP_SIZE);
     return register_map[r % REGISTER_MAP_SIZE];
+}
+
+/* Return the eBPF register mapped to a given Arm64 register, or -1 if none is.
+ * The map is injective, so this is exact. */
+static int
+unmap_register(enum Registers native)
+{
+    int r;
+    for (r = 0; r < REGISTER_MAP_SIZE; r++) {
+        if (register_map[r] == native) {
+            return r;
+        }
+    }
+    return -1;
 }
 
 /* Some forward declarations.  */
@@ -453,6 +488,209 @@ emit_single_region_address(
     emit_conditionalselect(state, dst, translated, RZ, COND_HS); // dst = valid ? translated : 0
 }
 
+
+static bool
+native_frame_base_active(const struct ubpf_vm* vm)
+{
+    return vm->jit_pointer_mask && vm->native_frame_base;
+}
+
+/* True when `[base + offset]`, `size` bytes wide, is a frame access the backend
+ * can emit with no bounds check at all.
+ *
+ * The reasoning is the x86-64 backend's, and so is the deliberate refusal to
+ * take the hint on trust: the base really being R10, and the access ending at or
+ * below it and starting no more than one local frame below, are re-derived here
+ * from the instruction itself. Only the claim that R10 was never assigned comes
+ * from the analysis, and a program cannot assign it - every write is refused at
+ * load. */
+static bool
+emit_frame_access_ok(const struct ubpf_vm* vm, int region_hint, enum Registers base, int16_t offset, int size)
+{
+    if (!native_frame_base_active(vm) || region_hint != JIT_REGION_FRAME) {
+        return false;
+    }
+    if (base != map_register(10)) {
+        return false;
+    }
+    if (offset > -size) {
+        return false;
+    }
+    if (offset < -(int32_t)UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE) {
+        return false;
+    }
+    /* The unscaled load/store form this turns into reaches -256 only. */
+    return offset >= -256;
+}
+
+/* Materialize the *guest* value of eBPF R10 into `dst`.
+ *
+ * Under a native frame base the register mapped to R10 holds a host address,
+ * which is what makes a frame access a single instruction - but a program that
+ * reads R10 as a value must still see a guest address, or it would observe a
+ * host pointer and could hand one to a helper. */
+static void
+emit_guest_frame_pointer(struct jit_state* state, enum Registers dst, enum Registers scratch)
+{
+    emit_loadstore_immediate(state, LS_LDRX, scratch, R29, JIT_MEMORY_FRAME_DELTA_OFFSET);
+    emit_addsub_register(state, true, AS_SUB, dst, map_register(10), scratch);
+}
+
+/* True when `inst` reads its source register as a value rather than as a memory
+ * base or an opcode mode selector. Stores are absent deliberately: the store
+ * path handles its own value operand, after the address is formed. */
+static bool
+reads_src_as_value(const struct ebpf_inst* inst)
+{
+    switch (inst->opcode & EBPF_CLS_MASK) {
+    case EBPF_CLS_ALU:
+    case EBPF_CLS_ALU64:
+        return (inst->opcode & EBPF_SRC_REG) == EBPF_SRC_REG;
+    case EBPF_CLS_JMP:
+    case EBPF_CLS_JMP32:
+        if (inst->opcode == EBPF_OP_CALL || inst->opcode == EBPF_OP_EXIT || inst->opcode == EBPF_OP_JA ||
+            inst->opcode == EBPF_OP_JA32) {
+            return false;
+        }
+        return (inst->opcode & EBPF_SRC_REG) == EBPF_SRC_REG;
+    default:
+        return false;
+    }
+}
+
+/* eBPF registers `inst` may overwrite; used to close an access group whose base
+ * is redefined under it. Over-approximating only ends groups early. */
+static uint16_t
+written_registers_mask(const struct ebpf_inst* inst)
+{
+    switch (inst->opcode & EBPF_CLS_MASK) {
+    case EBPF_CLS_LD:
+    case EBPF_CLS_LDX:
+    case EBPF_CLS_ALU:
+    case EBPF_CLS_ALU64:
+        return (uint16_t)(1u << inst->dst);
+    case EBPF_CLS_STX:
+        if ((inst->opcode & 0xe0) == 0xc0) {
+            return (uint16_t)((1u << inst->src) | 1u);
+        }
+        return 0;
+    case EBPF_CLS_JMP:
+    case EBPF_CLS_JMP32:
+        return inst->opcode == EBPF_OP_CALL ? 0x3f : 0;
+    default:
+        return 0;
+    }
+}
+
+/* Index of the span slot for an access `size` bytes wide. */
+static int
+span_slot_index(int size)
+{
+    switch (size) {
+    case 1:
+        return 0;
+    case 2:
+        return 1;
+    case 4:
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+/* The same check as emit_single_region_address, reading the region's bounds from
+ * the frame constants the embedder derived once per invocation rather than
+ * rebuilding them from the descriptor at every access.
+ *
+ * It also folds the two bounds into one unsigned comparison the way the x86-64
+ * backend does - with `off = guest - bottom`, the access is in range exactly
+ * when `off <= (top - width) - bottom` - which the descriptor version cannot do
+ * because it would have to compute the span first anyway. Seven instructions,
+ * three of them frame loads, and no descriptor indirection. */
+static void
+emit_single_region_address_from_frame(
+    struct jit_state* state,
+    enum Registers dst,
+    enum Registers scratch,
+    int size,
+    int bottom_slot,
+    int delta_slot,
+    int span_base)
+{
+    enum Registers off = temp_register;
+    const int COND_HS = 2; // unsigned >=
+
+    emit_loadstore_immediate(state, LS_LDRX, scratch, R29, bottom_slot);
+    emit_addsub_register(state, true, AS_SUB, off, dst, scratch);
+
+    // Translate unconditionally; the CSEL below undoes it when out of range.
+    emit_loadstore_immediate(state, LS_LDRX, scratch, R29, delta_slot);
+    emit_addsub_register(state, true, AS_ADD, dst, dst, scratch);
+
+    if (size == 1 || size == 2 || size == 4 || size == 8) {
+        emit_loadstore_immediate(state, LS_LDRX, scratch, R29, span_base + span_slot_index(size) * 8);
+    } else {
+        // An access group checks a whole window at once, which is any width up
+        // to a page rather than one of the four the precomputed spans cover.
+        // Narrow the width-1 span instead: (top - 1) - bottom - (size - 1) is
+        // the same (top - size) - bottom.
+        emit_loadstore_immediate(state, LS_LDRX, scratch, R29, span_base + span_slot_index(1) * 8);
+        emit_addsub_immediate(state, true, AS_SUB, scratch, scratch, (uint32_t)(size - 1));
+    }
+
+    // HS iff span >= off, i.e. iff in range.
+    emit_addsub_register(state, true, AS_SUBS, RZ, scratch, off);
+    emit_conditionalselect(state, dst, dst, RZ, COND_HS);
+}
+
+/* Where one guest region's bounds can be found: in the memory descriptor, and -
+ * when the embedder supplies them - in the frame constants. */
+struct guest_region
+{
+    int desc_bottom;
+    int desc_top;
+    int desc_native_base;
+    int slot_bottom;
+    int slot_delta;
+    int slot_span;
+};
+
+static const struct guest_region guest_stack_region = {
+    JIT_MEMORY_STACK_GUEST_BOTTOM,
+    JIT_MEMORY_STACK_GUEST_TOP,
+    JIT_MEMORY_STACK_NATIVE_BASE,
+    JIT_DERIVED_STACK_BOTTOM,
+    JIT_DERIVED_STACK_DELTA,
+    JIT_DERIVED_STACK_SPAN,
+};
+
+static const struct guest_region guest_data_region = {
+    JIT_MEMORY_DATA_GUEST_BOTTOM,
+    JIT_MEMORY_DATA_GUEST_TOP,
+    JIT_MEMORY_DATA_NATIVE_BASE,
+    JIT_DERIVED_DATA_BOTTOM,
+    JIT_DERIVED_DATA_DELTA,
+    JIT_DERIVED_DATA_SPAN,
+};
+
+static void
+emit_region_address(
+    const struct ubpf_vm* vm,
+    struct jit_state* state,
+    enum Registers dst,
+    enum Registers scratch,
+    int size,
+    const struct guest_region* region)
+{
+    if (vm->frame_constants) {
+        emit_single_region_address_from_frame(
+            state, dst, scratch, size, region->slot_bottom, region->slot_delta, region->slot_span);
+    } else {
+        emit_single_region_address(
+            state, dst, scratch, size, region->desc_bottom, region->desc_top, region->desc_native_base);
+    }
+}
+
 static void
 emit_masked_address_with_offset(
     const struct ubpf_vm* vm,
@@ -467,7 +705,12 @@ emit_masked_address_with_offset(
 {
     assert(dst != scratch);
 
-    if (src != dst) {
+    if (native_frame_base_active(vm) && src == map_register(10)) {
+        // Everything below works in guest space: it compares against the guest
+        // bounds and only then translates. Under a native frame base R10 holds a
+        // host address, so recover the guest frame pointer before starting.
+        emit_guest_frame_pointer(state, dst, scratch);
+    } else if (src != dst) {
         emit_logical_register(state, true, LOG_ORR, dst, RZ, src);
     }
 
@@ -495,13 +738,11 @@ emit_masked_address_with_offset(
         // single-region and use the branchless emit_single_region_address
         // directly.
         if (store || region_hint == JIT_REGION_STACK || region_hint == JIT_REGION_FRAME) {
-            emit_single_region_address(
-                state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
+            emit_region_address(vm, state, dst, scratch, size, &guest_stack_region);
             return;
         }
         if (region_hint == JIT_REGION_DATA) {
-            emit_single_region_address(
-                state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
+            emit_region_address(vm, state, dst, scratch, size, &guest_data_region);
             return;
         }
 
@@ -519,17 +760,110 @@ emit_masked_address_with_offset(
         enum Registers stack_candidate = R17;
 
         emit_logical_register(state, true, LOG_ORR, saved_addr, RZ, dst); // save guest address
-        emit_single_region_address(
-            state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
+        emit_region_address(vm, state, dst, scratch, size, &guest_stack_region);
         emit_logical_register(state, true, LOG_ORR, stack_candidate, RZ, dst); // save stack candidate
         emit_logical_register(state, true, LOG_ORR, dst, RZ, saved_addr);      // restore guest address
-        emit_single_region_address(
-            state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
+        emit_region_address(vm, state, dst, scratch, size, &guest_data_region);
         emit_logical_register(state, true, LOG_ORR, dst, dst, stack_candidate); // dst |= stack candidate
         return;
     }
 
     emit_masked_address(vm, state, dst, dst, scratch);
+}
+
+#define JIT_MAX_GROUP_SPAN UBPF_MAX_GROUP_SPAN
+#define JIT_PLAN_ROLE_LEADER 1
+#define JIT_PLAN_ROLE_MEMBER 2
+
+static const struct ubpf_access_plan_entry*
+access_plan_entry(const struct ubpf_vm* vm, uint32_t pc)
+{
+    if (!vm->jit_pointer_mask || !vm->frame_constants || !vm->access_plan || pc >= vm->access_plan_len) {
+        return NULL;
+    }
+    return &vm->access_plan[pc];
+}
+
+/* Folds a group displacement into the address, since this backend's load/store
+ * immediate reaches only +-256 while a group window is a page wide. */
+static int16_t
+apply_group_delta(struct jit_state* state, enum Registers addr_reg, uint16_t delta)
+{
+    if (delta < 256) {
+        return (int16_t)delta;
+    }
+    emit_addsub_immediate(state, true, AS_ADD, addr_reg, addr_reg, (uint32_t)delta);
+    return 0;
+}
+
+/* Resolves `[base + offset]`, `width` bytes wide, to a native address, emitting
+ * whatever check that needs, and returns the register it left the address in
+ * along with the displacement to use with it.
+ *
+ * The four outcomes and the reasoning behind each are the x86-64 backend's; so
+ * is the refusal to take the plan on trust. Every condition the backend can
+ * re-derive from the instruction stream it is already walking, it does, and any
+ * that fails drops through to an ordinary checked access. */
+static enum Registers
+emit_checked_address(
+    const struct ubpf_vm* vm,
+    struct jit_state* state,
+    uint32_t pc,
+    enum Registers base,
+    int16_t offset,
+    int width,
+    bool store,
+    int region_hint,
+    enum Registers addr_reg,
+    enum Registers scratch_reg,
+    int16_t* out_disp)
+{
+    if (emit_frame_access_ok(vm, region_hint, base, offset, width)) {
+        *out_disp = offset;
+        return base;
+    }
+
+    const struct ubpf_access_plan_entry* plan = access_plan_entry(vm, pc);
+    int base_ebpf = unmap_register(base);
+
+    if (plan && plan->role == JIT_PLAN_ROLE_MEMBER) {
+        bool usable = state->group_leader_pc >= 0 && (uint32_t)state->group_leader_pc == plan->leader_pc &&
+                      base_ebpf >= 0 && base == (enum Registers)state->group_base_reg &&
+                      (state->group_written & (uint16_t)(1u << (unsigned)base_ebpf)) == 0 &&
+                      (uint64_t)plan->delta + (uint64_t)width <= (uint64_t)state->group_span &&
+                      (int64_t)state->group_lo + (int64_t)plan->delta == (int64_t)offset &&
+                      (!store || state->group_region == JIT_REGION_STACK);
+        if (usable) {
+            emit_loadstore_immediate(state, LS_LDRX, addr_reg, R29, JIT_MEMORY_GROUP_BASE_OFFSET);
+            *out_disp = apply_group_delta(state, addr_reg, plan->delta);
+            return addr_reg;
+        }
+    }
+
+    if (plan && plan->role == JIT_PLAN_ROLE_LEADER) {
+        bool usable = base_ebpf >= 0 && plan->span > 0 && plan->span <= JIT_MAX_GROUP_SPAN &&
+                      (uint64_t)plan->delta + (uint64_t)width <= (uint64_t)plan->span &&
+                      (int64_t)plan->lo + (int64_t)plan->delta == (int64_t)offset &&
+                      plan->region != JIT_REGION_FRAME && (!store || plan->region == JIT_REGION_STACK) &&
+                      plan->lo >= INT16_MIN && plan->lo <= INT16_MAX;
+        if (usable) {
+            emit_masked_address_with_offset(
+                vm, state, base, addr_reg, scratch_reg, (int16_t)plan->lo, (int)plan->span, store, plan->region);
+            emit_loadstore_immediate(state, LS_STRX, addr_reg, R29, JIT_MEMORY_GROUP_BASE_OFFSET);
+            state->group_leader_pc = (int64_t)pc;
+            state->group_span = plan->span;
+            state->group_lo = plan->lo;
+            state->group_base_reg = (int)base;
+            state->group_region = plan->region;
+            state->group_written = 0;
+            *out_disp = apply_group_delta(state, addr_reg, plan->delta);
+            return addr_reg;
+        }
+    }
+
+    emit_masked_address_with_offset(vm, state, base, addr_reg, scratch_reg, offset, width, store, region_hint);
+    *out_disp = 0;
+    return addr_reg;
 }
 
 static int
@@ -572,11 +906,24 @@ emit_masked_loadstore(
     enum Registers rt,
     enum Registers rn,
     int16_t offset,
-    int region_hint)
+    int region_hint,
+    uint32_t pc)
 {
     if (vm->jit_pointer_mask) {
-        emit_masked_address_with_offset(vm, state, rn, temp_div_register, offset_register, offset, loadstore_access_size(op), loadstore_is_store(op), region_hint);
-        emit_loadstore_immediate(state, op, rt, temp_div_register, 0);
+        int16_t disp;
+        enum Registers addr = emit_checked_address(
+            vm,
+            state,
+            pc,
+            rn,
+            offset,
+            loadstore_access_size(op),
+            loadstore_is_store(op),
+            region_hint,
+            temp_div_register,
+            offset_register,
+            &disp);
+        emit_loadstore_immediate(state, op, rt, addr, disp);
         return;
     }
 
@@ -1564,6 +1911,13 @@ translate_range(
 {
     int i;
 
+    if (whole_program && (vm->native_frame_base || vm->frame_constants)) {
+        *errmsg = ubpf_error(
+            "ubpf_set_native_frame_base/ubpf_set_frame_constants describe a frame the embedder's "
+            "entry code establishes, which the whole-program prologue does not");
+        return -1;
+    }
+
     if (end_pc > vm->num_insts || start_pc >= end_pc) {
         *errmsg = ubpf_error("Invalid function range [%u, %u)", start_pc, end_pc);
         return -1;
@@ -1591,6 +1945,40 @@ translate_range(
     } else {
         /* Lazy functions are entered through an indirect call. */
         emit_instruction(state, 0xd503245fU); /* bti c */
+    }
+
+    // Where an access group has to end because a branch can land there. A member
+    // addresses the base its leader parked, so any path reaching it without
+    // running the leader would be reading a stale one.
+    state->group_leader_pc = -1;
+    state->group_written = 0;
+    for (i = start_pc; i < (int)end_pc; i++) {
+        struct ebpf_inst barrier_inst = ubpf_fetch_instruction(vm, i);
+
+        // A local function entry is reached by `call`, never by falling into it.
+        if (vm->int_funcs && vm->int_funcs[i]) {
+            state->group_barrier[i] = 1;
+        }
+
+        uint8_t barrier_cls = barrier_inst.opcode & EBPF_CLS_MASK;
+        if (barrier_cls != EBPF_CLS_JMP && barrier_cls != EBPF_CLS_JMP32) {
+            continue;
+        }
+        // Nothing falls through an EXIT, an unconditional jump, or a call, so
+        // whatever follows is entered from somewhere else. A call ends the group
+        // for its own reasons too: a local callee shares this host frame and
+        // would overwrite the parked base.
+        if (i + 1 <= (int)vm->num_insts) {
+            state->group_barrier[i + 1] = 1;
+        }
+        if (barrier_inst.opcode == EBPF_OP_CALL || barrier_inst.opcode == EBPF_OP_EXIT) {
+            continue;
+        }
+        int64_t barrier_target =
+            (int64_t)i + 1 + (barrier_inst.opcode == EBPF_OP_JA32 ? barrier_inst.imm : barrier_inst.offset);
+        if (barrier_target >= 0 && barrier_target <= (int64_t)vm->num_insts) {
+            state->group_barrier[barrier_target] = 1;
+        }
     }
 
     for (i = start_pc; i < (int)end_pc; i++) {
@@ -1641,9 +2029,25 @@ translate_range(
 
         state->pc_locs[i] = state->offset;
 
+        // A branch can land here, so no access group can span it.
+        if (state->group_barrier[i]) {
+            state->group_leader_pc = -1;
+            state->group_written = 0;
+        }
+
         enum Registers dst = map_register(inst.dst);
         enum Registers src = map_register(inst.src);
         uint8_t opcode = inst.opcode;
+
+        // Under a native frame base the register mapped to eBPF R10 holds a host
+        // address, so an instruction that reads R10 as a value must see the
+        // guest address instead. temp_store_value_register is used for this
+        // rather than temp_register, which the div/mod helper may take as its
+        // own scratch.
+        if (native_frame_base_active(vm) && inst.src == 10 && reads_src_as_value(&inst)) {
+            emit_guest_frame_pointer(state, temp_store_value_register, offset_register);
+            src = temp_store_value_register;
+        }
 
         // Use int64_t to avoid signed overflow with large immediates
         int64_t target_pc_64;
@@ -1896,6 +2300,13 @@ translate_range(
         case EBPF_OP_STXH:
         case EBPF_OP_STXB:
         case EBPF_OP_STXDW: {
+            if (native_frame_base_active(vm) && inst.src == 10) {
+                // Storing R10 stores a pointer, and it has to be the guest one.
+                // Materialized before the address computation below, which
+                // clobbers temp_register and both scratches but not this one.
+                emit_guest_frame_pointer(state, temp_store_value_register, offset_register);
+                src = temp_store_value_register;
+            }
             enum Registers tmp = dst;
             dst = src;
             src = tmp;
@@ -1913,7 +2324,7 @@ translate_range(
                 if (vm->region_hints && i < vm->region_hints_len) {
                     region_hint = vm->region_hints[i];
                 }
-                emit_masked_loadstore(vm, state, to_loadstore_opcode(opcode), dst, src, inst.offset, region_hint);
+                emit_masked_loadstore(vm, state, to_loadstore_opcode(opcode), dst, src, inst.offset, region_hint, i);
             }
             break;
 
@@ -2026,6 +2437,11 @@ translate_range(
             *errmsg = ubpf_error("Unknown instruction at PC %d: opcode %02x", i, opcode);
             state->jit_status = UnknownInstruction;
         }
+
+        // After the instruction has used its operands, note what it overwrote:
+        // an access whose destination is its own base is still valid, but
+        // nothing addressing that base afterwards is.
+        state->group_written |= written_registers_mask(&inst);
     }
 
     if (state->jit_status != NoError) {
