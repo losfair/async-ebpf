@@ -77,9 +77,31 @@
 // recovers the guest value of R10 for the instructions that read the frame
 // pointer as a value rather than as a memory base.
 #define JIT_MEMORY_FRAME_DELTA_OFFSET -40
-// Bytes the prologue reserves below RBP for the slots above, rounded up to keep
-// the host stack 16-byte aligned.
-#define JIT_MEMORY_FRAME_RESERVED 48
+
+// Under ubpf_set_frame_constants(), twelve values the embedder's entry code
+// derives once per invocation and copies into the frame, in this order:
+//
+//   0 stack bottom      6 data bottom
+//   1 stack delta       7 data delta          delta = native_base - guest_bottom
+//   2..5 stack spans    8..11 data spans      span  = (guest_top - w) - bottom
+//
+// with the four spans indexed by access width w = 1, 2, 4, 8. Every one is
+// constant for the whole invocation: the memory descriptor is built once per
+// run and never mutated. Reading them straight off RBP is what lets a bounds
+// check drop from ten instructions to six - no descriptor pointer to load
+// first, and no spill of the offset to compare against later.
+#define JIT_DERIVED_SLOTS 12
+#define JIT_DERIVED_SLOT(i) (-136 + (i) * 8)
+#define JIT_DERIVED_STACK_BOTTOM JIT_DERIVED_SLOT(0)
+#define JIT_DERIVED_STACK_DELTA JIT_DERIVED_SLOT(1)
+#define JIT_DERIVED_STACK_SPAN JIT_DERIVED_SLOT(2)
+#define JIT_DERIVED_DATA_BOTTOM JIT_DERIVED_SLOT(6)
+#define JIT_DERIVED_DATA_DELTA JIT_DERIVED_SLOT(7)
+#define JIT_DERIVED_DATA_SPAN JIT_DERIVED_SLOT(8)
+
+// Bytes the prologue reserves below RBP for all of the slots above, a multiple
+// of 16 so the host stack stays aligned.
+#define JIT_MEMORY_FRAME_RESERVED 144
 
 // Per-access region routing hints (computed by the Rust region analysis and
 // supplied via ubpf_set_region_hints). An access whose pointer provably targets
@@ -526,6 +548,57 @@ emit_cmov(struct jit_state* state, int cc, int dst, int src)
     emit_modrm_reg2reg(state, dst, src);
 }
 
+/* Index of the span slot for an access `size` bytes wide: 1 -> 0, 2 -> 1,
+ * 4 -> 2, 8 -> 3. */
+static inline int
+span_slot_index(int size)
+{
+    switch (size) {
+    case 1:
+        return 0;
+    case 2:
+        return 1;
+    case 4:
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+/* The same check as emit_single_region_address below, reading the region's
+ * bounds from the frame constants the embedder derived once per invocation
+ * rather than rebuilding them from the descriptor at every access.
+ *
+ * Seven of the ten instructions the descriptor version emits are recomputing
+ * values that cannot change during the invocation, and one of them spills the
+ * offset to memory only to compare against it three instructions later - a
+ * store-to-load forward sitting on the dependency chain of every guest memory
+ * access. Both go away here. What remains is the same branchless shape: one
+ * unsigned comparison of `off = guest - bottom` against the precomputed span,
+ * and a CMOV substituting address 0 when it fails. */
+static inline void
+emit_single_region_address_from_frame(
+    struct jit_state* state, int dst, int scratch, int size, int bottom_slot, int delta_slot, int span_base)
+{
+    int zero = R9;
+    int span_slot = span_base + span_slot_index(size) * 8;
+
+    // off = guest - bottom, kept in a register for the comparison below.
+    emit_mov(state, dst, scratch);
+    emit_alu64_mem(state, 0x2B, scratch, RBP, bottom_slot);
+
+    // Translate unconditionally; the CMOV below undoes it when out of range.
+    emit_alu64_mem(state, 0x03, dst, RBP, delta_slot);
+
+    // Zero the fault address before the compare, which sets the flags.
+    emit_alu64(state, 0x31, zero, zero);
+
+    // flags = span - off. 0x39 is CMP r/m64, r64, so the memory operand is the
+    // left-hand side: CF is set iff span < off, i.e. iff out of range.
+    emit_alu64_mem(state, 0x39, scratch, RBP, span_slot);
+    emit_cmov(state, 0x42, dst, zero); // CMOVB dst, 0
+}
+
 /* Bounds-check [dst, dst+size) against a single guest region described by the
  * memory descriptor at [RBP + JIT_MEMORY_FRAME_OFFSET], then translate dst to
  * the corresponding native address. Branchless: the address is translated
@@ -533,9 +606,12 @@ emit_cmov(struct jit_state* state, int cc, int dst, int src)
  * when out of range, so there is no predictable branch whose mis-speculation
  * could perform a transient out-of-bounds access (Spectre-v1). The two bounds
  * are folded into one unsigned comparison: with off = dst - bottom, the access
- * is in range iff off <= (top - size) - bottom. */
+ * is in range iff off <= (top - size) - bottom.
+ *
+ * Used when the embedder has not supplied frame constants; see
+ * emit_single_region_address_from_frame for the version that has them. */
 static inline void
-emit_single_region_address(
+emit_single_region_address_via_descriptor(
     struct jit_state* state, int dst, int scratch, int size, int bottom_off, int top_off, int base_off)
 {
     int span = R9;
@@ -560,6 +636,54 @@ emit_single_region_address(
     // flags = span - off; CF set (JB) iff span < off iff out of range.
     emit_alu64_mem(state, 0x3B, span, RBP, JIT_MEMORY_SPILL_OFFSET);
     emit_cmov(state, 0x42, dst, scratch); // CMOVB dst, 0
+}
+
+/* Where one guest region's bounds can be found: in the memory descriptor, and -
+ * when the embedder supplies them - in the frame constants. */
+struct guest_region
+{
+    int desc_bottom;
+    int desc_top;
+    int desc_native_base;
+    int slot_bottom;
+    int slot_delta;
+    int slot_span;
+};
+
+static const struct guest_region guest_stack_region = {
+    JIT_MEMORY_STACK_GUEST_BOTTOM,
+    JIT_MEMORY_STACK_GUEST_TOP,
+    JIT_MEMORY_STACK_NATIVE_BASE,
+    JIT_DERIVED_STACK_BOTTOM,
+    JIT_DERIVED_STACK_DELTA,
+    JIT_DERIVED_STACK_SPAN,
+};
+
+static const struct guest_region guest_data_region = {
+    JIT_MEMORY_DATA_GUEST_BOTTOM,
+    JIT_MEMORY_DATA_GUEST_TOP,
+    JIT_MEMORY_DATA_NATIVE_BASE,
+    JIT_DERIVED_DATA_BOTTOM,
+    JIT_DERIVED_DATA_DELTA,
+    JIT_DERIVED_DATA_SPAN,
+};
+
+static inline void
+emit_single_region_address(
+    const struct ubpf_vm* vm,
+    struct jit_state* state,
+    int dst,
+    int scratch,
+    int size,
+    const struct guest_region* region)
+{
+    if (vm->frame_constants) {
+        emit_single_region_address_from_frame(
+            state, dst, scratch, size, region->slot_bottom, region->slot_delta, region->slot_span);
+    } else {
+        emit_single_region_address_via_descriptor(
+            state, dst, scratch, size, region->desc_bottom, region->desc_top, region->desc_native_base);
+    }
 }
 
 static inline bool
@@ -694,13 +818,11 @@ emit_masked_address_with_offset(
         // confident hint check only their region. All of these are single-region
         // and use the branchless emit_single_region_address directly.
         if (store || region_hint == JIT_REGION_STACK) {
-            emit_single_region_address(
-                state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
+            emit_single_region_address(vm, state, dst, scratch, size, &guest_stack_region);
             return;
         }
         if (region_hint == JIT_REGION_DATA) {
-            emit_single_region_address(
-                state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
+            emit_single_region_address(vm, state, dst, scratch, size, &guest_data_region);
             return;
         }
 
@@ -713,12 +835,10 @@ emit_masked_address_with_offset(
         // mis-speculatable path that could perform a transient OOB access
         // (Spectre-v1).
         emit_store(state, S64, dst, RBP, JIT_MEMORY_ADDR_SPILL_OFFSET); // save guest address
-        emit_single_region_address(
-            state, dst, scratch, size, JIT_MEMORY_STACK_GUEST_BOTTOM, JIT_MEMORY_STACK_GUEST_TOP, JIT_MEMORY_STACK_NATIVE_BASE);
+        emit_single_region_address(vm, state, dst, scratch, size, &guest_stack_region);
         emit_store(state, S64, dst, RBP, JIT_MEMORY_ACC_SPILL_OFFSET);  // save stack candidate
         emit_load(state, S64, RBP, dst, JIT_MEMORY_ADDR_SPILL_OFFSET);  // restore guest address
-        emit_single_region_address(
-            state, dst, scratch, size, JIT_MEMORY_DATA_GUEST_BOTTOM, JIT_MEMORY_DATA_GUEST_TOP, JIT_MEMORY_DATA_NATIVE_BASE);
+        emit_single_region_address(vm, state, dst, scratch, size, &guest_data_region);
         emit_alu64_mem(state, 0x0B, dst, RBP, JIT_MEMORY_ACC_SPILL_OFFSET); // dst |= stack candidate
     }
 }
@@ -3065,6 +3185,21 @@ translate_range(
     state->retpoline_loc = emit_retpoline(state);
     state->dispatcher_loc = emit_dispatched_external_helper_address(state, vm);
     state->helper_table_loc = emit_helper_table(state, vm);
+
+    // Everything above is emitted after the per-instruction error check, so an
+    // overflow here would otherwise be reported as success. That is not merely
+    // untidy: emit_bytes refuses to write past the buffer but a patch site whose
+    // location was recorded just before the overflow is still in the jump table,
+    // and resolve_patchable_relatives would write four bytes at it - off the end
+    // of the code arena, into whatever follows.
+    if (state->jit_status != NoError) {
+        if (state->jit_status == NotEnoughSpace) {
+            *errmsg = ubpf_error("Target buffer too small");
+        } else {
+            *errmsg = ubpf_error("Failure to emit the function epilogue");
+        }
+        return -1;
+    }
 
     return 0;
 }

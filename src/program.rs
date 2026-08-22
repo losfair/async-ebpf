@@ -136,9 +136,28 @@ async_ebpf_entry_trampoline:
     mov rdi, rsi
     sub rsp, 8
     mov rbp, rsp
-    sub rsp, 48
+    sub rsp, 144
     mov [rbp - 8], rax
     mov [rbp - 40], rdx
+    // Copy JitMemory::derived - the twelve bounds-check constants - into the
+    // frame, where the backend reads them off rbp without a descriptor load.
+    // See ubpf_set_frame_constants(). xmm0 keeps this to twelve instructions
+    // without disturbing any of the registers still carrying guest state; the
+    // guest has no way to name an xmm register, and these are guest-space
+    // bounds rather than host addresses, but it is cleared afterwards anyway.
+    movdqu xmm0, [rax + 48]
+    movdqu [rbp - 136], xmm0
+    movdqu xmm0, [rax + 64]
+    movdqu [rbp - 120], xmm0
+    movdqu xmm0, [rax + 80]
+    movdqu [rbp - 104], xmm0
+    movdqu xmm0, [rax + 96]
+    movdqu [rbp - 88], xmm0
+    movdqu xmm0, [rax + 112]
+    movdqu [rbp - 72], xmm0
+    movdqu xmm0, [rax + 128]
+    movdqu [rbp - 56], xmm0
+    pxor xmm0, xmm0
     mov rcx, r9
     mov r11, rdi
     // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
@@ -493,6 +512,10 @@ impl ExecContext {
   }
 }
 
+/// Access widths a single guest memory instruction can have, in the order the
+/// backend's span slots expect (`span_slot_index` in `ubpf_jit_x86_64.c`).
+const ACCESS_WIDTHS: [usize; 4] = [1, 2, 4, 8];
+
 #[repr(C)]
 struct JitMemory {
   stack_guest_bottom: usize,
@@ -501,6 +524,11 @@ struct JitMemory {
   data_guest_bottom: usize,
   data_guest_top: usize,
   data_native_base: usize,
+  /// Everything a single-region bounds check needs, derived once here instead
+  /// of being rebuilt from the fields above at every guest memory access. The
+  /// entry trampoline copies the block into the frame, where the backend reads
+  /// it off `RBP` directly. See `ubpf_set_frame_constants()` for the layout.
+  derived: [usize; 12],
 }
 
 /// The entry trampoline reaches into this layout with literal displacements,
@@ -513,9 +541,54 @@ const _: () = {
   assert!(std::mem::offset_of!(JitMemory, data_guest_bottom) == 24);
   assert!(std::mem::offset_of!(JitMemory, data_guest_top) == 32);
   assert!(std::mem::offset_of!(JitMemory, data_native_base) == 40);
+  assert!(std::mem::offset_of!(JitMemory, derived) == 48);
+  assert!(std::mem::size_of::<JitMemory>() == 144);
 };
 
 impl JitMemory {
+  /// Derives the twelve bounds-check constants from the six region fields.
+  ///
+  /// The check the backend emits is a single unsigned comparison: with
+  /// `off = guest - bottom`, an access of width `w` is in range exactly when
+  /// `off <= (top - w) - bottom`. Both operands are invariant for the whole
+  /// invocation, so precomputing them here is the difference between a bounds
+  /// check that reloads and re-derives them every time and one that reads two
+  /// frame slots.
+  fn fill_derived(&mut self) {
+    // A region narrower than the widest access would make `(top - w) - bottom`
+    // wrap, and the unsigned comparison would then accept everything. Neither
+    // region can be that small - the data region is page-rounded and the guest
+    // stack is tens of kilobytes - but the check below is what says so.
+    let widest = *ACCESS_WIDTHS.last().unwrap();
+    assert!(
+      self.stack_guest_top - self.stack_guest_bottom >= widest
+        && self.data_guest_top - self.data_guest_bottom >= widest,
+      "a guest region is narrower than the widest access"
+    );
+
+    let mut slot = 0;
+    for (bottom, top, native_base) in [
+      (
+        self.stack_guest_bottom,
+        self.stack_guest_top,
+        self.stack_native_base,
+      ),
+      (
+        self.data_guest_bottom,
+        self.data_guest_top,
+        self.data_native_base,
+      ),
+    ] {
+      self.derived[slot] = bottom;
+      self.derived[slot + 1] = native_base.wrapping_sub(bottom);
+      for (i, width) in ACCESS_WIDTHS.iter().enumerate() {
+        self.derived[slot + 2 + i] = (top - width) - bottom;
+      }
+      slot += 2 + ACCESS_WIDTHS.len();
+    }
+    debug_assert_eq!(slot, self.derived.len());
+  }
+
   fn checked_region(
     guest: usize,
     size: usize,
@@ -1415,14 +1488,17 @@ impl Program {
       let guest_stack_top = self.unbound.cage.stack_top();
       let guest_stack_bottom = self.unbound.cage.stack_bottom();
       let ctx = &mut *ectx.ctx;
-      let memory = JitMemory {
+      let mut memory = JitMemory {
         stack_guest_bottom: guest_stack_bottom,
         stack_guest_top: guest_stack_top,
         stack_native_base: ctx.guest_stack.as_mut_ptr() as usize,
         data_guest_bottom: self.unbound.cage.data_bottom(),
         data_guest_top: self.unbound.cage.data_top(),
         data_native_base: self.unbound.cage.data_native_base(),
+        derived: [0; 12],
       };
+      memory.fill_derived();
+      let memory = memory;
       let memory_ptr = &memory as *const JitMemory as usize;
 
       let mut co = AssumeSend(CoDropper(Coroutine::with_stack(
@@ -1675,7 +1751,10 @@ impl Vm {
       // the arm64 one still starts `x23` at a guest address, and its backend
       // routes a frame hint to the ordinary single-region stack check.
       #[cfg(target_arch = "x86_64")]
-      crate::ubpf::ubpf_set_native_frame_base(vm.as_ptr(), true);
+      {
+        crate::ubpf::ubpf_set_native_frame_base(vm.as_ptr(), true);
+        crate::ubpf::ubpf_set_frame_constants(vm.as_ptr(), true);
+      }
     }
     Self(vm)
   }

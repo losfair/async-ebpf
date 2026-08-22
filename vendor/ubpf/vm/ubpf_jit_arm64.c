@@ -2072,6 +2072,21 @@ translate_range(
     state->dispatcher_loc = emit_dispatched_external_helper_address(state, (uint64_t)vm->dispatcher);
     state->helper_table_loc = emit_helper_table(state, vm);
 
+    // Everything above is emitted after the per-instruction error check, so an
+    // overflow here would otherwise be reported as success. That is not merely
+    // untidy: emission refuses to write past the buffer but a patch site whose
+    // location was recorded just before the overflow is still in the jump table,
+    // and resolve_patchable_relatives would write to it - off the end of the
+    // code arena, into whatever follows.
+    if (state->jit_status != NoError) {
+        if (state->jit_status == NotEnoughSpace) {
+            *errmsg = ubpf_error("Target buffer too small");
+        } else {
+            *errmsg = ubpf_error("Failure to emit the function epilogue");
+        }
+        return -1;
+    }
+
     return 0;
 }
 

@@ -694,6 +694,35 @@ extern "C"
     ubpf_set_native_frame_base(struct ubpf_vm* vm, bool native);
 
     /**
+     * @brief Declare that the embedder's entry code fills in the derived
+     * bounds-check constants below the established frame pointer.
+     *
+     * Off by default, and meaningful only together with
+     * ubpf_set_jit_pointer_mask_and_offset(). Every value a single-region bounds
+     * check needs is constant for the whole invocation - the memory descriptor
+     * is built once and never mutated - but the backend otherwise rebuilds them
+     * at every access: load the descriptor pointer, subtract the region bottom,
+     * reload the top, subtract the access width and the bottom again. Seven of
+     * the ten instructions are recomputing invariants, and one spills the offset
+     * to memory only to compare against it three instructions later.
+     *
+     * When enabled, the embedder promises that twelve 64-bit values are present
+     * at JIT_DERIVED_SLOT(0)..JIT_DERIVED_SLOT(11) below the frame pointer, in
+     * the order documented in the backend: for the stack region and then the
+     * data region, the guest bottom, the guest-to-native delta, and the four
+     * spans `(guest_top - w) - guest_bottom` for access widths 1, 2, 4 and 8.
+     *
+     * The check keeps its shape exactly - one unsigned comparison and a CMOV to
+     * address 0, no data-dependent branch - and drops to six instructions with
+     * no spill on the dependency chain.
+     *
+     * @param[in] vm The VM.
+     * @param[in] available True if the frame constants are present.
+     */
+    void
+    ubpf_set_frame_constants(struct ubpf_vm* vm, bool available);
+
+    /**
      * @brief Set a size for the buffer allocated to machine code generated during JIT compilation.
      * The JIT compiler allocates a buffer to store the code while it is being generated. The default
      * may be too big for some embedded platforms. Use this to customize the size of that buffer.
