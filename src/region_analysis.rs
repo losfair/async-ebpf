@@ -56,6 +56,14 @@ const EBPF_ALU_OP_ADD: u8 = 0x00;
 const EBPF_ALU_OP_SUB: u8 = 0x10;
 const EBPF_ALU_OP_MOV: u8 = 0xb0;
 
+/// Operation selector inside an atomic instruction's `imm` field, and the
+/// CMPXCHG value. These mirror `EBPF_ALU_OP_MASK` and
+/// `EBPF_ATOMIC_OP_CMPXCHG & ~EBPF_ATOMIC_OP_FETCH` in the JIT backends; the
+/// comparison is written the same way the backends switch on `imm` so the
+/// analysis and the emitted code always agree on which ops are CMPXCHG.
+const EBPF_ATOMIC_OP_MASK: i32 = 0xf0;
+const EBPF_ATOMIC_OP_CMPXCHG: i32 = 0xf0;
+
 const EBPF_OP_LDDW: u8 = EBPF_CLS_LD | 0x18; // LD | IMM | DW
 const EBPF_OP_JA: u8 = EBPF_CLS_JMP; // JMP | JA (mode 0)
 const EBPF_OP_JA32: u8 = EBPF_CLS_JMP32;
@@ -616,6 +624,14 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
       if is_atomic {
         // An atomic fetch writes the previous value into src.
         s.regs[inst.src] = RegKind::Unknown;
+        if inst.imm & EBPF_ATOMIC_OP_MASK == EBPF_ATOMIC_OP_CMPXCHG {
+          // CMPXCHG is the exception: it leaves src alone and writes the
+          // previous memory contents into R0 instead (x86-64 lowers it to
+          // `lock cmpxchg`, whose comparand is RAX; the arm64 backend mirrors
+          // that). The guest chooses those contents, so R0 must not keep the
+          // provenance it had before the instruction.
+          s.regs[0] = RegKind::Unknown;
+        }
       }
     }
     EBPF_CLS_ALU => {
@@ -1075,6 +1091,46 @@ mod tests {
     ]);
     let result = analyze(&code, DATA_LO, DATA_HI);
     assert_eq!(result.unresolved, vec![3]);
+  }
+
+  /// `BPF_ATOMIC | CMPXCHG` writes the previous memory contents into R0, so a
+  /// data pointer materialized there before the instruction must not survive it.
+  #[test]
+  fn atomic_cmpxchg_clobbers_r0() {
+    const ATOMIC_DW: u8 = EBPF_CLS_STX | 0xc0 | 0x18;
+    const CMPXCHG_FETCH: i32 = 0xf1;
+    let code = flatten(&[
+      slot(EBPF_OP_LDDW, 0, 0, 0, DATA_LO as i32), // r0 = <data>
+      slot(0, 0, 0, 0, 0),                         // lddw high half
+      slot(ATOMIC_DW, 10, 2, -16, CMPXCHG_FETCH),  // r0 = old(*(u64*)(r10-16))
+      slot(EBPF_CLS_LDX | 0x10, 1, 0, 0, 0),       // r1 = *(u8*)(r0)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[3], REGION_UNKNOWN);
+    assert_eq!(result.unresolved, vec![3]);
+  }
+
+  /// The CMPXCHG rule is narrow: every other atomic writes only `src`, so an
+  /// unrelated pointer register stays routable across it.
+  #[test]
+  fn atomic_fetch_add_leaves_r0_alone() {
+    const ATOMIC_DW: u8 = EBPF_CLS_STX | 0xc0 | 0x18;
+    const ADD_FETCH: i32 = 0x01;
+    let code = flatten(&[
+      slot(EBPF_OP_LDDW, 0, 0, 0, DATA_LO as i32),
+      slot(0, 0, 0, 0, 0),
+      slot(ATOMIC_DW, 10, 2, -16, ADD_FETCH), // r2 = old(...); r0 untouched
+      slot(EBPF_CLS_LDX | 0x10, 1, 0, 0, 0),  // r1 = *(u8*)(r0)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze(&code, DATA_LO, DATA_HI);
+    assert_eq!(result.hints[3], REGION_DATA);
+    assert!(
+      result.unresolved.is_empty(),
+      "unexpected unresolved: {:?}",
+      result.unresolved
+    );
   }
 
   #[test]

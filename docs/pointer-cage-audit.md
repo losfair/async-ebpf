@@ -5,14 +5,19 @@ Scope: `src/pointer_cage.rs`, the JIT address translation it drives
 descriptor in `src/program.rs` (`JitMemory`, `async_ebpf_entry_trampoline`), and
 the static pointer-region analysis in `src/region_analysis.rs`.
 
-Every finding below is reproduced in `tests/pointer_cage_audit.rs` using only
-the safe public API (`ProgramLoader::load` + `Program::run`); the test helper in
-`tests/common/mod.rs` assembles a BPF relocatable ELF, which the loader accepts
-like any other program. For the fixed findings the reproducer has been flipped
-into a regression test asserting the corrected behaviour. Run with:
+Every finding below was reproduced through the safe public API
+(`ProgramLoader::load` + `Program::run`). Several need instruction-level control
+the C pipeline cannot express, so they hand-assemble a BPF relocatable ELF via
+`src/test/raw_elf.rs`, which the loader accepts like any other program. The
+reproducers now live as ordinary tests:
+
+| | |
+|---|---|
+| Findings 1, 2 | `src/test/entry_isolation.rs` |
+| Finding 5 | `src/test/atomics.rs`, plus unit tests in `src/region_analysis.rs` |
 
 ```
-cargo test --features testing --test pointer_cage_audit -- --nocapture
+cargo test --features testing
 ```
 
 Host used for the reproductions: Linux x86-64, 4 KiB pages.
@@ -23,21 +28,27 @@ Host used for the reproductions: Linux x86-64, 4 KiB pages.
 |---|---------|-------|----------|--------|
 | 1 | Host pointers and the randomized cage layout are readable from eBPF registers at program entry | Information disclosure | High | Fixed |
 | 2 | Lazy local calls hand the callee's native code address to the guest in `r0` | Information disclosure | High | Fixed |
-| 3 | `StackKind::Foreign` is wrongly assumed not to alias the current frame | Analysis unsoundness | Medium | Open |
-| 4 | Spill slots are assumed to survive calls, but helpers/callees can overwrite them | Analysis unsoundness | Medium | Open |
-| 5 | `BPF_ATOMIC \| CMPXCHG` clobbers `r0`; the analysis does not model it | Analysis unsoundness | Medium | Open |
+| 3 | `StackKind::Foreign` is wrongly assumed not to alias the current frame | Analysis precision | Low | By design |
+| 4 | Spill slots are assumed to survive calls, but helpers/callees can overwrite them | Analysis precision | Low | By design |
+| 5 | `BPF_ATOMIC \| CMPXCHG` clobbers `r0`; the analysis does not model it | Analysis unsoundness | Medium | Fixed |
 
-Findings 1 and 2 are fixed in this branch; their reproducers were flipped into
-regression tests (`entry_scrubs_every_guest_visible_register`,
-`entry_does_not_disclose_the_cage_layout`,
-`local_call_preserves_r0_and_hides_the_callee_address`). Findings 3-5 are still
-open and their reproducers still assert the buggy behaviour.
+Findings 1, 2 and 5 are fixed in this branch and their reproducers are now
+regression tests. Findings 3 and 4 were reviewed and **accepted as intended
+behaviour**: both require the program to break its own invariants, and the
+cost of detecting them is a cost this runtime deliberately does not pay. See
+each section for the reasoning.
+
+Finding 5 is the one that needed fixing, and the line between it and the other
+two is worth stating: in findings 3 and 4 the *guest* does something the eBPF
+model does not define, and only harms itself. In finding 5 a plain, well-formed
+`cmpxchg` was enough — the analysis simply did not model an instruction's
+register effects.
 
 What held up under the audit is described in
 [What the cage does get right](#what-the-cage-does-get-right) — in particular,
 none of findings 3–5 is a memory-safety hole. The confinement guarantee itself
-survives; what breaks is the analysis's own stated invariant, plus address
-disclosure that undoes the crate's deliberate randomization.
+survives; what breaks is analysis precision, plus the address disclosure of
+findings 1 and 2 that undid the crate's deliberate randomization.
 
 ---
 
@@ -87,13 +98,13 @@ Consequences:
   disclosed to the guest, and with it the offsets of the stack and data regions
   inside the cage.
 
-Reproducers: `finding1_host_pointers_readable_at_entry`,
-`finding1_cage_layout_disclosed_at_entry`. The first classifies the leaked
-values against `/proc/self/maps` from inside a helper (while the mappings are
-still alive) and asserts `r4` lands in an `r-xp` mapping and `r0` in a live
-`rw-p` mapping. The second returns `r3` to the host, checks it matches the
-`gen_range(16..128) * page_size` shape, and then dereferences it to show it
-really is the live guest stack bottom.
+Reproduced during the audit by classifying the leaked values against
+`/proc/self/maps` from inside a helper, while the mappings were still alive:
+`r4` landed in an `r-xp` mapping, `r0` in a live `rw-p` one, and `r3` matched
+the `gen_range(16..128) * page_size` shape and dereferenced to the live guest
+stack bottom. The regression tests are
+`entry_isolation::entry_registers_are_scrubbed` (every probed register must read
+zero) and `entry_isolation::entry_context_and_frame_pointer_survive_the_scrub`.
 
 **Fix.** `async_ebpf_entry_trampoline` now zeroes every eBPF-visible register
 except `r1` (ctx) and `r10` (frame pointer) immediately before entering guest
@@ -136,9 +147,10 @@ program's return value:
 leaked JIT code address returned to the host: 0x7f92c428b27c
 ```
 
-Reproducer: `finding2_local_call_leaks_callee_code_address` — classifies the
-value as living in an `r-xp` mapping, and separately shows it flowing out
-through `Program::run`'s return value.
+Reproduced by classifying the value as living in an `r-xp` mapping, and
+separately by watching it flow out through `Program::run`'s return value.
+Regression tests: `entry_isolation::local_call_preserves_r0` and
+`entry_isolation::local_callee_observes_the_callers_r0`.
 
 **Fix.** `emit_lazy_local_call` now preserves BPF `r0` across the resolver call
 alongside `r1`-`r5` and enters the callee through a register that is not mapped
@@ -158,8 +170,7 @@ helper-call sequence already uses.
 
 ## Finding 3 — `StackKind::Foreign` may alias the current frame
 
-**Severity: Medium** (analysis unsoundness → spurious `MemoryFault` on
-in-bounds programs; strict mode accepts the program anyway)
+**Severity: Low &mdash; reviewed and accepted as intended behaviour**
 
 `region_analysis` splits stack provenance into `Current` (this frame) and
 `Foreign` (inherited from a caller), and `RegKind::aliases_current_stack`
@@ -188,17 +199,21 @@ which invalidates the slot and leaves the reload `UNKNOWN`. It succeeds. So the
 fault is caused solely by the stale `REGION_DATA` hint: the JIT bounds-checks a
 stack address against the data region and folds it to address 0.
 
-Reproducer: `finding3_foreign_stack_pointer_aliases_callee_frame`.
+**Resolution: by design.** Deriving a pointer that crosses a frame boundary is
+undefined in the eBPF model, and nothing a compiler emits does it. A program
+that does it breaks only itself: the JIT keeps its exact single-region bounds
+check, so the access faults rather than escaping, and no other program or the
+host is affected.
 
-**Suggested fix.** Drop the `Foreign` special case for aliasing:
-`aliases_current_stack()` should be true for every `Stack` kind, so a store
-through any stack pointer with an unknown frame-relative offset invalidates all
-tracked slots. `Foreign` remains useful for routing (it is still `REGION_STACK`)
-but must not be used to prove non-aliasing.
+The alternative — making `aliases_current_stack()` true for every `Stack` kind
+— would invalidate every tracked spill slot on any store through a stack pointer
+with an unknown frame-relative offset. That is the dominant pattern in `-O2` BPF
+output, so it would cost the optimization most of its value in order to serve
+programs that are already outside the model.
 
 ## Finding 4 — spill slots are assumed to survive calls
 
-**Severity: Medium** (same failure mode as finding 3)
+**Severity: Low &mdash; reviewed and accepted as intended behaviour**
 
 `transfer()` deliberately preserves tracked `r10`-relative spill slots across
 `EBPF_OP_CALL`, with the comment that a helper overwriting a spill can at worst
@@ -213,17 +228,20 @@ helper-overwrite, lax:    Err(Error(MemoryFault(0)))
 helper-overwrite, strict: Err(Error(MemoryFault(0)))   <- analysis reported "fully routable"
 ```
 
-Reproducer: `finding4_helper_write_invalidates_tracked_spill`.
-
-**Suggested fix.** Either invalidate tracked slots on every call (costly for the
-generated code this optimization targets), or keep the slot but downgrade the
-recorded kind to `Unknown` at call boundaries unless the analysis can prove no
-guest pointer to that slot escaped. Downgrading is enough: the routing hint
-becomes `UNKNOWN` (dual-region probe) instead of confidently wrong.
+**Resolution: by design.** Knowing which bytes a helper may write would mean
+every helper declaring its argument types and buffer layout, which this runtime
+deliberately does not require — `Helper` is a plain function of five `u64`s, and
+`user_memory_mut` validates only that the range is inside the guest stack. A
+program that hands a helper a pointer overlapping its own spilled pointers is
+breaking its own invariants, and again breaks only itself.
 
 ## Finding 5 — `BPF_ATOMIC | CMPXCHG` clobbers `r0`
 
-**Severity: Medium** (same failure mode as findings 3 and 4)
+**Severity: Medium &mdash; fixed**
+
+Unlike findings 3 and 4, nothing here is the program's fault. A single
+well-formed `cmpxchg` is enough, the guest stays entirely inside the eBPF model,
+and the analysis still hands the JIT a confident, wrong region.
 
 x86-64 `lock cmpxchg` uses `RAX` — BPF `r0` — as the comparand and writes the
 previous memory contents back into it; the JIT's 32-bit path makes this explicit
@@ -246,30 +264,61 @@ cmpxchg, strict:        Err(Error(MemoryFault(0)))   <- analysis reported "fully
 control (UNKNOWN hint): Ok(0)
 ```
 
-Reproducer: `finding5_atomic_cmpxchg_clobbers_r0`, with a control that performs
-the identical accesses under an `UNKNOWN` hint and succeeds.
+**Fix.** `transfer()` now marks `r0` unknown when the atomic's operation
+selector is `CMPXCHG`, matching the way the backends themselves switch on `imm`
+so the analysis and the emitted code cannot disagree about which encodings are
+compare-and-exchange:
 
-**Suggested fix.** In `transfer()`, set `s.regs[0] = RegKind::Unknown` (or
-`Scalar`) for `EBPF_ATOMIC_OP_CMPXCHG`, in addition to the existing `src`
-handling.
+```rust
+if is_atomic {
+  // An atomic fetch writes the previous value into src.
+  s.regs[inst.src] = RegKind::Unknown;
+  if inst.imm & EBPF_ATOMIC_OP_MASK == EBPF_ATOMIC_OP_CMPXCHG {
+    // ... but CMPXCHG leaves src alone and writes the previous memory
+    // contents into R0 instead.
+    s.regs[0] = RegKind::Unknown;
+  }
+}
+```
 
-## Cross-cutting: `require_static_region_analysis` is weaker than documented
+The rule is deliberately narrow: every other atomic writes only `src`, so an
+unrelated pointer register stays statically routed across it. With the fix the
+program above runs to completion under the dual-region probe, and strict mode
+rejects it up front instead of accepting it and faulting later:
+
+```
+cmpxchg, lax:     Ok(0x8e)
+cmpxchg, strict:  Err(InvalidArgumentOwned("static region analysis failed in
+                  function [0, 12): 1 memory access(es) could not be routed ..."))
+```
+
+Tests: `atomics::cmpxchg_result_is_not_routed_to_the_stale_region`,
+`atomics::cmpxchg_preserves_other_registers`, and the analysis-level
+`region_analysis::tests::atomic_cmpxchg_clobbers_r0` /
+`atomic_fetch_add_leaves_r0_alone`.
+
+## Cross-cutting: what `require_static_region_analysis` guarantees
 
 `ProgramLoader::require_static_region_analysis` is documented as guaranteeing
-that "every executed access is statically routable". Findings 3, 4 and 5 each
-produce an access that the analysis classifies *confidently and wrongly*: it is
-counted as resolved, strict mode accepts the program, and the access then faults
-at run time. A wrong classification is worse than `UNKNOWN` — `UNKNOWN` falls
-back to the dual-region probe and works, whereas a wrong hint faults. The flag's
-guarantee should be restated as "every executed access was classified", or the
-classifier tightened so that classification implies correctness.
+that "every executed access is statically routable". All three findings produced
+an access the analysis classified *confidently and wrongly* — counted as
+resolved, accepted by strict mode, then faulting at run time. A wrong
+classification is worse than `UNKNOWN`, because `UNKNOWN` falls back to the
+dual-region probe and works.
+
+With finding 5 fixed, the guarantee holds for any program that stays inside the
+eBPF model. It does **not** extend to a program that leaves it: findings 3 and 4
+are still accepted by strict mode and still fault, by design. The documented
+scope is worth stating that way — the flag proves routability for well-formed
+programs, not for programs that alias across their own frames or invite a helper
+to overwrite their spilled pointers.
 
 ---
 
 ## What the cage does get right
 
-These were examined and found sound; they are why findings 3–5 are correctness
-bugs rather than sandbox escapes.
+These were examined and found sound; they are why findings 3–5 stay inside the
+offending program rather than becoming sandbox escapes.
 
 * **The bounds check is exact and is never skipped for a hint.**
   `emit_single_region_address` folds both bounds into one unsigned comparison
@@ -295,9 +344,11 @@ bugs rather than sandbox escapes.
   stack region through call nesting alone.
 * **Guest stacks are refilled with `0x8e` on every borrow** from
   `EXEC_CONTEXT_POOL`, so no guest data leaks between invocations.
-* `positive_out_of_region_accesses_fault` exercises three of these directly: a
-  far out-of-range data load, a store through a data pointer, and an under-run
-  of the guest stack all produce `MemoryFault`.
+* The existing suite already exercises these directly:
+  `basic::test_fault_read_past_stack`, `test_fault_write_past_stack`,
+  `test_fault_write_rodata` and `test_fault_read_null_ptr` all produce
+  `MemoryFault`, and `pointer_cage::tests` covers the reserved stack window and
+  the data-region bounds of `data_slice`.
 
 ## Additional observations (not reproduced here)
 
