@@ -1350,11 +1350,13 @@ impl Program {
     let outcome = unsafe {
       translate_function_into(
         vm,
-        &region_analysis.hints,
-        &region_analysis.plan,
-        &resolver_ids,
-        function.start_pc,
-        function.end_pc,
+        &TranslationInputs {
+          hints: &region_analysis.hints,
+          plan: &region_analysis.plan,
+          resolver_ids: &resolver_ids,
+          start_pc: function.start_pc,
+          end_pc: function.end_pc,
+        },
         code_ptr as *mut u8,
         remaining,
       )
@@ -1813,6 +1815,17 @@ enum TranslateError {
   Failed(String),
 }
 
+/// What the analysis tells the JIT about one function, beyond the bytecode
+/// itself. All of it is borrowed for the duration of a single translation and
+/// cleared again afterwards.
+struct TranslationInputs<'a> {
+  hints: &'a [u8],
+  plan: &'a [crate::region_analysis::PlanEntry],
+  resolver_ids: &'a [u32],
+  start_pc: usize,
+  end_pc: usize,
+}
+
 /// Translates `[start_pc, end_pc)` into `buffer`, returning the number of bytes
 /// emitted.
 ///
@@ -1821,28 +1834,24 @@ enum TranslateError {
 /// must be writable for `capacity` bytes.
 unsafe fn translate_function_into(
   vm: *mut crate::ubpf::ubpf_vm,
-  hints: &[u8],
-  plan: &[crate::region_analysis::PlanEntry],
-  resolver_ids: &[u32],
-  start_pc: usize,
-  end_pc: usize,
+  inputs: &TranslationInputs<'_>,
   buffer: *mut u8,
   capacity: usize,
 ) -> Result<usize, TranslateError> {
   let mut written_len = capacity;
   let mut errmsg_ptr = std::ptr::null_mut();
 
-  crate::ubpf::ubpf_set_region_hints(vm, hints.as_ptr(), hints.len());
+  crate::ubpf::ubpf_set_region_hints(vm, inputs.hints.as_ptr(), inputs.hints.len());
   crate::ubpf::ubpf_set_access_plan(
     vm,
-    plan.as_ptr() as *const crate::ubpf::ubpf_access_plan_entry,
-    plan.len(),
+    inputs.plan.as_ptr() as *const crate::ubpf::ubpf_access_plan_entry,
+    inputs.plan.len(),
   );
   crate::ubpf::ubpf_set_lazy_local_call_resolver(
     vm,
     Some(tls_local_call_resolver),
-    resolver_ids.as_ptr(),
-    resolver_ids.len(),
+    inputs.resolver_ids.as_ptr(),
+    inputs.resolver_ids.len(),
   );
   let ret = crate::ubpf::ubpf_translate_function_ex(
     vm,
@@ -1850,8 +1859,8 @@ unsafe fn translate_function_into(
     &mut written_len,
     &mut errmsg_ptr,
     crate::ubpf::JitMode_ExtendedJitMode,
-    start_pc as u32,
-    end_pc as u32,
+    inputs.start_pc as u32,
+    inputs.end_pc as u32,
   );
   crate::ubpf::ubpf_set_region_hints(vm, std::ptr::null(), 0);
   crate::ubpf::ubpf_set_access_plan(vm, std::ptr::null(), 0);
