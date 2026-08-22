@@ -127,6 +127,12 @@ initialize_jit_state_result(
      */
     state->pc_locs_capacity = num_insts + 1;
     state->pc_locs = calloc(state->pc_locs_capacity, sizeof(state->pc_locs[0]));
+    state->group_barrier = calloc(num_insts + 1, sizeof(state->group_barrier[0]));
+    state->group_leader_pc = -1;
+    state->group_span = 0;
+    state->group_base_reg = -1;
+    state->group_region = 0;
+    state->group_written = 0;
     state->jumps = NULL;
     state->loads = NULL;
     state->leas = NULL;
@@ -143,7 +149,7 @@ initialize_jit_state_result(
     state->jit_mode = jit_mode;
     state->bpf_function_prolog_size = 0;
 
-    if (!state->pc_locs) {
+    if (!state->pc_locs || !state->group_barrier) {
         *errmsg = ubpf_error("Could not allocate space needed to JIT compile eBPF program");
         return -1;
     }
@@ -157,6 +163,8 @@ release_jit_state_result(struct jit_state* state, struct ubpf_jit_result* compil
     UNUSED_PARAMETER(compile_result);
     free(state->pc_locs);
     state->pc_locs = NULL;
+    free(state->group_barrier);
+    state->group_barrier = NULL;
     free(state->jumps);
     state->jumps = NULL;
     free(state->loads);

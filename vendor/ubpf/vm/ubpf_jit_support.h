@@ -166,6 +166,24 @@ struct jit_state
     uint32_t pc_locs_capacity;
     uint32_t stack_size;
     size_t bpf_function_prolog_size; // Count of bytes emitted at the start of the function.
+
+    /* State of the open access group, if any. See ubpf_set_access_plan().
+     *
+     * A group's members address the base its leader checked and parked, so the
+     * backend has to know that the leader really did run: that it is the most
+     * recent one emitted, that no branch can land between the two, and that
+     * nothing has redefined the base register in between. The plan says all
+     * this, but the plan is not trusted - these fields are what the backend
+     * derives for itself while walking the instruction stream.
+     */
+    int64_t group_leader_pc; /* -1 when no group is open. */
+    uint32_t group_span;     /* Bytes the open group's leader checked. */
+    int group_base_reg;      /* eBPF register the open group is based on. */
+    uint8_t group_region;    /* Region the open group's leader checked against. */
+    uint16_t group_written;  /* eBPF registers written since that leader. */
+    /* One byte per instruction slot: non-zero where a branch can land, which
+     * closes any open group. Indexed by absolute eBPF PC. */
+    uint8_t* group_barrier;
 };
 
 /**

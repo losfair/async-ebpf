@@ -723,6 +723,47 @@ extern "C"
     ubpf_set_frame_constants(struct ubpf_vm* vm, bool available);
 
     /**
+     * @brief One access-plan entry per instruction slot.
+     *
+     * A *group* is a run of memory accesses that share a base register, so all
+     * of their addresses lie within a bounded window around that register's
+     * value. The group's **leader** bounds-checks the whole window once and
+     * parks the translated base in the frame; each later **member** reads that
+     * base back and accesses it at a constant displacement.
+     */
+    struct ubpf_access_plan_entry
+    {
+        uint8_t role;       ///< 0 = ordinary checked access, 1 = leader, 2 = member.
+        uint8_t region;     ///< Region the leader checks against, as for ubpf_set_region_hints().
+        uint16_t delta;     ///< This access's displacement from the window's low bound.
+        uint32_t span;      ///< Bytes the leader's check covers.
+        int32_t lo;         ///< The low bound, as a displacement from the base register.
+        uint32_t leader_pc; ///< The leader that established the base; leaders name themselves.
+    };
+
+    /**
+     * @brief Supply a per-instruction access plan for JIT compilation.
+     *
+     * Meaningful only together with ubpf_set_jit_pointer_mask_and_offset() and
+     * ubpf_set_frame_constants(). The pointer must remain valid until
+     * translation completes; pass NULL to clear it.
+     *
+     * The plan is advisory, and the backend does not take it on trust. Before
+     * emitting a member it re-derives, from the instruction stream it is already
+     * walking, that the named leader is the one most recently emitted, that no
+     * branch can land between the two, that nothing has redefined the base
+     * register in between, and that the access lies inside the window the leader
+     * checked. Any failure emits an ordinary checked access instead, so a plan
+     * that is wrong - or hostile - costs speed and nothing else.
+     *
+     * @param[in] vm The VM.
+     * @param[in] plan Pointer to the plan array (one entry per instruction slot).
+     * @param[in] len Number of entries in @p plan.
+     */
+    void
+    ubpf_set_access_plan(struct ubpf_vm* vm, const struct ubpf_access_plan_entry* plan, size_t len);
+
+    /**
      * @brief Set a size for the buffer allocated to machine code generated during JIT compilation.
      * The JIT compiler allocates a buffer to store the code while it is being generated. The default
      * may be too big for some embedded platforms. Use this to customize the size of that buffer.

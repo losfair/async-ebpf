@@ -20,6 +20,11 @@ instruction streams and directed cases for unreachable code, stack spill/fill
 tracking, helper/local calls, caller-frame stack pointers, and per-function
 pointer-tag specialization.
 
+On a toolchain without cargo-fuzz, `cargo run --release --bin soak -- 30000` drives
+the same three harnesses over a deterministic pseudorandom stream. There is no
+coverage feedback and no sanitizer, so it only catches what crashes, faults, or
+lets a host pointer escape - but it runs anywhere.
+
 Leak detection is disabled for the bounded fuzz jobs because LeakSanitizer can
 fail at process shutdown on the supported sanitizer runner configurations. The
 targets still run with cargo-fuzz coverage instrumentation and AddressSanitizer.

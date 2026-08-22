@@ -136,7 +136,7 @@ async_ebpf_entry_trampoline:
     mov rdi, rsi
     sub rsp, 8
     mov rbp, rsp
-    sub rsp, 144
+    sub rsp, 160
     mov [rbp - 8], rax
     mov [rbp - 40], rdx
     // Copy JitMemory::derived - the twelve bounds-check constants - into the
@@ -543,6 +543,21 @@ const _: () = {
   assert!(std::mem::offset_of!(JitMemory, data_native_base) == 40);
   assert!(std::mem::offset_of!(JitMemory, derived) == 48);
   assert!(std::mem::size_of::<JitMemory>() == 144);
+};
+
+/// The access plan crosses into C as a raw pointer, so the two declarations of
+/// its entry have to agree field for field.
+const _: () = {
+  use crate::region_analysis::PlanEntry;
+  use crate::ubpf::ubpf_access_plan_entry as CEntry;
+  assert!(std::mem::size_of::<PlanEntry>() == std::mem::size_of::<CEntry>());
+  assert!(std::mem::align_of::<PlanEntry>() == std::mem::align_of::<CEntry>());
+  assert!(std::mem::offset_of!(PlanEntry, role) == std::mem::offset_of!(CEntry, role));
+  assert!(std::mem::offset_of!(PlanEntry, region) == std::mem::offset_of!(CEntry, region));
+  assert!(std::mem::offset_of!(PlanEntry, delta) == std::mem::offset_of!(CEntry, delta));
+  assert!(std::mem::offset_of!(PlanEntry, span) == std::mem::offset_of!(CEntry, span));
+  assert!(std::mem::offset_of!(PlanEntry, lo) == std::mem::offset_of!(CEntry, lo));
+  assert!(std::mem::offset_of!(PlanEntry, leader_pc) == std::mem::offset_of!(CEntry, leader_pc));
 };
 
 impl JitMemory {
@@ -1336,6 +1351,7 @@ impl Program {
       translate_function_into(
         vm,
         &region_analysis.hints,
+        &region_analysis.plan,
         &resolver_ids,
         function.start_pc,
         function.end_pc,
@@ -1806,6 +1822,7 @@ enum TranslateError {
 unsafe fn translate_function_into(
   vm: *mut crate::ubpf::ubpf_vm,
   hints: &[u8],
+  plan: &[crate::region_analysis::PlanEntry],
   resolver_ids: &[u32],
   start_pc: usize,
   end_pc: usize,
@@ -1816,6 +1833,11 @@ unsafe fn translate_function_into(
   let mut errmsg_ptr = std::ptr::null_mut();
 
   crate::ubpf::ubpf_set_region_hints(vm, hints.as_ptr(), hints.len());
+  crate::ubpf::ubpf_set_access_plan(
+    vm,
+    plan.as_ptr() as *const crate::ubpf::ubpf_access_plan_entry,
+    plan.len(),
+  );
   crate::ubpf::ubpf_set_lazy_local_call_resolver(
     vm,
     Some(tls_local_call_resolver),
@@ -1832,6 +1854,7 @@ unsafe fn translate_function_into(
     end_pc as u32,
   );
   crate::ubpf::ubpf_set_region_hints(vm, std::ptr::null(), 0);
+  crate::ubpf::ubpf_set_access_plan(vm, std::ptr::null(), 0);
   crate::ubpf::ubpf_set_lazy_local_call_resolver(vm, None, std::ptr::null(), 0);
 
   let errmsg = if errmsg_ptr.is_null() {

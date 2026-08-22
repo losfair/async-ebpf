@@ -125,6 +125,8 @@ struct ubpf_vm
     size_t region_hints_len;     ///< Number of valid entries in region_hints.
     bool native_frame_base;      ///< The embedder's entry code puts a native frame base in R10. See ubpf_set_native_frame_base().
     bool frame_constants;        ///< The embedder's entry code fills in the derived bounds-check constants. See ubpf_set_frame_constants().
+    const struct ubpf_access_plan_entry* access_plan; ///< Per-instruction access grouping. See ubpf_set_access_plan(). NULL disables.
+    size_t access_plan_len;      ///< Number of valid entries in access_plan.
     local_call_resolver_t local_call_resolver;
     const uint32_t* local_call_resolver_ids;
     size_t local_call_resolver_ids_len;

@@ -1,3 +1,4 @@
+mod access_groups;
 mod atomics;
 mod basic;
 mod entry_isolation;

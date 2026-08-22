@@ -351,6 +351,8 @@ pub struct RegionAnalysis {
 
 pub(crate) struct FunctionRegionAnalysis {
   pub(crate) hints: Vec<u8>,
+  /// Per-slot access grouping, parallel to `hints`. See [`PlanEntry`].
+  pub(crate) plan: Vec<PlanEntry>,
   pub(crate) unresolved: Vec<usize>,
   pub(crate) call_signatures: std::collections::HashMap<usize, PointerSignature>,
 }
@@ -451,6 +453,7 @@ pub(crate) fn analyze_function(
   if start_pc >= end_pc || end_pc > num_slots {
     return FunctionRegionAnalysis {
       hints,
+      plan: vec![PlanEntry::default(); num_slots],
       unresolved,
       call_signatures,
     };
@@ -519,8 +522,12 @@ pub(crate) fn analyze_function(
     }
   }
 
+  // Grouping runs last: it keys off the hints the loop above just settled.
+  let plan = build_access_plan(code, start_pc, end_pc, num_slots, &hints, &reached);
+
   FunctionRegionAnalysis {
     hints,
+    plan,
     unresolved,
     call_signatures,
   }
@@ -975,6 +982,222 @@ fn add_imm_kind(a: RegKind, imm: i32) -> RegKind {
     RegKind::Scalar => RegKind::Scalar,
     _ => RegKind::Unknown,
   }
+}
+
+/// One entry per instruction slot, handed to the JIT alongside the region
+/// hints. See `ubpf_set_access_plan()` for what the backend does with it.
+///
+/// A *group* is a run of memory accesses sharing one base register, so all of
+/// their addresses lie within a bounded window around that register's value.
+/// The first access is the group's **leader**: it bounds-checks the whole window
+/// once and parks the translated base in the frame. Every later **member** reads
+/// that base back and accesses it at a constant displacement - two instructions
+/// instead of a full check.
+///
+/// The plan is advisory. The backend re-derives every condition it can see for
+/// itself and emits an ordinary checked access when any of them fails, so a
+/// wrong plan costs speed, not safety.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct PlanEntry {
+  /// 0 = ordinary checked access, 1 = group leader, 2 = group member.
+  pub(crate) role: u8,
+  /// Region the leader's check runs against (`REGION_*`). Members inherit it.
+  pub(crate) region: u8,
+  /// This access's displacement from the group's low bound. Always below
+  /// `span`, so a failed check leaves it inside the guard window at address 0.
+  pub(crate) delta: u16,
+  /// Bytes the leader's check covers, starting at the low bound.
+  pub(crate) span: u32,
+  /// The low bound, as a displacement from the base register's value.
+  pub(crate) lo: i32,
+  /// The leader that established the base. Leaders name themselves.
+  pub(crate) leader_pc: u32,
+}
+
+pub(crate) const PLAN_ROLE_LEADER: u8 = 1;
+pub(crate) const PLAN_ROLE_MEMBER: u8 = 2;
+
+/// Widest window a group may span.
+///
+/// A failed check yields base 0, so a member then dereferences `[0 + delta]`.
+/// That has to land inside the runtime's guard window - the range the SIGSEGV
+/// handler claims as a guest fault rather than a host crash - which bounds
+/// `delta`, and with it the span, at one page.
+pub(crate) const MAX_GROUP_SPAN: i32 = 4096;
+
+/// A group under construction.
+struct OpenGroup {
+  base: usize,
+  leader_pc: usize,
+  /// `(pc, displacement)` of each access so far.
+  members: Vec<(usize, i32)>,
+  /// True once any member is a store, which pins the group to the stack.
+  has_store: bool,
+  /// The region the loads so far agree on, if any.
+  load_region: Option<u8>,
+  lo: i32,
+  hi: i32,
+}
+
+fn close_group(open: &mut Option<OpenGroup>, plan: &mut [PlanEntry]) {
+  let Some(g) = open.take() else { return };
+  if g.members.len() < 2 {
+    return;
+  }
+  let region = if g.has_store {
+    // A store is confined to the stack whatever its hint says, so the whole
+    // window is checked there. A load sharing the base is a stack access too -
+    // if it were not, the store through that base would already be faulting.
+    REGION_STACK
+  } else {
+    g.load_region.unwrap_or(REGION_UNKNOWN)
+  };
+  let span = (g.hi - g.lo) as u32;
+  for (i, &(pc, disp)) in g.members.iter().enumerate() {
+    plan[pc] = PlanEntry {
+      role: if i == 0 {
+        PLAN_ROLE_LEADER
+      } else {
+        PLAN_ROLE_MEMBER
+      },
+      region,
+      delta: (disp - g.lo) as u16,
+      span,
+      lo: g.lo,
+      leader_pc: g.leader_pc as u32,
+    };
+  }
+}
+
+/// Registers `inst` may overwrite. Over-approximating only ends groups early;
+/// under-approximating would let a group keep using a base that has changed.
+fn written_registers(inst: &Inst) -> Vec<usize> {
+  match inst.opcode & EBPF_CLS_MASK {
+    EBPF_CLS_LD | EBPF_CLS_LDX | EBPF_CLS_ALU | EBPF_CLS_ALU64 => vec![inst.dst],
+    // A fetching atomic writes its source register, and CMPXCHG writes R0.
+    EBPF_CLS_STX if inst.opcode & 0xe0 == 0xc0 => vec![inst.src, 0],
+    EBPF_CLS_JMP | EBPF_CLS_JMP32 if inst.opcode == EBPF_OP_CALL => (0..6).collect(),
+    _ => Vec::new(),
+  }
+}
+
+/// Assigns the accesses in `[start_pc, end_pc)` to groups.
+///
+/// The rule is deliberately local: a group is a straight-line run inside one
+/// basic block, off a base register that nothing redefines along the way. That
+/// covers the shape compilers actually emit - a struct initialised field by
+/// field, a loop body touching several members of one object - without having to
+/// reason about what a branch or a call might have done to the base.
+///
+/// Frame accesses are left out: `R10` addressing is already unchecked, so a
+/// window would save nothing.
+fn build_access_plan(
+  code: &[u8],
+  start_pc: usize,
+  end_pc: usize,
+  num_slots: usize,
+  hints: &[u8],
+  reached: &[bool],
+) -> Vec<PlanEntry> {
+  let mut plan = vec![PlanEntry::default(); num_slots];
+
+  // Anything a branch can land on ends the previous group: the base would not
+  // have been established on the path that jumped in. Calls end it too - a
+  // local callee runs in the same host frame and would overwrite the parked
+  // base, and a helper call can suspend the guest entirely.
+  let mut is_target = vec![false; num_slots];
+  for pc in start_pc..end_pc {
+    if !reached[pc] {
+      continue;
+    }
+    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    let cls = inst.opcode & EBPF_CLS_MASK;
+    if (cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32) && inst.opcode != EBPF_OP_EXIT {
+      for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+        is_target[succ] = true;
+      }
+    }
+  }
+
+  let mut open: Option<OpenGroup> = None;
+  let mut written: u16 = 0;
+
+  for pc in start_pc..end_pc {
+    if !reached[pc] {
+      close_group(&mut open, &mut plan);
+      written = 0;
+      continue;
+    }
+    if is_target[pc] {
+      close_group(&mut open, &mut plan);
+      written = 0;
+    }
+
+    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    let cls = inst.opcode & EBPF_CLS_MASK;
+    let is_atomic = cls == EBPF_CLS_STX && inst.opcode & 0xe0 == 0xc0;
+    let base_and_store = match cls {
+      EBPF_CLS_LDX => Some((inst.src, false)),
+      EBPF_CLS_ST | EBPF_CLS_STX => Some((inst.dst, true)),
+      _ => None,
+    };
+
+    // Atomics both read and write, and the backend routes them through the full
+    // check, so they neither join nor start a group.
+    if let Some((base, is_store)) = base_and_store.filter(|_| !is_atomic) {
+      if base != R10 {
+        let width = access_width(inst.opcode) as i32;
+        let disp = inst.offset as i32;
+        let extends = open.as_ref().is_some_and(|g| {
+          g.base == base
+            && written & (1 << base) == 0
+            && g.hi.max(disp + width) - g.lo.min(disp) <= MAX_GROUP_SPAN
+        });
+        if !extends {
+          close_group(&mut open, &mut plan);
+          written = 0;
+          open = Some(OpenGroup {
+            base,
+            leader_pc: pc,
+            members: Vec::new(),
+            has_store: false,
+            load_region: None,
+            lo: disp,
+            hi: disp + width,
+          });
+        }
+        let g = open.as_mut().expect("a group is open");
+        g.members.push((pc, disp));
+        g.lo = g.lo.min(disp);
+        g.hi = g.hi.max(disp + width);
+        if is_store {
+          g.has_store = true;
+        } else {
+          // Loads that disagree on a region leave the group to the dual-region
+          // probe, which covers both.
+          g.load_region = Some(match g.load_region {
+            None => hints[pc],
+            Some(prev) if prev == hints[pc] => prev,
+            Some(_) => REGION_UNKNOWN,
+          });
+        }
+      }
+    }
+
+    // Record what this instruction overwrites, after using it: an access whose
+    // destination is its own base is still valid, but nothing after it is.
+    for reg in written_registers(&inst) {
+      written |= 1 << reg;
+      if open.as_ref().is_some_and(|g| g.base == reg) {
+        close_group(&mut open, &mut plan);
+        written = 0;
+      }
+    }
+  }
+  close_group(&mut open, &mut plan);
+
+  plan
 }
 
 #[cfg(test)]
