@@ -1226,6 +1226,723 @@ mod tests {
     function_live_in(code, 0, code.len() / 8, &|_| callee)
   }
 
+  // ---------------------------------------------------------------------
+  // Audit scaffolding (added while reviewing the access plan / frame hint).
+  // ---------------------------------------------------------------------
+
+  /// Whole-fragment `analyze_function` from the ordinary entry signature.
+  fn analyze_fn(code: &[u8]) -> FunctionRegionAnalysis {
+    analyze_function(
+      code,
+      0,
+      code.len() / 8,
+      PointerSignature::entry(),
+      DATA_LO,
+      DATA_HI,
+      &crate::function_analysis::FunctionLayout::unmasked(code.len() / 8),
+    )
+  }
+
+  fn plan_of(code: &[u8]) -> Vec<PlanEntry> {
+    analyze_fn(code).plan
+  }
+
+  /// `(role, region, delta, span, lo, leader_pc)` for a slot, for terse asserts.
+  fn entry(p: &PlanEntry) -> (u8, u8, u16, u32, i32, u32) {
+    (p.role, p.region, p.delta, p.span, p.lo, p.leader_pc)
+  }
+
+  const LDXB: u8 = EBPF_CLS_LDX | 0x10;
+  const LDXH: u8 = EBPF_CLS_LDX | 0x08;
+  const LDXW: u8 = EBPF_CLS_LDX | 0x00;
+  const LDXDW: u8 = EBPF_CLS_LDX | 0x18;
+  const LDXWSX: u8 = EBPF_CLS_LDX | 0x80; // MEMSX | W
+  const LDXHSX: u8 = EBPF_CLS_LDX | 0x88;
+  const LDXBSX: u8 = EBPF_CLS_LDX | 0x90;
+  const STDW: u8 = EBPF_CLS_ST | 0x18;
+  const STXDW: u8 = EBPF_CLS_STX | 0x18;
+  const ATOMIC_DW: u8 = EBPF_CLS_STX | 0xc0 | 0x18;
+  const MOV64_REG: u8 = EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV;
+  const ADD64_IMM: u8 = EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD;
+  const JEQ_IMM: u8 = EBPF_CLS_JMP | 0x10;
+
+  /// `r1 = r10; r1 += -1024` - a base that is stack-derived but is not `R10`
+  /// itself, so accesses off it are grouped rather than taking the frame path.
+  fn base_off_frame() -> [[u8; 8]; 2] {
+    [
+      slot(MOV64_REG, 1, 10, 0, 0),
+      slot(ADD64_IMM, 1, 0, 0, -1024),
+    ]
+  }
+
+  /// Every accepted `LDX`/`ST`/`STX` opcode form, with the width the backend
+  /// uses for it. The frame window test and the group span both depend on
+  /// `access_width` agreeing with the backend for every one of them.
+  #[test]
+  fn access_width_matches_every_accepted_opcode_form() {
+    for (opcode, want) in [
+      (LDXB, 1),
+      (LDXH, 2),
+      (LDXW, 4),
+      (LDXDW, 8),
+      (LDXBSX, 1),
+      (LDXHSX, 2),
+      (LDXWSX, 4),
+      (EBPF_CLS_ST | 0x10, 1),
+      (EBPF_CLS_ST | 0x08, 2),
+      (EBPF_CLS_ST | 0x00, 4),
+      (STDW, 8),
+      (EBPF_CLS_STX | 0x10, 1),
+      (EBPF_CLS_STX | 0x08, 2),
+      (EBPF_CLS_STX | 0x00, 4),
+      (STXDW, 8),
+      (EBPF_CLS_STX | 0xc0 | 0x00, 4), // ATOMIC32
+      (ATOMIC_DW, 8),
+    ] {
+      assert_eq!(access_width(opcode), want, "opcode {opcode:#04x}");
+    }
+  }
+
+  /// The frame window is `[R10 - FRAME_WINDOW, R10)`, closed at the bottom and
+  /// open at the top, for every width.
+  #[test]
+  fn frame_hint_window_boundaries() {
+    const W: i16 = crate::program::FRAME_WINDOW as i16;
+    for (opcode, width) in [(LDXB, 1i16), (LDXH, 2), (LDXW, 4), (LDXDW, 8)] {
+      for (offset, want_frame) in [
+        (-W, true),          // lowest byte of the window
+        (-W - 1, false),     // one byte below it
+        (-width, true),      // ends exactly at R10
+        (-width + 1, false), // would cross R10
+        (0i16, false),
+        (1, false),
+      ] {
+        let code = flatten(&[
+          slot(opcode, 0, 10, offset, 0),
+          slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+        ]);
+        let hints = analyze_fn(&code).hints;
+        let want = if want_frame {
+          REGION_FRAME
+        } else {
+          REGION_STACK
+        };
+        assert_eq!(
+          hints[0], want,
+          "opcode {opcode:#04x} width {width} offset {offset}"
+        );
+      }
+    }
+  }
+
+  /// The sign-extended loads carry their width in the same bits, so they get
+  /// the same window - `ldxwsx [r10-4]` fits, `ldxwsx [r10-3]` does not.
+  #[test]
+  fn sign_extended_loads_use_their_real_width_in_the_frame_window() {
+    for (opcode, width) in [(LDXBSX, 1i16), (LDXHSX, 2), (LDXWSX, 4)] {
+      for (offset, want) in [(-width, REGION_FRAME), (-width + 1, REGION_STACK)] {
+        let code = flatten(&[
+          slot(opcode, 0, 10, offset, 0),
+          slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+        ]);
+        assert_eq!(
+          analyze_fn(&code).hints[0],
+          want,
+          "opcode {opcode:#04x} offset {offset}"
+        );
+      }
+    }
+  }
+
+  /// Stores now get a hint too, but only the frame one: everything else is
+  /// left UNKNOWN, because the backend confines a store to the stack anyway.
+  #[test]
+  fn only_the_frame_hint_is_emitted_for_stores() {
+    let code = flatten(&[
+      slot(STDW, 10, 0, -8, 0),     // st [r10-8], 0      -> FRAME
+      slot(STXDW, 10, 1, -16, 0),   // stx [r10-16], r1   -> FRAME
+      slot(STDW, 10, 0, -8192, 0),  // outside the window -> UNKNOWN
+      slot(ATOMIC_DW, 10, 2, -8, 1), // an atomic is never a frame access
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let hints = analyze_fn(&code).hints;
+    assert_eq!(hints[0], REGION_FRAME);
+    assert_eq!(hints[1], REGION_FRAME);
+    assert_eq!(hints[2], REGION_UNKNOWN);
+    assert_eq!(hints[3], REGION_UNKNOWN);
+  }
+
+  /// A group's window is the convex hull of its members, and every member's
+  /// delta is measured from the hull's low bound - including the leader, which
+  /// need not be the lowest.
+  #[test]
+  fn group_deltas_are_measured_from_the_windows_low_bound() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXB, 2, 1, 5, 0),   // leader, disp 5, width 1
+      slot(LDXDW, 3, 1, 8, 0),  // disp 8, width 8 -> hi = 16
+      slot(LDXH, 4, 1, 0, 0),   // disp 0, width 2 -> lo = 0
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let code = flatten(&slots);
+    let plan = plan_of(&code);
+    assert_eq!(
+      entry(&plan[2]),
+      (PLAN_ROLE_LEADER, REGION_STACK, 5, 16, 0, 2)
+    );
+    assert_eq!(
+      entry(&plan[3]),
+      (PLAN_ROLE_MEMBER, REGION_STACK, 8, 16, 0, 2)
+    );
+    assert_eq!(
+      entry(&plan[4]),
+      (PLAN_ROLE_MEMBER, REGION_STACK, 0, 16, 0, 2)
+    );
+    // What the backend re-derives: delta + width <= span, for every member.
+    for (pc, width) in [(2usize, 1u32), (3, 8), (4, 2)] {
+      assert!(plan[pc].delta as u32 + width <= plan[pc].span);
+    }
+  }
+
+  /// The span cap is inclusive, and one byte past it starts a new group.
+  #[test]
+  fn the_span_cap_is_inclusive() {
+    let build = |far: i16| {
+      let mut slots = base_off_frame().to_vec();
+      slots.extend([
+        slot(LDXB, 2, 1, 0, 0),
+        slot(LDXB, 3, 1, far, 0),
+        slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+      ]);
+      plan_of(&flatten(&slots))
+    };
+    let plan = build(4095); // hull [0, 4096) - exactly the cap
+    assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
+    assert_eq!(entry(&plan[3]), (PLAN_ROLE_MEMBER, REGION_STACK, 4095, 4096, 0, 2));
+
+    let plan = build(4096); // hull [0, 4097) - over the cap
+    assert_eq!(plan[2].role, 0);
+    assert_eq!(plan[3].role, 0);
+  }
+
+  /// The extreme displacements an `i16` offset can hold must not overflow the
+  /// span arithmetic; they just refuse to group.
+  #[test]
+  fn extreme_displacements_do_not_overflow_the_span() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, i16::MIN, 0),
+      slot(LDXDW, 3, 1, i16::MAX, 0),
+      slot(LDXDW, 4, 1, i16::MIN, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    for pc in 2..5 {
+      assert_eq!(plan[pc].role, 0, "slot {pc}");
+    }
+  }
+
+  /// A group containing a store is checked against the stack even when its
+  /// loads say data. Documented as sound because a store through that base
+  /// would already be faulting - this pins the behaviour down either way.
+  #[test]
+  fn a_store_pins_the_group_to_the_stack() {
+    let code = flatten(&[
+      slot(EBPF_OP_LDDW, 1, 0, 0, DATA_LO as i32),
+      slot(0, 0, 0, 0, 0),
+      slot(LDXDW, 2, 1, 0, 0),  // hint DATA
+      slot(LDXDW, 3, 1, 8, 0),  // hint DATA
+      slot(STDW, 1, 0, 16, 0),  // a store pins the whole window
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze_fn(&code);
+    assert_eq!(result.hints[2], REGION_DATA);
+    assert_eq!(result.hints[3], REGION_DATA);
+    assert_eq!(result.plan[2].region, REGION_STACK);
+    assert_eq!(result.plan[3].region, REGION_STACK);
+    assert_eq!(result.plan[4].region, REGION_STACK);
+  }
+
+  /// The window a group covers never reaches from one guest region into the
+  /// other, which is what makes "a store in the group implies the whole window
+  /// is stack" sound. The cage's inter-region guard is what guarantees it.
+  #[test]
+  fn a_group_window_cannot_span_two_guest_regions() {
+    // The narrowest guard the cage can randomize to, on the smallest page size
+    // it will accept.
+    const MIN_INTER_REGION_GUARD: i32 = 16 * 4096;
+    assert!(
+      MAX_GROUP_SPAN <= MIN_INTER_REGION_GUARD,
+      "a single group window could straddle the stack and data regions"
+    );
+  }
+
+  /// A group without a store takes the loads' region, and a group whose loads
+  /// cannot be routed stays UNKNOWN so the backend probes both.
+  #[test]
+  fn a_load_only_group_takes_the_loads_region() {
+    let code = flatten(&[
+      slot(EBPF_OP_LDDW, 1, 0, 0, DATA_LO as i32),
+      slot(0, 0, 0, 0, 0),
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(LDXDW, 3, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&code);
+    assert_eq!(plan[2].region, REGION_DATA);
+    assert_eq!(plan[3].region, REGION_DATA);
+
+    // r6 is Scalar at entry, so nothing routes.
+    let code = flatten(&[
+      slot(LDXDW, 2, 6, 0, 0),
+      slot(LDXDW, 3, 6, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&code);
+    assert_eq!(plan[0].region, REGION_UNKNOWN);
+    assert_eq!(plan[0].role, PLAN_ROLE_LEADER);
+  }
+
+  /// An `R10` access in the middle of a run neither joins the group nor closes
+  /// it: it needs no base of its own and touches nothing the group parked.
+  #[test]
+  fn a_frame_access_between_members_keeps_the_group_open() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(LDXDW, 3, 10, -8, 0), // frame access, ungrouped
+      slot(LDXDW, 4, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
+    assert_eq!(plan[3].role, 0);
+    assert_eq!(entry(&plan[4]), (PLAN_ROLE_MEMBER, REGION_STACK, 8, 16, 0, 2));
+  }
+
+  /// An atomic is routed through the full check, so it neither joins a group
+  /// nor ends one - but it does write its source register, which does.
+  #[test]
+  fn an_atomic_does_not_join_a_group_but_its_write_closes_one() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(ATOMIC_DW, 1, 3, 16, 1), // atomic fetch_add through r1, writes r3
+      slot(LDXDW, 4, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
+    assert_eq!(plan[3].role, 0, "the atomic itself is never grouped");
+    assert_eq!(plan[4].role, PLAN_ROLE_MEMBER);
+    // The window covers only the two loads; the atomic's own displacement is
+    // not in it.
+    assert_eq!(plan[2].span, 16);
+
+    // An atomic whose source is the base closes the group.
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(ATOMIC_DW, 6, 1, 0, 1), // fetch writes r1
+      slot(LDXDW, 4, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    assert_eq!(plan[2].role, 0);
+    assert_eq!(plan[4].role, 0);
+  }
+
+  /// A `lddw` in the middle of a run of accesses splits the group in two,
+  /// because its second slot is never reached by the dataflow. Nothing unsafe -
+  /// but both halves lose their window.
+  #[test]
+  fn a_lddw_between_accesses_dissolves_the_group() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(EBPF_OP_LDDW, 3, 0, 0, 0), // two slots
+      slot(0, 0, 0, 0, 0),
+      slot(LDXDW, 4, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    // Both accesses are left ungrouped: the group is closed at the unreached
+    // second slot with a single member, and the one after it never gets a
+    // partner.
+    assert_eq!(plan[2].role, 0, "the group did not survive the lddw");
+    assert_eq!(plan[5].role, 0);
+
+    // Without the lddw the very same pair does group, which is the point.
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(MOV64_REG, 3, 0, 0, 0),
+      slot(LDXDW, 4, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
+    assert_eq!(plan[4].role, PLAN_ROLE_MEMBER);
+  }
+
+  /// The second slot of a `lddw` is never decoded as an access, so it can
+  /// neither lead nor join a group even when its bit pattern would say so.
+  #[test]
+  fn the_second_slot_of_a_lddw_is_never_an_access() {
+    let code = flatten(&[
+      slot(EBPF_OP_LDDW, 1, 0, 0, DATA_LO as i32),
+      slot(0, 0, 0, 0, 0),
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(LDXDW, 3, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let result = analyze_fn(&code);
+    assert_eq!(result.plan[1], PlanEntry::default());
+    assert_eq!(result.hints[1], REGION_UNKNOWN);
+    assert!(!result.unresolved.contains(&1));
+    assert_eq!(result.plan[2].role, PLAN_ROLE_LEADER);
+  }
+
+  /// Unreachable slots get no plan entry, so the backend - which walks the
+  /// whole range regardless of reachability - falls back to a checked access.
+  #[test]
+  fn unreachable_accesses_get_no_plan_entry() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(LDXDW, 3, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+      slot(LDXDW, 4, 1, 16, 0), // dead
+      slot(LDXDW, 5, 1, 24, 0), // dead
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
+    assert_eq!(plan[3].role, PLAN_ROLE_MEMBER);
+    assert_eq!(plan[5], PlanEntry::default());
+    assert_eq!(plan[6], PlanEntry::default());
+  }
+
+  /// Every landing site of a conditional branch - target and fall-through -
+  /// ends the group before it.
+  #[test]
+  fn both_edges_of_a_conditional_branch_are_barriers() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(JEQ_IMM, 3, 0, 1, 0), // -> slot 5 (skipping slot 4)
+      slot(LDXDW, 4, 1, 8, 0),   // fall-through, and a barrier itself
+      slot(LDXDW, 5, 1, 16, 0),  // branch target
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    for pc in [2usize, 4, 5] {
+      assert_eq!(plan[pc].role, 0, "slot {pc} should not be grouped");
+    }
+  }
+
+  /// A backward branch target ends the group that ran into it.
+  #[test]
+  fn a_backward_branch_target_is_a_barrier() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),  // slot 2: loop head, a branch target
+      slot(LDXDW, 3, 1, 8, 0),  // slot 3
+      slot(JEQ_IMM, 4, 0, -3, 0), // slot 4: back to slot 2
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    assert_eq!(plan[2].role, PLAN_ROLE_LEADER, "the loop body still groups");
+    assert_eq!(plan[3].role, PLAN_ROLE_MEMBER);
+  }
+
+  /// A branch whose target lands outside the function is dropped rather than
+  /// indexing out of the barrier array.
+  #[test]
+  fn an_out_of_range_branch_target_is_dropped() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(EBPF_OP_JA, 0, 0, i16::MIN, 0), // wildly out of range, backwards
+      slot(LDXDW, 3, 1, 8, 0),             // unreachable after the JA
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots)); // must not panic
+    assert_eq!(plan[2].role, 0);
+  }
+
+  /// The barrier pre-pass ignores unreachable branches, so a group can span a
+  /// slot the backend treats as a landing site. Safe - the backend closes the
+  /// group itself and the member falls back to a checked access - but it means
+  /// the two barrier sets are not identical.
+  #[test]
+  fn an_unreachable_branch_leaves_no_barrier() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(EBPF_OP_JA, 0, 0, 2, 0),  // slot 2: -> slot 5
+      slot(JEQ_IMM, 0, 0, 3, 0),     // slot 3: dead; its target would be slot 7
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0), // slot 4: dead
+      slot(LDXDW, 2, 1, 0, 0),       // slot 5
+      slot(LDXDW, 3, 1, 8, 0),       // slot 6
+      slot(LDXDW, 4, 1, 16, 0),      // slot 7: the dead branch's target
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    assert_eq!(plan[5].role, PLAN_ROLE_LEADER);
+    assert_eq!(plan[6].role, PLAN_ROLE_MEMBER);
+    // Slot 7 is in the group even though the backend's barrier table marks it.
+    assert_eq!(plan[7].role, PLAN_ROLE_MEMBER);
+  }
+
+  /// Both a helper call and a local call end the group at their return slot.
+  #[test]
+  fn a_call_ends_the_group_at_its_return_slot() {
+    for src in [0u8, 1] {
+      let mut slots = base_off_frame().to_vec();
+      slots.extend([
+        slot(MOV64_REG, 6, 10, 0, 0),
+        slot(ADD64_IMM, 6, 0, 0, -1024),
+        slot(LDXDW, 2, 6, 0, 0),
+        slot(LDXDW, 3, 6, 8, 0),
+        slot(EBPF_OP_CALL, 0, src, 0, 2), // -> slot 9 when local
+        slot(LDXDW, 4, 6, 16, 0),
+        slot(LDXDW, 5, 6, 24, 0),
+        slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+        slot(EBPF_OP_EXIT, 0, 0, 0, 0), // callee
+      ]);
+      let code = flatten(&slots);
+      let plan = analyze_function(
+        &code,
+        0,
+        9,
+        PointerSignature::entry(),
+        DATA_LO,
+        DATA_HI,
+        &crate::function_analysis::FunctionLayout::unmasked(code.len() / 8),
+      )
+      .plan;
+      assert_eq!(plan[4].role, PLAN_ROLE_LEADER, "src {src}");
+      assert_eq!(plan[5].role, PLAN_ROLE_MEMBER, "src {src}");
+      assert_eq!(plan[5].span, 16, "src {src}: the window stops at the call");
+      assert_eq!(plan[7].role, PLAN_ROLE_LEADER, "src {src}");
+      assert_eq!(plan[7].leader_pc, 7, "src {src}");
+      assert_eq!(plan[8].role, PLAN_ROLE_MEMBER, "src {src}");
+    }
+  }
+
+  /// A group of one is no group at all.
+  #[test]
+  fn a_lone_access_is_not_a_group() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(plan_of(&flatten(&slots))[2], PlanEntry::default());
+  }
+
+  /// `hints` and `plan` are always as long as the whole program's slot count,
+  /// including on the early-return path, because the backend indexes both by
+  /// absolute PC.
+  #[test]
+  fn hints_and_plan_always_cover_every_slot() {
+    let code = flatten(&[
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(LDXDW, 3, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let slots = code.len() / 8;
+    let layout = crate::function_analysis::FunctionLayout::unmasked(slots);
+    for (start, end) in [(0, slots), (1, 2), (2, 2), (1, 0), (0, slots + 1)] {
+      let r = analyze_function(
+        &code,
+        start,
+        end,
+        PointerSignature::entry(),
+        DATA_LO,
+        DATA_HI,
+        &layout,
+      );
+      assert_eq!(r.hints.len(), slots, "[{start}, {end})");
+      assert_eq!(r.plan.len(), slots, "[{start}, {end})");
+    }
+  }
+
+  /// The plan is built over `[start_pc, end_pc)` only: no entry is written
+  /// outside the function the backend is about to translate.
+  #[test]
+  fn the_plan_is_confined_to_the_function_being_analyzed() {
+    let code = flatten(&[
+      slot(LDXDW, 2, 1, 0, 0), // another function's body
+      slot(LDXDW, 3, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+      slot(LDXDW, 2, 1, 0, 0), // the function under analysis
+      slot(LDXDW, 3, 1, 8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let slots = code.len() / 8;
+    let plan = analyze_function(
+      &code,
+      3,
+      slots,
+      PointerSignature::entry(),
+      DATA_LO,
+      DATA_HI,
+      &crate::function_analysis::FunctionLayout::unmasked(slots),
+    )
+    .plan;
+    assert_eq!(plan[0], PlanEntry::default());
+    assert_eq!(plan[1], PlanEntry::default());
+    assert_eq!(plan[3].role, PLAN_ROLE_LEADER);
+    assert_eq!(plan[3].leader_pc, 3);
+    assert_eq!(plan[4].role, PLAN_ROLE_MEMBER);
+  }
+
+  /// An access whose destination is its own base ends the group after it, but
+  /// is itself still a valid member.
+  #[test]
+  fn a_load_into_its_own_base_ends_the_group_after_it() {
+    let mut slots = base_off_frame().to_vec();
+    slots.extend([
+      slot(LDXDW, 2, 1, 0, 0),
+      slot(LDXDW, 1, 1, 8, 0), // r1 = *(u64 *)(r1 + 8)
+      slot(LDXDW, 3, 1, 16, 0),
+      slot(LDXDW, 4, 1, 24, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let plan = plan_of(&flatten(&slots));
+    assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
+    assert_eq!(entry(&plan[3]), (PLAN_ROLE_MEMBER, REGION_STACK, 8, 16, 0, 2));
+    assert_eq!(plan[4].role, PLAN_ROLE_LEADER, "a fresh group off the new r1");
+    assert_eq!(plan[4].leader_pc, 4);
+    assert_eq!(plan[5].role, PLAN_ROLE_MEMBER);
+  }
+
+  /// The frame hint's one unverifiable claim is that `R10` still holds the
+  /// frame pointer. The loader refuses every assignment to it, but the analysis
+  /// checks rather than assumes - so an assignment must suppress the hint.
+  #[test]
+  fn an_assignment_to_r10_suppresses_the_frame_hint() {
+    // `r10 = r1` (the ctx: a stack pointer, but not this frame's base).
+    let code = flatten(&[
+      slot(MOV64_REG, 10, 1, 0, 0),
+      slot(LDXDW, 0, 10, -8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(analyze_fn(&code).hints[1], REGION_STACK);
+
+    // `r10 = <data>` - not even a stack pointer any more.
+    let code = flatten(&[
+      slot(EBPF_OP_LDDW, 10, 0, 0, DATA_LO as i32),
+      slot(0, 0, 0, 0, 0),
+      slot(LDXDW, 0, 10, -8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(analyze_fn(&code).hints[2], REGION_DATA);
+
+    // A fetching atomic writes its source, so `r10` as a source kills it too.
+    let code = flatten(&[
+      slot(ATOMIC_DW, 1, 10, 0, 1),
+      slot(LDXDW, 0, 10, -8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(analyze_fn(&code).hints[1], REGION_UNKNOWN);
+  }
+
+  /// `R10` displaced and restored is still the frame pointer, and the offset
+  /// tracking is what says so - the hint follows the tracked displacement, not
+  /// the mere fact that the register is `R10`.
+  #[test]
+  fn the_frame_hint_follows_r10s_tracked_displacement() {
+    let code = flatten(&[
+      slot(ADD64_IMM, 10, 0, 0, -8),
+      slot(LDXDW, 0, 10, -8, 0), // r10 is displaced here: no frame hint
+      slot(ADD64_IMM, 10, 0, 0, 8),
+      slot(LDXDW, 1, 10, -8, 0), // restored: frame hint again
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let hints = analyze_fn(&code).hints;
+    assert_eq!(hints[1], REGION_STACK);
+    assert_eq!(hints[3], REGION_FRAME);
+  }
+
+  /// A join that cannot agree on `R10` suppresses the hint on the merged path.
+  #[test]
+  fn a_join_that_loses_r10_suppresses_the_frame_hint() {
+    let code = flatten(&[
+      slot(JEQ_IMM, 0, 0, 1, 0),      // -> slot 2
+      slot(ADD64_IMM, 10, 0, 0, -16), // only on the fall-through
+      slot(LDXDW, 0, 10, -8, 0),      // join: r10 is Current(None)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(analyze_fn(&code).hints[2], REGION_STACK);
+  }
+
+  /// The hint is for `R10` itself, never a register derived from it: a copy
+  /// holds a guest address at run time, so its displacement is not a native one.
+  #[test]
+  fn a_copy_of_r10_does_not_get_the_frame_hint() {
+    let code = flatten(&[
+      slot(MOV64_REG, 1, 10, 0, 0),
+      slot(LDXDW, 0, 1, -8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(analyze_fn(&code).hints[1], REGION_STACK);
+  }
+
+  /// A local callee's `R10` is its own frame pointer, not the caller's, so the
+  /// frame hint has to be re-established from the callee's entry.
+  #[test]
+  fn a_callees_frame_hint_is_its_own() {
+    let code = flatten(&[
+      slot(EBPF_OP_CALL, 0, 1, 0, 1), // -> slot 2
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+      slot(LDXDW, 0, 10, -8, 0), // callee
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let slots = code.len() / 8;
+    let layout = crate::function_analysis::FunctionLayout::unmasked(slots);
+    // Whatever signature the caller hands over, `apply_to_state` pins R10.
+    let mut regs = [RegKind::Unknown; NUM_REGS];
+    regs[R10] = RegKind::Unknown;
+    let r = analyze_function(
+      &code,
+      2,
+      slots,
+      PointerSignature { regs },
+      DATA_LO,
+      DATA_HI,
+      &layout,
+    );
+    assert_eq!(r.hints[2], REGION_FRAME);
+  }
+
+  /// Every register an instruction can overwrite has to end a group based on
+  /// it. This walks the forms the backend's own mask lists.
+  #[test]
+  fn written_registers_covers_every_writing_form() {
+    let cases: [(&str, [u8; 8], &[usize]); 9] = [
+      ("lddw", slot(EBPF_OP_LDDW, 4, 0, 0, 0), &[4]),
+      ("ldxdw", slot(LDXDW, 4, 1, 0, 0), &[4]),
+      ("alu64 add", slot(ADD64_IMM, 4, 0, 0, 1), &[4]),
+      ("alu32 mov", slot(EBPF_CLS_ALU | EBPF_ALU_OP_MOV, 4, 0, 0, 1), &[4]),
+      ("byteswap le", slot(EBPF_CLS_ALU | 0xd0, 4, 0, 0, 64), &[4]),
+      ("bswap64", slot(EBPF_CLS_ALU64 | 0xd0, 4, 0, 0, 64), &[4]),
+      ("atomic fetch", slot(ATOMIC_DW, 1, 4, 0, 1), &[4, 0]),
+      ("call helper", slot(EBPF_OP_CALL, 0, 0, 0, 1), &[0, 1, 2, 3, 4, 5]),
+      ("call local", slot(EBPF_OP_CALL, 0, 1, 0, 1), &[0, 1, 2, 3, 4, 5]),
+    ];
+    for (name, s, want) in cases {
+      let got = written_registers(&decode(&s));
+      for reg in want {
+        assert!(got.contains(reg), "{name}: expected r{reg} in {got:?}");
+      }
+    }
+    // Plain stores write nothing.
+    for s in [slot(STDW, 1, 0, 0, 0), slot(STXDW, 1, 2, 0, 0)] {
+      assert!(written_registers(&decode(&s)).is_empty());
+    }
+  }
+
   #[test]
   fn a_register_read_before_it_is_written_is_live_in() {
     let code = flatten(&[
