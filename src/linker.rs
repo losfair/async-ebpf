@@ -22,7 +22,7 @@ const EBPF_OP_EXIT: u8 = 0x95;
 #[cfg(test)]
 const EBPF_OP_JA: u8 = 0x05;
 #[cfg(test)]
-const MAX_LOCAL_CALL_DEPTH: usize = 8;
+use crate::function_analysis::MAX_LOCAL_CALL_DEPTH;
 
 #[derive(Copy, Clone, Debug)]
 struct EbpfInsn {

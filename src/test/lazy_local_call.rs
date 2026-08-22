@@ -21,7 +21,7 @@ use crate::{
   error::Error,
   program::{
     DummyProgramEventListener, HelperScope, PreemptionEnabled, Program, ProgramEventListener,
-    ProgramLoader, TimesliceConfig,
+    ProgramLoader, TimesliceConfig, MAX_CALLDATA_SIZE,
   },
   test::raw_elf::{build_elf, Insn},
   test_util::{gt_env, timeslice_config, TokioTimeslicer},
@@ -52,6 +52,33 @@ async fn run(program: &Program, calldata: &[u8]) -> Result<i64, Error> {
       &PreemptionEnabled::new(t_env),
     )
     .await
+}
+
+/// The loader caps the local call graph at `MAX_LOCAL_CALL_DEPTH` frames, and
+/// calldata is copied into the top of the same guest stack window with `R10`
+/// starting below it. The window has to cover both, or the deepest chain the
+/// loader accepts runs off the bottom of the stack as soon as any calldata is
+/// passed.
+#[tokio::test]
+async fn the_deepest_accepted_call_chain_fits_alongside_calldata() {
+  // Seven callers plus a leaf that touches the very bottom of its own frame -
+  // the deepest chain `validate_local_call_graph` accepts.
+  let mut code = Vec::new();
+  for _ in 0..7 {
+    code.push(Insn::call_local(1)); // target is pc + imm + 1, the next function
+    code.push(Insn::exit());
+  }
+  code.push(Insn::ldx_dw(0, 10, -4096));
+  code.push(Insn::exit());
+
+  let program = load_raw(&code, &[]);
+  for calldata_len in [0usize, 1, 8, 64, MAX_CALLDATA_SIZE] {
+    let ret = run(&program, &vec![0u8; calldata_len]).await;
+    assert!(
+      ret.is_ok(),
+      "{calldata_len} bytes of calldata pushed the deepest frame off the stack: {ret:?}"
+    );
+  }
 }
 
 /// The resolver is a full host call — it suspends the guest, runs the region

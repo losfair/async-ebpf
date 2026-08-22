@@ -32,7 +32,7 @@ use crate::{
     Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
   },
   error::{Error, RuntimeError},
-  function_analysis::{analyze_functions, FunctionLayout},
+  function_analysis::{analyze_functions, FunctionLayout, MAX_LOCAL_CALL_DEPTH},
   helpers::Helper,
   linker::{link_elf, validate_local_call_graph},
   pointer_cage::PointerCage,
@@ -41,8 +41,23 @@ use crate::{
 };
 
 const NATIVE_STACK_SIZE: usize = 16384;
-const SHADOW_STACK_SIZE: usize = 32768;
-const MAX_CALLDATA_SIZE: usize = 512;
+pub(crate) const MAX_CALLDATA_SIZE: usize = 512;
+
+/// Guest stack the deepest accepted local call chain can consume below the entry
+/// frame: every local function is charged one uBPF frame, and the loader caps
+/// the call graph at [`MAX_LOCAL_CALL_DEPTH`] frames.
+const LOCAL_CALL_FRAME_BUDGET: usize =
+  MAX_LOCAL_CALL_DEPTH * crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+
+/// The guest stack window.
+///
+/// Calldata is copied into the top of this window and `R10` starts at the first
+/// 8-aligned address below it, so the window has to cover the frame budget *and*
+/// the largest calldata a caller can pass. Sizing it to the frame budget alone
+/// leaves no slack: the deepest call chain the loader accepts would then run off
+/// the bottom of the stack by as much calldata as was passed, and a program that
+/// works with none would fault with any.
+const SHADOW_STACK_SIZE: usize = LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8);
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 
