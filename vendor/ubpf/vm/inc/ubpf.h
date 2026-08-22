@@ -49,6 +49,14 @@ extern "C"
 /**
  * @brief Default stack size for each local eBPF function.
  */
+/**
+ * @brief Returned by \ref ubpf_translate_ex and \ref ubpf_translate_function_ex
+ * when the program translates but the supplied output buffer was too small to
+ * hold the generated code. Distinguishes "give me a bigger buffer" from a
+ * program that cannot be translated at all, which returns -1.
+ */
+#define UBPF_TRANSLATE_OUT_OF_SPACE (-2)
+
 #if !defined(UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE)
 #define UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE 4096
 #endif

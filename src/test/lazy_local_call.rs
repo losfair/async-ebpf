@@ -364,7 +364,7 @@ async fn code_budget_exhaustion_names_the_budget() {
   match run(&program, &[]).await {
     Err(Error(RuntimeError::InvalidArgumentOwned(ref msg)))
       if msg.contains("code budget exhausted")
-        && msg.contains("65536 byte budget")
+        && msg.contains("65536 byte code budget")
         && msg.contains("with_code_size_limit") => {}
     other => panic!("expected a code budget error, got {other:?}"),
   }

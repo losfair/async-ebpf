@@ -2311,6 +2311,9 @@ ubpf_translate_arm64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum Jit
     }
 
     if (translate(vm, &state, &compile_result.errmsg) < 0) {
+        if (state.jit_status == NotEnoughSpace) {
+            compile_result.compile_result = UBPF_JIT_COMPILE_OUT_OF_SPACE;
+        }
         goto out;
     }
 
@@ -2353,6 +2356,9 @@ ubpf_translate_function_arm64(
     }
 
     if (translate_range(vm, &state, &compile_result.errmsg, start_pc, end_pc, false, true) < 0) {
+        if (state.jit_status == NotEnoughSpace) {
+            compile_result.compile_result = UBPF_JIT_COMPILE_OUT_OF_SPACE;
+        }
         goto out;
     }
 

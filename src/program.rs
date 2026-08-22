@@ -1142,52 +1142,26 @@ impl Program {
 
     let written_len = match outcome {
       Ok(written_len) => written_len,
-      Err(errmsg) => {
+      Err(reason) => {
         let _ = self.protect_code_pages(arena.used);
 
-        // uBPF reports a short output buffer the same way it reports a bad
-        // instruction, so the only way to tell "the code budget ran out" from a
-        // real translation failure is to translate again somewhere with room.
-        // This path is terminal either way, so the extra work costs nothing that
-        // matters.
-        let needed = measure_translated_size(
-          vm,
-          &region_analysis.hints,
-          &resolver_ids,
-          function.start_pc,
-          function.end_pc,
-          self.unbound.code_size,
-        );
-
-        let err = match needed {
-          // The function translates given enough room, so the budget is what
-          // stopped it. That is terminal for the whole program: the arena never
+        let err = match reason {
+          // The function translates; there was just no room left for it. That is
+          // terminal for the whole program, not for this variant: the arena never
           // shrinks, so nothing can be compiled from here on.
-          Some(needed) => {
-            let detail = if needed > self.unbound.code_size {
-              format!(
-                "needs {needed} bytes, more than the whole {} byte budget",
-                self.unbound.code_size
-              )
-            } else {
-              format!(
-                "needs {needed} bytes but only {remaining} of the {} byte budget are left \
-                 ({} already in use)",
-                self.unbound.code_size, arena.used,
-              )
-            };
+          TranslateError::OutOfSpace => {
             let err = RuntimeError::InvalidArgumentOwned(format!(
-              "jit code budget exhausted: function [{}, {}) {detail}. Raise \
+              "jit code budget exhausted: function [{}, {}) did not fit in the {remaining} bytes \
+               left of the {} byte code budget ({} already in use). Raise \
                ProgramLoader::with_code_size_limit if the program needs more.",
-              function.start_pc, function.end_pc,
+              function.start_pc, function.end_pc, self.unbound.code_size, arena.used,
             ));
             *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
             err
           }
-          None => RuntimeError::InvalidArgumentOwned(format!(
-            "ubpf: code translation failed for function [{}, {}), with {} of the {} byte code \
-             budget in use: {errmsg}",
-            function.start_pc, function.end_pc, arena.used, self.unbound.code_size,
+          TranslateError::Failed(errmsg) => RuntimeError::InvalidArgumentOwned(format!(
+            "ubpf: code translation failed for function [{}, {}): {errmsg}",
+            function.start_pc, function.end_pc,
           )),
         };
         section.functions[function_index]
@@ -1600,52 +1574,16 @@ impl Drop for LoaderValidationScope {
   }
 }
 
-/// Smallest and largest scratch buffer [`measure_translated_size`] will try. The
-/// ceiling only has to exceed what any loadable program can emit: uBPF caps a
-/// program at `UBPF_MAX_INSTS` instructions, and no instruction expands to
-/// anything near a kilobyte of native code.
-const MIN_SCRATCH_SIZE: usize = 1 << 20;
-const MAX_SCRATCH_SIZE: usize = 1 << 26;
-
-/// Number of bytes `[start_pc, end_pc)` translates to, or `None` if it does not
-/// translate at any size - i.e. the failure was not about running out of room.
-///
-/// The scratch buffer is ordinary memory. Emitted code is position-independent
-/// within its buffer and the host addresses baked into it are absolute, so
-/// translating there measures the function without the result having to be
-/// runnable.
-fn measure_translated_size(
-  vm: *mut crate::ubpf::ubpf_vm,
-  hints: &[u8],
-  resolver_ids: &[u32],
-  start_pc: usize,
-  end_pc: usize,
-  code_size: usize,
-) -> Option<usize> {
-  let mut capacity = code_size.max(MIN_SCRATCH_SIZE);
-  while capacity <= MAX_SCRATCH_SIZE {
-    let mut scratch = vec![0u8; capacity];
-    let translated = unsafe {
-      translate_function_into(
-        vm,
-        hints,
-        resolver_ids,
-        start_pc,
-        end_pc,
-        scratch.as_mut_ptr(),
-        capacity,
-      )
-    };
-    match translated {
-      Ok(len) => return Some(len),
-      Err(_) => capacity *= 2,
-    }
-  }
-  None
+/// Why a translation failed.
+enum TranslateError {
+  /// The function translates; `capacity` was not enough to hold it.
+  OutOfSpace,
+  /// The function does not translate at all.
+  Failed(String),
 }
 
 /// Translates `[start_pc, end_pc)` into `buffer`, returning the number of bytes
-/// emitted or uBPF's error message.
+/// emitted.
 ///
 /// # Safety
 /// `vm` must be a live VM whose loaded code contains the range, and `buffer`
@@ -1658,7 +1596,7 @@ unsafe fn translate_function_into(
   end_pc: usize,
   buffer: *mut u8,
   capacity: usize,
-) -> Result<usize, String> {
+) -> Result<usize, TranslateError> {
   let mut written_len = capacity;
   let mut errmsg_ptr = std::ptr::null_mut();
 
@@ -1689,10 +1627,10 @@ unsafe fn translate_function_into(
     msg
   };
 
-  if ret == 0 {
-    Ok(written_len)
-  } else {
-    Err(errmsg)
+  match ret {
+    0 => Ok(written_len),
+    crate::ubpf::UBPF_TRANSLATE_OUT_OF_SPACE => Err(TranslateError::OutOfSpace),
+    _ => Err(TranslateError::Failed(errmsg)),
   }
 }
 

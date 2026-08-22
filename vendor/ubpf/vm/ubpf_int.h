@@ -37,6 +37,8 @@ typedef enum
 {
     UBPF_JIT_COMPILE_SUCCESS,
     UBPF_JIT_COMPILE_FAILURE,
+    /** The program is translatable; the output buffer was too small to hold it. */
+    UBPF_JIT_COMPILE_OUT_OF_SPACE,
 } upbf_jit_result_t;
 
 struct ubpf_jit_result

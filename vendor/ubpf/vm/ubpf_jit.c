@@ -30,6 +30,19 @@
 #include <errno.h>
 #include "ubpf_int.h"
 
+static int
+ubpf_translate_status(upbf_jit_result_t compile_result)
+{
+    switch (compile_result) {
+    case UBPF_JIT_COMPILE_SUCCESS:
+        return 0;
+    case UBPF_JIT_COMPILE_OUT_OF_SPACE:
+        return UBPF_TRANSLATE_OUT_OF_SPACE;
+    default:
+        return -1;
+    }
+}
+
 int
 ubpf_translate_ex(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, char** errmsg, enum JitMode jit_mode)
 {
@@ -38,7 +51,7 @@ ubpf_translate_ex(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, char** errm
     if (jit_result.errmsg) {
         *errmsg = jit_result.errmsg;
     }
-    return jit_result.compile_result == UBPF_JIT_COMPILE_SUCCESS ? 0 : -1;
+    return ubpf_translate_status(jit_result.compile_result);
 }
 
 int
@@ -57,7 +70,7 @@ ubpf_translate_function_ex(
     if (jit_result.errmsg) {
         *errmsg = jit_result.errmsg;
     }
-    return jit_result.compile_result == UBPF_JIT_COMPILE_SUCCESS ? 0 : -1;
+    return ubpf_translate_status(jit_result.compile_result);
 }
 
 int
