@@ -15,6 +15,8 @@
 
 use std::{
   any::Any,
+  cell::{Cell, RefCell},
+  pin::Pin,
   sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -22,13 +24,16 @@ use std::{
   time::Duration,
 };
 
+use futures::Future;
+
 use crate::{
+  helpers::Helper,
   program::{
-    DummyProgramEventListener, GlobalEnv, HelperScope, PreemptionEnabled, ProgramEventListener,
-    ProgramLoader, TimesliceConfig,
+    DummyProgramEventListener, GlobalEnv, HelperScope, PreemptionEnabled, Program,
+    ProgramEventListener, ProgramLoader, ThreadEnv, TimesliceConfig,
   },
   test::raw_elf::{build_elf, Insn},
-  test_util::{gt_env, timeslice_config, TokioTimeslicer},
+  test_util::{gt_env, run_one_program, timeslice_config, RunOpts, TokioTimeslicer},
 };
 
 const OP_STXDW: u8 = 0x7b;
@@ -71,7 +76,7 @@ const RODATA: [u8; 16] = {
 /// machine: the point of these tests is that a preemption lands *inside* the
 /// loop body, and the loop body is where every frame slot is read. Raise this
 /// rather than weakening the assertion if it ever goes flaky.
-const ITERS: i32 = 4_000_000;
+const ITERS: i32 = 40_000_000;
 
 /// What the loop below accumulates: per iteration, three copies of the counter
 /// through the stack group, the two data words, and one more copy of the counter
@@ -125,14 +130,11 @@ fn mixed_access_loop(iters: i32) -> Vec<Insn> {
     add64_reg(7, 2),
     Insn::mov64_reg(3, 10), // r10 as a value, again
   ]);
-  let jeq_pc = code.len() as i16;
   code.push(jeq_reg(3, 9, 1)); // skip the error bump when unchanged
   code.push(Insn::add64_imm(5, 1));
   code.push(Insn::add64_imm(6, 1));
   let jne_pc = code.len() as i16;
   code.push(jne_imm(6, iters, loop_pc - (jne_pc + 1)));
-  let _ = jeq_pc;
-  let tail_pc = code.len() as i16;
   code.extend([
     jne_imm(5, 0, 2), // an error flag set anywhere in the loop
     Insn::mov64_reg(0, 7),
@@ -140,7 +142,6 @@ fn mixed_access_loop(iters: i32) -> Vec<Insn> {
     Insn::mov64_imm(0, -1),
     Insn::exit(),
   ]);
-  let _ = tail_pc;
   code
 }
 
@@ -381,4 +382,192 @@ async fn interleaved_programs_each_see_their_own_region_constants() {
     // The stores write 0 twice, so only the two data words contribute.
     assert_eq!(got, expected);
   }
+}
+
+// ---------------------------------------------------------------------------
+// A nested invocation, run while the outer guest is suspended.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+  /// The program the throttle hook runs. Taken out while it runs, so the
+  /// borrow does not have to be held across an await.
+  static NESTED_PROGRAM: RefCell<Option<Program>> = const { RefCell::new(None) };
+  static NESTED_ENV: Cell<Option<ThreadEnv>> = const { Cell::new(None) };
+  static NESTED_RUNS: Cell<usize> = const { Cell::new(0) };
+  static NESTED_WRONG: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Iterations of the nested program's loop - small, because it runs once per
+/// throttle of the outer one.
+const NESTED_ITERS: i32 = 1_000;
+
+struct NestingListener;
+
+impl ProgramEventListener for NestingListener {
+  fn did_throttle(&self, _: &HelperScope) -> Option<Pin<Box<dyn Future<Output = ()>>>> {
+    Some(Box::pin(async {
+      let Some(program) = NESTED_PROGRAM.with(|p| p.borrow_mut().take()) else {
+        return;
+      };
+      let env = NESTED_ENV.with(|e| e.get()).expect("nested env");
+      let timeslice = TimesliceConfig {
+        max_run_time_before_throttle: Duration::from_secs(60),
+        max_run_time_before_yield: Duration::from_secs(60),
+        throttle_duration: Duration::from_millis(1),
+      };
+      let mut resources: [&mut dyn Any; 0] = [];
+      let ret = program
+        .run(
+          &timeslice,
+          &TokioTimeslicer,
+          "test",
+          &mut resources,
+          &[],
+          &PreemptionEnabled::new(env),
+        )
+        .await;
+      NESTED_RUNS.with(|c| c.set(c.get() + 1));
+      if ret.as_ref().ok().copied() != Some(expected_checksum(NESTED_ITERS as i64)) {
+        NESTED_WRONG.with(|c| c.set(c.get() + 1));
+      }
+      NESTED_PROGRAM.with(|p| *p.borrow_mut() = Some(program));
+    }))
+  }
+}
+
+/// A second invocation, started on the same thread while the first one's
+/// coroutine is suspended, must not disturb the first one's frame.
+///
+/// This is the sharpest lifecycle case the runtime has: two invocations are
+/// live at once, each with its own pooled `ExecContext`, its own guest stack,
+/// its own `JitMemory` and therefore its own twelve derived constants - and the
+/// inner one publishes its own active-JIT-zone and yielder over the outer one's
+/// while it runs. Both programs read every frame slot every iteration, and both
+/// checksums have to come out exact.
+///
+/// The nesting point is the throttle hook, which the runtime awaits with the
+/// outer guest suspended.
+#[test]
+fn a_nested_invocation_leaves_the_outer_frame_intact() {
+  const OUTER_ITERS: i32 = 2_000_000;
+
+  let outer_elf = build_elf(&mixed_access_loop(OUTER_ITERS), &RODATA);
+  let inner_elf = build_elf(&mixed_access_loop(NESTED_ITERS), &RODATA);
+
+  let (outer, runs, wrong) = std::thread::spawn(move || {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
+    runtime.block_on(async move {
+      let global = unsafe { GlobalEnv::new() };
+      let thread = global.init_thread(Duration::from_millis(1));
+      NESTED_ENV.with(|e| e.set(Some(thread)));
+
+      let inner = ProgramLoader::new(
+        &mut rand::thread_rng(),
+        Arc::new(DummyProgramEventListener),
+        &[],
+      )
+      .load(&mut rand::thread_rng(), &inner_elf)
+      .unwrap()
+      .pin_to_current_thread(thread);
+      NESTED_PROGRAM.with(|p| *p.borrow_mut() = Some(inner));
+
+      let outer = ProgramLoader::new(&mut rand::thread_rng(), Arc::new(NestingListener), &[])
+        .load(&mut rand::thread_rng(), &outer_elf)
+        .unwrap()
+        .pin_to_current_thread(thread);
+
+      // Throttle early and often, because throttling is what runs the nested
+      // program.
+      let timeslice = TimesliceConfig {
+        max_run_time_before_throttle: Duration::from_millis(1),
+        max_run_time_before_yield: Duration::from_secs(60),
+        throttle_duration: Duration::from_millis(1),
+      };
+      let mut resources: [&mut dyn Any; 0] = [];
+      let ret = outer
+        .run(
+          &timeslice,
+          &TokioTimeslicer,
+          "test",
+          &mut resources,
+          &[],
+          &PreemptionEnabled::new(thread),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"));
+      // Drop the nested program before the thread's TLS is torn down.
+      NESTED_PROGRAM.with(|p| p.borrow_mut().take());
+      (
+        ret,
+        NESTED_RUNS.with(|c| c.get()),
+        NESTED_WRONG.with(|c| c.get()),
+      )
+    })
+  })
+  .join()
+  .unwrap();
+
+  assert_eq!(outer, Ok(expected_checksum(OUTER_ITERS as i64)));
+  eprintln!("nested invocations: {runs}");
+  assert!(
+    runs > 0,
+    "the outer program never throttled, so nothing was nested"
+  );
+  assert_eq!(wrong, 0, "a nested invocation computed the wrong checksum");
+}
+
+// ---------------------------------------------------------------------------
+// Helper suspensions interleaved with access groups.
+// ---------------------------------------------------------------------------
+
+static HELPERS: &[(&str, Helper)] = &[("add_one", h_add_one)];
+
+fn h_add_one(_: &HelperScope, a1: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+  Ok(a1 + 1)
+}
+
+/// Iterations of the helper loop. Each one suspends the guest into host code,
+/// so this is bounded by the cost of a coroutine round trip rather than by the
+/// JIT.
+const HELPER_LOOP_ITERS: u64 = 200_000;
+
+/// A helper call suspends the guest out of JIT code entirely - through the
+/// coroutine switch, into the async runtime, and back - between two runs of
+/// grouped accesses. The window a group's leader checked and parked is a frame
+/// slot the callee's own frame sits below, so a helper that returned with the
+/// host stack even slightly mismanaged would show up here as a wrong sum or a
+/// fault.
+#[tokio::test]
+async fn access_groups_survive_helper_suspensions() {
+  let n = HELPER_LOOP_ITERS;
+  // touch() returns 4i + 6; add_one() returns i + 1.
+  let expected = (5 * (n * (n - 1) / 2) + 7 * n) as i64;
+  let code = format!(
+    r#"
+    extern unsigned long long add_one(unsigned long long x);
+
+    static unsigned long long __attribute__((noinline, section("test")))
+    touch(volatile unsigned long long *p, unsigned long long i) {{
+      p[0] = i; p[1] = i + 1; p[2] = i + 2; p[3] = i + 3;
+      return p[0] + p[1] + p[2] + p[3];
+    }}
+
+    unsigned long long __attribute__((section("test"))) entry(void) {{
+      volatile unsigned long long buf[4];
+      unsigned long long sum = 0;
+      for (unsigned long long i = 0; i < {n}ULL; i++) {{
+        sum += touch(buf, i);
+        sum += add_one(i);
+      }}
+      return sum;
+    }}
+    "#
+  );
+
+  let mut opts = RunOpts::simple(vec![HELPERS], "test");
+  opts.allow_dynamic_regions = true;
+  assert_eq!(run_one_program(opts, &code).await.unwrap(), expected);
 }

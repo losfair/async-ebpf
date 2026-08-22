@@ -44,6 +44,42 @@ async fn lddw_into_the_frame_pointer_is_refused() {
   assert!(result.is_err(), "lddw r10 was accepted: {result:?}");
 }
 
+/// A conditional jump reads its *destination* as a value, and the opcode filter
+/// names `BPF_REG_10` as a legal destination for every one of them. Only
+/// `validate()`'s `store` rule refuses it - the pre-switch rewrite in
+/// `translate_range` materializes the guest frame pointer for a `src` operand
+/// and never for a `dst` one, so `if r10 == imm goto ...` would compare the
+/// *native* `R15` and hand the guest a host-address oracle one bit at a time.
+#[tokio::test]
+async fn a_conditional_jump_cannot_name_the_frame_pointer_as_its_destination() {
+  // (name, opcode) over the JMP and JMP32 encodings, immediate and register.
+  let forms: &[(&str, u8)] = &[
+    ("jeq imm", 0x15),
+    ("jgt imm", 0x25),
+    ("jge imm", 0x35),
+    ("jset imm", 0x45),
+    ("jne imm", 0x55),
+    ("jeq reg", 0x1d),
+    ("jgt reg", 0x2d),
+    ("jeq32 imm", 0x16),
+    ("jgt32 imm", 0x26),
+    ("jeq32 reg", 0x1e),
+  ];
+  for &(what, opcode) in forms {
+    let code = vec![
+      Insn::mov64_imm(0, 0),
+      Insn::raw(opcode, 10, 1, 1, 0), // if r10 <op> r1/imm goto +1
+      Insn::mov64_imm(0, 1),
+      Insn::exit(),
+    ];
+    let result = run_raw(&code, &RODATA, &[], false).await;
+    assert!(
+      result.is_err(),
+      "{what} compared the frame pointer and was accepted: {result:?}"
+    );
+  }
+}
+
 /// A *non-fetching* atomic does not write its source register, but it does copy
 /// it into guest memory. Under a native frame base that source is a host
 /// pointer, and nothing in `emit_masked_store`'s frame-pointer recovery covers
