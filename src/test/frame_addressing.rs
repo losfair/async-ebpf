@@ -140,7 +140,10 @@ async fn storing_the_frame_pointer_stores_a_guest_address() {
     Insn::ldx_dw(0, 10, -40),
     Insn::exit(),
   ];
-  assert_eq!(run_raw(&via_derived, &RODATA, &[], true).await.unwrap(), 0x9c);
+  assert_eq!(
+    run_raw(&via_derived, &RODATA, &[], true).await.unwrap(),
+    0x9c
+  );
 }
 
 /// Frame addressing has to survive a local call, which moves `R10` down by one

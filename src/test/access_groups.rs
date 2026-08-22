@@ -278,14 +278,200 @@ async fn interleaved_bases_do_not_share_a_window() {
     st_dw(2, 0, 0x2),
     st_dw(1, 8, 0x4),
     st_dw(2, 8, 0x8),
-    Insn::ldx_dw(0, 10, -256),  // 0x1
-    Insn::ldx_dw(3, 10, -248),  // 0x4
+    Insn::ldx_dw(0, 10, -256), // 0x1
+    Insn::ldx_dw(3, 10, -248), // 0x4
     add64_reg(0, 3),
-    Insn::ldx_dw(3, 10, -512),  // 0x2
+    Insn::ldx_dw(3, 10, -512), // 0x2
     add64_reg(0, 3),
-    Insn::ldx_dw(3, 10, -504),  // 0x8
+    Insn::ldx_dw(3, 10, -504), // 0x8
     add64_reg(0, 3),
     Insn::exit(),
   ];
   assert_eq!(run_raw(&code, &RODATA, &[], true).await.unwrap(), 0xf);
+}
+
+// ---------------------------------------------------------------------------
+// Added during the static-analysis audit of the access plan. These pin down the
+// cases where the Rust plan and the backend's own group bookkeeping have to
+// agree about what does and does not disturb the parked base.
+// ---------------------------------------------------------------------------
+
+/// `*(u8 *)(dst + offset) = imm`
+fn st_b(dst: u8, offset: i16, imm: i32) -> Insn {
+  Insn::raw(0x72, dst, 0, offset, imm)
+}
+
+/// `*(u16 *)(dst + offset) = imm`
+fn st_h(dst: u8, offset: i16, imm: i32) -> Insn {
+  Insn::raw(0x6a, dst, 0, offset, imm)
+}
+
+/// `*(u32 *)(dst + offset) = imm`
+fn st_w(dst: u8, offset: i16, imm: i32) -> Insn {
+  Insn::raw(0x62, dst, 0, offset, imm)
+}
+
+/// `dst = *(u16 *)(src + offset)`
+fn ldx_h(dst: u8, src: u8, offset: i16) -> Insn {
+  Insn::raw(0x69, dst, src, offset, 0)
+}
+
+/// `dst = *(u32 *)(src + offset)`
+fn ldx_w(dst: u8, src: u8, offset: i16) -> Insn {
+  Insn::raw(0x61, dst, src, offset, 0)
+}
+
+/// A window built from accesses of different widths. The high bound comes from
+/// whichever member reaches furthest, which is not the one with the largest
+/// displacement, so the widths have to be part of the arithmetic.
+#[tokio::test]
+async fn a_group_of_mixed_widths_round_trips() {
+  let mut code = base_in_frame();
+  code.extend([
+    st_b(1, 7, 0x11),  // leader: one byte at +7
+    st_dw(1, 8, 0x22), // reaches +16, the high bound
+    st_h(1, 0, 0x33),  // the low bound
+    st_w(1, 20, 0x44), // reaches +24
+    ldx_h(0, 1, 0),    // 0x33
+    Insn::ldx_b(2, 1, 7),
+    Insn::or64_reg(0, 2), // | 0x11
+    Insn::ldx_dw(2, 1, 8),
+    Insn::or64_reg(0, 2), // | 0x22
+    ldx_w(2, 1, 20),
+    Insn::or64_reg(0, 2), // | 0x44
+    Insn::exit(),
+  ]);
+  assert_eq!(run_raw(&code, &RODATA, &[], true).await.unwrap(), 0x77);
+}
+
+/// A frame access between two members must not disturb the base the leader
+/// parked: it needs no bounds check and no scratch register of its own.
+#[tokio::test]
+async fn a_frame_access_between_members_does_not_disturb_the_group() {
+  let mut code = base_in_frame();
+  code.extend([
+    st_dw(1, 0, 0x1),
+    st_dw(1, 8, 0x2),
+    // A frame store and a frame load right in the middle of the run.
+    st_dw(10, -8, 0x40),
+    Insn::ldx_dw(3, 10, -8),
+    st_dw(1, 16, 0x4),
+    Insn::ldx_dw(0, 1, 0),
+    Insn::ldx_dw(2, 1, 8),
+    Insn::or64_reg(0, 2),
+    Insn::ldx_dw(2, 1, 16),
+    Insn::or64_reg(0, 2),
+    Insn::or64_reg(0, 3),
+    Insn::exit(),
+  ]);
+  assert_eq!(run_raw(&code, &RODATA, &[], true).await.unwrap(), 0x47);
+}
+
+/// An atomic in the middle of a run is routed through the full check and does
+/// not join the group - but it must not invalidate it either. Its own scratch
+/// use has to leave the parked base alone.
+#[tokio::test]
+async fn an_atomic_between_members_does_not_disturb_the_group() {
+  const ATOMIC_DW: u8 = 0xdb;
+  const ADD_FETCH: i32 = 0x01;
+  let mut code = base_in_frame();
+  code.extend([
+    st_dw(1, 0, 0x1),
+    st_dw(1, 8, 0x2),
+    // atomic_fetch_add through a *different* frame slot; r3 takes the old value.
+    Insn::mov64_reg(4, 10),
+    Insn::add64_imm(4, -2048),
+    st_dw(4, 0, 0x40),
+    Insn::mov64_imm(3, 0),
+    Insn::raw(ATOMIC_DW, 4, 3, 0, ADD_FETCH), // r3 = old(*(u64*)(r4)) = 0x40
+    st_dw(1, 16, 0x4),
+    Insn::ldx_dw(0, 1, 0),
+    Insn::ldx_dw(2, 1, 8),
+    Insn::or64_reg(0, 2),
+    Insn::ldx_dw(2, 1, 16),
+    Insn::or64_reg(0, 2),
+    Insn::or64_reg(0, 3),
+    Insn::exit(),
+  ]);
+  assert_eq!(run_raw(&code, &RODATA, &[], true).await.unwrap(), 0x47);
+}
+
+/// An `lddw` between two accesses currently dissolves the group, because its
+/// second slot is never reached by the dataflow. Whether or not that stays
+/// true, the values must not move.
+#[tokio::test]
+async fn accesses_split_by_a_lddw_still_round_trip() {
+  let mut code = base_in_frame();
+  code.extend([st_dw(1, 0, 0x1), st_dw(1, 8, 0x2)]);
+  code.extend(Insn::lddw_data(5, 0));
+  code.extend([
+    st_dw(1, 16, 0x4),
+    Insn::ldx_dw(0, 1, 0),
+    Insn::ldx_dw(2, 1, 8),
+    Insn::or64_reg(0, 2),
+    Insn::ldx_dw(2, 1, 16),
+    Insn::or64_reg(0, 2),
+    Insn::ldx_b(2, 5, 0), // the loaded data pointer is real
+    Insn::or64_reg(0, 2),
+    Insn::exit(),
+  ]);
+  assert_eq!(run_raw(&code, &RODATA, &[], true).await.unwrap(), 0x8f);
+}
+
+/// A group whose loads are data accesses but which also contains a store is
+/// checked against the *stack*, because a store is confined there whatever its
+/// hint says. That is only sound if the program was already doomed - the store
+/// through a data pointer faults today too. Either way it must be a clean guest
+/// memory fault, not a host crash.
+#[tokio::test]
+async fn a_store_through_a_data_pointer_in_a_group_still_faults_cleanly() {
+  let mut code = Vec::new();
+  code.extend(Insn::lddw_data(1, 0));
+  code.extend([
+    Insn::ldx_b(0, 1, 0), // fine on its own
+    Insn::ldx_b(2, 1, 1),
+    st_b(1, 2, 0xff), // pins the whole window to the stack
+    Insn::exit(),
+  ]);
+  match run_raw(&code, &RODATA, &[], false).await {
+    Err(Error(RuntimeError::MemoryFault(_))) => {}
+    other => panic!("expected a memory fault, got {other:?}"),
+  }
+}
+
+/// Read-only data loads that share a base and have no store among them keep
+/// their data window, and every displacement still lands where it should.
+#[tokio::test]
+async fn a_data_only_group_round_trips() {
+  let mut code = Vec::new();
+  code.extend(Insn::lddw_data(1, 0));
+  code.extend([
+    Insn::ldx_b(0, 1, 7), // 0x11
+    Insn::ldx_b(2, 1, 0), // 0x88
+    Insn::or64_reg(0, 2),
+    Insn::ldx_b(2, 1, 3), // 0x55
+    Insn::or64_reg(0, 2),
+    Insn::exit(),
+  ]);
+  // RODATA is 0x1122334455667788 little-endian: byte 0 = 0x88, 3 = 0x55, 7 = 0x11.
+  assert_eq!(
+    run_raw(&code, &RODATA, &[], true).await.unwrap() as u64,
+    0x11 | 0x88 | 0x55
+  );
+}
+
+/// A group that starts with a store and continues with loads: the leader is the
+/// store, so the window's region is decided before any load has contributed one.
+#[tokio::test]
+async fn a_group_led_by_a_store_still_serves_its_loads() {
+  let mut code = base_in_frame();
+  code.extend([
+    st_dw(1, 24, 0x8), // leader, and the window's high bound
+    st_dw(1, 0, 0x1),  // the low bound
+    Insn::ldx_dw(0, 1, 24),
+    Insn::ldx_dw(2, 1, 0),
+    Insn::or64_reg(0, 2),
+    Insn::exit(),
+  ]);
+  assert_eq!(run_raw(&code, &RODATA, &[], true).await.unwrap(), 0x9);
 }

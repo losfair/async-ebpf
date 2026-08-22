@@ -1,5 +1,6 @@
 mod access_groups;
 mod atomics;
+mod audit_escape;
 mod basic;
 mod entry_isolation;
 mod frame_addressing;
@@ -10,3 +11,4 @@ mod lazy_local_call;
 mod jit_limits;
 mod preemption;
 mod raw_elf;
+mod runtime_state;

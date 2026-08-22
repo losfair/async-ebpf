@@ -1359,9 +1359,9 @@ mod tests {
   #[test]
   fn only_the_frame_hint_is_emitted_for_stores() {
     let code = flatten(&[
-      slot(STDW, 10, 0, -8, 0),     // st [r10-8], 0      -> FRAME
-      slot(STXDW, 10, 1, -16, 0),   // stx [r10-16], r1   -> FRAME
-      slot(STDW, 10, 0, -8192, 0),  // outside the window -> UNKNOWN
+      slot(STDW, 10, 0, -8, 0),      // st [r10-8], 0      -> FRAME
+      slot(STXDW, 10, 1, -16, 0),    // stx [r10-16], r1   -> FRAME
+      slot(STDW, 10, 0, -8192, 0),   // outside the window -> UNKNOWN
       slot(ATOMIC_DW, 10, 2, -8, 1), // an atomic is never a frame access
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
@@ -1379,9 +1379,9 @@ mod tests {
   fn group_deltas_are_measured_from_the_windows_low_bound() {
     let mut slots = base_off_frame().to_vec();
     slots.extend([
-      slot(LDXB, 2, 1, 5, 0),   // leader, disp 5, width 1
-      slot(LDXDW, 3, 1, 8, 0),  // disp 8, width 8 -> hi = 16
-      slot(LDXH, 4, 1, 0, 0),   // disp 0, width 2 -> lo = 0
+      slot(LDXB, 2, 1, 5, 0),  // leader, disp 5, width 1
+      slot(LDXDW, 3, 1, 8, 0), // disp 8, width 8 -> hi = 16
+      slot(LDXH, 4, 1, 0, 0),  // disp 0, width 2 -> lo = 0
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
     let code = flatten(&slots);
@@ -1418,7 +1418,10 @@ mod tests {
     };
     let plan = build(4095); // hull [0, 4096) - exactly the cap
     assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
-    assert_eq!(entry(&plan[3]), (PLAN_ROLE_MEMBER, REGION_STACK, 4095, 4096, 0, 2));
+    assert_eq!(
+      entry(&plan[3]),
+      (PLAN_ROLE_MEMBER, REGION_STACK, 4095, 4096, 0, 2)
+    );
 
     let plan = build(4096); // hull [0, 4097) - over the cap
     assert_eq!(plan[2].role, 0);
@@ -1450,9 +1453,9 @@ mod tests {
     let code = flatten(&[
       slot(EBPF_OP_LDDW, 1, 0, 0, DATA_LO as i32),
       slot(0, 0, 0, 0, 0),
-      slot(LDXDW, 2, 1, 0, 0),  // hint DATA
-      slot(LDXDW, 3, 1, 8, 0),  // hint DATA
-      slot(STDW, 1, 0, 16, 0),  // a store pins the whole window
+      slot(LDXDW, 2, 1, 0, 0), // hint DATA
+      slot(LDXDW, 3, 1, 8, 0), // hint DATA
+      slot(STDW, 1, 0, 16, 0), // a store pins the whole window
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
     let result = analyze_fn(&code);
@@ -1517,7 +1520,10 @@ mod tests {
     let plan = plan_of(&flatten(&slots));
     assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
     assert_eq!(plan[3].role, 0);
-    assert_eq!(entry(&plan[4]), (PLAN_ROLE_MEMBER, REGION_STACK, 8, 16, 0, 2));
+    assert_eq!(
+      entry(&plan[4]),
+      (PLAN_ROLE_MEMBER, REGION_STACK, 8, 16, 0, 2)
+    );
   }
 
   /// An atomic is routed through the full check, so it neither joins a group
@@ -1645,8 +1651,8 @@ mod tests {
   fn a_backward_branch_target_is_a_barrier() {
     let mut slots = base_off_frame().to_vec();
     slots.extend([
-      slot(LDXDW, 2, 1, 0, 0),  // slot 2: loop head, a branch target
-      slot(LDXDW, 3, 1, 8, 0),  // slot 3
+      slot(LDXDW, 2, 1, 0, 0),    // slot 2: loop head, a branch target
+      slot(LDXDW, 3, 1, 8, 0),    // slot 3
       slot(JEQ_IMM, 4, 0, -3, 0), // slot 4: back to slot 2
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
@@ -1678,12 +1684,12 @@ mod tests {
   fn an_unreachable_branch_leaves_no_barrier() {
     let mut slots = base_off_frame().to_vec();
     slots.extend([
-      slot(EBPF_OP_JA, 0, 0, 2, 0),  // slot 2: -> slot 5
-      slot(JEQ_IMM, 0, 0, 3, 0),     // slot 3: dead; its target would be slot 7
+      slot(EBPF_OP_JA, 0, 0, 2, 0),   // slot 2: -> slot 5
+      slot(JEQ_IMM, 0, 0, 3, 0),      // slot 3: dead; its target would be slot 7
       slot(EBPF_OP_EXIT, 0, 0, 0, 0), // slot 4: dead
-      slot(LDXDW, 2, 1, 0, 0),       // slot 5
-      slot(LDXDW, 3, 1, 8, 0),       // slot 6
-      slot(LDXDW, 4, 1, 16, 0),      // slot 7: the dead branch's target
+      slot(LDXDW, 2, 1, 0, 0),        // slot 5
+      slot(LDXDW, 3, 1, 8, 0),        // slot 6
+      slot(LDXDW, 4, 1, 16, 0),       // slot 7: the dead branch's target
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
     let plan = plan_of(&flatten(&slots));
@@ -1733,10 +1739,7 @@ mod tests {
   #[test]
   fn a_lone_access_is_not_a_group() {
     let mut slots = base_off_frame().to_vec();
-    slots.extend([
-      slot(LDXDW, 2, 1, 0, 0),
-      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
-    ]);
+    slots.extend([slot(LDXDW, 2, 1, 0, 0), slot(EBPF_OP_EXIT, 0, 0, 0, 0)]);
     assert_eq!(plan_of(&flatten(&slots))[2], PlanEntry::default());
   }
 
@@ -1811,8 +1814,14 @@ mod tests {
     ]);
     let plan = plan_of(&flatten(&slots));
     assert_eq!(plan[2].role, PLAN_ROLE_LEADER);
-    assert_eq!(entry(&plan[3]), (PLAN_ROLE_MEMBER, REGION_STACK, 8, 16, 0, 2));
-    assert_eq!(plan[4].role, PLAN_ROLE_LEADER, "a fresh group off the new r1");
+    assert_eq!(
+      entry(&plan[3]),
+      (PLAN_ROLE_MEMBER, REGION_STACK, 8, 16, 0, 2)
+    );
+    assert_eq!(
+      plan[4].role, PLAN_ROLE_LEADER,
+      "a fresh group off the new r1"
+    );
     assert_eq!(plan[4].leader_pc, 4);
     assert_eq!(plan[5].role, PLAN_ROLE_MEMBER);
   }
@@ -1846,6 +1855,28 @@ mod tests {
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
     assert_eq!(analyze_fn(&code).hints[1], REGION_UNKNOWN);
+  }
+
+  /// The hint is decided from the state *entering* the access, not the state
+  /// leaving it. `ldx r10, [r10 - 8]` is the sharp case: R10 is the frame
+  /// pointer when the address is formed and something else immediately after,
+  /// so the two states disagree and only the entering one is right.
+  ///
+  /// (The loader refuses this instruction; it is here because it is the only
+  /// shape that tells the two readings apart.)
+  #[test]
+  fn the_frame_hint_reads_the_state_entering_the_access() {
+    let code = flatten(&[
+      slot(LDXDW, 10, 10, -8, 0),
+      slot(LDXDW, 0, 10, -8, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let hints = analyze_fn(&code).hints;
+    // Entering slot 0, R10 is still the frame pointer.
+    assert_eq!(hints[0], REGION_FRAME);
+    // Leaving it, R10 holds a value read out of guest memory, so the next
+    // access through it is not a frame access at all.
+    assert_eq!(hints[1], REGION_UNKNOWN);
   }
 
   /// `R10` displaced and restored is still the frame pointer, and the offset
@@ -1924,12 +1955,24 @@ mod tests {
       ("lddw", slot(EBPF_OP_LDDW, 4, 0, 0, 0), &[4]),
       ("ldxdw", slot(LDXDW, 4, 1, 0, 0), &[4]),
       ("alu64 add", slot(ADD64_IMM, 4, 0, 0, 1), &[4]),
-      ("alu32 mov", slot(EBPF_CLS_ALU | EBPF_ALU_OP_MOV, 4, 0, 0, 1), &[4]),
+      (
+        "alu32 mov",
+        slot(EBPF_CLS_ALU | EBPF_ALU_OP_MOV, 4, 0, 0, 1),
+        &[4],
+      ),
       ("byteswap le", slot(EBPF_CLS_ALU | 0xd0, 4, 0, 0, 64), &[4]),
       ("bswap64", slot(EBPF_CLS_ALU64 | 0xd0, 4, 0, 0, 64), &[4]),
       ("atomic fetch", slot(ATOMIC_DW, 1, 4, 0, 1), &[4, 0]),
-      ("call helper", slot(EBPF_OP_CALL, 0, 0, 0, 1), &[0, 1, 2, 3, 4, 5]),
-      ("call local", slot(EBPF_OP_CALL, 0, 1, 0, 1), &[0, 1, 2, 3, 4, 5]),
+      (
+        "call helper",
+        slot(EBPF_OP_CALL, 0, 0, 0, 1),
+        &[0, 1, 2, 3, 4, 5],
+      ),
+      (
+        "call local",
+        slot(EBPF_OP_CALL, 0, 1, 0, 1),
+        &[0, 1, 2, 3, 4, 5],
+      ),
     ];
     for (name, s, want) in cases {
       let got = written_registers(&decode(&s));
