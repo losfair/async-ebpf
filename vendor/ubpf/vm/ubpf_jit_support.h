@@ -178,6 +178,7 @@ struct jit_state
      */
     int64_t group_leader_pc; /* -1 when no group is open. */
     uint32_t group_span;     /* Bytes the open group's leader checked. */
+    int32_t group_lo;        /* The open group's low bound, relative to its base. */
     int group_base_reg;      /* eBPF register the open group is based on. */
     uint8_t group_region;    /* Region the open group's leader checked against. */
     uint16_t group_written;  /* eBPF registers written since that leader. */

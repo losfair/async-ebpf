@@ -158,6 +158,12 @@ async_ebpf_entry_trampoline:
     movdqu xmm0, [rax + 128]
     movdqu [rbp - 56], xmm0
     pxor xmm0, xmm0
+    // The access-group base slot. The backend only reads it after emitting the
+    // leader that writes it, so this is belt and braces - but it costs one
+    // instruction per invocation and turns any future hole in that reasoning
+    // into a fault at page 0 rather than a dereference of whatever the host
+    // stack happened to hold.
+    mov qword ptr [rbp - 144], 0
     mov rcx, r9
     mov r11, rdi
     // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
@@ -1499,7 +1505,8 @@ impl Program {
     if calldata.len() > MAX_CALLDATA_SIZE {
       return Err(RuntimeError::InvalidArgument("calldata too large"));
     }
-    ectx.ctx.guest_stack.as_mut_slice()[SHADOW_STACK_SIZE - calldata.len()..].copy_from_slice(calldata);
+    ectx.ctx.guest_stack.as_mut_slice()[SHADOW_STACK_SIZE - calldata.len()..]
+      .copy_from_slice(calldata);
     let calldata_len = calldata.len();
 
     let program_ret: u64 = {

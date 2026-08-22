@@ -130,6 +130,7 @@ initialize_jit_state_result(
     state->group_barrier = calloc(num_insts + 1, sizeof(state->group_barrier[0]));
     state->group_leader_pc = -1;
     state->group_span = 0;
+    state->group_lo = 0;
     state->group_base_reg = -1;
     state->group_region = 0;
     state->group_written = 0;

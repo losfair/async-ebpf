@@ -994,6 +994,11 @@ emit_checked_address(
             (state->group_written & (uint16_t)(1u << (unsigned)base_ebpf)) == 0 &&
             // The access lies inside the window the leader checked.
             (uint64_t)plan->delta + (uint64_t)width <= (uint64_t)state->group_span &&
+            // And it is the address the instruction actually names. Without
+            // this the plan would be choosing *which* address to touch rather
+            // than merely how to check it - still inside the leader's window,
+            // so not an escape, but a silent miscompilation.
+            (int64_t)state->group_lo + (int64_t)plan->delta == (int64_t)offset &&
             // A store is confined to the stack; it cannot ride a window that
             // was checked against the read-only data region.
             (!store || state->group_region == JIT_REGION_STACK);
@@ -1010,6 +1015,7 @@ emit_checked_address(
     if (plan && plan->role == JIT_PLAN_ROLE_LEADER) {
         bool usable = base_ebpf >= 0 && plan->span > 0 && plan->span <= JIT_MAX_GROUP_SPAN &&
                       (uint64_t)plan->delta + (uint64_t)width <= (uint64_t)plan->span &&
+                      (int64_t)plan->lo + (int64_t)plan->delta == (int64_t)offset &&
                       plan->region != JIT_REGION_FRAME &&
                       (!store || plan->region == JIT_REGION_STACK);
         if (usable) {
@@ -1018,6 +1024,7 @@ emit_checked_address(
             emit_store(state, S64, addr_reg, RBP, JIT_MEMORY_GROUP_BASE_OFFSET);
             state->group_leader_pc = (int64_t)pc;
             state->group_span = plan->span;
+            state->group_lo = plan->lo;
             state->group_base_reg = base;
             state->group_region = plan->region;
             state->group_written = 0;
@@ -2568,17 +2575,30 @@ translate_range(
     state->group_written = 0;
     for (i = start_pc; i < (int)end_pc; i++) {
         struct ebpf_inst inst = ubpf_fetch_instruction(vm, i);
+
+        // A local function entry is reached by `call`, never by falling into it,
+        // so a group must not span one. This matters only when a whole program
+        // is translated in one range - translating function by function starts
+        // each range with no group open - but the guarantee is supposed to come
+        // from the backend re-deriving it, not from how the caller slices the
+        // program.
+        if (vm->int_funcs && vm->int_funcs[i]) {
+            state->group_barrier[i] = 1;
+        }
+
         uint8_t cls = inst.opcode & EBPF_CLS_MASK;
-        if ((cls != EBPF_CLS_JMP && cls != EBPF_CLS_JMP32) || inst.opcode == EBPF_OP_EXIT) {
+        if (cls != EBPF_CLS_JMP && cls != EBPF_CLS_JMP32) {
             continue;
         }
-        // A call ends the group too: a local callee shares this host frame and
+        // Nothing falls through an EXIT, an unconditional jump, or a call, so
+        // whatever follows is entered from somewhere else. A call ends the group
+        // for its own reasons as well: a local callee shares this host frame and
         // would overwrite the parked base, and a helper call can suspend the
         // guest outright.
         if (i + 1 <= (int)vm->num_insts) {
             state->group_barrier[i + 1] = 1;
         }
-        if (inst.opcode == EBPF_OP_CALL) {
+        if (inst.opcode == EBPF_OP_CALL || inst.opcode == EBPF_OP_EXIT) {
             continue;
         }
         int64_t target = (int64_t)i + 1 + (inst.opcode == EBPF_OP_JA32 ? inst.imm : inst.offset);
