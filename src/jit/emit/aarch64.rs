@@ -1,41 +1,38 @@
 //! The aarch64 backend.
 //!
-//! A port of `ubpf_translate_function_arm64` and everything it reaches, from
-//! `oracle/ubpf-sys/vendor/ubpf/vm/ubpf_jit_arm64.c`. Line numbers cited in
-//! comments are that file's.
+//! # Changing what this emits
 //!
-//! # Byte-identity
+//! Every byte this backend produces for the canonical cases is recorded in
+//! `src/jit/goldens/aarch64.txt`, so any change to code generation shows up as a
+//! diff there. That is deliberate: the diff is the deliverable, and an
+//! unexplained one means something moved that nobody meant to move.
 //!
-//! Until the C oracle is deleted this must emit **byte-identical** machine code
-//! to the C for every program and every configuration. Where the C does
-//! something odd, this does the same odd thing and says so. The places worth
-//! knowing about before reading:
+//! # Quirks worth knowing before reading
 //!
-//! * `le` with `imm == 64` emits *nothing at all* (C:2180-2193), and `be` with
-//!   `imm == 32` emits no zero-extension where `bswap` does.
-//! * The `EBPF_OP_MUL_IMM`/`ST*`/... arm of the main `switch` (C:2410-2435) has
-//!   no `break` before `default:`, so it falls through and the reported status
-//!   is `UnknownInstruction`, not `UnexpectedInstruction`. It is unreachable
-//!   anyway — every opcode it names is rewritten to its register form by the
-//!   immediate lowering above it.
-//! * A `st` (store-immediate) instruction whose raw `src` nibble happens to be
-//!   10 will, under a native frame base, have the guest frame pointer
-//!   materialised over the immediate it just parked in the same register
-//!   (C:2303-2309 tests `inst.src`, not the lowered operand). Reproduced.
-//! * `resolve_adr` writes only the `immhi` field and drops the two `immlo`
-//!   bits (C:2595-2610). Reproduced.
-//! * The atomic selector is the immediate's *high nibble* and the fetch flag
-//!   its low bit, with bits 1..3 dead (C:2339, C:2375). `xchg` and `cmpxchg`
-//!   fetch whether or not the flag is set, because the backend hardcodes it
-//!   (C:2353, C:2358). This is [`Insn::op_with_imm`]'s decode, so the two agree
-//!   on the non-canonical selectors the 32-bit filter admits.
+//! Each of these is deliberate and labelled where it lives. None is reachable
+//! through `Translator::load`, because the validator refuses the programs that
+//! would reach them; they are retained as defence in depth, not as behaviour
+//! anything depends on.
 //!
-//! # What is *not* here
+//! * `le` with `imm == 64` emits nothing at all, and `be` with `imm == 32`
+//!   emits no zero-extension where `bswap` does.
+//! * A `st` whose raw `src` nibble is 10 would, under a native frame base, have
+//!   the guest frame pointer materialised over the immediate it just parked in
+//!   the same register. The check reads the raw nibble rather than the lowered
+//!   operand; the operand filter bounds `st`'s source to zero, so no such
+//!   program loads.
+//! * `resolve_adr` writes only the `immhi` field and drops the two `immlo` bits.
+//! * The atomic selector is the immediate's high nibble and the fetch flag its
+//!   low bit, with bits 1..3 dead. `xchg` and `cmpxchg` fetch whether or not the
+//!   flag is set, because this backend hardcodes it. That matches
+//!   [`Insn::op_with_imm`], so decoder and backend agree on the non-canonical
+//!   selectors the 32-bit operand filter admits.
 //!
-//! `ubpf_translate_arm64` (whole-program mode), `emit_jit_prologue`,
-//! `emit_jit_epilogue`, `emit_local_call` (the eager local call: this entry
-//! point always passes `lazy_local_calls = true`) and constant blinding are all
-//! unreachable from `ubpf_translate_function_arm64` and are not ported.
+//! # What is not here
+//!
+//! Whole-program translation, the eager local call, and constant blinding.
+//! `translate_range` always translates one function at a time and always
+//! resolves local calls lazily, so none of them is reachable.
 
 use crate::jit::abi;
 use crate::jit::isa::{AluOp, AtomicOp, EndKind, Insn, JmpOp, Op, Source, Width};
@@ -43,7 +40,7 @@ use crate::jit::patch::{JitState, OpenGroup, PatchTarget, Progress, SpecialTarge
 use crate::jit::{Config, PlanEntry, TranslateError, TranslationInputs, Translator};
 
 // ---------------------------------------------------------------------------
-// Registers (C:42-100)
+// Registers
 // ---------------------------------------------------------------------------
 
 const R0: u32 = 0;
@@ -72,31 +69,30 @@ const RZ: u32 = 31;
 
 /// Temp register for immediate generation.
 const TEMP_REGISTER: u32 = R24;
-/// Value register for a store-immediate lowered to a store-register (C:86-94).
+/// Value register for a store-immediate lowered to a store-register.
 const TEMP_STORE_VALUE_REGISTER: u32 = R9;
 /// Temp register for division results.
 const TEMP_DIV_REGISTER: u32 = R25;
 /// Temp register for load/store offsets.
 const OFFSET_REGISTER: u32 = R26;
 /// Special register for external dispatcher context. Aliases [`OFFSET_REGISTER`]
-/// in the C too (C:98-100).
+/// here too.
 const VOLATILE_CTXT: u32 = R26;
 
-/// eBPF register to aarch64 register (C:164-176). `R0` is held in `R5` for the
+/// eBPF register to aarch64 register. `R0` is held in `R5` for the
 /// duration of the function and moved into the ABI return register only at the
 /// end.
 const REGISTER_MAP: [u32; 11] = [R5, R0, 1, R2, R3, 4, R19, R20, R21, R22, R23];
 
 /// The aarch64 register holding eBPF register `r`.
-///
-/// Mirrors `map_register` (C:179-184) including its modular wrap: with `NDEBUG`
-/// the C's `assert(r < REGISTER_MAP_SIZE)` is gone and `r % 11` is what runs.
+/// Wraps modularly rather than panicking on an out-of-range register, so a
+/// register field the validator would have refused still maps to something.
 fn map_register(r: u8) -> u32 {
   REGISTER_MAP[(r as usize) % REGISTER_MAP.len()]
 }
 
 /// The eBPF register mapped to `native`, or `None`. The map is injective, so
-/// this is exact (C:188-198).
+/// this is exact.
 fn unmap_register(native: u32) -> Option<u8> {
   REGISTER_MAP
     .iter()
@@ -105,13 +101,13 @@ fn unmap_register(native: u32) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Instruction encodings (C:234-1160)
+// Instruction encodings
 // ---------------------------------------------------------------------------
 
-/// `AddSubOpcode` (C:234-240), used as the two-bit `op` field at bit 29.
+/// `AddSubOpcode`, used as the two-bit `op` field at bit 29.
 mod addsub {
   pub const ADD: u32 = 0;
-  /// Reproduced from the C's enum for completeness; nothing this entry point
+  /// Present for completeness; nothing this entry point
   /// reaches emits a flag-setting add.
   #[allow(dead_code)]
   pub const ADDS: u32 = 1;
@@ -119,7 +115,7 @@ mod addsub {
   pub const SUBS: u32 = 3;
 }
 
-/// `LoadStoreOpcode` (C:298-315).
+/// `LoadStoreOpcode`.
 mod ls {
   pub const STRB: u32 = 0x0000_0000;
   pub const LDRB: u32 = 0x0040_0000;
@@ -135,7 +131,7 @@ mod ls {
   pub const LDRX: u32 = 0xc040_0000;
 }
 
-/// `LoadStoreExclusiveOpcode` (C:317-324).
+/// `LoadStoreExclusiveOpcode`.
 mod lse {
   pub const STXRW: u32 = 0x8800_7c00;
   pub const LDXRW: u32 = 0x885f_7c00;
@@ -143,13 +139,13 @@ mod lse {
   pub const LDXRX: u32 = 0xc85f_7c00;
 }
 
-/// `LoadStorePairOpcode` (C:363-371).
+/// `LoadStorePairOpcode`.
 mod lsp {
   pub const STPX: u32 = 0xa900_0000;
   pub const LDPX: u32 = 0xa940_0000;
 }
 
-/// `LogicalOpcode` (C:389-400).
+/// `LogicalOpcode`.
 mod log {
   pub const AND: u32 = 0x0000_0000;
   pub const ORR: u32 = 0x2000_0000;
@@ -157,13 +153,13 @@ mod log {
   pub const ANDS: u32 = 0x6000_0000;
 }
 
-/// `UnconditionalBranchOpcode` (C:953-959).
+/// `UnconditionalBranchOpcode`.
 mod br {
   pub const BLR: u32 = 0xd63f_0000;
   pub const RET: u32 = 0xd65f_0000;
 }
 
-/// `UnconditionalBranchImmediateOpcode` (C:968-973).
+/// `UnconditionalBranchImmediateOpcode`.
 mod ubr {
   pub const B: u32 = 0x1400_0000;
   pub const BL: u32 = 0x9400_0000;
@@ -171,7 +167,7 @@ mod ubr {
 
 const BR_BCOND: u32 = 0x5400_0000;
 
-/// `Condition` (C:1003-1023).
+/// `Condition`.
 mod cond {
   pub const EQ: u32 = 0;
   pub const NE: u32 = 1;
@@ -187,14 +183,14 @@ mod cond {
   pub const LO: u32 = CC;
 }
 
-/// `DP1Opcode` (C:1051-1057).
+/// `DP1Opcode`.
 mod dp1 {
   pub const REV16: u32 = 0x5ac0_0400;
   pub const REV32: u32 = 0x5ac0_0800;
   pub const REV64: u32 = 0xdac0_0c00;
 }
 
-/// `DP2Opcode` (C:1067-1076).
+/// `DP2Opcode`.
 mod dp2 {
   pub const UDIV: u32 = 0x1ac0_0800;
   pub const SDIV: u32 = 0x1ac0_0c00;
@@ -203,13 +199,13 @@ mod dp2 {
   pub const ASRV: u32 = 0x1ac0_2800;
 }
 
-/// `DP3Opcode` (C:1091-1096).
+/// `DP3Opcode`.
 mod dp3 {
   pub const MADD: u32 = 0x1b00_0000;
   pub const MSUB: u32 = 0x1b00_8000;
 }
 
-/// `MoveWideOpcode` (C:1112-1118).
+/// `MoveWideOpcode`.
 mod mw {
   pub const MOVN: u32 = 0x1280_0000;
   pub const MOVZ: u32 = 0x5280_0000;
@@ -217,14 +213,14 @@ mod mw {
 }
 
 /// `bti c`, emitted as the first instruction of every lazily compiled function
-/// because it is entered through an indirect call (C:1947).
+/// because it is entered through an indirect call.
 const BTI_C: u32 = 0xd503_245f;
 
 fn align_to(amount: u32, boundary: u32) -> u32 {
   (amount + (boundary - 1)) & !(boundary - 1)
 }
 
-/// Bit 31, the size bit in most encodings (C:243-247).
+/// Bit 31, the size bit in most encodings.
 fn sz(sixty_four: bool) -> u32 {
   if sixty_four {
     1 << 31
@@ -237,7 +233,7 @@ fn emit_instruction(st: &mut JitState, instr: u32) {
   st.emit_bytes(instr as u64, 4);
 }
 
-/// C4.1.64 add/subtract (immediate) (C:250-282).
+/// C4.1.64 add/subtract (immediate).
 fn emit_addsub_immediate(
   st: &mut JitState,
   sixty_four: bool,
@@ -249,7 +245,7 @@ fn emit_addsub_immediate(
   let mut imm12 = imm12;
   let mut sh = 0;
   if imm12 >= 0x1000 {
-    // The C asserts the low twelve bits are clear; with the shift on they have
+    // The low twelve bits must be clear; with the shift on they have
     // no bearing on the result. Every reachable caller satisfies it.
     debug_assert_eq!(imm12 & 0xfff, 0);
     imm12 >>= 12;
@@ -262,7 +258,7 @@ fn emit_addsub_immediate(
   );
 }
 
-/// C4.1.67 add/subtract (shifted register) (C:285-296).
+/// C4.1.67 add/subtract (shifted register).
 fn emit_addsub_register(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, rn: u32, rm: u32) {
   emit_instruction(
     st,
@@ -270,8 +266,7 @@ fn emit_addsub_register(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, r
   );
 }
 
-/// C4.1.66 load/store register, unscaled immediate (C:327-335).
-///
+/// C4.1.66 load/store register, unscaled immediate.
 /// This is the *unscaled* form: `imm9` is a byte displacement in `[-256, 256)`
 /// regardless of the access width. Using the scaled unsigned-offset form would
 /// change every one of these bytes.
@@ -281,24 +276,24 @@ fn emit_loadstore_immediate(st: &mut JitState, op: u32, rt: u32, rn: u32, imm9: 
   emit_instruction(st, 0x3800_0000 | op | (imm9 << 12) | (rn << 5) | rt);
 }
 
-/// Load-exclusive / store-exclusive, for atomics (C:338-344).
+/// Load-exclusive / store-exclusive, for atomics.
 fn emit_loadstore_exclusive(st: &mut JitState, op: u32, rt: u32, rn: u32, rs: u32) {
   emit_instruction(st, op | (rs << 16) | (rn << 5) | rt);
 }
 
-/// PC-relative literal load; the displacement is patched later (C:346-353).
+/// PC-relative literal load; the displacement is patched later.
 fn emit_loadstore_literal(st: &mut JitState, op: u32, rt: u32, target: PatchTarget) {
   note_load(st, target);
   emit_instruction(st, op | 0x0800_0000 | rt);
 }
 
-/// PC-relative address; the displacement is patched later (C:355-361).
+/// PC-relative address; the displacement is patched later.
 fn emit_adr(st: &mut JitState, target: PatchTarget, rd: u32) {
   note_lea(st, target);
   emit_instruction(st, 0x1000_0000 | rd);
 }
 
-/// C4.1.66 load/store register pair, offset form (C:374-387).
+/// C4.1.66 load/store register pair, offset form.
 fn emit_loadstorepair_immediate(st: &mut JitState, op: u32, rt: u32, rt2: u32, rn: u32, imm7: i32) {
   let imm_div = if op == lsp::STPX || op == lsp::LDPX {
     8
@@ -313,7 +308,7 @@ fn emit_loadstorepair_immediate(st: &mut JitState, op: u32, rt: u32, rt2: u32, r
   );
 }
 
-/// C4.1.67 logical (shifted register) (C:403-413).
+/// C4.1.67 logical (shifted register).
 fn emit_logical_register(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, rn: u32, rm: u32) {
   emit_instruction(
     st,
@@ -321,12 +316,12 @@ fn emit_logical_register(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, 
   );
 }
 
-/// `CSEL Rd, Rn, Rm, cond` (64-bit): `Rd = cond ? Rn : Rm` (C:438-442).
+/// `CSEL Rd, Rn, Rm, cond` (64-bit): `Rd = cond ? Rn : Rm`.
 fn emit_conditionalselect(st: &mut JitState, rd: u32, rn: u32, rm: u32, c: u32) {
   emit_instruction(st, 0x9a80_0000 | (rm << 16) | (c << 12) | (rn << 5) | rd);
 }
 
-/// `CCMP Rn, Rm, #nzcv, cond` (64-bit) (C:447-451).
+/// `CCMP Rn, Rm, #nzcv, cond` (64-bit).
 fn emit_conditionalcompare(st: &mut JitState, rn: u32, rm: u32, nzcv: u32, c: u32) {
   emit_instruction(
     st,
@@ -334,12 +329,12 @@ fn emit_conditionalcompare(st: &mut JitState, rn: u32, rm: u32, nzcv: u32, c: u3
   );
 }
 
-/// C4.1.67 data-processing, one source (C:1060-1065).
+/// C4.1.67 data-processing, one source.
 fn emit_dataprocessing_onesource(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, rn: u32) {
   emit_instruction(st, sz(sixty_four) | op | (rn << 5) | rd);
 }
 
-/// C4.1.67 data-processing, two sources (C:1079-1089).
+/// C4.1.67 data-processing, two sources.
 fn emit_dataprocessing_twosource(
   st: &mut JitState,
   sixty_four: bool,
@@ -351,7 +346,7 @@ fn emit_dataprocessing_twosource(
   emit_instruction(st, sz(sixty_four) | op | (rm << 16) | (rn << 5) | rd);
 }
 
-/// C4.1.67 data-processing, three sources (C:1099-1110).
+/// C4.1.67 data-processing, three sources.
 fn emit_dataprocessing_threesource(
   st: &mut JitState,
   sixty_four: bool,
@@ -367,15 +362,14 @@ fn emit_dataprocessing_threesource(
   );
 }
 
-/// C4.1.64 move wide (immediate) (C:1121-1160).
-///
+/// C4.1.64 move wide (immediate).
 /// A `MOVZ`/`MOVN` followed by `MOVK`s, choosing whichever of the `0x0000` and
 /// `0xffff` block patterns is more common so the sequence is as short as
 /// possible. The *number* of instructions therefore depends on the value: one
 /// for `0`, `-1` and any single non-zero halfword, up to four for a value with
 /// four distinct halfwords.
 fn emit_movewide_immediate(st: &mut JitState, sixty_four: bool, rd: u32, imm: u64) {
-  // The C seeds count0000 with 2 in the 32-bit case, standing in for the two
+  // count0000 is seeded with 2 in the 32-bit case, standing in for the two
   // high halfwords it never examines.
   let mut count0000: u32 = if sixty_four { 0 } else { 2 };
   let mut countffff: u32 = 0;
@@ -430,8 +424,7 @@ fn note_lea(st: &mut JitState, target: PatchTarget) {
   st.note_lea(at, target);
 }
 
-/// C4.1.65 unconditional branch (immediate) (C:976-1001).
-///
+/// C4.1.65 unconditional branch (immediate).
 /// A `BL` to a non-special target is a local call and goes in its own table, so
 /// that `resolve_local_calls` can subtract the per-function prologue from it.
 /// Returns the offset the instruction was emitted at, which is the handle
@@ -448,7 +441,7 @@ fn emit_unconditionalbranch_immediate(st: &mut JitState, op: u32, target: PatchT
   source_offset
 }
 
-/// C4.1.65 conditional branch (immediate) (C:1031-1042).
+/// C4.1.65 conditional branch (immediate).
 fn emit_conditionalbranch_immediate(st: &mut JitState, c: u32, target: PatchTarget) -> u32 {
   let source_offset = st.offset;
   st.note_jump(source_offset, target);
@@ -457,7 +450,7 @@ fn emit_conditionalbranch_immediate(st: &mut JitState, c: u32, target: PatchTarg
 }
 
 /// Retargets the branch emitted at `jump_src` to land here. Mirrors
-/// `emit_jump_target` in `ubpf_jit_support.c`.
+/// Resolves one jump target.
 fn emit_jump_target(st: &mut JitState, jump_src: u32) {
   let here = st.offset;
   st.retarget_jumps(
@@ -473,8 +466,7 @@ fn emit_jump_target(st: &mut JitState, jump_src: u32) {
 // The pointer cage
 // ---------------------------------------------------------------------------
 
-/// Mask-and-offset the address in `src` into `dst` (C:415-435).
-///
+/// Mask-and-offset the address in `src` into `dst`.
 /// Unreachable from this entry point — every caller of
 /// [`emit_masked_address_with_offset`] is already inside a `jit_pointer_mask`
 /// guard, so the fall-through that reaches this is dead. Kept for shape.
@@ -492,8 +484,7 @@ fn emit_masked_address(cfg: &Config, st: &mut JitState, src: u32, dst: u32, scra
 }
 
 /// Bounds-check `[dst, dst+size)` against one guest region described by the
-/// memory descriptor, then translate `dst` to the native address (C:460-489).
-///
+/// memory descriptor, then translate `dst` to the native address.
 /// Branchless on purpose: the address is translated unconditionally and a final
 /// `CSEL` replaces it with 0 — a guaranteed faulting access — when out of range,
 /// so there is no predictable branch whose mis-speculation could perform a
@@ -532,7 +523,7 @@ fn emit_single_region_address(
 }
 
 /// The same check, reading the region's bounds from the frame constants the
-/// embedder derived once per invocation (C:610-644).
+/// embedder derived once per invocation.
 fn emit_single_region_address_from_frame(
   st: &mut JitState,
   dst: u32,
@@ -571,7 +562,7 @@ fn emit_single_region_address_from_frame(
   emit_conditionalselect(st, dst, dst, RZ, cond::HS);
 }
 
-/// Where one guest region's bounds can be found (C:648-656).
+/// Where one guest region's bounds can be found.
 struct GuestRegion {
   desc_bottom: i32,
   desc_top: i32,
@@ -630,14 +621,13 @@ fn emit_region_address(
   }
 }
 
-/// Whether the native-frame-base fast path is live (C:492-496).
+/// Whether the native-frame-base fast path is live.
 fn native_frame_base_active(cfg: &Config) -> bool {
   cfg.pointer_mask != 0 && cfg.native_frame_base
 }
 
 /// True when `[base + offset]`, `size` bytes wide, is a frame access that needs
-/// no bounds check at all (C:507-524).
-///
+/// no bounds check at all.
 /// The hint is deliberately not taken on trust: the base really being R10, and
 /// the access ending at or below it and starting no more than one local frame
 /// below, are re-derived here from the instruction itself.
@@ -658,14 +648,14 @@ fn emit_frame_access_ok(cfg: &Config, region_hint: u8, base: u32, offset: i16, s
   offset >= -256
 }
 
-/// Materialise the *guest* value of eBPF R10 into `dst` (C:532-537).
+/// Materialise the *guest* value of eBPF R10 into `dst`.
 fn emit_guest_frame_pointer(st: &mut JitState, dst: u32, scratch: u32) {
   emit_loadstore_immediate(st, ls::LDRX, scratch, R29, abi::FRAME_DELTA_OFFSET as i16);
   emit_addsub_register(st, true, addsub::SUB, dst, map_register(10), scratch);
 }
 
 /// True when `insn` reads its source register as a value rather than as a
-/// memory base or an opcode mode selector (C:542-559).
+/// memory base or an opcode mode selector.
 fn reads_src_as_value(insn: &Insn) -> bool {
   use crate::jit::isa::{cls, opcode, src};
   match insn.opcode & cls::MASK {
@@ -684,7 +674,7 @@ fn reads_src_as_value(insn: &Insn) -> bool {
   }
 }
 
-/// eBPF registers `insn` may overwrite (C:563-583). Over-approximating only
+/// eBPF registers `insn` may overwrite. Over-approximating only
 /// ends access groups early.
 fn written_registers_mask(insn: &Insn) -> u16 {
   use crate::jit::isa::{cls, mode, opcode};
@@ -709,7 +699,7 @@ fn written_registers_mask(insn: &Insn) -> u16 {
 }
 
 /// Translate `[src + offset]` to a native address in `dst`, emitting whatever
-/// bounds check the configuration and hint call for (C:694-772).
+/// bounds check the configuration and hint call for.
 #[allow(clippy::too_many_arguments)]
 fn emit_masked_address_with_offset(
   cfg: &Config,
@@ -779,7 +769,7 @@ fn emit_masked_address_with_offset(
 }
 
 /// Folds a group displacement into the address, since the load/store immediate
-/// form reaches only ±256 while a group window is a page wide (C:789-797).
+/// form reaches only ±256 while a group window is a page wide.
 fn apply_group_delta(st: &mut JitState, addr_reg: u32, delta: u16) -> i16 {
   if delta < 256 {
     return delta as i16;
@@ -790,8 +780,7 @@ fn apply_group_delta(st: &mut JitState, addr_reg: u32, delta: u16) -> i16 {
 
 /// Resolve `[base + offset]`, `width` bytes wide, to a native address, and
 /// return the register holding it together with the displacement to use
-/// (C:807-867).
-///
+///.
 /// The plan is not taken on trust: every condition the backend can re-derive
 /// from the instruction stream it is already walking, it does, and any that
 /// fails drops through to an ordinary checked access.
@@ -858,7 +847,7 @@ fn emit_checked_address(
           plan.region,
         );
         emit_loadstore_immediate(st, ls::STRX, addr_reg, R29, abi::GROUP_BASE_OFFSET as i16);
-        // `base_reg` holds the *native* register here, matching the C's
+        // `base_reg` holds the *native* register here, matching the
         // `state->group_base_reg`; `written` is indexed by eBPF register.
         st.group = Some(OpenGroup {
           leader_pc: pc,
@@ -888,7 +877,7 @@ fn emit_checked_address(
   (addr_reg, 0)
 }
 
-/// Access width of a load/store opcode (C:869-893).
+/// Access width of a load/store opcode.
 fn loadstore_access_size(op: u32) -> i32 {
   match op {
     ls::STRB | ls::LDRB | ls::LDRSBX => 1,
@@ -903,7 +892,7 @@ fn loadstore_is_store(op: u32) -> bool {
 }
 
 /// Emit one guest load or store, with the cage applied where it is on
-/// (C:901-951).
+///.
 #[allow(clippy::too_many_arguments)]
 fn emit_masked_loadstore(
   cfg: &Config,
@@ -959,7 +948,7 @@ fn emit_masked_loadstore(
 // ---------------------------------------------------------------------------
 
 /// Call an external helper, through the registered dispatcher if there is one
-/// and through the per-index helper table otherwise (C:1275-1348).
+/// and through the per-index helper table otherwise.
 fn emit_dispatched_external_helper_call(st: &mut JitState, idx: u32) {
   let stack_movement = align_to(8, 16);
   emit_addsub_immediate(st, true, addsub::SUB, SP, SP, stack_movement);
@@ -1021,7 +1010,7 @@ fn emit_unconditionalbranch_register(st: &mut JitState, op: u32, rn: u32) {
 }
 
 /// A local call whose target has not been compiled yet: ask the embedder's
-/// resolver for the entry address at run time, then call it (C:1377-1426).
+/// resolver for the entry address at run time, then call it.
 fn emit_lazy_local_call(
   cfg: &Config,
   inputs: &TranslationInputs<'_>,
@@ -1095,7 +1084,7 @@ fn emit_lazy_local_call(
 // Atomics
 // ---------------------------------------------------------------------------
 
-/// An `LDXR`/`STXR` retry loop implementing one eBPF atomic (C:1429-1588).
+/// An `LDXR`/`STXR` retry loop implementing one eBPF atomic.
 #[allow(clippy::too_many_arguments)]
 fn emit_atomic_operation(
   cfg: &Config,
@@ -1245,7 +1234,7 @@ fn emit_atomic_operation(
 // ---------------------------------------------------------------------------
 
 /// Park the dispatcher's address, 4-byte aligned so the PC-relative load that
-/// reads it has a multiple-of-four displacement (C:1590-1607).
+/// reads it has a multiple-of-four displacement.
 fn emit_dispatched_external_helper_address(st: &mut JitState, dispatcher_addr: u64) -> u32 {
   let adjustment = (4 - (st.offset % 4)) % 4;
   for _ in 0..adjustment {
@@ -1256,7 +1245,7 @@ fn emit_dispatched_external_helper_address(st: &mut JitState, dispatcher_addr: u
   helper_address
 }
 
-/// The consecutive helper-address table (C:1609-1618). `async-ebpf` never
+/// The consecutive helper-address table. `async-ebpf` never
 /// registers individual helpers, so every entry is null.
 fn emit_helper_table(st: &mut JitState) -> u32 {
   let helper_table_address_target = st.offset;
@@ -1267,11 +1256,11 @@ fn emit_helper_table(st: &mut JitState) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Opcode classification (C:1620-1891)
+// Opcode classification
 // ---------------------------------------------------------------------------
 
 /// Whether this instruction carries an immediate operand the backend may have
-/// to lower into a register first (C:1620-1635).
+/// to lower into a register first.
 fn is_imm_op(insn: &Insn) -> bool {
   use crate::jit::isa::{alu, cls, opcode, src};
   let class = insn.opcode & cls::MASK;
@@ -1288,7 +1277,7 @@ fn is_imm_op(insn: &Insn) -> bool {
   (is_imm && (is_alu || is_jmp || is_jmp32)) || is_store
 }
 
-/// Whether the operation is 64-bit wide (C:1637-1642).
+/// Whether the operation is 64-bit wide.
 fn is_alu64_op(insn: &Insn) -> bool {
   use crate::jit::isa::cls;
   let class = insn.opcode & cls::MASK;
@@ -1296,12 +1285,11 @@ fn is_alu64_op(insn: &Insn) -> bool {
 }
 
 /// Whether the immediate can go straight into the instruction encoding, or has
-/// to be materialised in a register first (C:1644-1709).
-///
+/// to be materialised in a register first.
 /// The `add`/`sub` and conditional-jump forms take a 12-bit unsigned immediate.
 /// Everything else — including the logical operations, whose aarch64 immediate
 /// form uses the N/immr/imms bitmask encoding — is lowered to its register
-/// form. The C never attempts the bitmask encoding at all, so no constant is
+/// form. The bitmask encoding is never attempted, so no constant is
 /// ever "not encodable": the fallback is the only path.
 fn is_simple_imm(insn: &Insn) -> bool {
   use crate::jit::isa::{alu, cls};
@@ -1322,13 +1310,13 @@ fn is_simple_imm(insn: &Insn) -> bool {
         _ => insn.imm >= 0 && insn.imm < 0x1000,
       }
     }
-    // The C's `default: assert(false); return false;`. Unreachable for any
+    // Unreachable for any
     // opcode the validator admits.
     _ => false,
   }
 }
 
-/// Rewrite an immediate-form opcode into its register form (C:1711-1722).
+/// Rewrite an immediate-form opcode into its register form.
 fn to_reg_op(opcode: u8) -> u8 {
   use crate::jit::isa::{cls, src};
   let class = opcode & cls::MASK;
@@ -1337,12 +1325,12 @@ fn to_reg_op(opcode: u8) -> u8 {
   } else if class == cls::ST {
     (opcode & !cls::MASK) | cls::STX
   } else {
-    // The C's `assert(false); return 0;`.
+    // Unreachable: every caller passes a width this covers.
     0
   }
 }
 
-/// The condition code a conditional jump maps to (C:1860-1891).
+/// The condition code a conditional jump maps to.
 fn to_condition(op: JmpOp) -> u32 {
   match op {
     JmpOp::Eq => cond::EQ,
@@ -1359,7 +1347,7 @@ fn to_condition(op: JmpOp) -> u32 {
   }
 }
 
-/// The load/store opcode for a memory access (C:1824-1858).
+/// The load/store opcode for a memory access.
 fn to_loadstore_opcode(width: Width, signed: bool, load: bool) -> u32 {
   if load {
     match (width, signed) {
@@ -1383,18 +1371,18 @@ fn to_loadstore_opcode(width: Width, signed: bool, load: bool) -> u32 {
   }
 }
 
-/// The one-source byte-reversal opcode for an `end` immediate (C:1769-1792).
+/// The one-source byte-reversal opcode for an `end` immediate.
 fn to_dp1_opcode(imm: i32) -> u32 {
   match imm {
     16 => dp1::REV16,
     32 => dp1::REV32,
     64 => dp1::REV64,
-    // The C's `assert(false); return 0;`.
+    // Unreachable: every caller passes a width this covers.
     _ => 0,
   }
 }
 
-/// `divmod` (C:2530-2546). `offset == 1` selects the signed form.
+/// `divmod`. `offset == 1` selects the signed form.
 fn divmod(st: &mut JitState, opcode: u8, rd: u32, rn: u32, rm: u32, offset: i16) {
   use crate::jit::isa::{alu, cls};
   let is_mod = opcode & alu::MASK == alu::MOD;
@@ -1414,8 +1402,7 @@ fn divmod(st: &mut JitState, opcode: u8, rd: u32, rn: u32, rm: u32, offset: i16)
 // Relocation
 // ---------------------------------------------------------------------------
 
-/// Patch a branch immediate (C:2548-2577).
-///
+/// Patch a branch immediate.
 /// Conditional and compare-and-branch forms carry a signed 19-bit word
 /// displacement (±1 MiB); the unconditional form carries a signed 26-bit one
 /// (±128 MiB). Anything wider is [`Progress::RelocationOutOfRange`] rather than
@@ -1445,7 +1432,7 @@ fn resolve_branch_immediate(st: &mut JitState, offset: u32, imm: i32) -> bool {
   true
 }
 
-/// Patch an `LDR` (literal), whose immediate is signed 19-bit (C:2579-2593).
+/// Patch an `LDR` (literal), whose immediate is signed 19-bit.
 fn resolve_load_literal(st: &mut JitState, instr_offset: u32, target_offset: i32) -> bool {
   if (target_offset >> 18) != -1 && (target_offset >> 18) != 0 {
     st.fail(Progress::RelocationOutOfRange);
@@ -1457,11 +1444,10 @@ fn resolve_load_literal(st: &mut JitState, instr_offset: u32, target_offset: i32
   true
 }
 
-/// Patch an `ADR` (C:2595-2610).
-///
+/// Patch an `ADR`.
 /// Only the `immhi` field is written; the two `immlo` bits at 30:29 are left
 /// clear, because the caller already divided the displacement by four. That is
-/// what the C does, so it is what this does.
+/// what callers depend on.
 fn resolve_adr(st: &mut JitState, instr_offset: u32, immediate: i32) -> bool {
   if (immediate >> 18) != -1 && (immediate >> 18) != 0 {
     st.fail(Progress::RelocationOutOfRange);
@@ -1473,10 +1459,9 @@ fn resolve_adr(st: &mut JitState, instr_offset: u32, immediate: i32) -> bool {
   true
 }
 
-/// Resolve one patch target to a native offset, mirroring the C's dispatch
-/// (C:2618-2639).
-///
-/// The C decides between the two regular flavours with
+/// Resolve one patch target to a native offset, dispatching
+///.
+/// Decides between the two regular flavours with
 /// `jit_target_pc != 0` — a sentinel that would collide with a real offset of
 /// zero. It cannot here: offset 0 always holds the `bti c`, so nothing is ever
 /// patched to point at it. [`PatchTarget`] keeps the two apart by construction.
@@ -1542,7 +1527,7 @@ fn resolve_leas(st: &mut JitState) -> bool {
   true
 }
 
-/// Local-call fixups (C:2701-2719). Always empty here: this entry point uses
+/// Local-call fixups. Always empty here: this entry point uses
 /// the lazy resolver, which calls through a register rather than a `BL`.
 fn resolve_local_calls(st: &mut JitState) -> bool {
   for call in std::mem::take(&mut st.local_calls) {
@@ -1571,10 +1556,9 @@ fn failed(msg: impl Into<String>) -> TranslateError {
 
 /// Translates `inputs.start_pc .. inputs.end_pc` into `buffer`, returning the
 /// number of bytes written.
-///
 /// Port of `translate_range` with `whole_program = false, lazy_local_calls =
-/// true` (C:1902-2522), followed by the relocation passes
-/// `ubpf_translate_function_arm64` runs (C:2819-2828).
+/// true`, followed by the relocation passes
+/// translation runs.
 pub fn translate_range(
   t: &Translator,
   inputs: &TranslationInputs<'_>,
@@ -1643,7 +1627,7 @@ pub fn translate_range(
       emit_addsub_immediate(&mut st, true, addsub::SUB, SP, SP, 16);
       emit_loadstorepair_immediate(&mut st, lsp::STPX, TEMP_REGISTER, TEMP_REGISTER, SP, 0);
       // Recorded so a local call can skip it. Every function's prologue is the
-      // same length, which the C asserts.
+      // same length, which the assertion below pins.
       if st.prolog_size == 0 {
         st.prolog_size = (st.offset - prolog_start) as usize;
       } else {
@@ -1739,8 +1723,8 @@ pub fn translate_range(
     match decoded {
       None => {
         // An atomic whose selector immediate names no operation is reported
-        // differently from an unrecognised opcode (C:2360-2363). Both arms are
-        // unreachable through `ubpf_load`, whose filter table enumerates the
+        // differently from an unrecognised opcode. Both arms are
+        // unreachable through `Translator::load`, whose filter table enumerates the
         // ten legal atomic immediates.
         errmsg = Some(
           if matches!(Insn { opcode, ..insn }.op(), Some(Op::Atomic { .. })) {
@@ -1789,7 +1773,7 @@ pub fn translate_range(
         }
         (JmpOp::Set, Source::Imm) => {
           // Unreachable: JSET_IMM is never "simple", so the lowering above
-          // already rewrote it to JSET_REG. The C lists it under `Unexpected
+          // already rewrote it to JSET_REG. It is listed under `Unexpected
           // instruction`, but that arm has no `break` and falls into
           // `default:`, so the status it reports is `UnknownInstruction`.
           errmsg = Some(format!(
@@ -1831,7 +1815,7 @@ pub fn translate_range(
         if native_frame_base_active(cfg) && insn.src == 10 {
           // Storing R10 stores a pointer, and it has to be the guest one.
           //
-          // The C tests the *raw* `inst.src` nibble (C:2303), so a `st`
+          // This tests the *raw* `inst.src` nibble, so a `st`
           // instruction that happens to carry src == 10 has the frame pointer
           // materialised over the immediate it just parked in the same
           // register. Reproduced.
@@ -1910,7 +1894,7 @@ pub fn translate_range(
 
     // After the instruction has used its operands, note what it overwrote: an
     // access whose destination is its own base is still valid, but nothing
-    // addressing that base afterwards is. The C accumulates this in a state
+    // addressing that base afterwards is. This accumulates in a state
     // field that a leader resets to zero; here the accumulator lives in the
     // open group, which is created with it already zero, so the two agree.
     if let Some(group) = &mut st.group {
@@ -1970,7 +1954,7 @@ fn is_mov_imm(opcode: u8) -> bool {
     && opcode & src::REG == src::IMM
 }
 
-/// Map a non-`Ok` status to the error the C reports (C:2447-2493).
+/// Map a non-`Ok` status to the error reported for it.
 fn loop_error(status: Progress, errmsg: Option<String>) -> TranslateError {
   match status {
     Progress::TooManyJumps => failed("Too many jump instructions."),
@@ -1987,8 +1971,7 @@ fn loop_error(status: Progress, errmsg: Option<String>) -> TranslateError {
   }
 }
 
-/// The barrier pre-pass (C:1950-1982), which the x86_64 backend does not have.
-///
+/// The barrier pre-pass, which the x86_64 backend does not have.
 /// Builds the set of instruction slots a branch can land on. An access group's
 /// members address the base its leader parked, so any path reaching a member
 /// without running the leader would read a stale one.
@@ -2031,7 +2014,7 @@ fn barrier_prepass(t: &Translator, st: &mut JitState, start_pc: usize, end_pc: u
   }
 }
 
-/// The ALU arm of the main `switch` (C:2109-2216).
+/// The ALU arm of the main `switch`.
 #[allow(clippy::too_many_arguments)]
 fn emit_alu(
   st: &mut JitState,
@@ -2091,7 +2074,7 @@ fn emit_alu(
       }
     }
     // Every remaining immediate form is rewritten to its register form before
-    // the switch, so these arms are unreachable. The C lists them under
+    // the switch, so these arms are unreachable. They are listed under
     // `Unexpected instruction` but that arm has no `break`, so it falls into
     // `default:` and the status the caller sees is `UnknownInstruction`.
     (_, Source::Imm) => {
@@ -2103,8 +2086,7 @@ fn emit_alu(
   }
 }
 
-/// `le` / `be` / `bswap` (C:2180-2216).
-///
+/// `le` / `be` / `bswap`.
 /// Two deliberate asymmetries are reproduced: on a little-endian host `le`
 /// emits no byte reversal at all (and nothing whatsoever for `imm == 64`), and
 /// `be` zero-extends only for `imm == 16` where `bswap` also does so for 32.
@@ -2114,7 +2096,7 @@ fn emit_end(st: &mut JitState, kind: EndKind, imm: i32, sixty_four: bool, dst: u
   match kind {
     EndKind::Le => {
       // Little-endian host: the reversal is a no-op. Both supported targets are
-      // little-endian, so the C's `#if __BYTE_ORDER__` never takes the other
+      // little-endian, so the big-endian form never takes the other
       // branch here.
       if imm == 16 {
         emit_instruction(st, UXTH | (dst << 5) | dst);
@@ -2139,12 +2121,12 @@ fn emit_end(st: &mut JitState, kind: EndKind, imm: i32, sixty_four: bool, dst: u
   }
 }
 
-#[cfg(all(test, feature = "oracle"))]
+#[cfg(test)]
 mod tests {
   use super::*;
+  use crate::jit::golden::{self, SweepDigest};
   use crate::jit::isa::{alu, atomic, cls, jmp, mode, opcode, size, src as srcbit};
-  use crate::jit::oracle::{config_sweep, diff, plain_inputs, Diff};
-  use crate::jit::Target;
+  use crate::jit::{Dispatcher, LocalCallResolver, Target};
 
   fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Insn {
     Insn {
@@ -2160,50 +2142,198 @@ mod tests {
     insn(opcode::EXIT, 0, 0, 0, 0)
   }
 
-  /// Runs one program through every aarch64 configuration and asserts the C and
-  /// the Rust emit the same bytes.
+  // ---------------------------------------------------------------------------
+  // The harness
+  // ---------------------------------------------------------------------------
+
+  /// Stand-in addresses for the helper dispatcher and the local-call resolver.
+  /// A helper call materialises the dispatcher's address as an immediate, and a
+  /// lazy local call materialises the resolver's, so both end up *inside* the
+  /// emitted bytes. A real function's address moves with every build and with
+  /// address-space randomisation, so recording it would make the output differ
+  /// from one run to the next for no reason anybody could review. These fixed
+  /// sentinels keep the emitted code reproducible.
+  /// Nothing ever calls them: translation only writes their value into the
+  /// buffer, and this module never executes what it emits.
+  const STAND_IN_DISPATCHER: usize = 0x0000_5eed_1111_0000;
+  const STAND_IN_RESOLVER: usize = 0x0000_5eed_2222_0000;
+
+  fn stand_in_dispatcher() -> Dispatcher {
+    // SAFETY: the address is only ever materialised as an immediate. Producing
+    // a function pointer from an integer is well defined; calling it would not
+    // be, and nothing here does.
+    unsafe { std::mem::transmute::<usize, Dispatcher>(STAND_IN_DISPATCHER) }
+  }
+
+  fn stand_in_resolver() -> LocalCallResolver {
+    // SAFETY: as for the dispatcher above.
+    unsafe { std::mem::transmute::<usize, LocalCallResolver>(STAND_IN_RESOLVER) }
+  }
+
+  /// Admits every helper index, so that helper-call emission is exercised
+  /// rather than refused at load. This one is a real function, because the
+  /// validator calls it.
+  unsafe extern "C" fn accept_every_helper(_index: u32, _vm: *const std::ffi::c_void) -> bool {
+    true
+  }
+
+  /// Builds [`TranslationInputs`] covering a whole program with no hints or
+  /// plan.
+  fn plain_inputs(num_insns: usize) -> TranslationInputs<'static> {
+    TranslationInputs {
+      hints: &[],
+      plan: &[],
+      resolver_ids: &[],
+      start_pc: 0,
+      end_pc: num_insns,
+    }
+  }
+
+  /// The configuration sweep every emitter test runs over.
+  /// The emitted code depends on the pointer cage, the native frame base, the
+  /// frame constants and the region hints, and those features *interact* —
+  /// which is exactly where code generation goes wrong. Sweeping them is not
+  /// optional.
+  fn config_sweep(target: Target) -> Vec<(&'static str, Config)> {
+    let base = Config {
+      target,
+      dispatcher: Some(stand_in_dispatcher()),
+      dispatcher_validate: Some(accept_every_helper),
+      local_call_resolver: Some(stand_in_resolver()),
+      ..Default::default()
+    };
+    vec![
+      (
+        "no cage",
+        Config {
+          pointer_mask: 0,
+          pointer_offset: 0,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage only",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage + native frame base",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          native_frame_base: true,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage + frame constants",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          frame_constants: true,
+          ..base.clone()
+        },
+      ),
+      (
+        // What `async-ebpf` actually runs.
+        "production",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          native_frame_base: true,
+          frame_constants: true,
+          ..base.clone()
+        },
+      ),
+      (
+        "production + unwind helper",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          native_frame_base: true,
+          frame_constants: true,
+          unwind_helper_index: Some(3),
+          ..base
+        },
+      ),
+    ]
+  }
+
+  /// One case against its golden. Returns whether it produced code.
+  /// The label has to distinguish cases that share a program, a configuration
+  /// and a set of inputs but differ in the buffer they are given, since the
+  /// golden key is content-addressed over everything *but* the capacity.
+  fn golden_case(
+    label: &str,
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) -> bool {
+    let translated = golden::check(label, config, code, inputs, capacity);
+    // The test runner does not run process-exit hooks, so a recording run has
+    // to write the file back as it goes.
+    golden::flush();
+    translated
+  }
+
+  /// Folds one case into a sweep's rolling digest.
+  /// A program the loader refuses contributes its own outcome rather than
+  /// nothing, so a generator that quietly stops producing loadable programs
+  /// still moves the digest instead of silently shrinking the sweep.
+  fn sweep_case(
+    digest: &mut SweepDigest,
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) {
+    let out = golden::translate_one(config, code, inputs, capacity)
+      .unwrap_or_else(|| Err(TranslateError::Failed("refused at load".into())));
+    digest.add(&out);
+  }
+
+  /// Closes a sweep and writes it back, as [`golden_case`] does for one case.
+  fn finish_sweep(digest: SweepDigest, label: &str) {
+    digest.finish(label, Target::Aarch64);
+    golden::flush();
+  }
+
+  /// Runs one program through every aarch64 configuration, against the goldens.
   #[track_caller]
   fn check(what: &str, insns: &[Insn]) {
     check_with(what, insns, &plain_inputs(insns.len()));
   }
 
-  /// Asserts agreement *and* that real code came out, so a test cannot pass by
-  /// both sides failing for a reason the test did not intend.
+  /// Checks the goldens *and* that real code came out, so a test cannot pass by
+  /// quietly degrading into a program that is refused for a reason it never
+  /// meant to exercise.
   #[track_caller]
   fn check_with(what: &str, insns: &[Insn], inputs: &TranslationInputs<'_>) {
-    for d in outcomes(insns, inputs) {
-      assert!(
-        matches!(d.1, Diff::Same { .. }),
-        "{what} under {:?}: {}",
-        d.0,
-        d.1
-      );
-    }
-  }
-
-  /// Asserts that both backends refuse the program, in the same way.
-  #[track_caller]
-  fn check_rejected(what: &str, insns: &[Insn], inputs: &TranslationInputs<'_>) {
-    for d in outcomes(insns, inputs) {
-      assert!(
-        matches!(d.1, Diff::SameError(_)),
-        "{what} under {:?}: {}",
-        d.0,
-        d.1
-      );
-    }
-  }
-
-  fn outcomes(
-    insns: &[Insn],
-    inputs: &TranslationInputs<'_>,
-  ) -> Vec<(&'static str, crate::jit::oracle::Diff)> {
     let code = Insn::encode_all(insns);
     let capacity = 262144.max(insns.len() * 512);
-    config_sweep(Target::Aarch64)
-      .into_iter()
-      .map(|(name, config)| (name, diff(&config, &code, inputs, capacity)))
-      .collect()
+    for (name, config) in config_sweep(Target::Aarch64) {
+      assert!(
+        golden_case(&format!("{what}/{name}"), &config, &code, inputs, capacity),
+        "{what} under {name:?} produced no code"
+      );
+    }
+  }
+
+  /// Asserts that every configuration refuses the program.
+  #[track_caller]
+  fn check_rejected(what: &str, insns: &[Insn], inputs: &TranslationInputs<'_>) {
+    let code = Insn::encode_all(insns);
+    let capacity = 262144.max(insns.len() * 512);
+    for (name, config) in config_sweep(Target::Aarch64) {
+      assert!(
+        !golden_case(&format!("{what}/{name}"), &config, &code, inputs, capacity),
+        "{what} under {name:?} emitted code where a refusal was expected"
+      );
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -2282,8 +2412,8 @@ mod tests {
   #[test]
   fn movsx_uses_the_offset_field_to_pick_a_width() {
     let mut program = Vec::new();
-    // A 32-bit MOVSX has no 32-bit sign-extension form, and `ubpf_load`
-    // refuses `offset == 32` there.
+    // A 32-bit MOVSX has no 32-bit sign-extension form, and the loader refuses
+    // `offset == 32` there.
     for (class, offsets) in [
       (cls::ALU, &[0i16, 8, 16][..]),
       (cls::ALU64, &[0, 8, 16, 32][..]),
@@ -2478,19 +2608,28 @@ mod tests {
       insn(cls::LDX | mode::MEM | size::DW, 1, 10, -300, 0),
       exit(),
     ];
+    // Sixteen hint pairings across six configurations: a cross-product, so one
+    // digest rather than ninety-six entries.
+    let code = Insn::encode_all(&insns);
+    let mut digest = SweepDigest::new();
     for a in 0..4u8 {
       for b in 0..4u8 {
         let hints = vec![a, b, a, b, a, 0];
-        check_with(
-          &format!("hints {a}/{b}"),
-          &insns,
-          &TranslationInputs {
-            hints: &hints,
-            ..plain_inputs(insns.len())
-          },
-        );
+        let inputs = TranslationInputs {
+          hints: &hints,
+          ..plain_inputs(insns.len())
+        };
+        for (_, config) in config_sweep(Target::Aarch64) {
+          sweep_case(&mut digest, &config, &code, &inputs, 65536);
+        }
       }
     }
+    assert_eq!(
+      digest.translated(),
+      digest.cases(),
+      "every hint pairing must translate"
+    );
+    finish_sweep(digest, "region-hints");
   }
 
   // -------------------------------------------------------------------------
@@ -2528,9 +2667,10 @@ mod tests {
   fn non_canonical_atomic_selectors_at_thirty_two_bits() {
     // The 32-bit atomic filter bounds the immediate at 0..=255 rather than
     // enumerating legal values (the doubleword one does enumerate), so
-    // selectors no compiler emits still load at this width. The C switches on
-    // `imm & 0xf0` and takes the fetch flag from bit 0, which leaves bits 1..3
-    // dead: `0x02` is a plain atomic add and `0x0f` a fetching one.
+    // selectors no compiler emits still load at this width. The backend
+    // switches on `imm & 0xf0` and takes the fetch flag from bit 0, which
+    // leaves bits 1..3 dead: `0x02` is a plain atomic add and `0x0f` a fetching
+    // one. Both are recorded, so the dead bits staying dead is pinned.
     let mut program = Vec::new();
     for imm in [
       0x02i32, 0x0f, 0x0e, 0x41, 0x4f, 0x5e, 0xa2, 0xe1, 0xf1, 0xff,
@@ -2546,12 +2686,13 @@ mod tests {
   }
 
   #[test]
-  fn an_atomic_selector_naming_no_operation_is_refused_identically() {
+  fn an_atomic_selector_naming_no_operation_is_refused() {
     // `validate()` masks the selector the same way the backend does and refuses
     // any high nibble it does not name, plus `xchg`/`cmpxchg` without the fetch
-    // bit. So the backend's own `Unknown atomic operation` arm - which this
-    // port reproduces - is in fact unreachable through `ubpf_load`; what these
-    // inputs establish is that the two agree on refusing them.
+    // bit. So the backend's own `Unknown atomic operation` arm is in fact
+    // unreachable through the loader; what these inputs establish is that the
+    // refusal happens at load, where it can still be reported cleanly, rather
+    // than half-way through emitting code.
     for imm in [
       0x10i32, 0x20, 0x30, 0x60, 0x70, 0x80, 0x90, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0xe2, 0xf2,
     ] {
@@ -2599,7 +2740,7 @@ mod tests {
   }
 
   #[test]
-  fn a_local_call_without_a_resolver_id_is_rejected_identically() {
+  fn a_local_call_without_a_resolver_id_is_rejected() {
     let insns = vec![insn(opcode::CALL, 0, 1, 0, 1), exit(), exit()];
     check_rejected(
       "local call, no ids",
@@ -2642,7 +2783,7 @@ mod tests {
   }
 
   #[test]
-  fn a_jump_out_of_the_translation_range_is_refused_identically() {
+  fn a_jump_out_of_the_translation_range_is_refused() {
     let insns = vec![
       insn(opcode::CALL, 0, 1, 0, 1),
       exit(),
@@ -2663,7 +2804,7 @@ mod tests {
   }
 
   #[test]
-  fn an_invalid_range_is_refused_identically() {
+  fn an_invalid_range_is_refused() {
     let insns = vec![insn(0xb7, 0, 0, 0, 1), exit()];
     for (start, end) in [(0usize, 0usize), (1, 2), (0, 3)] {
       check_rejected(
@@ -2781,9 +2922,10 @@ mod tests {
 
   #[test]
   fn hostile_plans_fall_back_to_an_ordinary_checked_access() {
-    // Each of these must be rejected by the backend's own re-derivation and
-    // produce the same bytes as no plan at all would - which is what comparing
-    // against the C establishes, since the C rejects them for the same reasons.
+    // Each of these must be rejected by the backend's own re-derivation, which
+    // means it emits exactly what no plan at all would: an ordinary checked
+    // access. A plan that is wrong - or hostile - costs speed and nothing else,
+    // and the recorded bytes are what holds that claim up.
     let cases: Vec<(&str, Vec<Insn>, Vec<PlanEntry>)> = vec![
       (
         "member names a leader that never ran",
@@ -3008,6 +3150,60 @@ mod tests {
       .expect("the probe must translate")
   }
 
+  /// The raw outcome of one translation, for tests that classify a *failure*
+  /// rather than only pinning it.
+  fn outcome(
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) -> Result<Vec<u8>, TranslateError> {
+    let t =
+      Translator::load(std::sync::Arc::new(config.clone()), code).expect("the program must load");
+    let mut buf = vec![0u8; capacity];
+    t.translate_range(inputs, &mut buf).map(|len| {
+      buf.truncate(len);
+      buf
+    })
+  }
+
+  /// Grows a branch span across a reach boundary, requiring the sweep to
+  /// straddle it: some sizes must fit and some must be refused as out of range.
+  /// The golden pins each outcome; this pins that the *boundary itself* is
+  /// still where the test believes it is, which a golden alone cannot say.
+  #[track_caller]
+  fn straddle(
+    what: &str,
+    config: &Config,
+    range: std::ops::RangeInclusive<usize>,
+    build: impl Fn(usize) -> Vec<Insn>,
+  ) {
+    let capacity = (1 << 21) + (1 << 16);
+    let mut saw_success = false;
+    let mut saw_out_of_range = false;
+    for n in range {
+      let insns = build(n);
+      let code = Insn::encode_all(&insns);
+      let inputs = plain_inputs(insns.len());
+      golden_case(&format!("{what} n={n}"), config, &code, &inputs, capacity);
+      match outcome(config, &code, &inputs, capacity) {
+        Ok(_) => saw_success = true,
+        Err(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
+          saw_out_of_range = true
+        }
+        other => panic!("{what}: n = {n} failed unexpectedly: {other:?}"),
+      }
+    }
+    assert!(
+      saw_success,
+      "{what}: never fitted; the boundary was not straddled"
+    );
+    assert!(
+      saw_out_of_range,
+      "{what}: never overflowed; the boundary was not straddled"
+    );
+  }
+
   /// `jeq r1, 0, +n; <n fillers>; exit`
   fn long_forward_branch(n: usize) -> Vec<Insn> {
     let mut p = vec![insn(cls::JMP | srcbit::IMM | jmp::JEQ, 1, 0, n as i16, 0)];
@@ -3017,10 +3213,10 @@ mod tests {
   }
 
   #[test]
-  fn a_conditional_branch_straddling_one_mebibyte_agrees_on_both_sides() {
+  fn a_conditional_branch_straddling_one_mebibyte_is_pinned_either_side() {
     // A conditional branch carries a signed 19-bit word displacement, so it
-    // reaches +-1 MiB. Grow the span across that boundary and require the two
-    // backends to agree on the failure as well as on the success.
+    // reaches +-1 MiB. Grow the span across that boundary and require both the
+    // success and the refusal to be pinned.
     let (_, config) = config_sweep(Target::Aarch64)
       .into_iter()
       .find(|(name, _)| *name == "cage only")
@@ -3032,34 +3228,16 @@ mod tests {
     assert!(per > 0, "the filler must grow the output");
     let boundary = (1 << 20) / per;
 
-    let mut saw_success = false;
-    let mut saw_out_of_range = false;
-    for n in boundary - 2..=boundary + 2 {
-      let insns = long_forward_branch(n);
-      let code = Insn::encode_all(&insns);
-      let d = diff(
-        &config,
-        &code,
-        &plain_inputs(insns.len()),
-        (1 << 21) + (1 << 16),
-      );
-      match &d {
-        Diff::Same { .. } => saw_success = true,
-        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
-          saw_out_of_range = true
-        }
-        other => panic!("n = {n}: {other}"),
-      }
-    }
-    assert!(saw_success, "never fitted; the boundary was not straddled");
-    assert!(
-      saw_out_of_range,
-      "never overflowed; the boundary was not straddled"
+    straddle(
+      "conditional branch at 1 MiB",
+      &config,
+      boundary - 2..=boundary + 2,
+      long_forward_branch,
     );
   }
 
   #[test]
-  fn a_literal_load_straddling_one_mebibyte_agrees_on_both_sides() {
+  fn a_literal_load_straddling_one_mebibyte_is_pinned_either_side() {
     // The dispatcher address and the helper table are parked after all the
     // code, and a helper call reaches them with an LDR (literal) and an ADR -
     // both signed 19-bit, so both stop reaching at 1 MiB.
@@ -3080,29 +3258,11 @@ mod tests {
     let per = (rust_len(&config, &build(200)) - rust_len(&config, &build(100))) / 100;
     let boundary = (1 << 20) / per;
 
-    let mut saw_success = false;
-    let mut saw_out_of_range = false;
-    for n in boundary - 2..=boundary + 2 {
-      let insns = build(n);
-      let code = Insn::encode_all(&insns);
-      let d = diff(
-        &config,
-        &code,
-        &plain_inputs(insns.len()),
-        (1 << 21) + (1 << 16),
-      );
-      match &d {
-        Diff::Same { .. } => saw_success = true,
-        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
-          saw_out_of_range = true
-        }
-        other => panic!("n = {n}: {other}"),
-      }
-    }
-    assert!(saw_success, "never fitted; the boundary was not straddled");
-    assert!(
-      saw_out_of_range,
-      "never overflowed; the boundary was not straddled"
+    straddle(
+      "literal load at 1 MiB",
+      &config,
+      boundary - 2..=boundary + 2,
+      build,
     );
   }
 
@@ -3201,7 +3361,7 @@ mod tests {
   ];
   const RANDOM_OFFSETS: [i16; 10] = [0, 1, -1, 8, 255, 256, -256, -257, 4095, -4096];
 
-  /// One random instruction, kept inside what `ubpf_load` accepts so that most
+  /// One random instruction, kept inside what the loader accepts so that most
   /// generated programs actually translate. Jumps are emitted with a zero
   /// offset and retargeted once the program's instruction boundaries are known.
   fn random_insn(rng: &mut Rng) -> Insn {
@@ -3326,11 +3486,13 @@ mod tests {
   /// keep the suite fast. It has been run at 1500 programs across five seeds -
   /// 45,000 differential translations - with no disagreement.
   #[test]
-  fn randomised_programs_with_random_hints_and_plans_agree() {
-    let seed = env_u64("FUZZ_SEED", 0x2545_f491_4f6c_dd1d);
-    let count = env_u64("FUZZ_N", 400) as usize;
+  fn randomised_programs_with_random_hints_and_plans_are_pinned() {
+    const SEED: u64 = 0x2545_f491_4f6c_dd1d;
+    const COUNT: usize = 400;
+    let seed = env_u64("FUZZ_SEED", SEED);
+    let count = env_u64("FUZZ_N", COUNT as u64) as usize;
     let mut rng = Rng(seed);
-    let mut translated = 0usize;
+    let mut digest = SweepDigest::new();
     for _ in 0..count {
       let len = 4 + rng.below(24);
 
@@ -3389,22 +3551,21 @@ mod tests {
         end_pc: program.len(),
       };
       let code = Insn::encode_all(&program);
-      for (name, config) in config_sweep(Target::Aarch64) {
-        let d = diff(&config, &code, &inputs, 262144);
-        assert!(
-          d.is_same(),
-          "randomised program disagrees under {name:?}\n{d}"
-        );
-        if matches!(d, Diff::Same { .. }) {
-          translated += 1;
-        }
+      for (_, config) in config_sweep(Target::Aarch64) {
+        sweep_case(&mut digest, &config, &code, &inputs, 262144);
       }
     }
     // A run in which nothing translated would prove nothing.
+    let translated = digest.translated();
     assert!(
       translated * 10 > 2000,
       "only {translated} randomised translations produced code"
     );
+    // A run cranked up through the environment explores a different corner of
+    // the space and has no golden of its own; only the default sweep is pinned.
+    if (seed, count) == (SEED, COUNT) {
+      finish_sweep(digest, "randomised-programs");
+    }
   }
 
   #[test]
@@ -3414,7 +3575,7 @@ mod tests {
     // that shape - several functions, calls into each of them, and each range
     // translated on its own.
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let mut translated = 0usize;
+    let mut digest = SweepDigest::new();
 
     for _ in 0..150 {
       let functions = 2 + rng.below(3);
@@ -3463,19 +3624,14 @@ mod tests {
           start_pc: bounds[w],
           end_pc: bounds[w + 1],
         };
-        for (name, config) in config_sweep(Target::Aarch64) {
-          let d = diff(&config, &code, &inputs, 262144);
-          assert!(
-            d.is_same(),
-            "randomised multi-function program disagrees under {name:?}\n{d}"
-          );
-          if matches!(d, Diff::Same { .. }) {
-            translated += 1;
-          }
+        for (_, config) in config_sweep(Target::Aarch64) {
+          sweep_case(&mut digest, &config, &code, &inputs, 262144);
         }
       }
     }
+    let translated = digest.translated();
     assert!(translated > 1000, "only {translated} ranges produced code");
+    finish_sweep(digest, "randomised-multi-function-programs");
   }
 
   // -------------------------------------------------------------------------
@@ -3483,12 +3639,17 @@ mod tests {
   // -------------------------------------------------------------------------
 
   #[test]
-  fn running_out_of_space_is_reported_identically() {
+  fn running_out_of_space_is_reported_as_recorded() {
     let code = Insn::encode_all(&[insn(0xb7, 0, 0, 0, 42), exit()]);
     for (name, config) in config_sweep(Target::Aarch64) {
       for capacity in [0usize, 4, 8, 64, 128, 512] {
-        let d = diff(&config, &code, &plain_inputs(2), capacity);
-        assert!(d.is_same(), "capacity {capacity} under {name:?}\n{d}");
+        golden_case(
+          &format!("out of space/{name}/cap {capacity}"),
+          &config,
+          &code,
+          &plain_inputs(2),
+          capacity,
+        );
       }
     }
   }
@@ -3519,27 +3680,28 @@ mod tests {
       end_pc: 4,
       ..Default::default()
     };
-    for (name, config) in config_sweep(Target::Aarch64) {
+    let mut digest = SweepDigest::new();
+    for (_, config) in config_sweep(Target::Aarch64) {
       for capacity in 0usize..64 {
-        let d = diff(&config, &code, &inputs, capacity);
-        assert!(d.is_same(), "capacity {capacity} under {name:?}\n{d}");
+        sweep_case(&mut digest, &config, &code, &inputs, capacity);
       }
     }
+    assert_eq!(digest.cases(), 64 * 6);
+    finish_sweep(digest, "audit-escaping-jump-capacity");
   }
 
-  /// AUDIT FINDING 1 (fails): `JitState::fail` keeps the *first* failure, but
-  /// the C assigns `state->jit_status` directly, so the *last* assignment wins.
-  ///
-  /// When the per-function prologue overruns the buffer (`NotEnoughSpace`) and
-  /// the same instruction then hits an error arm, the C's status is overwritten
-  /// and it reports the instruction error; this port keeps `NotEnoughSpace` and
-  /// reports `OutOfSpace`. The two are not interchangeable: the caller's code
+  /// AUDIT FINDING 1: which failure survives when two happen at once.
+  /// `JitState::fail` keeps the *first* failure. So when the per-function
+  /// prologue overruns the buffer (`NotEnoughSpace`) and the very same
+  /// instruction then hits an error arm, what comes out is `OutOfSpace` and not
+  /// the instruction error. The two are not interchangeable: the caller's code
   /// arena treats `OutOfSpace` as terminal for the whole program and a `Failed`
-  /// as terminal for one function.
-  ///
+  /// as terminal for one function, so which one wins decides whether the rest
+  /// of the program is still compiled.
   /// Reachable through the loader: pc2 is a local function entry (the target of
   /// the call at pc0) *and* a local call with no resolver id, so the guard in
   /// `emit_lazy_local_call` fires after the prologue has already been emitted.
+  /// Every buffer size either side of that point is recorded.
   #[test]
   fn audit_a_full_buffer_masks_a_later_error() {
     let insns = vec![
@@ -3554,42 +3716,38 @@ mod tests {
       end_pc: 4,
       ..Default::default()
     };
-    for (name, config) in config_sweep(Target::Aarch64) {
+    let mut digest = SweepDigest::new();
+    for (_, config) in config_sweep(Target::Aarch64) {
       for capacity in 0usize..=64 {
-        let d = diff(&config, &code, &inputs, capacity);
-        assert!(d.is_same(), "capacity {capacity} under {name:?}\n{d}");
+        sweep_case(&mut digest, &config, &code, &inputs, capacity);
       }
     }
+    assert_eq!(digest.cases(), 65 * 6);
+    finish_sweep(digest, "audit-full-buffer-masks-a-later-error");
   }
 
-  /// AUDIT: report (do not assert) every disagreement, so one run surfaces all.
-  fn audit_report(
+  /// AUDIT: fold one probe into the batch's rolling digest.
+  /// These batches enumerate hundreds of shapes apiece, so they are recorded as
+  /// one digest per batch rather than one entry per case: the whole batch stays
+  /// a single reviewable line, at the cost of saying only *that* something
+  /// changed rather than which shape.
+  fn audit_case(
+    digest: &mut SweepDigest,
     what: &str,
     insns: &[Insn],
     inputs: &TranslationInputs<'_>,
-    bad: &mut Vec<String>,
   ) {
-    if std::env::var("AUDIT_VERBOSE").is_ok() {
-      let code0 = Insn::encode_all(insns);
-      let cap0 = 262144.max(insns.len() * 512);
-      let (n0, c0) = config_sweep(Target::Aarch64).into_iter().next().unwrap();
-      println!("  [{what}] {n0}: {}", diff(&c0, &code0, inputs, cap0));
-    }
     let code = Insn::encode_all(insns);
     let capacity = 262144.max(insns.len() * 512);
-    for (name, config) in config_sweep(Target::Aarch64) {
-      let d = diff(&config, &code, &inputs.clone(), capacity);
-      match &d {
-        Diff::Same { .. } => {}
-        Diff::SameError(_) => {}
-        _ => bad.push(format!("DISAGREE {what} under {name}: {d}")),
-      }
+    let _ = what;
+    for (_, config) in config_sweep(Target::Aarch64) {
+      sweep_case(digest, &config, &code, inputs, capacity);
     }
   }
 
   #[test]
   fn audit_probe_batch() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     // --- B: extreme load/store offsets -------------------------------------
     for &off in &[
@@ -3628,14 +3786,14 @@ mod tests {
       let n = p.len();
       for hint in [0u8, 1, 2, 3] {
         let hints = vec![hint; n];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("offset {off} hint {hint}"),
           &p,
           &TranslationInputs {
             hints: &hints,
             ..plain_inputs(n)
           },
-          &mut bad,
         );
       }
     }
@@ -3655,18 +3813,23 @@ mod tests {
       }
       p.push(exit());
       let n = p.len();
-      audit_report(
+      audit_case(
+        &mut digest,
         &format!("atomic offset {off}"),
         &p,
         &plain_inputs(n),
-        &mut bad,
       );
     }
 
     // --- D: call immediates outside 0..64 ----------------------------------
     for &idx in &[-1i32, i32::MIN, i32::MAX, 64, 65, 1000, 0x7fff_ffff] {
       let p = vec![insn(opcode::CALL, 0, 0, 0, idx), exit()];
-      audit_report(&format!("call imm {idx}"), &p, &plain_inputs(2), &mut bad);
+      audit_case(
+        &mut digest,
+        &format!("call imm {idx}"),
+        &p,
+        &plain_inputs(2),
+      );
     }
 
     // --- F: region hints outside 0..=3 -------------------------------------
@@ -3678,23 +3841,18 @@ mod tests {
         exit(),
       ];
       let hints = vec![hint; 4];
-      audit_report(
+      audit_case(
+        &mut digest,
         &format!("hint {hint}"),
         &p,
         &TranslationInputs {
           hints: &hints,
           ..plain_inputs(4)
         },
-        &mut bad,
       );
     }
 
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-probe-batch");
   }
 
   /// AUDIT: the existing fuzzer draws offsets, plan deltas, spans, lo bounds
@@ -3702,11 +3860,12 @@ mod tests {
   /// domain of each field, including the values a hostile embedder could pass.
   #[test]
   fn audit_wide_randomised_plans_and_offsets() {
-    let seed = env_u64("AUDIT_SEED", 0xdead_beef_1234_5678);
-    let count = env_u64("AUDIT_N", 500) as usize;
+    const SEED: u64 = 0xdead_beef_1234_5678;
+    const COUNT: usize = 500;
+    let seed = env_u64("AUDIT_SEED", SEED);
+    let count = env_u64("AUDIT_N", COUNT as u64) as usize;
     let mut rng = Rng(seed);
-    let mut translated = 0usize;
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     const WIDE_OFFSETS: [i16; 16] = [
       i16::MIN,
@@ -3800,34 +3959,24 @@ mod tests {
         end_pc: n,
       };
       let code = Insn::encode_all(&program);
-      for (name, config) in config_sweep(Target::Aarch64) {
-        let d = diff(&config, &code, &inputs, 262144);
-        match &d {
-          Diff::Same { .. } => translated += 1,
-          Diff::SameError(_) => {}
-          _ => bad.push(format!(
-            "{name}: {d}\n  program: {program:?}\n  plan: {plan:?}\n  hints: {hints:?}"
-          )),
-        }
-        if !bad.is_empty() {
-          break;
-        }
-      }
-      if !bad.is_empty() {
-        break;
+      for (_, config) in config_sweep(Target::Aarch64) {
+        sweep_case(&mut digest, &config, &code, &inputs, 262144);
       }
     }
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let translated = digest.translated();
     assert!(
       translated > 100,
       "only {translated} translations produced code"
     );
+    if (seed, count) == (SEED, COUNT) {
+      finish_sweep(digest, "audit-wide-randomised-plans");
+    }
   }
 
   /// AUDIT: well-formed groups at every boundary of span/delta/lo/width.
   #[test]
   fn audit_group_boundaries() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     let widths = [(size::B, 1i32), (size::H, 2), (size::W, 4), (size::DW, 8)];
 
@@ -3860,31 +4009,26 @@ mod tests {
             ];
             // The leader's own access must fit its window too, or it is refused
             // - which is itself worth checking, so do not skip it.
-            audit_report(
+            audit_case(
+              &mut digest,
               &format!("group span {span} delta {d} lo {lo} width {w}"),
               &insns,
               &TranslationInputs {
                 plan: &plan,
                 ..plain_inputs(3)
               },
-              &mut bad,
             );
           }
         }
       }
     }
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-group-boundaries");
   }
 
   /// AUDIT: plan shapes the existing hostile-plan table does not name.
   #[test]
   fn audit_more_hostile_plans() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
     let g = two_access_group(0, 8);
 
     let cases: Vec<(&str, Vec<PlanEntry>)> = vec![
@@ -4037,7 +4181,8 @@ mod tests {
     for (what, plan) in cases {
       for hint in [0u8, 1, 2, 3] {
         let hints = vec![hint; g.len()];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("{what} hint {hint}"),
           &g,
           &TranslationInputs {
@@ -4045,23 +4190,17 @@ mod tests {
             hints: &hints,
             ..plain_inputs(g.len())
           },
-          &mut bad,
         );
       }
     }
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-more-hostile-plans");
   }
 
   /// AUDIT: a leader whose access is also a frame access, and a group crossing
   /// a `lddw` (whose second slot the loop skips).
   #[test]
   fn audit_group_interactions() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     // The frame fast path preempts the plan entirely.
     {
@@ -4077,7 +4216,8 @@ mod tests {
       ];
       for hint in [0u8, 1, 2, 3] {
         let hints = vec![hint; 3];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("frame-eligible leader hint {hint}"),
           &insns,
           &TranslationInputs {
@@ -4085,7 +4225,6 @@ mod tests {
             hints: &hints,
             ..plain_inputs(3)
           },
-          &mut bad,
         );
       }
     }
@@ -4109,14 +4248,14 @@ mod tests {
           member(abi::region::STACK, 0, 8, 0),
           none_entry(),
         ];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("group across a lddw writing r{lddw_dst}"),
           &insns,
           &TranslationInputs {
             plan: &plan,
             ..plain_inputs(5)
           },
-          &mut bad,
         );
       }
     }
@@ -4135,14 +4274,14 @@ mod tests {
         member(abi::region::STACK, 0, 8, 0),
         none_entry(),
       ];
-      audit_report(
+      audit_case(
+        &mut digest,
         "ja lands on the member",
         &insns,
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(4)
         },
-        &mut bad,
       );
     }
 
@@ -4150,27 +4289,21 @@ mod tests {
     {
       let insns = vec![insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0), exit()];
       let plan = vec![leader(abi::region::STACK, 0, 0, 16, 0), none_entry()];
-      audit_report(
+      audit_case(
+        &mut digest,
         "leader at the end of the range",
         &insns,
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(2)
         },
-        &mut bad,
       );
     }
 
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-group-interactions");
   }
 
   /// AUDIT: a local function entry reached by *fall-through*.
-  ///
   /// The validator requires every sub-program to end with `exit` or to carry an
   /// unconditional jump as its second-to-last instruction - so the instruction
   /// physically before a function entry can still fall through, and the
@@ -4178,7 +4311,7 @@ mod tests {
   /// existing test reaches it.
   #[test]
   fn audit_fallthrough_into_a_local_function_entry() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
     // pc0 calls pc3; pc1 is the unconditional jump that satisfies the
     // validator; pc2 falls through into the function entry at pc3.
     let insns = vec![
@@ -4189,17 +4322,18 @@ mod tests {
       exit(),
     ];
     let ids = [4u32; 5];
-    audit_report(
+    audit_case(
+      &mut digest,
       "fallthrough entry, whole program",
       &insns,
       &TranslationInputs {
         resolver_ids: &ids,
         ..plain_inputs(5)
       },
-      &mut bad,
     );
     for (start, end) in [(0usize, 3usize), (3, 5)] {
-      audit_report(
+      audit_case(
+        &mut digest,
         &format!("fallthrough entry, range {start}..{end}"),
         &insns,
         &TranslationInputs {
@@ -4208,7 +4342,6 @@ mod tests {
           end_pc: end,
           ..Default::default()
         },
-        &mut bad,
       );
     }
 
@@ -4227,7 +4360,8 @@ mod tests {
       insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
       exit(),
     ];
-    audit_report(
+    audit_case(
+      &mut digest,
       "fallthrough entry with a group across it",
       &insns2,
       &TranslationInputs {
@@ -4235,21 +4369,15 @@ mod tests {
         resolver_ids: &ids,
         ..plain_inputs(5)
       },
-      &mut bad,
     );
 
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-fallthrough-entry");
   }
 
   /// AUDIT: a region-hint array shorter than the program.
   #[test]
   fn audit_short_hint_array() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
     let insns = vec![
       insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
       insn(cls::LDX | mode::MEM | size::W, 1, 10, -8, 0),
@@ -4259,23 +4387,18 @@ mod tests {
     for n in 0..=4usize {
       for fill in [0u8, 1, 2, 3] {
         let hints = vec![fill; n];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("hints len {n} fill {fill}"),
           &insns,
           &TranslationInputs {
             hints: &hints,
             ..plain_inputs(4)
           },
-          &mut bad,
         );
       }
     }
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-short-hint-array");
   }
 
   /// AUDIT: the *backward* conditional-branch boundary. The existing test only
@@ -4310,27 +4433,12 @@ mod tests {
       "the offset field must reach the target"
     );
 
-    let mut saw_success = false;
-    let mut saw_out_of_range = false;
-    for n in boundary - 2..=boundary + 2 {
-      let insns = build(n);
-      let code = Insn::encode_all(&insns);
-      let d = diff(
-        &config,
-        &code,
-        &plain_inputs(insns.len()),
-        (1 << 21) + (1 << 16),
-      );
-      match &d {
-        Diff::Same { .. } => saw_success = true,
-        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
-          saw_out_of_range = true
-        }
-        other => panic!("n = {n}: {other}"),
-      }
-    }
-    assert!(saw_success, "never fitted");
-    assert!(saw_out_of_range, "never overflowed");
+    straddle(
+      "backward conditional branch at 1 MiB",
+      &config,
+      boundary - 2..=boundary + 2,
+      build,
+    );
   }
 
   /// AUDIT: the unwind helper emits a conditional branch to the epilogue, which
@@ -4355,37 +4463,30 @@ mod tests {
     assert!(per > 0);
     let boundary = (1 << 20) / per;
 
-    let mut saw_success = false;
-    let mut saw_out_of_range = false;
-    for n in boundary - 3..=boundary + 3 {
-      let insns = build(n);
-      let code = Insn::encode_all(&insns);
-      let d = diff(
-        &config,
-        &code,
-        &plain_inputs(insns.len()),
-        (1 << 21) + (1 << 16),
-      );
-      match &d {
-        Diff::Same { .. } => saw_success = true,
-        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
-          saw_out_of_range = true
-        }
-        other => panic!("n = {n}: {other}"),
-      }
-    }
-    assert!(saw_success, "never fitted");
-    assert!(saw_out_of_range, "never overflowed");
+    straddle(
+      "unwind branch to the epilogue at 1 MiB",
+      &config,
+      boundary - 3..=boundary + 3,
+      build,
+    );
   }
 
-  /// AUDIT: `is_simple_imm` in the C is a `switch` over *whole opcode bytes*;
-  /// the port rewrote it as a match on class + operation nibble. Enumerate all
-  /// 256 opcodes and report every byte where the two disagree, together with
-  /// whether that byte can reach the function at all.
+  /// AUDIT: `is_simple_imm` decides whether an immediate can be folded into the
+  /// instruction instead of materialised into a register, and it is written as
+  /// a match on class plus operation nibble. The set it is *meant* to name is a
+  /// flat list of whole opcode bytes, written out below; a nibble match is a
+  /// compression of that list and can easily admit one byte too many.
+  /// So enumerate all 256 opcodes against the list and report every byte where
+  /// the two differ, together with whether that byte can reach the function at
+  /// all — most cannot, because the loader refuses the opcode outright.
   #[test]
-  fn audit_is_simple_imm_matches_the_c_switch_byte_for_byte() {
-    // Transcription of the C's switch (ubpf_jit_arm64.c:1644-1709).
-    fn c_is_simple_imm(op: u8, imm: i32) -> bool {
+  fn audit_is_simple_imm_matches_the_opcode_list_byte_for_byte() {
+    /// The opcodes that may carry a folded immediate, one byte at a time.
+    /// ADD/SUB take a 12-bit unsigned immediate, and so does the compare a
+    /// conditional jump lowers to; everything else has to go through a
+    /// register. `mov` is the exception at the end: an immediate move *is* the
+    /// materialisation, so it is always "simple".
+    fn expected_is_simple_imm(op: u8, imm: i32) -> bool {
       const RANGED: [u8; 24] = [
         0x04, 0x07, 0x14, 0x17, // ADD/SUB IMM, both widths
         0x15, 0x25, 0x35, 0x55, 0x65, 0x75, 0xa5, 0xb5, 0xc5, 0xd5, // JMP  *_IMM
@@ -4403,8 +4504,8 @@ mod tests {
       for imm in [-1i32, 0, 0x7ff, 0xfff, 0x1000, i32::MIN, i32::MAX] {
         let i = insn(op, 1, 2, 0, imm);
         let rust = is_simple_imm(&i);
-        let c = c_is_simple_imm(op, imm);
-        if rust == c {
+        let expected = expected_is_simple_imm(op, imm);
+        if rust == expected {
           continue;
         }
         // The function is only consulted for an instruction `is_imm_op` admits
@@ -4429,7 +4530,8 @@ mod tests {
     );
     assert!(
       disagree_reachable.is_empty(),
-      "is_simple_imm disagrees with the C on defined, consulted opcodes: {disagree_reachable:02x?}"
+      "is_simple_imm folds an immediate for a defined, consulted opcode that is \
+       not on the list — or refuses one that is: {disagree_reachable:02x?}"
     );
   }
 
@@ -4442,11 +4544,15 @@ mod tests {
       let insns = vec![insn(cls::ST | mode::MEM | sz, 1, 10, 0, 0x1234), exit()];
       let code = Insn::encode_all(&insns);
       for (name, config) in config_sweep(Target::Aarch64) {
-        let d = diff(&config, &code, &plain_inputs(2), 65536);
-        assert!(d.is_same(), "st src=10 under {name}: {d}");
         assert!(
-          matches!(d, Diff::SameError(_)),
-          "st src=10 under {name} translated: {d}"
+          !golden_case(
+            &format!("st src=10 width {sz}/{name}"),
+            &config,
+            &code,
+            &plain_inputs(2),
+            65536
+          ),
+          "st src=10 under {name} translated; the loader is expected to refuse it"
         );
       }
     }
@@ -4500,11 +4606,12 @@ mod tests {
   /// exactly one function per range.
   #[test]
   fn audit_wide_multi_function_ranges_with_plans_and_hints() {
-    let seed = env_u64("AUDIT_SEED", 0x1357_9bdf_2468_ace0);
-    let count = env_u64("AUDIT_N", 400) as usize;
+    const SEED: u64 = 0x1357_9bdf_2468_ace0;
+    const COUNT: usize = 400;
+    let seed = env_u64("AUDIT_SEED", SEED);
+    let count = env_u64("AUDIT_N", COUNT as u64) as usize;
     let mut rng = Rng(seed);
-    let mut translated = 0usize;
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     for _ in 0..count {
       let functions = 2 + rng.below(4);
@@ -4575,51 +4682,34 @@ mod tests {
             start_pc: bounds[a],
             end_pc: bounds[b],
           };
-          for (name, config) in config_sweep(Target::Aarch64) {
-            let d = diff(&config, &code, &inputs, 262144);
-            match &d {
-              Diff::Same { .. } => translated += 1,
-              Diff::SameError(_) => {}
-              _ => bad.push(format!(
-                "{name} range {}..{}: {d}\n  program: {program:?}\n  plan: {plan:?}\n  hints: {hints:?}",
-                bounds[a], bounds[b]
-              )),
-            }
-          }
-          if !bad.is_empty() {
-            break;
+          for (_, config) in config_sweep(Target::Aarch64) {
+            sweep_case(&mut digest, &config, &code, &inputs, 262144);
           }
         }
-        if !bad.is_empty() {
-          break;
-        }
-      }
-      if !bad.is_empty() {
-        break;
       }
     }
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let translated = digest.translated();
     assert!(
       translated > 200,
       "only {translated} translations produced code"
     );
+    if (seed, count) == (SEED, COUNT) {
+      finish_sweep(digest, "audit-wide-multi-function-ranges");
+    }
   }
 
-  /// AUDIT FINDING 2 (fails): the patch-table ceilings do not match the C.
-  ///
-  /// `reserve_patchable_relatives` refuses to grow past `UBPF_MAX_INSTS`
-  /// (65536) entries, so the C reports "Too many jump instructions." on the
-  /// 65537th jump fixup. `patch.rs` sets `MAX_JUMPS` (and the other three) to
-  /// `1 << 20` while its doc comment claims they are "the same bounds the C
-  /// grew to". They are 16x too large.
-  ///
-  /// A `cmpxchg` emits two jump fixups, so 32769 of them cross the C's ceiling
-  /// while staying well inside the 65536-instruction program limit: the C
-  /// rejects the program and this port emits a megabyte of code for it.
-  ///
-  /// `patch.rs` is shared, so the x86_64 backend inherits the same gap.
+  /// AUDIT FINDING 2 (was: the patch tables grew sixteen times too far).
+  /// The jump-fixup table stops growing at [`abi::MAX_INSTS`] entries, the same
+  /// ceiling a loaded program's instruction count has, and reports "Too many
+  /// jump instructions." past it. The tables in `patch.rs` were once set to
+  /// `1 << 20`, which let a program that should have been refused emit a
+  /// megabyte of code instead.
+  /// A `cmpxchg` emits two jump fixups, so 32769 of them cross the ceiling
+  /// while staying well inside the instruction limit — the smallest program
+  /// that tells the two ceilings apart. `patch.rs` is shared, so the x86_64
+  /// backend is bounded by the same numbers.
   #[test]
-  fn audit_the_patch_table_ceilings_match_the_c() {
+  fn audit_the_patch_table_ceilings_hold_at_the_instruction_limit() {
     let (_, config) = config_sweep(Target::Aarch64)
       .into_iter()
       .find(|(name, _)| *name == "no cage")
@@ -4634,21 +4724,42 @@ mod tests {
       p
     };
 
-    // 32768 cmpxchg is exactly 65536 fixups - the last one the C accepts.
-    // 32769 is one jump past it.
-    for n in [32768usize, 32769] {
+    // 32768 cmpxchg is exactly 65536 fixups - the last one the ceiling admits.
+    // 32769 is one jump past it, and must be refused.
+    for (n, fits) in [(32768usize, true), (32769, false)] {
       let insns = build(n);
       let code = Insn::encode_all(&insns);
-      let d = diff(&config, &code, &plain_inputs(insns.len()), 32 << 20);
-      assert!(d.is_same(), "{n} cmpxchg ({} jump fixups): {d}", n * 2);
+      let inputs = plain_inputs(insns.len());
+      let capacity = 32 << 20;
+      assert_eq!(
+        golden_case(
+          &format!("cmpxchg storm n={n}"),
+          &config,
+          &code,
+          &inputs,
+          capacity
+        ),
+        fits,
+        "{n} cmpxchg is {} jump fixups against a ceiling of {}",
+        n * 2,
+        abi::MAX_INSTS
+      );
+      if !fits {
+        assert_eq!(
+          outcome(&config, &code, &inputs, capacity),
+          Err(TranslateError::Failed("Too many jump instructions.".into())),
+          "the {}th jump fixup must be refused by name",
+          n * 2
+        );
+      }
     }
   }
 
   /// AUDIT: every capacity from zero to just past the full output, for a
   /// program that fills all four patch tables. The existing capacity test uses
   /// six sizes and a two-instruction program, so it never lands inside the
-  /// epilogue, the dispatcher slot or the helper table - the places the port's
-  /// own comments call out as hazardous.
+  /// epilogue, the dispatcher slot or the helper table - the places where a
+  /// truncated buffer is most likely to be handled badly.
   #[test]
   fn audit_every_capacity_for_a_program_that_fills_the_patch_tables() {
     let insns = vec![
@@ -4678,16 +4789,22 @@ mod tests {
       plan: &plan,
       ..plain_inputs(insns.len())
     };
-    for (name, config) in config_sweep(Target::Aarch64) {
+    // Every capacity in the sweep is one entry, so this one rolls up into a
+    // digest rather than several thousand lines of mostly "out of space".
+    let mut digest = SweepDigest::new();
+    for (_, config) in config_sweep(Target::Aarch64) {
       let full = rust_len(&config, &insns);
       for capacity in 0..full + 16 {
-        let d = diff(&config, &code, &inputs, capacity);
-        assert!(
-          d.is_same(),
-          "capacity {capacity}/{full} under {name:?}\n{d}"
-        );
+        sweep_case(&mut digest, &config, &code, &inputs, capacity);
       }
+      // The last sixteen capacities are past the full output, so the sweep has
+      // to contain successes as well as refusals.
+      assert!(
+        digest.translated() > 0,
+        "no capacity in the sweep was large enough to translate {full} bytes"
+      );
     }
+    finish_sweep(digest, "audit-every-capacity");
   }
 
   /// AUDIT: every way the barrier pre-pass can close a group - the slot after a
@@ -4695,7 +4812,7 @@ mod tests {
   /// local function entry - with a leader/member pair straddling each.
   #[test]
   fn audit_every_barrier_source_closes_a_group() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
     let ld = |dst: u8, off: i16| insn(cls::LDX | mode::MEM | size::DW, dst, 2, off, 0);
 
     // leader; <separator>; member
@@ -4730,14 +4847,14 @@ mod tests {
       plan.push(member(abi::region::STACK, 0, 8, 0));
       plan.push(none_entry());
       assert_eq!(plan.len(), n);
-      audit_report(
+      audit_case(
+        &mut digest,
         what,
         &insns,
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(n)
         },
-        &mut bad,
       );
     }
 
@@ -4755,14 +4872,14 @@ mod tests {
         none_entry(),
         none_entry(),
       ];
-      audit_report(
+      audit_case(
+        &mut digest,
         "backward branch target is the member",
         &insns,
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(4)
         },
-        &mut bad,
       );
     }
 
@@ -4783,7 +4900,8 @@ mod tests {
         none_entry(),
       ];
       let ids = [7u32; 5];
-      audit_report(
+      audit_case(
+        &mut digest,
         "function entry lands on the member",
         &insns,
         &TranslationInputs {
@@ -4791,16 +4909,10 @@ mod tests {
           resolver_ids: &ids,
           ..plain_inputs(5)
         },
-        &mut bad,
       );
     }
 
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-barrier-sources");
   }
 
   /// AUDIT (informational): how far one eBPF instruction can expand, which

@@ -10,9 +10,10 @@ const EBPF_CLS_JMP: u8 = 0x05;
 const EBPF_CLS_JMP32: u8 = 0x06;
 const EBPF_OP_JA: u8 = 0x05;
 const EBPF_OP_JA32: u8 = 0x06;
-/// Maximum depth of the local call graph, in frames. uBPF charges every local
-/// function one `UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE` frame, so this also bounds
-/// how far below its entry `R10` a program can push the guest stack.
+/// Maximum depth of the local call graph, in frames. Every local function is
+/// charged one [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`] frame, so this
+/// also bounds how far below its entry `R10` a program can push the guest
+/// stack.
 pub(crate) const MAX_LOCAL_CALL_DEPTH: usize = 8;
 
 #[derive(Clone, Debug)]

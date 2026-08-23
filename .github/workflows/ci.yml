@@ -24,62 +24,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # clang and llvm compile the eBPF fixtures the test suite runs. Nothing
+      # in the build itself needs a C toolchain.
       - name: Install native dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
             clang \
-            cmake \
-            libclang-dev \
             llvm
 
       - name: Run unit tests
         run: cargo test --features testing
 
-      # The default build must not need cmake or libclang: the vendored C is
-      # behind the `oracle` feature now, and this is what stops it quietly
-      # becoming a build dependency again.
-      - name: Build without the C oracle
+      - name: Build
         run: cargo build --locked
-
-  differential:
-    name: JIT differential vs vendored C (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install native dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            llvm
-
-      # Byte-for-byte comparison of the Rust JIT against the vendored C, over
-      # the corpus and the configuration sweep. Both backends are covered on
-      # both runners: ubpf_jit_x86_64.c and ubpf_jit_arm64.c are compiled in
-      # unconditionally and translation never executes what it emits, so the
-      # cross-architecture half of this runs anywhere. Only the execution
-      # differential needs a matching host, which is why this is a matrix.
-      - name: Byte-identical translation
-        run: "cargo test --features testing,oracle --lib jit:: -- --nocapture"
-
-      - name: Execution differential and full suite
-        run: cargo test --features testing,oracle
 
   openbsd-tests:
     name: OpenBSD unit tests (${{ matrix.arch }})
@@ -105,14 +63,14 @@ jobs:
           usesh: true
           copyback: false
           prepare: |
-            pkg_add cmake rust-1.94.1 llvm-21.1.8p4
+            pkg_add rust-1.94.1 llvm-21.1.8p4
           run: |
             set -eux
+            # LLVM is here for the eBPF fixtures the tests compile, not for the
+            # build. libclang is no longer needed at all.
             LLVM_PREFIX=/usr/local/llvm21
             test -x "$LLVM_PREFIX/bin/llvm-link"
-            test -f "$LLVM_PREFIX/lib/libclang.so.0.0"
             export PATH="$LLVM_PREFIX/bin:$PATH"
-            export LIBCLANG_PATH="$LLVM_PREFIX/lib"
             export LD_LIBRARY_PATH="$LLVM_PREFIX/lib"
 
             uname -a
@@ -141,14 +99,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # CoreMark itself is C, so this job keeps a compiler; the crate does not
+      # need one.
       - name: Install native dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             clang \
-            cmake \
-            libclang-dev \
             llvm
 
       - name: Checkout CoreMark
@@ -239,10 +197,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
             clang \
-            cmake \
-            libclang-dev \
             llvm
 
       - name: Install nightly Rust

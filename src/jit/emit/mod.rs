@@ -1,10 +1,10 @@
 //! The two JIT backends.
 //!
-//! Each owns its own `translate_range` port. They share [`super::patch`] but not
-//! a driver loop: the C's two loops share only their preamble checks, and arm64
-//! runs a barrier pre-pass x86_64 does not have. Unifying them would be a
-//! refactor performed during a port required to be byte-identical, and the
-//! arm64 jump-sentinel bug already lived in exactly that gap.
+//! Each owns its own `translate_range`. They share [`super::patch`] — the code
+//! buffer, the fixup tables, the access-group state — but not a driver loop:
+//! past the preamble checks the two have little in common, and aarch64 runs a
+//! barrier pre-pass x86_64 does not have. See [`super::patch`] for why they are
+//! still separate.
 
 use super::{Target, TranslateError, TranslationInputs, Translator};
 

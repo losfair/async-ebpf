@@ -1,8 +1,8 @@
 //! Instruction-cache maintenance after writing generated code.
 //!
-//! This is the one part of the JIT that cannot be written in safe Rust. The C
-//! called `__builtin___clear_cache`, which has no stable Rust equivalent, so the
-//! aarch64 sequence is spelled out here.
+//! This is the one part of the JIT that cannot be written in safe Rust: there is
+//! no stable Rust equivalent of `__builtin___clear_cache`, so the aarch64
+//! sequence is spelled out in inline assembly here.
 //!
 //! Getting it wrong is not a crash you will see in testing: stale instruction
 //! cache lines produce a program that runs correctly on the machine you wrote it
@@ -22,9 +22,9 @@ pub unsafe fn clear(buffer: *mut u8, size: usize) {
 #[cfg(target_arch = "x86_64")]
 mod imp {
   /// x86_64 has a coherent instruction cache: a store to a location and a
-  /// subsequent fetch from it are ordered by the hardware, and no explicit
-  /// maintenance is required. The C reached `__builtin___clear_cache` here too,
-  /// which expands to nothing on this target.
+  /// subsequent fetch from it are ordered by the hardware, so no explicit
+  /// maintenance is required and this is genuinely empty rather than
+  /// unimplemented.
   #[inline]
   pub unsafe fn clear(_buffer: *mut u8, _size: usize) {}
 }

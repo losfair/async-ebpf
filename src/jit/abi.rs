@@ -1,11 +1,10 @@
 //! The contract between the entry trampoline, the JIT backends, and the
 //! runtime's memory descriptor.
 //!
-//! These displacements are stated in four places today: the `global_asm!`
-//! trampoline in `program.rs`, `JIT_MEMORY_*` in `ubpf_jit_x86_64.c`,
-//! `JIT_MEMORY_*` in `ubpf_jit_arm64.c`, and the `JitMemory` struct. `program.rs`
-//! already carries a comment observing that if they ever drift, the symptom is a
-//! legitimate guest program aborting the process rather than taking a fault.
+//! These displacements are stated in three places: the `global_asm!` entry
+//! trampolines in `program.rs`, the `JitMemory` struct they fill in, and here.
+//! If they ever drift, the symptom is a legitimate guest program corrupting
+//! host memory or aborting the process rather than taking a fault.
 //!
 //! Both emitters read this module. The trampolines do not: their `global_asm!`
 //! blocks are raw string literals with hard-coded displacements, and
@@ -23,8 +22,8 @@
 //! left as a follow-up; it changes generated code, which this port deliberately
 //! does not.
 //!
-//! Both C backends define the same values; they are reproduced once here rather
-//! than per-architecture, and [`tests`] asserts the two stay in agreement.
+//! Both backends use the same values, so they are stated once here rather than
+//! per-architecture.
 
 /// Byte offsets into the `JitMemory` descriptor the runtime builds once per
 /// invocation and whose address lives at [`FRAME_OFFSET`] below the frame
@@ -85,8 +84,7 @@ pub const ACCESS_WIDTHS: [usize; 4] = [1, 2, 4, 8];
 
 /// Maps an access width to its span slot index within a region's block.
 ///
-/// Mirrors `span_slot_index()` in the C backends. A width the table does not
-/// cover has no span slot; the caller must not ask.
+/// A width the table does not cover has no span slot; the caller must not ask.
 pub const fn span_slot_index(width: usize) -> Option<usize> {
   match width {
     1 => Some(0),
@@ -104,8 +102,8 @@ pub const GROUP_BASE_OFFSET: i32 = -144;
 /// all of the above.
 pub const FRAME_RESERVED: i32 = 160;
 
-/// Per-instruction region routing hints. Mirrors `JIT_REGION_*`, and the values
-/// are shared with `crate::region_analysis`.
+/// Per-instruction region routing hints. The values are shared with
+/// `crate::region_analysis`, which produces them.
 pub mod region {
   /// Probe both regions.
   pub const UNKNOWN: u8 = 0;
@@ -120,7 +118,7 @@ pub mod region {
   pub const FRAME: u8 = 3;
 }
 
-/// Access plan roles. Mirrors `JIT_PLAN_ROLE_*`.
+/// Access plan roles.
 pub mod plan_role {
   pub const NONE: u8 = 0;
   pub const LEADER: u8 = 1;
@@ -138,7 +136,7 @@ pub const MAX_GROUP_SPAN: u32 = 4096;
 /// Guest stack charged to each local function.
 pub const LOCAL_FUNCTION_STACK_SIZE: u16 = 4096;
 
-/// Maximum eBPF call depth uBPF permits.
+/// Maximum eBPF call depth permitted.
 pub const MAX_CALL_DEPTH: u32 = 8;
 
 /// Total guest stack `UBPF_EBPF_STACK_SIZE` describes.
@@ -185,19 +183,38 @@ mod tests {
     assert_eq!(DERIVED_DATA_BASE + 6, DERIVED_SLOTS);
   }
 
-  /// The C is still in the tree as the oracle; assert this module agrees with
-  /// it rather than trusting that it was transcribed correctly.
-  #[cfg(feature = "oracle")]
+  /// The numbers themselves, written out.
+  ///
+  /// Every constant below is part of the contract with loaded programs and with
+  /// the entry trampolines: change one and previously valid programs are
+  /// refused, or the stack the guest is given stops matching the stack the
+  /// prologue reserves. None of them can be derived from anything else in the
+  /// tree, so restating them here is what makes an edit to one of them a
+  /// deliberate act rather than a typo nobody notices.
   #[test]
-  fn the_constants_match_the_c_headers() {
-    assert_eq!(
-      LOCAL_FUNCTION_STACK_SIZE as u32,
-      ubpf_sys::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE
-    );
-    assert_eq!(MAX_GROUP_SPAN, ubpf_sys::UBPF_MAX_GROUP_SPAN);
-    assert_eq!(MAX_INSTS, ubpf_sys::UBPF_MAX_INSTS);
-    assert_eq!(MAX_EXT_FUNCS, ubpf_sys::UBPF_MAX_EXT_FUNCS);
-    assert_eq!(MAX_CALL_DEPTH, ubpf_sys::UBPF_MAX_CALL_DEPTH);
-    assert_eq!(EBPF_STACK_SIZE, ubpf_sys::UBPF_EBPF_STACK_SIZE);
+  fn the_constants_are_the_ones_the_contract_names() {
+    // One local eBPF function's stack frame, and the eight-deep call chain
+    // built out of it: together they are the whole guest stack.
+    assert_eq!(LOCAL_FUNCTION_STACK_SIZE, 4096);
+    assert_eq!(MAX_CALL_DEPTH, 8);
+    assert_eq!(EBPF_STACK_SIZE, 32768);
+
+    // The widest window one bounds check may cover, so that a checked group
+    // can never straddle more than a page.
+    assert_eq!(MAX_GROUP_SPAN, 4096);
+
+    // The instruction ceiling a loaded program may not reach: 65536 is refused,
+    // 65535 is accepted.
+    //
+    // The same number is reused as the per-patch-table ceiling, but not for the
+    // reason it looks like: a fixup is not one per instruction. A single helper
+    // call emits three jump fixups, so roughly 21,800 helper calls cross the
+    // ceiling in a program comfortably inside the instruction limit. See
+    // `patch::MAX_JUMPS`.
+    assert_eq!(MAX_INSTS, 65536);
+
+    // Helper indices run 0..64, which is what makes the helper address table a
+    // fixed-size block the emitted code can index without a bounds check.
+    assert_eq!(MAX_EXT_FUNCS, 64);
   }
 }

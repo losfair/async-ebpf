@@ -343,8 +343,9 @@ async fn lazy_compilation_is_charged_to_the_timeslice() {
   );
 }
 
-/// Running out of code budget names the budget, rather than surfacing uBPF's
-/// internal "target buffer too small" with nothing pointing at the cause.
+/// Running out of code budget names the budget and the limit that set it,
+/// rather than surfacing the JIT's internal out-of-space failure with nothing
+/// pointing at the cause.
 #[tokio::test]
 async fn code_budget_exhaustion_names_the_budget() {
   let (_, t_env) = gt_env();

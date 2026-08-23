@@ -2,19 +2,23 @@
 //!
 //! # Why this exists
 //!
-//! The primary oracle for the JIT port is byte-for-byte comparison against the
-//! vendored C. That oracle is silent about one class of defect: a bug faithfully
-//! reproduced from the C. Byte equality proves the port is a port; it proves
-//! nothing about whether the thing being ported computes the right answer.
+//! Tests that compare the JIT's output against recorded bytes prove the backend
+//! still emits what it emitted before. They say nothing about whether what it
+//! emits computes the right answer — a wrong instruction sequence is recorded
+//! just as faithfully as a right one. This interpreter is the independent
+//! second opinion that closes that gap: run a program through both, compare the
+//! results, and a disagreement means one of them is wrong.
 //!
-//! This interpreter is the second opinion. It is written **from the instruction
-//! set** — from [`crate::jit::isa`] and from the published eBPF semantics — and
-//! deliberately *not* from `ubpf_vm.c`'s interpreter, which was never read while
-//! writing it. Copying that would reproduce its bugs and make this layer
-//! worthless.
+//! That only works if the two were arrived at separately. This interpreter is
+//! therefore written **from the instruction set** — from [`crate::jit::isa`] and
+//! from the published eBPF semantics — and deliberately not from any existing
+//! implementation, including this crate's own backends. Deriving it from the
+//! thing it checks would reproduce that thing's mistakes and make the whole
+//! layer worthless.
 //!
-//! Consequently, where this disagrees with the C, neither side is automatically
-//! right. The disagreement is the result; it wants investigating, not silencing.
+//! Consequently, where this disagrees with the JIT, neither side is
+//! automatically right. The disagreement is the result; it wants investigating,
+//! not silencing.
 //!
 //! # Deliberately naive
 //!
@@ -58,26 +62,26 @@
 //! * `le`/`be` are implemented for a little-endian host: `le` is a truncation to
 //!   the named width, `be` is a byte reversal of that width. Both zero-extend.
 //!   `bswap` reverses unconditionally. A big-endian host would need `le` and
-//!   `be` swapped; uBPF targets x86_64 and aarch64 only.
+//!   `be` swapped; this runtime supports x86_64 and aarch64 only.
 //! * A local `call` preserves `R6`–`R9` and `R10` and clobbers everything else.
 //!   The eBPF calling convention names `R6`–`R9` callee-saved, but nothing in
 //!   the *bytecode* saves them: the preservation is performed by the
 //!   implementation — a JIT's per-function prologue — so whether it happens at
 //!   the bytecode level is an implementation property rather than an ISA one,
 //!   and it could plausibly have gone either way. It was settled by black-box
-//!   probe rather than by assumption: the C interpreter, driven through
-//!   `ubpf_exec` with a callee that overwrites each register in turn, restores
-//!   `R6`–`R9` and lets `R0`, `R1` and `R5` through.
-//!   [`Interpreter::not_preserving_callee_saved`] selects the other behaviour
-//!   for an implementation that turns out to differ.
+//!   probe rather than by assumption: a callee that overwrites every register in
+//!   turn leaves `R6`–`R9` restored on return and `R0`, `R1` and `R5` clobbered.
+//!   [`Interpreter::not_preserving_callee_saved`] selects the other behaviour,
+//!   for comparing against an implementation that turns out to differ.
 //! * Helper calls do not clobber `R1`–`R5`; only `R0` changes. A host ABI would
-//!   clobber them, but the ISA only promises they are *arguments*. Probing the C
-//!   interpreter agrees: `R1` survives a helper call there.
+//!   clobber them, but the ISA only promises they are *arguments*, and the same
+//!   probe finds `R1` intact across a helper call.
 //! * Unaligned access faults by default, and this is the one place the default
-//!   is knowingly *stricter* than the C, which was probed and reads an unaligned
-//!   word happily. Faulting catches a class of test-program bug that would
-//!   otherwise pass silently; [`Interpreter::allowing_unaligned`] turns it off,
-//!   and an execution-differential test against the C wants that.
+//!   is knowingly *stricter* than what it is checking: the generated code reads
+//!   an unaligned word happily. Faulting catches a class of test-program bug
+//!   that would otherwise pass silently; [`Interpreter::allowing_unaligned`]
+//!   turns it off for a differential run, where matching behaviour is what is
+//!   wanted.
 //! * A write to `R10` is permitted here. The validator rejects such programs, so
 //!   this only matters for hand-written test inputs.
 
@@ -567,18 +571,17 @@ fn sign_extend(value: u64, width: Width) -> u64 {
 /// a shift whose masked amount is zero.
 /// Whether a `div`/`mod` is the signed flavour.
 ///
-/// There is no separate `sdiv`/`smod` opcode in this ISA generation — `ebpf.h`
-/// names none, which makes it easy to conclude the operation does not exist.
-/// It does: signedness rides in the *offset field* of the ordinary `div`/`mod`
-/// opcode, and both JIT backends read it
-/// (`is_signed = (offset == 1)`, `ubpf_jit_x86_64.c:1907`,
-/// `ubpf_jit_arm64.c:2535`). The validator's filter bounds that offset at
-/// `0..=1`, so both flavours load.
+/// There is no separate `sdiv`/`smod` opcode in this ISA generation, which
+/// makes it easy to conclude the operation does not exist. It does: signedness
+/// rides in the *offset field* of the ordinary `div`/`mod` opcode, and both JIT
+/// backends read it as `offset == 1`. [`crate::jit::validate`] bounds that
+/// offset at `0..=1` rather than requiring zero, so both flavours load and both
+/// have to be implemented here.
 ///
-/// Note that the C *interpreter* does not implement this at all — `is_signed`
-/// appears nowhere in `ubpf_vm.c`. So the vendored tree's JIT and interpreter
-/// genuinely disagree about what `div r1, r2` with `offset == 1` computes. This
-/// interpreter follows the JIT, because its job is to be an oracle for the JIT.
+/// It is an easy operation to miss, precisely because nothing in the opcode
+/// byte hints at it — an interpreter written from the opcode table alone would
+/// silently compute the unsigned result for a program the JIT compiles as
+/// signed.
 pub fn is_signed_divmod(insn: &Insn) -> bool {
   insn.offset == 1
 }
@@ -596,8 +599,8 @@ fn alu_signed(width: AluWidth, op: AluOp, dst: u64, operand: u64, signed: bool) 
       // true quotient is not representable. Both backends special-case it: the
       // result wraps to `INT_MIN` for division and is 0 for modulo, which is
       // what `wrapping_div`/`wrapping_rem` already do. Doing it with plain `/`
-      // would panic in debug and trap on x86 `idiv` — the reason the C emits an
-      // explicit overflow check around it.
+      // would panic in debug and trap on x86 `idiv`, which is why the x86_64
+      // backend emits an explicit overflow check around it.
       AluOp::Div if signed => {
         if operand == 0 {
           0
@@ -1508,9 +1511,9 @@ mod tests {
 
   #[test]
   fn a_local_call_preserves_the_callee_saved_registers() {
-    // The callee clobbers r6. The caller must not see the clobber — this is the
-    // calling convention, and is what the C interpreter was observed to do.
-    // `not_preserving_callee_saved` selects the other reading.
+    // The callee clobbers r6. The caller must not see the clobber — this is
+    // the calling convention, and is what a black-box probe of the generated
+    // code shows. `not_preserving_callee_saved` selects the other reading.
     let p = [
       mov64(6, 1),
       // The callee begins at slot 4, two past the slot after the call.
@@ -1673,9 +1676,9 @@ mod signed_divmod_tests {
     }
   }
 
-  /// The corner the C emits an explicit overflow check for: on x86 `idiv`,
-  /// `INT_MIN / -1` raises #DE rather than producing a value. Both backends
-  /// special-case it so the result wraps.
+  /// The corner the backends emit an explicit overflow check for: on x86
+  /// `idiv`, `INT_MIN / -1` raises #DE rather than producing a value. Both
+  /// backends special-case it so the result wraps.
   #[test]
   fn signed_division_of_the_minimum_by_minus_one_wraps_instead_of_trapping() {
     assert_eq!(

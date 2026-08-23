@@ -204,7 +204,6 @@ fn hostile_config(target: Target) -> Arc<Config> {
     pointer_offset: 0x1_0000_0000,
     native_frame_base: true,
     frame_constants: true,
-    bounds_check: false,
     dispatcher: Some(never_called_dispatcher),
     dispatcher_validate: Some(accept_every_helper),
     unwind_helper_index: None,
@@ -583,7 +582,7 @@ fn no_hostile_program_makes_the_translator_panic() {
         }
       }
 
-      // Truncated analysis inputs: the C indexed these by pc against a length
+      // Truncated analysis inputs: these are indexed by pc against a length
       // it was told, so a short slice is the classic out-of-bounds.
       let mut buf = vec![0u8; 1 << 16];
       let inputs = TranslationInputs {
@@ -790,7 +789,7 @@ fn extreme_local_call_displacements_are_refused_without_overflowing() {
   }
 }
 
-/// A program at and around the instruction-count ceiling. The C's bound is
+/// A program at and around the instruction-count ceiling. The bound is
 /// `>=` and `Translator::load`'s is `>`; together they must reject exactly
 /// `MAX_INSTS` and above, and neither may allocate or index off the end.
 #[test]
@@ -832,7 +831,7 @@ fn malformed_code_lengths_are_refused() {
     if len == 0 {
       assert_eq!(
         outcome.err().map(|e| e.0),
-        Some("out of memory".to_string())
+        Some("program is empty".to_string())
       );
     } else if len % 8 != 0 {
       assert_eq!(
@@ -847,68 +846,84 @@ fn malformed_code_lengths_are_refused() {
 // The patch-table ceilings
 // ---------------------------------------------------------------------------
 
-/// `patch.rs` says its `MAX_*` constants are "the same bounds the C grew to".
-/// They are not. `reserve_patchable_relatives()` in `ubpf_jit_support.c`
-/// refuses when `needed > UBPF_MAX_INSTS`, i.e. at 65536 entries; the port sets
-/// every ceiling to `1 << 20`, sixteen times higher.
+/// Every patch table stops growing at the instruction ceiling.
 ///
-/// The consequence is not cosmetic: a program with between 65536 and 1048575
-/// jump fixups is rejected by the C with "Too many jump instructions" and
-/// accepted by the port. Three jump fixups are emitted per helper call, so
-/// 21846 helper calls is enough — well inside `MAX_INSTS`.
+/// A program can hold at most [`abi::MAX_INSTS`] instructions, so no correct
+/// program needs more fixups than that, and a table allowed to grow further is
+/// a table that accepts a program the loader should have refused. These were
+/// once `1 << 20` — sixteen times too high — which let a program with between
+/// 65536 and 1048575 jump fixups translate into a megabyte of code instead of
+/// being refused. Three jump fixups are emitted per helper call, so 21846
+/// helper calls was enough to reach it, well inside the instruction ceiling.
 #[test]
-fn the_patch_table_ceilings_match_the_c() {
+fn the_patch_table_ceilings_are_the_instruction_ceiling() {
   use super::patch::{MAX_JUMPS, MAX_LEAS, MAX_LOADS, MAX_LOCAL_CALLS};
-  let c_ceiling = abi::MAX_INSTS as usize;
-  assert_eq!(MAX_JUMPS, c_ceiling, "jump table ceiling");
-  assert_eq!(MAX_LOADS, c_ceiling, "load table ceiling");
-  assert_eq!(MAX_LEAS, c_ceiling, "lea table ceiling");
-  assert_eq!(MAX_LOCAL_CALLS, c_ceiling, "local call table ceiling");
+  let ceiling = abi::MAX_INSTS as usize;
+  assert_eq!(MAX_JUMPS, ceiling, "jump table ceiling");
+  assert_eq!(MAX_LOADS, ceiling, "load table ceiling");
+  assert_eq!(MAX_LEAS, ceiling, "lea table ceiling");
+  assert_eq!(MAX_LOCAL_CALLS, ceiling, "local call table ceiling");
 }
 
 /// A program of nothing but helper calls, sized so that the jump-fixup table
-/// crosses the C's ceiling.
-#[cfg(feature = "oracle")]
+/// crosses the ceiling above.
 fn helper_call_storm(calls: usize) -> Vec<u8> {
   let mut insns: Vec<Insn> = (0..calls).map(|_| ins(0x85, 0, 0, 0, 1)).collect();
   insns.push(ins(0x95, 0, 0, 0, 0));
   Insn::encode_all(&insns)
 }
 
-/// Executed proof of the divergence above, against the C itself.
+/// The executed form of the test above: a program that really does overrun the
+/// jump-fixup table has to be refused, by name, rather than translated.
 ///
-/// Was `#[ignore]`d as a record of the defect; the ceiling is now the C's, so
-/// it passes and stays as the regression test for it.
-#[cfg(feature = "oracle")]
+/// The ceiling is a number in one file and the refusal is a code path in
+/// another; this is what ties them together.
 #[test]
-fn a_jump_fixup_storm_is_refused_by_both_backends() {
-  use super::oracle::{oracle_config, COracle};
+fn a_jump_fixup_storm_is_refused() {
   // Three jump fixups per helper call: the jcc past the default dispatcher,
-  // the jmp past the external one, and the retpoline call.
-  let calls = 65536 / 3 + 2;
+  // the jmp past the external one, and the retpoline call. Two calls past the
+  // ceiling divided by three is the smallest program that overruns it.
+  let calls = abi::MAX_INSTS as usize / 3 + 2;
   let code = helper_call_storm(calls);
-  let config = std::sync::Arc::new(oracle_config(Target::X86_64));
+  let config = hostile_config(Target::X86_64);
 
-  let c = COracle::load(&config, &code).expect("the C loads it");
-  let rust = Translator::load(config.clone(), &code).expect("the port loads it");
-
-  let capacity = 1 << 24;
+  let translator = Translator::load(config, &code).expect("the program must load");
   let inputs = TranslationInputs {
     hints: &[],
     plan: &[],
     resolver_ids: &[],
     start_pc: 0,
-    end_pc: rust.insns().len(),
+    end_pc: translator.insns().len(),
   };
-  let c_outcome = c.translate(Target::X86_64, &inputs, capacity);
-  let mut buf = vec![0u8; capacity];
-  let rust_outcome = rust.translate_range(&inputs, &mut buf);
+  let mut buf = vec![0u8; 1 << 24];
+  let outcome = translator.translate_range(&inputs, &mut buf);
 
+  // The wording embedders see, and the reason it is this one: the table that
+  // overflowed is the jump table.
   assert_eq!(
-    c_outcome.is_ok(),
-    rust_outcome.is_ok(),
-    "the C and the port disagree about a {calls}-helper-call program: \
-     C = {c_outcome:?}, port = {rust_outcome:?}"
+    outcome,
+    Err(super::TranslateError::Failed(
+      "Too many jump instructions".to_string()
+    )),
+    "a {calls}-helper-call program emits {} jump fixups against a ceiling of {}",
+    calls * 3,
+    abi::MAX_INSTS
+  );
+
+  // ...and the same program one call shorter still fits, so the refusal is the
+  // ceiling and not merely "large programs fail".
+  let code = helper_call_storm(abi::MAX_INSTS as usize / 3 - 1);
+  let translator = Translator::load(hostile_config(Target::X86_64), &code).expect("must load");
+  let inputs = TranslationInputs {
+    hints: &[],
+    plan: &[],
+    resolver_ids: &[],
+    start_pc: 0,
+    end_pc: translator.insns().len(),
+  };
+  assert!(
+    translator.translate_range(&inputs, &mut buf).is_ok(),
+    "a program just inside the ceiling must still translate"
   );
 }
 
@@ -917,11 +932,12 @@ fn a_jump_fixup_storm_is_refused_by_both_backends() {
 // ---------------------------------------------------------------------------
 
 /// `Progress::into_error` is reached from exactly one place: the `other` arm of
-/// `x86_64::Emit::status_error`. Every status that arm can carry is one the
-/// x86_64 C names, so the strings have to agree with `ubpf_jit_x86_64.c`'s
-/// switch (C:3357-3401). Two did not, and now do.
+/// `x86_64::Emit::status_error`. Its strings are the ones an embedder sees when
+/// a program is refused, so they are part of the interface and are pinned here
+/// character for character rather than left to whatever the code happens to
+/// say. Two of them were wrong once, and this is what would have caught it.
 #[test]
-fn into_error_reproduces_the_c_strings() {
+fn into_error_reports_the_documented_strings() {
   use super::patch::Progress;
   use super::TranslateError::{Failed, OutOfSpace};
 
@@ -942,14 +958,16 @@ fn into_error_reproduces_the_c_strings() {
     Progress::TooManyLocalCalls.into_error(crate::jit::Target::X86_64),
     Some(Failed("Too many local calls".into()))
   );
-  // C:3368 — "Too many LEA calculations", not "Too many lea instructions".
+  // "Too many LEA calculations", not "Too many lea instructions": the wording
+  // is deliberately not parallel with the three above.
   assert_eq!(
     Progress::TooManyLeas.into_error(crate::jit::Target::X86_64),
     Some(Failed("Too many LEA calculations".into()))
   );
-  // C:3396 — the x86_64 backend leaves errmsg untouched for this one, and it
-  // is set only by the arm64 relocation resolver, which does not use
-  // `into_error` at all.
+  // Empty on purpose. An out-of-range relocation is only ever reported by the
+  // aarch64 resolver, which writes its own message where the error is detected
+  // — it has the pc and the opcode, and this does not — and does not come
+  // through `into_error` at all.
   assert_eq!(
     Progress::RelocationOutOfRange.into_error(crate::jit::Target::X86_64),
     Some(Failed(String::new()))

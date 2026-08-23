@@ -1,35 +1,40 @@
-//! A Rust port of the vendored uBPF JIT.
+//! The eBPF JIT: validation, decoding, and native code generation.
 //!
-//! # What this replaces
+//! # Using it
 //!
-//! `async-ebpf` reached exactly twenty-one symbols of the C library, and never
-//! called its interpreter, its ELF loader, `ubpf_compile`, constant blinding,
-//! data relocation, the bounds-check callback, or the debug hook. What is ported
-//! here is that reachable surface: instruction decoding, validation, per-local-
-//! function stack usage, and the two JIT backends.
+//! [`Translator::load`](crate::jit::Translator::load) validates a program once
+//! and keeps the decoded instructions, the set of slots that begin local
+//! functions, and the per-function stack usage.
+//! [`Translator::translate_range`](crate::jit::Translator::translate_range) then
+//! compiles a half-open instruction range into a caller-supplied buffer and
+//! reports how many bytes it wrote. Ranges rather than whole programs, because
+//! the runtime compiles one local function at a time, on first call, into an
+//! arena it manages itself.
 //!
-//! # The equivalence requirement
+//! Everything the analysis knows about a range beyond the bytecode — region
+//! hints, the access plan, the lazy-call resolver ids — arrives through
+//! [`TranslationInputs`](crate::jit::TranslationInputs) and is borrowed for
+//! exactly that one call. Everything fixed for the life of the program — the
+//! target, the pointer cage, the helper dispatcher — lives in
+//! [`Config`](crate::jit::Config), which is built once and immutable afterwards.
 //!
-//! Until the C is deleted, this backend must emit **byte-identical** machine
-//! code to `vendor/ubpf` for every program and every configuration. Not
-//! equivalent code — the same bytes. That constraint costs nothing (this is a
-//! port, not an improvement) and buys the strongest oracle available: a total
-//! function whose equality is decidable without executing anything, covering
-//! paths no behavioural test reaches. See `tests/oracle/`.
-//!
-//! A consequence worth stating: where the C does something odd, this code does
-//! the same odd thing, and says so in a comment rather than quietly improving
-//! it. Improvements come after the oracle is retired.
+//! Translation is pure computation over a byte buffer: it allocates no
+//! executable memory, patches nothing already running, and depends on the host
+//! only through [`Config::target`](crate::jit::Config::target), which either
+//! host can set to either value. Making the result runnable is the caller's job,
+//! and on aarch64 that includes
+//! [`clear_instruction_cache`](crate::jit::clear_instruction_cache).
 //!
 //! # Layout
 //!
-//! * [`isa`] — the wire format and the one opcode decode.
-//! * [`abi`] — the frame contract shared with the entry trampoline.
-//! * [`validate`] — what `ubpf_load` accepts.
-//! * [`stack`] — per-local-function stack usage.
-//! * [`patch`] — the code buffer and jump fixups.
-//! * [`emit`] — the shared driver and the two backends.
-//! * [`interp`] — a reference interpreter, for tests only.
+//! * [`isa`](crate::jit::isa) — the wire format and the one opcode decode.
+//! * [`abi`](crate::jit::abi) — the frame contract shared with the entry
+//!   trampoline.
+//! * [`validate`](crate::jit::validate) — what `Translator::load` accepts.
+//! * [`stack`](crate::jit::stack) — per-local-function stack usage.
+//! * [`patch`](crate::jit::patch) — the code buffer and jump fixups.
+//! * [`emit`](crate::jit::emit) — the two backends.
+//! * `interp` — a reference interpreter, for tests only.
 
 pub mod abi;
 pub mod isa;
@@ -45,10 +50,10 @@ pub mod validate;
 #[cfg(any(test, feature = "testing"))]
 pub mod interp;
 
-// Strictly feature-gated, not `cfg(test)`: this is the only thing that links
-// the vendored C, and a plain `cargo test` must not need cmake or bindgen.
-#[cfg(feature = "oracle")]
-pub mod oracle;
+// Checked-in expected code generation. `cfg(test)` rather than the `testing`
+// feature, so its dependencies stay dev-only.
+#[cfg(test)]
+pub mod golden;
 
 use std::sync::Arc;
 
@@ -57,9 +62,9 @@ use isa::Insn;
 /// Which architecture to emit code for.
 ///
 /// Translation is pure computation over a byte buffer, so either target can be
-/// produced from either host — which is what lets the byte-level differential
-/// test cover both backends on a single CI runner. Only *executing* the result
-/// requires a matching host.
+/// produced from either host — which is what lets the byte-level tests cover
+/// both backends on a single CI runner. Only *executing* the result requires a
+/// matching host.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum Target {
   X86_64,
@@ -82,25 +87,29 @@ impl Target {
 
 /// The external helper dispatcher the JIT emits calls to.
 ///
-/// Signature matches `external_function_dispatcher_t`: five guest arguments,
-/// then the helper index, then an opaque cookie. The index precedes the cookie —
-/// the emitted call sequence loads them into that argument order, so getting it
-/// backwards would compile and then pass a pointer where an index belongs.
+/// Five guest arguments, then the helper index, then an opaque cookie. The index
+/// precedes the cookie — the emitted call sequence loads them into that argument
+/// order, so getting it backwards would compile and then pass a pointer where an
+/// index belongs.
 pub type Dispatcher =
   unsafe extern "C" fn(u64, u64, u64, u64, u64, u32, *mut std::ffi::c_void) -> u64;
 
-/// Validates that a helper index is one the embedder registered. Matches
-/// `external_function_validate_t`, whose second argument is the VM itself.
+/// Validates that a helper index is one the embedder registered.
+///
+/// The second argument is an opaque cookie for the embedder's own use;
+/// [`validate`] has none to give and passes null.
 pub type DispatcherValidate = unsafe extern "C" fn(u32, *const std::ffi::c_void) -> bool;
 
-/// Resolves a lazily-compiled local call target. Matches `local_call_resolver_t`.
+/// Resolves a lazily-compiled local call target, returning the callee's native
+/// code address.
 pub type LocalCallResolver = unsafe extern "C" fn(u32) -> u64;
 
 /// Everything about a translation that is fixed for the life of a program.
 ///
-/// The C spreads this across a dozen setters that mutate a VM struct, with
-/// nothing preventing an incoherent combination. Here it is built once and is
-/// immutable afterwards.
+/// Built once and immutable afterwards, so the fields that only mean something
+/// together — the dispatcher and its validator, the pointer cage and the two
+/// features that depend on it — cannot drift into an incoherent combination
+/// between one translation and the next.
 #[derive(Clone)]
 pub struct Config {
   /// Emit code for this architecture.
@@ -121,9 +130,6 @@ pub struct Config {
   /// constants below the frame pointer. Enables access plans.
   pub frame_constants: bool,
 
-  /// Retain uBPF's own bounds checks. `async-ebpf` turns these off because the
-  /// pointer cage subsumes them.
-  pub bounds_check: bool,
 
   /// Helper dispatch. Both must be set together or neither.
   pub dispatcher: Option<Dispatcher>,
@@ -144,8 +150,8 @@ impl Default for Config {
       pointer_offset: 0,
       native_frame_base: false,
       frame_constants: false,
-      // uBPF's `ubpf_create` defaults this on.
-      bounds_check: true,
+      // Safe default: a caller that has not set up a pointer cage should have
+      // to say explicitly that it wants unchecked guest accesses.
       dispatcher: None,
       dispatcher_validate: None,
       unwind_helper_index: None,
@@ -155,14 +161,17 @@ impl Default for Config {
 }
 
 impl Config {
-  /// Whether the native-frame-base fast path is live. Mirrors
-  /// `native_frame_base_active()`: the pointer cage has to be on for the frame
-  /// base to mean anything.
+  /// Whether the native-frame-base fast path is live. The pointer cage has to be
+  /// on for the frame base to mean anything: without it the backend does not
+  /// translate guest addresses at all, so there is no shift for the entry code
+  /// to have pre-applied.
   pub const fn native_frame_base_active(&self) -> bool {
     self.pointer_mask != 0 && self.native_frame_base
   }
 
-  /// Whether access plans are honoured. Mirrors `access_plan_entry()`'s guard.
+  /// Whether access plans are honoured. A plan only saves work relative to a
+  /// check the cage would otherwise emit, and its members read the leader's
+  /// translated base out of the frame constants.
   pub const fn access_plans_active(&self) -> bool {
     self.pointer_mask != 0 && self.frame_constants
   }
@@ -200,9 +209,9 @@ pub struct PlanEntry {
 
 /// What the analysis tells the JIT about one function, beyond the bytecode.
 ///
-/// All of it is borrowed for exactly one translation. The C stashed these as raw
-/// pointers in the VM and cleared them afterwards; borrowing them here removes
-/// the lifetime hazard that dance was working around.
+/// All of it is borrowed for exactly one translation: these describe one range
+/// of one function under one specialization, so nothing may outlive the call
+/// that consumes them.
 #[derive(Copy, Clone, Default)]
 pub struct TranslationInputs<'a> {
   /// Per-instruction region routing hints, one byte per slot. Empty disables.
@@ -263,13 +272,15 @@ impl std::fmt::Display for LoadError {
 
 /// A validated eBPF program, ready to translate.
 ///
-/// Equivalent to a `struct ubpf_vm` that has had `ubpf_load` called on it, minus
-/// everything only the interpreter needed.
+/// Holds only what code generation needs: the decoded instructions, where the
+/// local functions start, and their stack usage. One of these is built per
+/// section at load time and then translated from repeatedly, once per function
+/// variant.
 pub struct Translator {
   config: Arc<Config>,
   insns: Box<[Insn]>,
   /// Slots that are the entry point of a local function, i.e. the target of some
-  /// `call` with `src == 1`. Mirrors `vm->int_funcs`.
+  /// `call` with `src == 1`.
   local_func_entries: Box<[bool]>,
   /// Memoised per-local-function stack usage, indexed by entry pc.
   stack_usage: stack::StackUsage,
@@ -278,24 +289,20 @@ pub struct Translator {
 impl Translator {
   /// Validates `code` and prepares it for translation.
   ///
-  /// `code.len()` must be a multiple of 8. Mirrors `ubpf_load`, including its
-  /// rejection messages, which callers surface verbatim.
+  /// `code.len()` must be a multiple of 8. Rejection messages are surfaced
+  /// verbatim by callers and matched on by tests, so their wording is part of
+  /// the interface rather than a diagnostic detail.
   pub fn load(config: Arc<Config>, code: &[u8]) -> Result<Translator, LoadError> {
     if code.len() % 8 != 0 {
       return Err(LoadError("code_len must be a multiple of 8".to_string()));
     }
-    // The C accepts a zero-length program in `validate()` — the loop does not
-    // run and the sub-program check finds no local call — and then fails in
-    // `ubpf_load` itself, where the read-only bytecode mapping asks for
-    // `mmap(NULL, 0, ...)`, gets EINVAL, and reports "out of memory".
-    //
-    // That message is an allocator artifact rather than a judgement about the
-    // program, so it does not belong in the validator; but this function is the
-    // analogue of `ubpf_load`, which is where it happens in the C, so it
-    // belongs here. Rejecting it keeps the divergence allowlist empty, which
-    // was the point of having one.
+    // A zero-length program is rejected here rather than in [`validate`],
+    // because there is nothing for the validator to object to: its
+    // per-instruction loop does not run and its sub-program check finds no
+    // local call. So the empty case has to be caught by whoever assembles the
+    // program, which is this function.
     if code.is_empty() {
-      return Err(LoadError("out of memory".to_string()));
+      return Err(LoadError("program is empty".to_string()));
     }
     let insns = Insn::decode_all(code).expect("length checked above");
     if insns.len() > abi::MAX_INSTS as usize {
@@ -360,8 +367,11 @@ impl Translator {
   /// Translates `inputs.start_pc .. inputs.end_pc` into `buffer`, returning the
   /// number of bytes written.
   ///
-  /// Mirrors `ubpf_translate_function_ex` in extended JIT mode, which is the
-  /// only mode `async-ebpf` ever used.
+  /// The range must begin at pc 0 or at a local function entry and end at a
+  /// local function entry or at the end of the program, and every jump it
+  /// contains must stay inside it — the emitted code is self-contained, so a
+  /// branch to a pc translated into some other buffer has nowhere to go and is
+  /// rejected rather than emitted.
   pub fn translate_range(
     &self,
     inputs: &TranslationInputs<'_>,
@@ -370,8 +380,9 @@ impl Translator {
     emit::translate(self, inputs, buffer)
   }
 
-  /// Translates the whole program. Only used by tests and by the differential
-  /// harness; the runtime always translates one function at a time.
+  /// Translates the whole program, with no analysis inputs. Only used by tests;
+  /// the runtime always translates one function at a time, with hints and a
+  /// plan.
   pub fn translate_all(&self, buffer: &mut [u8]) -> Result<usize, TranslateError> {
     let inputs = TranslationInputs {
       start_pc: 0,
