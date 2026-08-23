@@ -5,7 +5,6 @@ use std::{
   any::{Any, TypeId},
   cell::{Cell, RefCell},
   collections::HashMap,
-  ffi::CStr,
   marker::PhantomData,
   mem::ManuallyDrop,
   ops::{Deref, DerefMut},
@@ -47,7 +46,7 @@ pub(crate) const MAX_CALLDATA_SIZE: usize = 512;
 /// frame: every local function is charged one uBPF frame, and the loader caps
 /// the call graph at [`MAX_LOCAL_CALL_DEPTH`] frames.
 const LOCAL_CALL_FRAME_BUDGET: usize =
-  MAX_LOCAL_CALL_DEPTH * crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+  MAX_LOCAL_CALL_DEPTH * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
 
 /// The guest stack window.
 ///
@@ -77,7 +76,7 @@ const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 ///
 /// `src/test/lazy_local_call.rs::the_deepest_accepted_call_chain_fits_alongside_calldata`
 /// exercises exactly this corner at run time.
-pub(crate) const FRAME_WINDOW: usize = crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+pub(crate) const FRAME_WINDOW: usize = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
 
 /// Guest addresses the SIGSEGV handler claims as a guest fault rather than a
 /// host crash: `(0, POINTER_CAGE_PROTECTED_WINDOW)`.
@@ -99,7 +98,7 @@ const _: () = {
      claims, so a group off a bad base would abort the process instead of faulting"
   );
   assert!(
-    crate::region_analysis::MAX_GROUP_SPAN == crate::ubpf::UBPF_MAX_GROUP_SPAN as i32,
+    crate::region_analysis::MAX_GROUP_SPAN == crate::jit::abi::MAX_GROUP_SPAN as i32,
     "the analysis and the backend disagree about how wide an access group may be"
   );
 };
@@ -108,7 +107,7 @@ const _: () = {
   // What the window has left below the deepest frame pointer the loader accepts.
   let headroom = SHADOW_STACK_SIZE
     - MAX_CALLDATA_SIZE.next_multiple_of(8)
-    - (MAX_LOCAL_CALL_DEPTH - 1) * crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+    - (MAX_LOCAL_CALL_DEPTH - 1) * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
   // Tight today - headroom is exactly one frame. Raising MAX_CALLDATA_SIZE,
   // shrinking SHADOW_STACK_SIZE or charging local functions more than one frame
   // would each silently invalidate Tier F's proof, so fail the build instead.
@@ -609,21 +608,6 @@ const _: () = {
   assert!(std::mem::size_of::<JitMemory>() == 144);
 };
 
-/// The access plan crosses into C as a raw pointer, so the two declarations of
-/// its entry have to agree field for field.
-const _: () = {
-  use crate::region_analysis::PlanEntry;
-  use crate::ubpf::ubpf_access_plan_entry as CEntry;
-  assert!(std::mem::size_of::<PlanEntry>() == std::mem::size_of::<CEntry>());
-  assert!(std::mem::align_of::<PlanEntry>() == std::mem::align_of::<CEntry>());
-  assert!(std::mem::offset_of!(PlanEntry, role) == std::mem::offset_of!(CEntry, role));
-  assert!(std::mem::offset_of!(PlanEntry, region) == std::mem::offset_of!(CEntry, region));
-  assert!(std::mem::offset_of!(PlanEntry, delta) == std::mem::offset_of!(CEntry, delta));
-  assert!(std::mem::offset_of!(PlanEntry, span) == std::mem::offset_of!(CEntry, span));
-  assert!(std::mem::offset_of!(PlanEntry, lo) == std::mem::offset_of!(CEntry, lo));
-  assert!(std::mem::offset_of!(PlanEntry, leader_pc) == std::mem::offset_of!(CEntry, leader_pc));
-};
-
 impl JitMemory {
   /// Derives the twelve bounds-check constants from the six region fields.
   ///
@@ -857,7 +841,7 @@ struct CodeArena {
 }
 
 struct Section {
-  vm: Vm,
+  translator: crate::jit::Translator,
   code_vaddr: usize,
   code_len: usize,
   layout: FunctionLayout,
@@ -1417,10 +1401,9 @@ impl Program {
 
     let code_ptr = self.unbound.code_base + arena.used;
     let remaining = self.unbound.code_size - arena.used;
-    let vm = section.vm.0.as_ptr();
     let outcome = unsafe {
       translate_function_into(
-        vm,
+        &section.translator,
         &TranslationInputs {
           hints: &region_analysis.hints,
           plan: &region_analysis.plan,
@@ -1465,7 +1448,7 @@ impl Program {
     };
 
     unsafe {
-      crate::ubpf::ubpf_clear_instruction_cache(code_ptr as *mut u8, written_len);
+      crate::jit::clear_instruction_cache(code_ptr as *mut u8, written_len);
     }
 
     // Restore W^X protection covering the newly emitted function before
@@ -1829,31 +1812,24 @@ impl Program {
   }
 }
 
-struct Vm(NonNull<crate::ubpf::ubpf_vm>);
-unsafe impl Send for Vm {}
-
-impl Vm {
-  fn new(cage: &PointerCage) -> Self {
-    let vm = NonNull::new(unsafe { crate::ubpf::ubpf_create() }).expect("failed to create ubpf_vm");
-    unsafe {
-      crate::ubpf::ubpf_toggle_bounds_check(vm.as_ptr(), false);
-      crate::ubpf::ubpf_set_jit_pointer_mask_and_offset(vm.as_ptr(), cage.mask(), cage.offset());
-      // Both entry trampolines establish the frame these describe.
-      #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-      {
-        crate::ubpf::ubpf_set_native_frame_base(vm.as_ptr(), true);
-        crate::ubpf::ubpf_set_frame_constants(vm.as_ptr(), true);
-      }
-    }
-    Self(vm)
-  }
-}
-
-impl Drop for Vm {
-  fn drop(&mut self) {
-    unsafe {
-      crate::ubpf::ubpf_destroy(self.0.as_ptr());
-    }
+/// The JIT configuration this runtime always uses.
+///
+/// uBPF spread this across a dozen setters mutating a VM struct, with nothing
+/// preventing an incoherent combination; it is built once here instead. The
+/// pointer cage subsumes uBPF's own bounds checks, which is why they are off.
+fn jit_config(cage: &PointerCage) -> crate::jit::Config {
+  crate::jit::Config {
+    target: crate::jit::Target::host(),
+    pointer_mask: cage.mask(),
+    pointer_offset: cage.offset(),
+    // Both entry trampolines establish the frame these describe.
+    native_frame_base: true,
+    frame_constants: true,
+    bounds_check: false,
+    dispatcher: Some(tls_dispatcher),
+    dispatcher_validate: Some(std_validator),
+    unwind_helper_index: None,
+    local_call_resolver: Some(tls_local_call_resolver),
   }
 }
 
@@ -1878,20 +1854,14 @@ impl Drop for LoaderValidationScope {
   }
 }
 
-/// Why a translation failed.
-enum TranslateError {
-  /// The function translates; `capacity` was not enough to hold it.
-  OutOfSpace,
-  /// The function does not translate at all.
-  Failed(String),
-}
+use crate::jit::TranslateError;
 
 /// What the analysis tells the JIT about one function, beyond the bytecode
 /// itself. All of it is borrowed for the duration of a single translation and
 /// cleared again afterwards.
 struct TranslationInputs<'a> {
   hints: &'a [u8],
-  plan: &'a [crate::region_analysis::PlanEntry],
+  plan: &'a [crate::jit::PlanEntry],
   resolver_ids: &'a [u32],
   start_pc: usize,
   end_pc: usize,
@@ -1901,55 +1871,25 @@ struct TranslationInputs<'a> {
 /// emitted.
 ///
 /// # Safety
-/// `vm` must be a live VM whose loaded code contains the range, and `buffer`
-/// must be writable for `capacity` bytes.
+/// `buffer` must be writable for `capacity` bytes.
 unsafe fn translate_function_into(
-  vm: *mut crate::ubpf::ubpf_vm,
+  translator: &crate::jit::Translator,
   inputs: &TranslationInputs<'_>,
   buffer: *mut u8,
   capacity: usize,
 ) -> Result<usize, TranslateError> {
-  let mut written_len = capacity;
-  let mut errmsg_ptr = std::ptr::null_mut();
-
-  crate::ubpf::ubpf_set_region_hints(vm, inputs.hints.as_ptr(), inputs.hints.len());
-  crate::ubpf::ubpf_set_access_plan(
-    vm,
-    inputs.plan.as_ptr() as *const crate::ubpf::ubpf_access_plan_entry,
-    inputs.plan.len(),
-  );
-  crate::ubpf::ubpf_set_lazy_local_call_resolver(
-    vm,
-    Some(tls_local_call_resolver),
-    inputs.resolver_ids.as_ptr(),
-    inputs.resolver_ids.len(),
-  );
-  let ret = crate::ubpf::ubpf_translate_function_ex(
-    vm,
-    buffer,
-    &mut written_len,
-    &mut errmsg_ptr,
-    crate::ubpf::JitMode_ExtendedJitMode,
-    inputs.start_pc as u32,
-    inputs.end_pc as u32,
-  );
-  crate::ubpf::ubpf_set_region_hints(vm, std::ptr::null(), 0);
-  crate::ubpf::ubpf_set_access_plan(vm, std::ptr::null(), 0);
-  crate::ubpf::ubpf_set_lazy_local_call_resolver(vm, None, std::ptr::null(), 0);
-
-  let errmsg = if errmsg_ptr.is_null() {
-    String::new()
-  } else {
-    let msg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-    libc::free(errmsg_ptr as _);
-    msg
+  // The analysis inputs are borrowed for exactly this call. uBPF stashed them as
+  // raw pointers in the VM and cleared them afterwards; borrowing removes the
+  // lifetime hazard that dance was working around.
+  let jit_inputs = crate::jit::TranslationInputs {
+    hints: inputs.hints,
+    plan: inputs.plan,
+    resolver_ids: inputs.resolver_ids,
+    start_pc: inputs.start_pc,
+    end_pc: inputs.end_pc,
   };
-
-  match ret {
-    0 => Ok(written_len),
-    crate::ubpf::UBPF_TRANSLATE_OUT_OF_SPACE => Err(TranslateError::OutOfSpace),
-    _ => Err(TranslateError::Failed(errmsg)),
-  }
+  let out = std::slice::from_raw_parts_mut(buffer, capacity);
+  translator.translate_range(&jit_inputs, out)
 }
 
 fn local_call_target(code: &[u8], pc: usize) -> usize {
@@ -2114,22 +2054,9 @@ impl ProgramLoader {
     let resolvers = HashMap::new();
     let next_resolver_id = 1u32;
 
-    for (section_name, code_vaddr_size) in code_sections {
-      let vm = Vm::new(&cage);
-      unsafe {
-        if crate::ubpf::ubpf_register_external_dispatcher(
-          vm.0.as_ptr(),
-          Some(tls_dispatcher),
-          Some(std_validator),
-        ) != 0
-        {
-          return Err(RuntimeError::PlatformError(
-            "ubpf: failed to register external dispatcher",
-          ));
-        }
-      }
+    let config = std::sync::Arc::new(jit_config(&cage));
 
-      let mut errmsg_ptr = std::ptr::null_mut();
+    for (section_name, code_vaddr_size) in code_sections {
       let code = cage
         .data_slice(code_vaddr_size.0, code_vaddr_size.1)
         .unwrap();
@@ -2145,33 +2072,21 @@ impl ProgramLoader {
           "local function analysis failed in {section_name}: {err}"
         ))
       })?;
-      let ret = unsafe {
-        let validation_scope = LoaderValidationScope::new(self);
-        let ret = crate::ubpf::ubpf_load(
-          vm.0.as_ptr(),
-          code.as_ptr() as *const _,
-          code.len() as u32,
-          &mut errmsg_ptr,
-        );
-        drop(validation_scope);
-        ret
+      // The validator calls back into the loader to check helper indices, so
+      // the scope has to be live across the call.
+      let translator = {
+        let _validation_scope = LoaderValidationScope::new(self);
+        crate::jit::Translator::load(config.clone(), code_bytes)
       };
-      if ret != 0 {
-        let errmsg = unsafe {
-          if errmsg_ptr.is_null() {
-            "".to_string()
-          } else {
-            CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned()
-          }
-        };
-        if !errmsg_ptr.is_null() {
-          unsafe { libc::free(errmsg_ptr as _) };
+      let translator = match translator {
+        Ok(translator) => translator,
+        Err(err) => {
+          tracing::error!(section_name, error = %err, "failed to load code");
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "ubpf: code load failed: {err}"
+          )));
         }
-        tracing::error!(section_name, error = errmsg, "failed to load code");
-        return Err(RuntimeError::InvalidArgumentOwned(format!(
-          "ubpf: code load failed: {errmsg}"
-        )));
-      }
+      };
 
       let section_index = sections.len();
 
@@ -2180,7 +2095,7 @@ impl ProgramLoader {
         .map(|_| FunctionState::default())
         .collect();
       sections.push(Section {
-        vm,
+        translator,
         code_vaddr: code_vaddr_size.0,
         code_len: code_vaddr_size.1,
         layout,
@@ -2282,7 +2197,7 @@ unsafe extern "C" fn tls_local_call_resolver(resolver_id: std::os::raw::c_uint) 
 
 unsafe extern "C" fn std_validator(
   index: std::os::raw::c_uint,
-  _vm: *const crate::ubpf::ubpf_vm,
+  _vm: *const std::ffi::c_void,
 ) -> bool {
   let loader = LOADING_PROGRAM_LOADER.with(|x| x.get());
   if loader.is_null() {

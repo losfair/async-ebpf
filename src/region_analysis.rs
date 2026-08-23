@@ -997,23 +997,14 @@ fn add_imm_kind(a: RegKind, imm: i32) -> RegKind {
 /// The plan is advisory. The backend re-derives every condition it can see for
 /// itself and emits an ordinary checked access when any of them fails, so a
 /// wrong plan costs speed, not safety.
-#[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub(crate) struct PlanEntry {
-  /// 0 = ordinary checked access, 1 = group leader, 2 = group member.
-  pub(crate) role: u8,
-  /// Region the leader's check runs against (`REGION_*`). Members inherit it.
-  pub(crate) region: u8,
-  /// This access's displacement from the group's low bound. Always below
-  /// `span`, so a failed check leaves it inside the guard window at address 0.
-  pub(crate) delta: u16,
-  /// Bytes the leader's check covers, starting at the low bound.
-  pub(crate) span: u32,
-  /// The low bound, as a displacement from the base register's value.
-  pub(crate) lo: i32,
-  /// The leader that established the base. Leaders name themselves.
-  pub(crate) leader_pc: u32,
-}
+/// The plan entry type is [`crate::jit::PlanEntry`] itself.
+///
+/// It used to be declared twice — once here and once for the C FFI — with
+/// three `const _` assertions in `program.rs` tying the two together field by
+/// field, because the analysis built one and the backend read the other through
+/// a pointer cast. With the backend in Rust there is one type and the
+/// assertions are gone.
+pub(crate) use crate::jit::PlanEntry;
 
 pub(crate) const PLAN_ROLE_LEADER: u8 = 1;
 pub(crate) const PLAN_ROLE_MEMBER: u8 = 2;
