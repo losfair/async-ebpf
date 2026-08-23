@@ -528,10 +528,17 @@ static TRANSLATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 
 #[test]
 fn no_hostile_program_makes_the_translator_panic() {
+  // Miri interprets rather than executes, so a sweep sized for native runs
+  // takes hours there. Shrink it instead of skipping: what Miri contributes
+  // here is undefined-behaviour detection inside the emitters, and a few dozen
+  // hostile programs exercise the same code paths as eight thousand. The
+  // coverage floor below scales with it so the test still refuses to pass
+  // vacuously.
+  let iterations: u32 = if cfg!(miri) { 60 } else { 8000 };
   let mut rng = Rng(0x1234_5678_9abc_def0);
   for target in [Target::X86_64, Target::Aarch64] {
     let config = hostile_config(target);
-    for iteration in 0..8000u32 {
+    for iteration in 0..iterations {
       let len = 1 + rng.below(24);
       let code = match iteration % 5 {
         0 => random_bytes(&mut rng, len),
@@ -592,10 +599,14 @@ fn no_hostile_program_makes_the_translator_panic() {
   // test at all, so assert the coverage rather than hoping for it.
   let loaded = LOADED.load(std::sync::atomic::Ordering::Relaxed);
   let translated = TRANSLATED.load(std::sync::atomic::Ordering::Relaxed);
+  // Scales with `iterations` so the floor keeps its meaning under Miri: it is
+  // here to catch a generator that quietly stops producing loadable programs,
+  // which is how a sweep like this turns green while testing nothing.
+  let floor = (iterations as usize) / 4;
   assert!(
-    loaded > 2000 && translated > 2000,
+    loaded > floor && translated > floor,
     "the generator stopped producing loadable programs: {loaded} loaded, \
-     {translated} translated"
+     {translated} translated, floor {floor}"
   );
 }
 
@@ -635,12 +646,24 @@ fn no_hostile_translation_range_makes_the_translator_panic() {
 /// register/offset/immediate corner that has ever mattered.
 #[test]
 fn every_opcode_byte_loads_or_is_refused_without_panicking() {
+  // See `no_hostile_program_makes_the_translator_panic`: under Miri the full
+  // cross-product is ~100k load attempts and takes hours. Every opcode byte is
+  // still covered; only the operand corners per byte are thinned.
+  let (dst_src, offsets, imms): (&[(u8, u8)], &[i16], &[i32]) = if cfg!(miri) {
+    (&[(0, 0), (10, 10)], &[0, i16::MIN], &[0, i32::MIN])
+  } else {
+    (
+      &[(0, 0), (9, 10), (10, 10), (15, 15), (10, 0)],
+      &[0, -1, 1, i16::MIN, i16::MAX],
+      &[0, -1, 1, i32::MIN, i32::MAX, 16, 32, 64],
+    )
+  };
   for target in [Target::X86_64, Target::Aarch64] {
     let config = hostile_config(target);
     for opcode in 0u8..=255 {
-      for &(dst, src) in &[(0u8, 0u8), (9, 10), (10, 10), (15, 15), (10, 0)] {
-        for &offset in &[0i16, -1, 1, i16::MIN, i16::MAX] {
-          for &imm in &[0i32, -1, 1, i32::MIN, i32::MAX, 16, 32, 64] {
+      for &(dst, src) in dst_src {
+        for &offset in offsets {
+          for &imm in imms {
             let insns = [
               Insn {
                 opcode,
