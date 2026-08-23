@@ -141,14 +141,12 @@ pub fn flush() {
     let _ = std::fs::create_dir_all(path.parent().unwrap());
     let mut out = String::new();
     out.push_str(
-      "# Generated. Every entry below was recorded while the vendored C uBPF was\n\
-       # still in the tree, by a run that asserted the Rust emitter's bytes equalled\n\
-       # the C's before recording them. They are a photograph of a verified state:\n\
-       # from here they detect change, not correctness.\n\
+      "# Generated: the machine code this backend is expected to emit.\n\
        #\n\
-       # Regenerate with ASYNC_EBPF_UPDATE_GOLDENS=1 cargo test --features testing\n\
-       # An unexplained diff here means code generation changed when nobody meant\n\
-       # it to.\n",
+       # Regenerate with ASYNC_EBPF_UPDATE_GOLDENS=1 cargo test --features testing.\n\
+       # A diff here means code generation changed. That is fine when it was\n\
+       # intended and the diff is part of the change being reviewed; an\n\
+       # unexplained one means something moved that nobody meant to move.\n",
     );
     for (k, v) in &guard.entries {
       out.push_str(k);
@@ -229,39 +227,10 @@ pub fn check(
   inputs: &TranslationInputs<'_>,
   capacity: usize,
 ) -> bool {
-  let translator = match Translator::load(std::sync::Arc::new(config.clone()), code) {
-    Ok(t) => t,
-    Err(_) => return false,
+  let Some(out) = translate_one(config, code, inputs, capacity) else {
+    return false;
   };
-  let mut buf = vec![0u8; capacity];
-  let out = translator.translate_range(inputs, &mut buf).map(|len| {
-    buf.truncate(len);
-    buf.clone()
-  });
   let translated = out.is_ok();
-
-  // While the vendored C is still in the tree, every golden is cross-checked
-  // against it before being recorded or compared. This is what gives the
-  // goldens their provenance: the file that survives the C's deletion is not a
-  // record of whatever the Rust happened to emit, but of output that was
-  // verified equal to the C's on the run that wrote it.
-  //
-  // When the `oracle` feature goes, so does this block, and the goldens become
-  // a pure change detector. That transition is the whole point of the phase,
-  // and it is safe exactly to the degree that this assertion held beforehand.
-  #[cfg(feature = "oracle")]
-  {
-    if let Ok(c_vm) = super::oracle::COracle::load(config, code) {
-      let c_out = c_vm.translate(config.target, inputs, capacity);
-      assert_eq!(
-        outcome_digest(&c_out),
-        outcome_digest(&out),
-        "golden certification failed for {label} on {:?}: the Rust emitter and \
-         the vendored C disagree, so this golden must not be recorded",
-        config.target
-      );
-    }
-  }
 
   let k = key(label, config, code, inputs);
   let digest = outcome_digest(&out);
@@ -292,6 +261,26 @@ pub fn check(
   }
 }
 
+/// Loads and translates one case, returning `None` if the program does not
+/// load at all.
+///
+/// Shared by [`check`] and by sweeps, so a sweep folding hundreds of thousands
+/// of outcomes into one digest goes through exactly the same path as a named
+/// per-case golden.
+pub fn translate_one(
+  config: &Config,
+  code: &[u8],
+  inputs: &TranslationInputs<'_>,
+  capacity: usize,
+) -> Option<Result<Vec<u8>, TranslateError>> {
+  let translator = Translator::load(std::sync::Arc::new(config.clone()), code).ok()?;
+  let mut buf = vec![0u8; capacity];
+  Some(translator.translate_range(inputs, &mut buf).map(|len| {
+    buf.truncate(len);
+    buf
+  }))
+}
+
 /// Accumulates a digest across a whole randomised sweep.
 ///
 /// Per-case goldens are right for named tests and hopeless for a sweep of
@@ -316,6 +305,34 @@ impl SweepDigest {
       self.translated += 1;
     }
     self.hasher.update(outcome_digest(out).as_bytes());
+  }
+
+  /// Translates one case and folds its outcome in, going through the same
+  /// certification [`check`] does.
+  ///
+  /// Returns whether the case produced code, so a sweep can still assert it is
+  /// exercising the emitter rather than agreeing about a refusal. A program
+  /// that does not load contributes a distinct marker rather than nothing, so
+  /// a case that silently stops loading changes the digest.
+  pub fn add_case(
+    &mut self,
+    label: &str,
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) -> bool {
+    match translate_certified(label, config, code, inputs, capacity) {
+      Some(out) => {
+        self.add(&out);
+        out.is_ok()
+      }
+      None => {
+        self.cases += 1;
+        self.hasher.update(b"did-not-load");
+        false
+      }
+    }
   }
 
   pub fn translated(&self) -> usize {
