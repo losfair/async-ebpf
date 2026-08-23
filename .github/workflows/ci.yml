@@ -76,7 +76,7 @@ jobs:
       # cross-architecture half of this runs anywhere. Only the execution
       # differential needs a matching host, which is why this is a matrix.
       - name: Byte-identical translation
-        run: cargo test --features testing,oracle --lib jit:: -- --nocapture
+        run: "cargo test --features testing,oracle --lib jit:: -- --nocapture"
 
       - name: Execution differential and full suite
         run: cargo test --features testing,oracle
@@ -104,7 +104,7 @@ jobs:
       # rather than a list of module paths. Without the `oracle` feature: the
       # differential tests call into the C, which Miri cannot execute.
       - name: Run Miri over the JIT modules
-        run: cargo +nightly miri test --features testing --lib -- jit::
+        run: "cargo +nightly miri test --features testing --lib -- jit::"
 
   openbsd-tests:
     name: OpenBSD unit tests (${{ matrix.arch }})
