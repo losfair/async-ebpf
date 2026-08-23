@@ -43,4 +43,6 @@ ubpf-sys = { path = "oracle/ubpf-sys", optional = true }
 [dev-dependencies]
 async-ebpf = { path = ".", features = ["testing"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
+# Golden-file keys and sweep digests. Test-only: `jit::golden` is `cfg(test)`.
+sha2 = "0.10"
 tracing-test = "0.2"

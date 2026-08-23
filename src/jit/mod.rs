@@ -45,6 +45,11 @@ pub mod validate;
 #[cfg(any(test, feature = "testing"))]
 pub mod interp;
 
+// Checked-in expected code generation. `cfg(test)` rather than the `testing`
+// feature, so its dependencies stay dev-only.
+#[cfg(test)]
+pub mod golden;
+
 // Strictly feature-gated, not `cfg(test)`: this is the only thing that links
 // the vendored C, and a plain `cargo test` must not need cmake or bindgen.
 #[cfg(feature = "oracle")]
