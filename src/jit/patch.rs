@@ -46,9 +46,10 @@ impl Progress {
   /// Two things here are easy to get wrong and were:
   ///
   /// * The two backends disagree about punctuation — aarch64 ends each
-  ///   `TooMany*` message with a full stop and x86_64 does not. Taking the
-  ///   target is the difference between a helper correct for both and one
-  ///   quietly correct for whichever backend called it first.
+  ///   `TooMany*` message with a full stop and x86_64 does not. Why they differ
+  ///   is not recorded anywhere; what matters is that each keeps its own
+  ///   wording, so taking the target is the difference between a helper correct
+  ///   for both and one quietly correct for whichever backend called it first.
   /// * The three statuses below carry no message of their own, and must not be
   ///   given one here. Their text needs the pc and the opcode, neither of which
   ///   this function has, so the backend records an `errmsg` where the error is

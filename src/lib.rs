@@ -10,7 +10,6 @@ pub mod error;
 mod function_analysis;
 /// Helper definitions and utilities for eBPF programs.
 pub mod helpers;
-/// The Rust JIT backend.
 pub mod jit;
 mod linker;
 mod pointer_cage;

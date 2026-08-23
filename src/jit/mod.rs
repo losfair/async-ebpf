@@ -2,36 +2,39 @@
 //!
 //! # Using it
 //!
-//! [`Translator::load`] validates a program once and keeps the decoded
-//! instructions, the set of slots that begin local functions, and the
-//! per-function stack usage. [`Translator::translate_range`] then compiles a
-//! half-open instruction range into a caller-supplied buffer and reports how
-//! many bytes it wrote. Ranges rather than whole programs, because the runtime
-//! compiles one local function at a time, on first call, into an arena it
-//! manages itself.
+//! [`Translator::load`](crate::jit::Translator::load) validates a program once
+//! and keeps the decoded instructions, the set of slots that begin local
+//! functions, and the per-function stack usage.
+//! [`Translator::translate_range`](crate::jit::Translator::translate_range) then
+//! compiles a half-open instruction range into a caller-supplied buffer and
+//! reports how many bytes it wrote. Ranges rather than whole programs, because
+//! the runtime compiles one local function at a time, on first call, into an
+//! arena it manages itself.
 //!
 //! Everything the analysis knows about a range beyond the bytecode — region
 //! hints, the access plan, the lazy-call resolver ids — arrives through
-//! [`TranslationInputs`] and is borrowed for exactly that one call. Everything
-//! fixed for the life of the program — the target, the pointer cage, the helper
-//! dispatcher — lives in [`Config`], which is built once and immutable
-//! afterwards.
+//! [`TranslationInputs`](crate::jit::TranslationInputs) and is borrowed for
+//! exactly that one call. Everything fixed for the life of the program — the
+//! target, the pointer cage, the helper dispatcher — lives in
+//! [`Config`](crate::jit::Config), which is built once and immutable afterwards.
 //!
 //! Translation is pure computation over a byte buffer: it allocates no
 //! executable memory, patches nothing already running, and depends on the host
-//! only through [`Config::target`], which either host can set to either value.
-//! Making the result runnable is the caller's job, and on aarch64 that includes
-//! [`clear_instruction_cache`].
+//! only through [`Config::target`](crate::jit::Config::target), which either
+//! host can set to either value. Making the result runnable is the caller's job,
+//! and on aarch64 that includes
+//! [`clear_instruction_cache`](crate::jit::clear_instruction_cache).
 //!
 //! # Layout
 //!
-//! * [`isa`] — the wire format and the one opcode decode.
-//! * [`abi`] — the frame contract shared with the entry trampoline.
-//! * [`validate`] — what [`Translator::load`] accepts.
-//! * [`stack`] — per-local-function stack usage.
-//! * [`patch`] — the code buffer and jump fixups.
-//! * [`emit`] — the two backends.
-//! * [`interp`] — a reference interpreter, for tests only.
+//! * [`isa`](crate::jit::isa) — the wire format and the one opcode decode.
+//! * [`abi`](crate::jit::abi) — the frame contract shared with the entry
+//!   trampoline.
+//! * [`validate`](crate::jit::validate) — what `Translator::load` accepts.
+//! * [`stack`](crate::jit::stack) — per-local-function stack usage.
+//! * [`patch`](crate::jit::patch) — the code buffer and jump fixups.
+//! * [`emit`](crate::jit::emit) — the two backends.
+//! * `interp` — a reference interpreter, for tests only.
 
 pub mod abi;
 pub mod isa;
@@ -127,13 +130,6 @@ pub struct Config {
   /// constants below the frame pointer. Enables access plans.
   pub frame_constants: bool,
 
-  /// Whether guest memory accesses are expected to carry their own bounds
-  /// check. `async-ebpf` sets this false: the pointer cage subsumes the check,
-  /// and no backend consults the flag — with `pointer_mask` zero an access is
-  /// emitted unchecked either way. Kept as a declaration of intent, so a caller
-  /// that wants checked accesses without a cage is asking for something the
-  /// backends do not currently provide rather than silently getting none.
-  pub bounds_check: bool,
 
   /// Helper dispatch. Both must be set together or neither.
   pub dispatcher: Option<Dispatcher>,
@@ -156,7 +152,6 @@ impl Default for Config {
       frame_constants: false,
       // Safe default: a caller that has not set up a pointer cage should have
       // to say explicitly that it wants unchecked guest accesses.
-      bounds_check: true,
       dispatcher: None,
       dispatcher_validate: None,
       unwind_helper_index: None,

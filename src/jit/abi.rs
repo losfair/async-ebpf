@@ -206,8 +206,13 @@ mod tests {
     assert_eq!(MAX_GROUP_SPAN, 4096);
 
     // The instruction ceiling a loaded program may not reach: 65536 is refused,
-    // 65535 is accepted. It also bounds every patch table, since no accepted
-    // program can need more fixups than it has instructions.
+    // 65535 is accepted.
+    //
+    // The same number is reused as the per-patch-table ceiling, but not for the
+    // reason it looks like: a fixup is not one per instruction. A single helper
+    // call emits three jump fixups, so roughly 21,800 helper calls cross the
+    // ceiling in a program comfortably inside the instruction limit. See
+    // `patch::MAX_JUMPS`.
     assert_eq!(MAX_INSTS, 65536);
 
     // Helper indices run 0..64, which is what makes the helper address table a

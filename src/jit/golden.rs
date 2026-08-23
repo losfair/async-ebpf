@@ -64,7 +64,12 @@ impl Hasher {
   }
 
   fn finish(self) -> String {
-    self.0.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    self
+      .0
+      .finalize()
+      .iter()
+      .map(|b| format!("{b:02x}"))
+      .collect()
   }
 }
 
@@ -95,7 +100,9 @@ pub fn updating() -> bool {
 /// ASYNC_EBPF_UPDATE_GOLDENS=prune cargo test --features testing
 /// ```
 pub fn pruning() -> bool {
-  std::env::var("ASYNC_EBPF_UPDATE_GOLDENS").map(|v| v == "prune").unwrap_or(false)
+  std::env::var("ASYNC_EBPF_UPDATE_GOLDENS")
+    .map(|v| v == "prune")
+    .unwrap_or(false)
 }
 
 fn golden_path(target: Target) -> std::path::PathBuf {
@@ -235,7 +242,6 @@ pub fn key(label: &str, config: &Config, code: &[u8], inputs: &TranslationInputs
   h.update(&[
     config.native_frame_base as u8,
     config.frame_constants as u8,
-    config.bounds_check as u8,
     config.dispatcher.is_some() as u8,
     config.local_call_resolver.is_some() as u8,
   ]);
@@ -399,7 +405,12 @@ impl SweepDigest {
 
   /// Compares the accumulated digest against its golden, or records it.
   pub fn finish(self, label: &str, target: Target) {
-    let digest = format!("{}:{}:{}", self.cases, self.translated, self.hasher.finish());
+    let digest = format!(
+      "{}:{}:{}",
+      self.cases,
+      self.translated,
+      self.hasher.finish()
+    );
     let k = format!("sweep.{label}");
     let mut guard = lock(store(target));
     guard.seen.insert(k.clone());
@@ -512,8 +523,20 @@ mod tests {
     use crate::jit::isa::{opcode, Insn};
     // A jump past the end of the program: refused at load, not at translation.
     let code = Insn::encode_all(&[
-      Insn { opcode: opcode::JA, dst: 0, src: 0, offset: 99, imm: 0 },
-      Insn { opcode: opcode::EXIT, dst: 0, src: 0, offset: 0, imm: 0 },
+      Insn {
+        opcode: opcode::JA,
+        dst: 0,
+        src: 0,
+        offset: 99,
+        imm: 0,
+      },
+      Insn {
+        opcode: opcode::EXIT,
+        dst: 0,
+        src: 0,
+        offset: 0,
+        imm: 0,
+      },
     ]);
     let config = Config::default();
     let err = match Translator::load(std::sync::Arc::new(config.clone()), &code) {
@@ -536,7 +559,11 @@ mod tests {
     );
 
     // And `check` reports it as not translated, whichever mode it is in.
-    let inputs = TranslationInputs { start_pc: 0, end_pc: 2, ..Default::default() };
+    let inputs = TranslationInputs {
+      start_pc: 0,
+      end_pc: 2,
+      ..Default::default()
+    };
     assert!(super::translate_one(&config, &code, &inputs, 4096).is_none());
   }
 
@@ -549,7 +576,10 @@ mod tests {
     assert_ne!(ok, failed);
     assert_ne!(oos, failed);
     // Different messages are distinguishable, so an error-text regression shows.
-    assert_ne!(failed, outcome_digest(&Err(TranslateError::Failed("bang".into()))));
+    assert_ne!(
+      failed,
+      outcome_digest(&Err(TranslateError::Failed("bang".into())))
+    );
     // And an empty success is not the same as a failure.
     assert_ne!(outcome_digest(&Ok(vec![])), oos);
   }

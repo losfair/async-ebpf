@@ -2229,7 +2229,6 @@ mod tests {
         Config {
           pointer_mask: 0,
           pointer_offset: 0,
-          bounds_check: true,
           ..base.clone()
         },
       ),
@@ -2238,7 +2237,6 @@ mod tests {
         Config {
           pointer_mask: 0x0fff_ffff,
           pointer_offset: 0x1_0000_0000,
-          bounds_check: false,
           ..base.clone()
         },
       ),
@@ -2247,7 +2245,6 @@ mod tests {
         Config {
           pointer_mask: 0x0fff_ffff,
           pointer_offset: 0x1_0000_0000,
-          bounds_check: false,
           native_frame_base: true,
           ..base.clone()
         },
@@ -2257,7 +2254,6 @@ mod tests {
         Config {
           pointer_mask: 0x0fff_ffff,
           pointer_offset: 0x1_0000_0000,
-          bounds_check: false,
           frame_constants: true,
           ..base.clone()
         },
@@ -2268,7 +2264,6 @@ mod tests {
         Config {
           pointer_mask: 0x0fff_ffff,
           pointer_offset: 0x1_0000_0000,
-          bounds_check: false,
           native_frame_base: true,
           frame_constants: true,
           ..base.clone()
@@ -2279,7 +2274,6 @@ mod tests {
         Config {
           pointer_mask: 0x0fff_ffff,
           pointer_offset: 0x1_0000_0000,
-          bounds_check: false,
           native_frame_base: true,
           frame_constants: true,
           unwind_helper_index: Some(3),

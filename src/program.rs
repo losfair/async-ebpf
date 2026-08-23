@@ -1823,9 +1823,9 @@ impl Program {
 /// The JIT configuration this runtime always uses.
 ///
 /// Built once, so the settings that only make sense together cannot drift
-/// apart. `bounds_check` is off because the pointer cage already bounds every
-/// guest access, and `native_frame_base`/`frame_constants` are on because both
-/// entry trampolines above establish exactly the frame the backend expects.
+/// apart: `native_frame_base` and `frame_constants` are on because both entry
+/// trampolines above establish exactly the frame the backend expects, and
+/// neither means anything without the pointer cage.
 fn jit_config(cage: &PointerCage) -> crate::jit::Config {
   crate::jit::Config {
     target: crate::jit::Target::host(),
@@ -1834,7 +1834,6 @@ fn jit_config(cage: &PointerCage) -> crate::jit::Config {
     // Both entry trampolines establish the frame these describe.
     native_frame_base: true,
     frame_constants: true,
-    bounds_check: false,
     dispatcher: Some(tls_dispatcher),
     dispatcher_validate: Some(std_validator),
     unwind_helper_index: None,

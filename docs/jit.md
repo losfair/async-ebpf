@@ -1,56 +1,61 @@
 # Lazy per-function JIT design
 
-## Goal
+## What this describes
 
-`async-ebpf` currently JIT-compiles every executable ELF section during
-`ProgramLoader::load`. The target design is to make loading validate and prepare
-metadata only, then JIT-compile individual eBPF functions on first execution.
+`async-ebpf` does not JIT-compile a program at load time. `ProgramLoader::load`
+validates the image and prepares metadata; individual eBPF functions are
+translated to native code the first time they are executed, and are specialized
+by the pointer-region tags known at the call site that reached them.
 
-The code cache should be a single large native-code arena:
+This document describes that design and the reasoning behind it. The JIT itself
+lives in `src/jit`; see `src/jit/mod.rs` for its interface.
 
-- allocate one code region up front with guard pages;
-- keep unused code pages `PROT_NONE`;
-- append generated function variants into the region;
-- temporarily make pages writable while emitting or patching code;
-- flip emitted pages to `PROT_READ | PROT_EXEC`;
-- never leave pages writable and executable at the same time.
+The code cache is a single large native-code arena:
 
-Function code should be specialized by the pointer-region tags known at a
-particular call site. The important tags are stack, data, scalar, unknown, and
-uninitialized, matching the region-analysis model.
+- one code region is allocated up front, with `PROT_NONE` guard pages on each
+  side and a randomized guard size;
+- unused code pages stay `PROT_NONE`;
+- generated function variants are appended into the region;
+- pages are made writable only while emitting or patching code;
+- emitted pages are flipped to `PROT_READ | PROT_EXEC`;
+- pages are never writable and executable at the same time.
+
+Function code is specialized by the pointer-region tags known at a particular
+call site. The tags are stack, data, scalar, unknown, and uninitialized, matching
+the region-analysis model in `src/region_analysis.rs`.
 
 ## Load-time work
 
-Loading should still perform the work that is independent of the eventual
+Loading performs only the work that is independent of the eventual
 specialization:
 
 1. Allocate the pointer cage.
 2. Copy the ELF into the data region.
 3. Relocate the ELF.
 4. Freeze the data region.
-5. Run uBPF validation for each executable section.
+5. Validate each executable section (`jit::Translator::load`).
 6. Run shared local-function layout validation.
 7. Allocate the native code arena as `PROT_NONE`.
 8. Store per-section metadata, but do not translate eBPF to native code.
 
-Loading must not perform strict region validation. Local functions are
-polymorphic over their incoming pointer tags, so an access that is unroutable
+Loading deliberately does *not* perform strict region validation. Local functions
+are polymorphic over their incoming pointer tags, so an access that is unroutable
 from a section-wide or default entry state may be routable for a concrete local
-call specialization. Strict region validation happens only when compiling a
-specific function variant.
+call specialization. Strict region validation therefore happens only when
+compiling a specific function variant, which is also why
+`ProgramLoader::require_static_region_analysis` is a per-variant guarantee rather
+than a load-time one.
 
-The existing `validate_local_call_graph` logic in `src/linker.rs` should be
-extracted into a reusable function-layout pass. `region_analysis` currently
-walks local-call CFG edges, but the reusable boundary/range logic lives in the
-linker validation path. The new pass should produce a single source of truth for
-validation, region analysis, and function-granular JIT.
-
-Suggested shape:
+The function-layout pass lives in `src/function_analysis.rs` and is the single
+source of truth shared by validation, region analysis, and the function-granular
+JIT. `src/linker.rs` calls into it rather than carrying its own copy of the
+boundary and range logic.
 
 ```rust
 struct FunctionLayout {
   functions: Vec<FunctionInfo>,
   pc_to_func: Vec<usize>,
+  arg_masks: Vec<RegMask>,
 }
 
 struct FunctionInfo {
@@ -61,70 +66,80 @@ struct FunctionInfo {
 }
 ```
 
-The pass should also retain the current guarantees:
+The pass enforces:
 
 - local-call targets must be function starts;
 - intra-function jumps and fallthrough must stay inside the function range;
 - recursion is rejected;
-- local-call depth remains bounded.
+- local-call depth is bounded by `MAX_LOCAL_CALL_DEPTH`.
+
+The depth bound is load-bearing beyond the call graph itself: every local
+function is charged one fixed frame, so a bounded depth is what makes the guest
+stack window a fixed size and what justifies the unchecked frame-access window
+below `R10`.
 
 ## Runtime structures
 
-`Entrypoint` should become a lazy handle rather than a raw native pointer:
+An entrypoint is a lazy handle rather than a raw native pointer. Per section:
 
 ```rust
 struct Section {
-  name: String,
+  translator: jit::Translator,
   code_vaddr: usize,
   code_len: usize,
   layout: FunctionLayout,
-  variants: Vec<FunctionVariants>,
+  functions: Vec<FunctionState>,
 }
 
-struct FunctionVariants {
-  by_signature: HashMap<PointerSignature, CompiledFunction>,
+struct FunctionState {
+  compiled: HashMap<PointerSignature, FunctionCompilation>,
 }
 
-struct CompiledFunction {
-  ptr: usize,
-  len: usize,
-  signature: PointerSignature,
+enum FunctionCompilation {
+  Succeeded(Entrypoint),
+  Failed(RuntimeError),
 }
 ```
 
-`PointerSignature` should describe the callee's incoming register kinds. At a
-minimum this needs `R1` through `R5`, and it may include callee-saved registers
-if the analysis needs them for precision or soundness. `R10` is always stack.
+Failures are cached alongside successes, so a variant that does not compile is
+not retried on every call.
+
+`PointerSignature` describes the callee's incoming register kinds, one per eBPF
+register. `R10` is always stack.
 
 Because `Program::run` takes `&self`, compilation needs interior mutability.
-Programs are already pinned to one thread, so `RefCell` is a reasonable starting
-point unless the execution model later changes.
+Programs are pinned to one thread, so `RefCell` is enough.
 
 ## Region analysis
 
-Region analysis should become function-aware. Instead of one section-wide entry
-state, it should support:
+Region analysis is function-aware:
 
 ```rust
-analyze_function(
+fn analyze_function(
   code: &[u8],
-  layout: &FunctionLayout,
-  function_index: usize,
+  start_pc: usize,
+  end_pc: usize,
   incoming: PointerSignature,
   data_lo: u64,
   data_hi: u64,
+  layout: &FunctionLayout,
 ) -> FunctionRegionAnalysis
 ```
 
-The analysis result should include:
+The result carries:
 
 - per-instruction region hints for the function's instruction range;
-- unresolved memory accesses for strict static-region mode;
+- an access plan, grouping runs of accesses that share a base register;
+- unresolved memory accesses, for strict static-region mode;
 - outgoing register state at each local-call site.
 
+The hints and the plan are handed to the JIT as `jit::TranslationInputs`, and
+both are advisory: the backend re-derives every condition it can see for itself
+and falls back to a fully checked access whenever a hint or plan entry does not
+hold. A wrong analysis costs speed, not safety.
+
 The outgoing state at a local-call site determines the callee's specialization
-key. For example, the same callee may be compiled once for `R1=stack` and once
-for `R1=data`.
+key. The same callee may be compiled once for `R1=stack` and once for `R1=data`.
 
 The key is masked to the registers the callee can observe — those it may read
 before writing, transitively through its own callees (`function_live_in`). A
@@ -141,14 +156,14 @@ For a section entrypoint, the initial signature is:
 
 ## Local-call resolver stubs
 
-Local eBPF calls should use small native resolver stubs, not eager recursive
-compilation during parent compilation.
+Local eBPF calls go through resolver slots rather than being compiled eagerly
+along with their caller.
 
-The generated local-call sequence should call through a resolver slot:
+The generated local-call sequence calls through a resolver slot:
 
 1. The slot initially points at a resolver stub.
 2. The first execution enters the stub.
-3. The stub preserves the JIT's BPF register state and native call-frame
+3. The stub preserves the JIT's eBPF register state and native call-frame
    invariants.
 4. The stub yields out to Rust using the same coroutine/yielder mechanism used
    by external helpers.
@@ -159,39 +174,35 @@ The generated local-call sequence should call through a resolver slot:
 8. Later calls enter the same resolver host function, which returns the cached
    native callee pointer without suspending back to the runtime.
 
-This is similar to helper dispatch because it yields to the host, but it is not
-the same ABI as a helper call. A helper receives only `R1` through `R5` and
-returns a value in `R0`. A local function call must preserve the JIT's complete
-eBPF machine state and stack-frame bookkeeping, including callee-saved registers
-and frame-pointer behavior.
+This resembles helper dispatch in that it yields to the host, but it is not the
+same ABI. A helper receives only `R1` through `R5` and returns a value in `R0`. A
+local function call must preserve the JIT's complete eBPF machine state and
+stack-frame bookkeeping, including callee-saved registers and frame-pointer
+behavior. The resolver's return value — the callee's native code address —
+arrives in the host ABI return register, which the backend maps to eBPF `R0`, so
+the call sequence saves and restores `R0` around it.
 
-Suggested dispatch extension:
+Dispatch back to the host distinguishes the cases:
 
 ```rust
-enum DispatchKind {
-  Helper {
-    index: u32,
-    args: [u64; 5],
-  },
-  LazyLocalCall {
-    resolver_id: u32,
-  },
-  AsyncPreemption,
-  MemoryFault {
-    addr: usize,
-  },
+struct Dispatch {
+  async_preemption: bool,
+  memory_access_error: Option<usize>,
+  lazy_local_call: Option<u32>,
+
+  index: u32,
+  arg1: u64,
+  // ... arg2 ..= arg5
 }
 ```
 
-The current flat `Dispatch` struct can also be extended with an optional
-`lazy_local_call` field if that is less disruptive.
+## Why translation is function-granular
 
-## Why uBPF needs changes
+Handing the JIT a per-function slice of the section's bytecode is not enough on
+its own, which is why `jit::Translator::translate_range` takes a range into the
+whole program rather than a standalone buffer.
 
-Passing a per-function eBPF slice to the current `ubpf_load` and
-`ubpf_translate_ex` APIs is not enough for correct local functions.
-
-Slicing works only for a standalone leaf function:
+Slicing alone would work for a standalone leaf function:
 
 - internal PC-relative jumps remain valid after slicing;
 - relocated data pointers remain valid;
@@ -201,26 +212,30 @@ It does not work for general local functions:
 
 - local-call immediates target PCs in the original section, so they become
   invalid or out of bounds after slicing;
-- uBPF currently emits local calls as native calls inside one generated code
-  body and resolves them through `pc_locs`;
-- a separately translated slice has the public program ABI
-  `fn(ctx, mem_len, stack, stack_len)`, not the internal native ABI expected by
-  a local eBPF callee;
+- a local call compiled as a direct native call would have to point at code
+  that has not been generated yet, and may never be;
+- a slice translated as if it were a whole program is entered through the
+  program entry ABI, which is not the internal native ABI a local eBPF callee is
+  entered with;
 - the external-helper ABI cannot marshal the full eBPF register file or local
   stack-frame state.
 
-The smallest useful uBPF change is a function-granular translation mode:
+What the JIT provides instead:
 
-- translate only `[start_pc, end_pc)`;
-- use caller-provided region hints for that range;
-- reject or externalize any branch that leaves the function range;
-- emit local calls through caller-provided resolver slots;
-- keep uBPF's existing internal register mapping, prologue/epilogue, helper
-  dispatch, masked memory access, and stack-frame conventions.
+- translate only `[start_pc, end_pc)`, where the range must begin at pc 0 or at
+  a local function entry and end at a function boundary or the end of the
+  program;
+- consume caller-provided region hints and access plan for that range;
+- reject any branch that leaves the function range, rather than emitting a jump
+  to code that is not in this buffer;
+- emit local calls through caller-provided resolver ids;
+- keep one internal register mapping, prologue/epilogue, helper dispatch, masked
+  memory access, and stack-frame convention across all of the above, so that
+  separately compiled functions can call each other.
 
 ## Code arena and protection
 
-The native code arena should track:
+The native code arena tracks:
 
 - allocation base and guard sizes;
 - append offset;
@@ -228,57 +243,65 @@ The native code arena should track:
 - page size;
 - resolver ids and their owning call-site metadata.
 
-When emitting a function variant:
+Emitting a function variant:
 
 1. Reserve aligned space from the append pointer.
 2. `mprotect` the affected pages to `PROT_READ | PROT_WRITE`.
-3. Ask the function-granular uBPF JIT to write into the reserved range.
-4. Flush the instruction cache where required, especially on aarch64.
-5. `mprotect` the emitted pages to `PROT_READ | PROT_EXEC`.
+3. Translate the function's range into the reserved space.
+4. Flush the instruction cache where required — `jit::clear_instruction_cache`,
+   which is a real sequence on aarch64 and a no-op on x86_64.
+5. `mprotect` the emitted pages to `PROT_READ | PROT_EXEC`, and the rest of the
+   arena back to `PROT_NONE`.
 6. Advance the executable high-water mark.
 
-The current implementation does not patch generated call slots after the first
-call. It avoids repeated compilation by consulting the per-program function
-cache in the resolver host function. Direct slot patching can still be added
-later if the remaining host-call overhead matters.
+Generated call slots are not patched after the first call. Repeated compilation
+is avoided by consulting the per-program function cache in the resolver host
+function instead. Direct slot patching could still be added if the remaining
+host-call overhead matters.
 
 ## Signal and preemption handling
 
-`ACTIVE_JIT_CODE_ZONE` currently records the active entrypoint's native pointer
-range. With lazy per-function code, execution may move through multiple compiled
-function ranges and resolver stubs.
-
-The signal handlers should accept PCs anywhere in the generated-code arena's
-active executable span, not just the original entry function. Otherwise memory
-fault and async preemption handling may incorrectly fall through to the default
-signal handler while executing a lazily compiled callee.
+`ACTIVE_JIT_CODE_ZONE` records the whole code arena's range, not the active
+entrypoint's. With lazy per-function code, execution moves through multiple
+compiled function ranges and resolver stubs, so the signal handlers accept PCs
+anywhere in the arena's active executable span. Recording only the entry
+function's range would make memory-fault and async-preemption handling fall
+through to the default signal handler while executing a lazily compiled callee.
 
 ## Error behavior
 
-Errors that previously happened at load time may move to first execution:
+Errors that would otherwise happen at load time happen at first execution:
 
 - native code arena exhaustion;
 - function-specific translation failure;
 - strict static-region failure for a particular specialization;
 - architecture-specific branch/literal range failures.
 
-The public error should still be surfaced through `Program::run`, because that
-is the point where lazy compilation occurs.
+These are surfaced through `Program::run`, because that is the point where lazy
+compilation occurs.
 
-## Test plan
+Arena exhaustion is distinguished from an ordinary translation failure and is
+terminal for the whole program rather than for one function: the arena never
+shrinks, so nothing can be compiled after it runs out. It is reported against the
+configured code-size limit, so the message names the budget rather than the
+JIT's internal out-of-space condition.
 
-Add focused tests for:
+## Tests
 
-- loading does not JIT-translate every function;
-- first entrypoint execution compiles the entry function;
-- first local-call execution yields to the host and compiles the callee;
-- a second local call reuses the patched resolver slot;
-- one callee can have multiple variants for different pointer signatures;
-- strict static-region mode fails when a specialization still has unresolved
-  accesses;
-- code-size exhaustion is reported at first execution;
-- memory faults and async preemption work from lazily compiled callees;
-- behavior remains correct on x86_64 and aarch64.
+The behaviour specific to lazy, per-function, specialized compilation is
+exercised in `src/test/lazy_local_call.rs`:
 
-Existing runtime tests should continue to pass unchanged after the lazy JIT is
-complete.
+- the deepest accepted call chain fits alongside the largest calldata;
+- a lazy call leaks nothing into the callee's registers;
+- a branch-heavy function grows the patch tables without tripping their limits;
+- signature registers the callee cannot observe do not multiply
+  specializations, and observed ones do;
+- lazy compilation is charged to the caller's timeslice, and a compilation storm
+  does not starve the async runtime;
+- code-budget exhaustion names the budget, and is terminal for the program.
+
+`src/test/jit_limits.rs` covers the arena and per-section code-size ceilings;
+`src/test/entry_isolation.rs` covers what a lazily compiled callee can observe in
+its registers, including `R0` across the resolver; `src/test/preemption.rs`
+covers async preemption from inside a local-call loop. All of these run on both
+x86_64 and aarch64.
