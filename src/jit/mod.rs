@@ -34,6 +34,9 @@
 pub mod abi;
 pub mod isa;
 
+#[cfg(test)]
+mod audit;
+
 pub mod emit;
 pub mod patch;
 pub mod stack;

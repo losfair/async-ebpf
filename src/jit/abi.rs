@@ -7,9 +7,21 @@
 //! already carries a comment observing that if they ever drift, the symptom is a
 //! legitimate guest program aborting the process rather than taking a fault.
 //!
-//! This module is the single definition. Both emitters read it, the `JitMemory`
-//! layout assertions check against it, and the trampoline's `const` operands are
-//! derived from it. Nothing here may be changed without changing the trampoline.
+//! Both emitters read this module. The trampolines do not: their `global_asm!`
+//! blocks are raw string literals with hard-coded displacements, and
+//! `JitMemory`'s `offset_of` assertions use literals too. So this is the
+//! authority by convention, not by construction — editing a constant here
+//! produces no compile error in the trampoline that has to agree with it.
+//!
+//! `jit::audit::trampoline_contract` closes that gap from the other side: it
+//! reads `program.rs` with `include_str!` and asserts every displacement in both
+//! trampolines equals the value named here. That is a test rather than a type,
+//! so it is worth knowing it exists — a change here that the trampoline does not
+//! follow fails there and nowhere else.
+//!
+//! Making the trampolines take `const` operands would be the real fix and is
+//! left as a follow-up; it changes generated code, which this port deliberately
+//! does not.
 //!
 //! Both C backends define the same values; they are reproduced once here rather
 //! than per-architecture, and [`tests`] asserts the two stay in agreement.

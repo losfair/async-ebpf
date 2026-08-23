@@ -3492,4 +3492,1384 @@ mod tests {
       }
     }
   }
+
+  // -------------------------------------------------------------------------
+  // AUDIT: probes added by the adversarial audit.
+  // -------------------------------------------------------------------------
+
+  /// AUDIT: a small buffer combined with a *rejected* program. This shape
+  /// passes; the one that does not is
+  /// `audit_a_full_buffer_masks_a_later_error` below.
+  #[test]
+  fn audit_capacity_sweep_with_an_escaping_jump() {
+    // NOTE: this program is refused by `validate` (a jump may not leave its own
+    // sub-program), so the backend's own translation-range guard is never
+    // reached through the loader - it is defence in depth only.
+    let insns = vec![
+      insn(opcode::CALL, 0, 1, 0, 1),
+      exit(),
+      insn(cls::JMP | srcbit::REG | jmp::JEQ, 1, 10, -3, 0),
+      exit(),
+    ];
+    let ids = [5u32; 4];
+    let code = Insn::encode_all(&insns);
+    let inputs = TranslationInputs {
+      resolver_ids: &ids,
+      start_pc: 2,
+      end_pc: 4,
+      ..Default::default()
+    };
+    for (name, config) in config_sweep(Target::Aarch64) {
+      for capacity in 0usize..64 {
+        let d = diff(&config, &code, &inputs, capacity);
+        assert!(d.is_same(), "capacity {capacity} under {name:?}\n{d}");
+      }
+    }
+  }
+
+  /// AUDIT FINDING 1 (fails): `JitState::fail` keeps the *first* failure, but
+  /// the C assigns `state->jit_status` directly, so the *last* assignment wins.
+  ///
+  /// When the per-function prologue overruns the buffer (`NotEnoughSpace`) and
+  /// the same instruction then hits an error arm, the C's status is overwritten
+  /// and it reports the instruction error; this port keeps `NotEnoughSpace` and
+  /// reports `OutOfSpace`. The two are not interchangeable: the caller's code
+  /// arena treats `OutOfSpace` as terminal for the whole program and a `Failed`
+  /// as terminal for one function.
+  ///
+  /// Reachable through the loader: pc2 is a local function entry (the target of
+  /// the call at pc0) *and* a local call with no resolver id, so the guard in
+  /// `emit_lazy_local_call` fires after the prologue has already been emitted.
+  #[test]
+  fn audit_a_full_buffer_masks_a_later_error() {
+    let insns = vec![
+      insn(opcode::CALL, 0, 1, 0, 1),
+      exit(),
+      insn(opcode::CALL, 0, 1, 0, -3),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let inputs = TranslationInputs {
+      start_pc: 2,
+      end_pc: 4,
+      ..Default::default()
+    };
+    for (name, config) in config_sweep(Target::Aarch64) {
+      for capacity in 0usize..=64 {
+        let d = diff(&config, &code, &inputs, capacity);
+        assert!(d.is_same(), "capacity {capacity} under {name:?}\n{d}");
+      }
+    }
+  }
+
+  /// AUDIT: report (do not assert) every disagreement, so one run surfaces all.
+  fn audit_report(
+    what: &str,
+    insns: &[Insn],
+    inputs: &TranslationInputs<'_>,
+    bad: &mut Vec<String>,
+  ) {
+    if std::env::var("AUDIT_VERBOSE").is_ok() {
+      let code0 = Insn::encode_all(insns);
+      let cap0 = 262144.max(insns.len() * 512);
+      let (n0, c0) = config_sweep(Target::Aarch64).into_iter().next().unwrap();
+      println!("  [{what}] {n0}: {}", diff(&c0, &code0, inputs, cap0));
+    }
+    let code = Insn::encode_all(insns);
+    let capacity = 262144.max(insns.len() * 512);
+    for (name, config) in config_sweep(Target::Aarch64) {
+      let d = diff(&config, &code, &inputs.clone(), capacity);
+      match &d {
+        Diff::Same { .. } => {}
+        Diff::SameError(_) => {}
+        _ => bad.push(format!("DISAGREE {what} under {name}: {d}")),
+      }
+    }
+  }
+
+  #[test]
+  fn audit_probe_batch() {
+    let mut bad: Vec<String> = Vec::new();
+
+    // --- B: extreme load/store offsets -------------------------------------
+    for &off in &[
+      i16::MIN,
+      -32767,
+      -4097,
+      -4096,
+      -4095,
+      -257,
+      -256,
+      -255,
+      -1,
+      0,
+      1,
+      255,
+      256,
+      257,
+      4095,
+      4096,
+      4097,
+      32766,
+      i16::MAX,
+    ] {
+      let mut p = Vec::new();
+      for sz in [size::B, size::H, size::W, size::DW] {
+        p.push(insn(cls::LDX | mode::MEM | sz, 1, 2, off, 0));
+        p.push(insn(cls::STX | mode::MEM | sz, 1, 2, off, 0));
+        p.push(insn(cls::ST | mode::MEM | sz, 1, 0, off, 0x1234));
+        p.push(insn(cls::LDX | mode::MEM | sz, 1, 10, off, 0));
+        p.push(insn(cls::STX | mode::MEM | sz, 10, 1, off, 0));
+      }
+      for sz in [size::B, size::H, size::W] {
+        p.push(insn(cls::LDX | mode::MEMSX | sz, 1, 2, off, 0));
+      }
+      p.push(exit());
+      let n = p.len();
+      for hint in [0u8, 1, 2, 3] {
+        let hints = vec![hint; n];
+        audit_report(
+          &format!("offset {off} hint {hint}"),
+          &p,
+          &TranslationInputs {
+            hints: &hints,
+            ..plain_inputs(n)
+          },
+          &mut bad,
+        );
+      }
+    }
+
+    // --- I: extreme atomic offsets -----------------------------------------
+    for &off in &[i16::MIN, -4096, -256, -1, 0, 4095, 4096, i16::MAX] {
+      let mut p = Vec::new();
+      for op in [opcode::ATOMIC32_STORE, opcode::ATOMIC_STORE] {
+        for imm in [
+          alu::ADD as i32,
+          alu::ADD as i32 | atomic::OP_FETCH,
+          atomic::OP_XCHG,
+          atomic::OP_CMPXCHG,
+        ] {
+          p.push(insn(op, 1, 2, off, imm));
+        }
+      }
+      p.push(exit());
+      let n = p.len();
+      audit_report(
+        &format!("atomic offset {off}"),
+        &p,
+        &plain_inputs(n),
+        &mut bad,
+      );
+    }
+
+    // --- D: call immediates outside 0..64 ----------------------------------
+    for &idx in &[-1i32, i32::MIN, i32::MAX, 64, 65, 1000, 0x7fff_ffff] {
+      let p = vec![insn(opcode::CALL, 0, 0, 0, idx), exit()];
+      audit_report(&format!("call imm {idx}"), &p, &plain_inputs(2), &mut bad);
+    }
+
+    // --- F: region hints outside 0..=3 -------------------------------------
+    for &hint in &[4u8, 5, 100, 255] {
+      let p = vec![
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+        insn(cls::LDX | mode::MEM | size::DW, 1, 10, -8, 0),
+        insn(cls::STX | mode::MEM | size::DW, 10, 1, -8, 0),
+        exit(),
+      ];
+      let hints = vec![hint; 4];
+      audit_report(
+        &format!("hint {hint}"),
+        &p,
+        &TranslationInputs {
+          hints: &hints,
+          ..plain_inputs(4)
+        },
+        &mut bad,
+      );
+    }
+
+    assert!(
+      bad.is_empty(),
+      "{} disagreements:\n{}",
+      bad.len(),
+      bad.join("\n")
+    );
+  }
+
+  /// AUDIT: the existing fuzzer draws offsets, plan deltas, spans, lo bounds
+  /// and leader_pcs from small hand-picked sets. This one draws from the whole
+  /// domain of each field, including the values a hostile embedder could pass.
+  #[test]
+  fn audit_wide_randomised_plans_and_offsets() {
+    let seed = env_u64("AUDIT_SEED", 0xdead_beef_1234_5678);
+    let count = env_u64("AUDIT_N", 500) as usize;
+    let mut rng = Rng(seed);
+    let mut translated = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+
+    const WIDE_OFFSETS: [i16; 16] = [
+      i16::MIN,
+      -32767,
+      -4097,
+      -4096,
+      -4095,
+      -257,
+      -256,
+      -255,
+      -1,
+      0,
+      1,
+      255,
+      256,
+      4095,
+      4096,
+      i16::MAX,
+    ];
+
+    for _ in 0..count {
+      let len = 3 + rng.below(10);
+      let mut program: Vec<Insn> = Vec::new();
+      while program.len() < len - 1 {
+        let mut next = random_insn(&mut rng);
+        if is_conditional_jump(&next) {
+          next.offset = 0;
+        }
+        // Widen the offsets the memory instructions carry.
+        let class = next.opcode & cls::MASK;
+        if class == cls::LDX || class == cls::STX || class == cls::ST {
+          next.offset = rng.pick(&WIDE_OFFSETS);
+        }
+        program.push(next);
+      }
+      program.push(exit());
+      let n = program.len();
+
+      let hints: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+      let plan: Vec<PlanEntry> = (0..n)
+        .map(|_| PlanEntry {
+          role: if rng.below(4) == 0 {
+            rng.next() as u8
+          } else {
+            rng.below(3) as u8
+          },
+          region: if rng.below(4) == 0 {
+            rng.next() as u8
+          } else {
+            rng.below(4) as u8
+          },
+          delta: if rng.below(3) == 0 {
+            rng.next() as u16
+          } else {
+            rng.pick(&[0u16, 1, 4, 8, 255, 256, 4088, 4095, 4096])
+          },
+          span: if rng.below(3) == 0 {
+            rng.next() as u32
+          } else {
+            rng.pick(&[0u32, 1, 2, 3, 4, 8, 9, 16, 4095, 4096, 4097, u32::MAX])
+          },
+          lo: if rng.below(3) == 0 {
+            rng.next() as i32
+          } else {
+            rng.pick(&[
+              0i32,
+              8,
+              -8,
+              255,
+              -32768,
+              32767,
+              -32769,
+              32768,
+              i32::MIN,
+              i32::MAX,
+            ])
+          },
+          leader_pc: if rng.below(3) == 0 {
+            rng.next() as u32
+          } else {
+            rng.below(n + 2) as u32
+          },
+        })
+        .collect();
+
+      let inputs = TranslationInputs {
+        hints: &hints,
+        plan: &plan,
+        resolver_ids: &[],
+        start_pc: 0,
+        end_pc: n,
+      };
+      let code = Insn::encode_all(&program);
+      for (name, config) in config_sweep(Target::Aarch64) {
+        let d = diff(&config, &code, &inputs, 262144);
+        match &d {
+          Diff::Same { .. } => translated += 1,
+          Diff::SameError(_) => {}
+          _ => bad.push(format!(
+            "{name}: {d}\n  program: {program:?}\n  plan: {plan:?}\n  hints: {hints:?}"
+          )),
+        }
+        if !bad.is_empty() {
+          break;
+        }
+      }
+      if !bad.is_empty() {
+        break;
+      }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(
+      translated > 100,
+      "only {translated} translations produced code"
+    );
+  }
+
+  /// AUDIT: well-formed groups at every boundary of span/delta/lo/width.
+  #[test]
+  fn audit_group_boundaries() {
+    let mut bad: Vec<String> = Vec::new();
+
+    let widths = [(size::B, 1i32), (size::H, 2), (size::W, 4), (size::DW, 8)];
+
+    // span exactly equal to the width (the precomputed-span slots), and spans
+    // that are not one of 1/2/4/8 (the narrowed width-1 span).
+    for (szbits, w) in widths {
+      for span in [w as u32, w as u32 + 1, 3, 5, 8, 9, 16, 255, 256, 4095, 4096] {
+        if span < w as u32 {
+          continue;
+        }
+        for lo in [0i32, 8, -8, -32768, 32767 - 4096] {
+          let deltas: Vec<u32> = vec![0, 255, 256, span.saturating_sub(w as u32)];
+          for d in deltas {
+            if d + w as u32 > span {
+              continue;
+            }
+            let second = lo as i64 + d as i64;
+            if !(i16::MIN as i64..=i16::MAX as i64).contains(&second) {
+              continue;
+            }
+            let insns = vec![
+              insn(cls::LDX | mode::MEM | size::DW, 1, 2, lo as i16, 0),
+              insn(cls::LDX | mode::MEM | szbits, 3, 2, second as i16, 0),
+              exit(),
+            ];
+            let plan = vec![
+              leader(abi::region::STACK, lo, 0, span, 0),
+              member(abi::region::STACK, lo, d as u16, 0),
+              none_entry(),
+            ];
+            // The leader's own access must fit its window too, or it is refused
+            // - which is itself worth checking, so do not skip it.
+            audit_report(
+              &format!("group span {span} delta {d} lo {lo} width {w}"),
+              &insns,
+              &TranslationInputs {
+                plan: &plan,
+                ..plain_inputs(3)
+              },
+              &mut bad,
+            );
+          }
+        }
+      }
+    }
+    assert!(
+      bad.is_empty(),
+      "{} disagreements:\n{}",
+      bad.len(),
+      bad.join("\n")
+    );
+  }
+
+  /// AUDIT: plan shapes the existing hostile-plan table does not name.
+  #[test]
+  fn audit_more_hostile_plans() {
+    let mut bad: Vec<String> = Vec::new();
+    let g = two_access_group(0, 8);
+
+    let cases: Vec<(&str, Vec<PlanEntry>)> = vec![
+      (
+        "member names itself as leader",
+        vec![
+          leader(abi::region::STACK, 0, 0, 16, 0),
+          member(abi::region::STACK, 0, 8, 1),
+          none_entry(),
+        ],
+      ),
+      (
+        "member names a leader ahead of it",
+        vec![
+          leader(abi::region::STACK, 0, 0, 16, 0),
+          member(abi::region::STACK, 0, 8, 2),
+          none_entry(),
+        ],
+      ),
+      (
+        "member names leader_pc u32::MAX",
+        vec![
+          leader(abi::region::STACK, 0, 0, 16, 0),
+          member(abi::region::STACK, 0, 8, u32::MAX),
+          none_entry(),
+        ],
+      ),
+      (
+        "no leader at all, member names u32::MAX",
+        vec![
+          none_entry(),
+          member(abi::region::STACK, 0, 8, u32::MAX),
+          none_entry(),
+        ],
+      ),
+      (
+        "leader with role 3",
+        vec![
+          PlanEntry {
+            role: 3,
+            ..leader(abi::region::STACK, 0, 0, 16, 0)
+          },
+          member(abi::region::STACK, 0, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "member with role 255",
+        vec![
+          leader(abi::region::STACK, 0, 0, 16, 0),
+          PlanEntry {
+            role: 255,
+            ..member(abi::region::STACK, 0, 8, 0)
+          },
+          none_entry(),
+        ],
+      ),
+      (
+        "leader region 255",
+        vec![leader(255, 0, 0, 16, 0), member(255, 0, 8, 0), none_entry()],
+      ),
+      (
+        "leader span u32::MAX",
+        vec![
+          leader(abi::region::STACK, 0, 0, u32::MAX, 0),
+          member(abi::region::STACK, 0, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "leader delta 65535",
+        vec![
+          PlanEntry {
+            delta: 65535,
+            ..leader(abi::region::STACK, 0, 0, 4096, 0)
+          },
+          member(abi::region::STACK, 0, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "member delta 65535",
+        vec![
+          leader(abi::region::STACK, 0, 0, 4096, 0),
+          PlanEntry {
+            delta: 65535,
+            ..member(abi::region::STACK, 0, 8, 0)
+          },
+          none_entry(),
+        ],
+      ),
+      (
+        "leader lo i32::MIN",
+        vec![
+          leader(abi::region::STACK, i32::MIN, 0, 16, 0),
+          member(abi::region::STACK, i32::MIN, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "leader lo i32::MAX",
+        vec![
+          leader(abi::region::STACK, i32::MAX, 0, 16, 0),
+          member(abi::region::STACK, i32::MAX, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "leader lo 32768, one past the offset field",
+        vec![
+          leader(abi::region::STACK, 32768, 0, 16, 0),
+          member(abi::region::STACK, 32768, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "leader lo -32769, one past the offset field",
+        vec![
+          leader(abi::region::STACK, -32769, 0, 16, 0),
+          member(abi::region::STACK, -32769, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "leader span exactly MAX_GROUP_SPAN",
+        vec![
+          leader(abi::region::STACK, 0, 0, abi::MAX_GROUP_SPAN, 0),
+          member(abi::region::STACK, 0, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "member reaches exactly to the end of the window",
+        vec![
+          leader(abi::region::STACK, 0, 0, 16, 0),
+          member(abi::region::STACK, 0, 8, 0),
+          none_entry(),
+        ],
+      ),
+      (
+        "member one byte past the window",
+        vec![
+          leader(abi::region::STACK, 0, 0, 15, 0),
+          member(abi::region::STACK, 0, 8, 0),
+          none_entry(),
+        ],
+      ),
+    ];
+
+    for (what, plan) in cases {
+      for hint in [0u8, 1, 2, 3] {
+        let hints = vec![hint; g.len()];
+        audit_report(
+          &format!("{what} hint {hint}"),
+          &g,
+          &TranslationInputs {
+            plan: &plan,
+            hints: &hints,
+            ..plain_inputs(g.len())
+          },
+          &mut bad,
+        );
+      }
+    }
+    assert!(
+      bad.is_empty(),
+      "{} disagreements:\n{}",
+      bad.len(),
+      bad.join("\n")
+    );
+  }
+
+  /// AUDIT: a leader whose access is also a frame access, and a group crossing
+  /// a `lddw` (whose second slot the loop skips).
+  #[test]
+  fn audit_group_interactions() {
+    let mut bad: Vec<String> = Vec::new();
+
+    // The frame fast path preempts the plan entirely.
+    {
+      let insns = vec![
+        insn(cls::LDX | mode::MEM | size::DW, 1, 10, -8, 0),
+        insn(cls::LDX | mode::MEM | size::DW, 3, 10, 0, 0),
+        exit(),
+      ];
+      let plan = vec![
+        leader(abi::region::STACK, -8, 0, 16, 0),
+        member(abi::region::STACK, -8, 8, 0),
+        none_entry(),
+      ];
+      for hint in [0u8, 1, 2, 3] {
+        let hints = vec![hint; 3];
+        audit_report(
+          &format!("frame-eligible leader hint {hint}"),
+          &insns,
+          &TranslationInputs {
+            plan: &plan,
+            hints: &hints,
+            ..plain_inputs(3)
+          },
+          &mut bad,
+        );
+      }
+    }
+
+    // A group spanning a `lddw`, whose high half the loop skips.
+    {
+      let insns = vec![
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+        insn(opcode::LDDW, 4, 0, 0, 0x1234_5678),
+        insn(0, 0, 0, 0, -1),
+        insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+        exit(),
+      ];
+      for lddw_dst in [4u8, 2u8] {
+        let mut insns = insns.clone();
+        insns[1].dst = lddw_dst;
+        let plan = vec![
+          leader(abi::region::STACK, 0, 0, 16, 0),
+          none_entry(),
+          none_entry(),
+          member(abi::region::STACK, 0, 8, 0),
+          none_entry(),
+        ];
+        audit_report(
+          &format!("group across a lddw writing r{lddw_dst}"),
+          &insns,
+          &TranslationInputs {
+            plan: &plan,
+            ..plain_inputs(5)
+          },
+          &mut bad,
+        );
+      }
+    }
+
+    // A forward `ja` whose target is the member, so the member is a barrier.
+    {
+      let insns = vec![
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+        insn(opcode::JA, 0, 0, 0, 0),
+        insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+        exit(),
+      ];
+      let plan = vec![
+        leader(abi::region::STACK, 0, 0, 16, 0),
+        none_entry(),
+        member(abi::region::STACK, 0, 8, 0),
+        none_entry(),
+      ];
+      audit_report(
+        "ja lands on the member",
+        &insns,
+        &TranslationInputs {
+          plan: &plan,
+          ..plain_inputs(4)
+        },
+        &mut bad,
+      );
+    }
+
+    // A group whose leader is the last instruction before `exit`.
+    {
+      let insns = vec![insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0), exit()];
+      let plan = vec![leader(abi::region::STACK, 0, 0, 16, 0), none_entry()];
+      audit_report(
+        "leader at the end of the range",
+        &insns,
+        &TranslationInputs {
+          plan: &plan,
+          ..plain_inputs(2)
+        },
+        &mut bad,
+      );
+    }
+
+    assert!(
+      bad.is_empty(),
+      "{} disagreements:\n{}",
+      bad.len(),
+      bad.join("\n")
+    );
+  }
+
+  /// AUDIT: a local function entry reached by *fall-through*.
+  ///
+  /// The validator requires every sub-program to end with `exit` or to carry an
+  /// unconditional jump as its second-to-last instruction - so the instruction
+  /// physically before a function entry can still fall through, and the
+  /// backend's "jump around the prologue" path is reachable after all. No
+  /// existing test reaches it.
+  #[test]
+  fn audit_fallthrough_into_a_local_function_entry() {
+    let mut bad: Vec<String> = Vec::new();
+    // pc0 calls pc3; pc1 is the unconditional jump that satisfies the
+    // validator; pc2 falls through into the function entry at pc3.
+    let insns = vec![
+      insn(opcode::CALL, 0, 1, 0, 2),
+      insn(opcode::JA, 0, 0, -2, 0),
+      insn(0xb7, 1, 0, 0, 7),
+      insn(0xb7, 2, 0, 0, 9),
+      exit(),
+    ];
+    let ids = [4u32; 5];
+    audit_report(
+      "fallthrough entry, whole program",
+      &insns,
+      &TranslationInputs {
+        resolver_ids: &ids,
+        ..plain_inputs(5)
+      },
+      &mut bad,
+    );
+    for (start, end) in [(0usize, 3usize), (3, 5)] {
+      audit_report(
+        &format!("fallthrough entry, range {start}..{end}"),
+        &insns,
+        &TranslationInputs {
+          resolver_ids: &ids,
+          start_pc: start,
+          end_pc: end,
+          ..Default::default()
+        },
+        &mut bad,
+      );
+    }
+
+    // The same shape with a group open across the boundary.
+    let plan = vec![
+      none_entry(),
+      none_entry(),
+      leader(abi::region::STACK, 0, 0, 16, 2),
+      member(abi::region::STACK, 0, 8, 2),
+      none_entry(),
+    ];
+    let insns2 = vec![
+      insn(opcode::CALL, 0, 1, 0, 2),
+      insn(opcode::JA, 0, 0, -2, 0),
+      insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+      insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+      exit(),
+    ];
+    audit_report(
+      "fallthrough entry with a group across it",
+      &insns2,
+      &TranslationInputs {
+        plan: &plan,
+        resolver_ids: &ids,
+        ..plain_inputs(5)
+      },
+      &mut bad,
+    );
+
+    assert!(
+      bad.is_empty(),
+      "{} disagreements:\n{}",
+      bad.len(),
+      bad.join("\n")
+    );
+  }
+
+  /// AUDIT: a region-hint array shorter than the program.
+  #[test]
+  fn audit_short_hint_array() {
+    let mut bad: Vec<String> = Vec::new();
+    let insns = vec![
+      insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+      insn(cls::LDX | mode::MEM | size::W, 1, 10, -8, 0),
+      insn(cls::STX | mode::MEM | size::B, 2, 1, -4, 0),
+      exit(),
+    ];
+    for n in 0..=4usize {
+      for fill in [0u8, 1, 2, 3] {
+        let hints = vec![fill; n];
+        audit_report(
+          &format!("hints len {n} fill {fill}"),
+          &insns,
+          &TranslationInputs {
+            hints: &hints,
+            ..plain_inputs(4)
+          },
+          &mut bad,
+        );
+      }
+    }
+    assert!(
+      bad.is_empty(),
+      "{} disagreements:\n{}",
+      bad.len(),
+      bad.join("\n")
+    );
+  }
+
+  /// AUDIT: the *backward* conditional-branch boundary. The existing test only
+  /// straddles it forwards.
+  #[test]
+  fn audit_a_backward_conditional_branch_straddling_one_mebibyte() {
+    let (_, config) = config_sweep(Target::Aarch64)
+      .into_iter()
+      .find(|(name, _)| *name == "cage only")
+      .unwrap();
+
+    // `mov r1, 0; <n fillers>; jeq r1, 0, -(n+1); exit`
+    let build = |n: usize| {
+      let mut p = vec![insn(0xb7, 1, 0, 0, 0)];
+      p.extend(std::iter::repeat(filler()).take(n));
+      p.push(insn(
+        cls::JMP | srcbit::IMM | jmp::JEQ,
+        1,
+        0,
+        -((n + 1) as i32) as i16,
+        0,
+      ));
+      p.push(exit());
+      p
+    };
+
+    let per = (rust_len(&config, &build(200)) - rust_len(&config, &build(100))) / 100;
+    assert!(per > 0);
+    let boundary = (1 << 20) / per;
+    assert!(
+      boundary + 2 < 32000,
+      "the offset field must reach the target"
+    );
+
+    let mut saw_success = false;
+    let mut saw_out_of_range = false;
+    for n in boundary - 2..=boundary + 2 {
+      let insns = build(n);
+      let code = Insn::encode_all(&insns);
+      let d = diff(
+        &config,
+        &code,
+        &plain_inputs(insns.len()),
+        (1 << 21) + (1 << 16),
+      );
+      match &d {
+        Diff::Same { .. } => saw_success = true,
+        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
+          saw_out_of_range = true
+        }
+        other => panic!("n = {n}: {other}"),
+      }
+    }
+    assert!(saw_success, "never fitted");
+    assert!(saw_out_of_range, "never overflowed");
+  }
+
+  /// AUDIT: the unwind helper emits a conditional branch to the epilogue, which
+  /// sits after all the code - a +-1 MiB reach the existing tests deliberately
+  /// avoid exercising ("call 0 is not the unwind index in any configuration").
+  #[test]
+  fn audit_the_unwind_branch_to_the_epilogue_straddles_one_mebibyte() {
+    let (_, config) = config_sweep(Target::Aarch64)
+      .into_iter()
+      .find(|(name, _)| *name == "production + unwind helper")
+      .unwrap();
+    assert_eq!(config.unwind_helper_index, Some(3));
+
+    let build = |n: usize| {
+      let mut p = vec![insn(opcode::CALL, 0, 0, 0, 3)];
+      p.extend(std::iter::repeat(filler()).take(n));
+      p.push(exit());
+      p
+    };
+
+    let per = (rust_len(&config, &build(200)) - rust_len(&config, &build(100))) / 100;
+    assert!(per > 0);
+    let boundary = (1 << 20) / per;
+
+    let mut saw_success = false;
+    let mut saw_out_of_range = false;
+    for n in boundary - 3..=boundary + 3 {
+      let insns = build(n);
+      let code = Insn::encode_all(&insns);
+      let d = diff(
+        &config,
+        &code,
+        &plain_inputs(insns.len()),
+        (1 << 21) + (1 << 16),
+      );
+      match &d {
+        Diff::Same { .. } => saw_success = true,
+        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
+          saw_out_of_range = true
+        }
+        other => panic!("n = {n}: {other}"),
+      }
+    }
+    assert!(saw_success, "never fitted");
+    assert!(saw_out_of_range, "never overflowed");
+  }
+
+  /// AUDIT: `is_simple_imm` in the C is a `switch` over *whole opcode bytes*;
+  /// the port rewrote it as a match on class + operation nibble. Enumerate all
+  /// 256 opcodes and report every byte where the two disagree, together with
+  /// whether that byte can reach the function at all.
+  #[test]
+  fn audit_is_simple_imm_matches_the_c_switch_byte_for_byte() {
+    // Transcription of the C's switch (ubpf_jit_arm64.c:1644-1709).
+    fn c_is_simple_imm(op: u8, imm: i32) -> bool {
+      const RANGED: [u8; 24] = [
+        0x04, 0x07, 0x14, 0x17, // ADD/SUB IMM, both widths
+        0x15, 0x25, 0x35, 0x55, 0x65, 0x75, 0xa5, 0xb5, 0xc5, 0xd5, // JMP  *_IMM
+        0x16, 0x26, 0x36, 0x56, 0x66, 0x76, 0xa6, 0xb6, 0xc6, 0xd6, // JMP32 *_IMM
+      ];
+      if RANGED.contains(&op) {
+        return imm >= 0 && imm < 0x1000;
+      }
+      matches!(op, 0xb4 | 0xb7) // MOV_IMM / MOV64_IMM
+    }
+
+    let mut disagree_reachable = Vec::new();
+    let mut disagree_gated = Vec::new();
+    for op in 0u8..=255 {
+      for imm in [-1i32, 0, 0x7ff, 0xfff, 0x1000, i32::MIN, i32::MAX] {
+        let i = insn(op, 1, 2, 0, imm);
+        let rust = is_simple_imm(&i);
+        let c = c_is_simple_imm(op, imm);
+        if rust == c {
+          continue;
+        }
+        // The function is only consulted for an instruction `is_imm_op` admits
+        // and that is not a bare MOV immediate.
+        let consulted = is_imm_op(&i) && !is_mov_imm(op);
+        // ...and only for an opcode the ISA actually defines, since anything
+        // else is refused at load.
+        let defined = Op::from_opcode(op).is_some();
+        if consulted && defined {
+          disagree_reachable.push((op, imm));
+        } else if consulted {
+          disagree_gated.push(op);
+        }
+      }
+    }
+    disagree_gated.sort_unstable();
+    disagree_gated.dedup();
+    println!(
+      "is_simple_imm: {} consulted-but-undefined opcodes disagree: {:02x?}",
+      disagree_gated.len(),
+      disagree_gated
+    );
+    assert!(
+      disagree_reachable.is_empty(),
+      "is_simple_imm disagrees with the C on defined, consulted opcodes: {disagree_reachable:02x?}"
+    );
+  }
+
+  /// AUDIT: the module doc says a `st` whose raw `src` nibble is 10 has the
+  /// guest frame pointer materialised over its immediate. Establish whether the
+  /// loader can produce such an instruction at all.
+  #[test]
+  fn audit_a_store_immediate_with_src_ten_is_refused_at_load() {
+    for sz in [size::B, size::H, size::W, size::DW] {
+      let insns = vec![insn(cls::ST | mode::MEM | sz, 1, 10, 0, 0x1234), exit()];
+      let code = Insn::encode_all(&insns);
+      for (name, config) in config_sweep(Target::Aarch64) {
+        let d = diff(&config, &code, &plain_inputs(2), 65536);
+        assert!(d.is_same(), "st src=10 under {name}: {d}");
+        assert!(
+          matches!(d, Diff::SameError(_)),
+          "st src=10 under {name} translated: {d}"
+        );
+      }
+    }
+  }
+
+  /// AUDIT: `le` with `imm == 64` must emit nothing at all.
+  #[test]
+  fn audit_le_sixty_four_emits_nothing() {
+    let (_, config) = config_sweep(Target::Aarch64)
+      .into_iter()
+      .find(|(name, _)| *name == "production")
+      .unwrap();
+    let base = rust_len(&config, &[insn(0xb7, 1, 0, 0, 0), exit()]);
+    let with_le = rust_len(
+      &config,
+      &[
+        insn(0xb7, 1, 0, 0, 0),
+        insn(opcode::LE, 1, 0, 0, 64),
+        exit(),
+      ],
+    );
+    assert_eq!(base, with_le, "le imm=64 emitted {} bytes", with_le - base);
+
+    // ...while `le 16`/`le 32` emit exactly one instruction, and `bswap 64`
+    // emits one too.
+    for (imm, want) in [(16i32, 4usize), (32, 4)] {
+      let n = rust_len(
+        &config,
+        &[
+          insn(0xb7, 1, 0, 0, 0),
+          insn(opcode::LE, 1, 0, 0, imm),
+          exit(),
+        ],
+      );
+      assert_eq!(n - base, want, "le imm={imm}");
+    }
+    let n = rust_len(
+      &config,
+      &[
+        insn(0xb7, 1, 0, 0, 0),
+        insn(opcode::BSWAP, 1, 0, 0, 64),
+        exit(),
+      ],
+    );
+    assert_eq!(n - base, 4, "bswap 64");
+  }
+
+  /// AUDIT: multi-function programs translated over ranges that *span several
+  /// functions*, with random hints and plans. The existing multi-function
+  /// fuzzer always passes empty hints and an empty plan, and always translates
+  /// exactly one function per range.
+  #[test]
+  fn audit_wide_multi_function_ranges_with_plans_and_hints() {
+    let seed = env_u64("AUDIT_SEED", 0x1357_9bdf_2468_ace0);
+    let count = env_u64("AUDIT_N", 400) as usize;
+    let mut rng = Rng(seed);
+    let mut translated = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+
+    for _ in 0..count {
+      let functions = 2 + rng.below(4);
+      let mut bounds = vec![0usize];
+      let mut program: Vec<Insn> = Vec::new();
+
+      let call_sites: Vec<usize> = (0..functions - 1).collect();
+      for _ in &call_sites {
+        program.push(insn(opcode::CALL, 0, 1, 0, 0));
+      }
+      for _ in 0..rng.below(5) {
+        let next = random_insn(&mut rng);
+        program.push(if is_conditional_jump(&next) {
+          Insn { offset: 0, ..next }
+        } else {
+          next
+        });
+      }
+      // Half the time the first function ends with a `ja` two slots from the
+      // end, so the next function entry is reached by fall-through too.
+      if rng.below(2) == 0 {
+        program.push(insn(opcode::JA, 0, 0, -1 - (program.len() as i16), 0));
+        program.push(insn(0xb7, 1, 0, 0, 3));
+      } else {
+        program.push(exit());
+      }
+
+      for _ in 1..functions {
+        bounds.push(program.len());
+        for _ in 0..rng.below(5) {
+          let next = random_insn(&mut rng);
+          program.push(if is_conditional_jump(&next) {
+            Insn { offset: 0, ..next }
+          } else {
+            next
+          });
+        }
+        program.push(exit());
+      }
+      bounds.push(program.len());
+
+      for (k, &site) in call_sites.iter().enumerate() {
+        program[site].imm = (bounds[k + 1] as i64 - site as i64 - 1) as i32;
+      }
+
+      let n = program.len();
+      let ids: Vec<u32> = (0..n).map(|_| rng.next() as u32).collect();
+      let hints: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+      let plan: Vec<PlanEntry> = (0..n)
+        .map(|_| PlanEntry {
+          role: rng.below(3) as u8,
+          region: rng.below(4) as u8,
+          delta: rng.pick(&[0u16, 4, 8, 255, 256, 4088, 4095]),
+          span: rng.pick(&[0u32, 1, 2, 4, 8, 16, 4095, 4096, 4097, u32::MAX]),
+          lo: rng.pick(&[0i32, 8, -8, 255, -32768, 32767, i32::MIN]),
+          leader_pc: rng.below(n + 2) as u32,
+        })
+        .collect();
+      let code = Insn::encode_all(&program);
+
+      // Every legal range: start at a boundary, end at any later boundary.
+      for a in 0..bounds.len() - 1 {
+        for b in a + 1..bounds.len() {
+          let inputs = TranslationInputs {
+            hints: &hints,
+            plan: &plan,
+            resolver_ids: &ids,
+            start_pc: bounds[a],
+            end_pc: bounds[b],
+          };
+          for (name, config) in config_sweep(Target::Aarch64) {
+            let d = diff(&config, &code, &inputs, 262144);
+            match &d {
+              Diff::Same { .. } => translated += 1,
+              Diff::SameError(_) => {}
+              _ => bad.push(format!(
+                "{name} range {}..{}: {d}\n  program: {program:?}\n  plan: {plan:?}\n  hints: {hints:?}",
+                bounds[a], bounds[b]
+              )),
+            }
+          }
+          if !bad.is_empty() {
+            break;
+          }
+        }
+        if !bad.is_empty() {
+          break;
+        }
+      }
+      if !bad.is_empty() {
+        break;
+      }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(
+      translated > 200,
+      "only {translated} translations produced code"
+    );
+  }
+
+  /// AUDIT FINDING 2 (fails): the patch-table ceilings do not match the C.
+  ///
+  /// `reserve_patchable_relatives` refuses to grow past `UBPF_MAX_INSTS`
+  /// (65536) entries, so the C reports "Too many jump instructions." on the
+  /// 65537th jump fixup. `patch.rs` sets `MAX_JUMPS` (and the other three) to
+  /// `1 << 20` while its doc comment claims they are "the same bounds the C
+  /// grew to". They are 16x too large.
+  ///
+  /// A `cmpxchg` emits two jump fixups, so 32769 of them cross the C's ceiling
+  /// while staying well inside the 65536-instruction program limit: the C
+  /// rejects the program and this port emits a megabyte of code for it.
+  ///
+  /// `patch.rs` is shared, so the x86_64 backend inherits the same gap.
+  #[test]
+  fn audit_the_patch_table_ceilings_match_the_c() {
+    let (_, config) = config_sweep(Target::Aarch64)
+      .into_iter()
+      .find(|(name, _)| *name == "no cage")
+      .unwrap();
+
+    let build = |n: usize| {
+      let mut p: Vec<Insn> =
+        std::iter::repeat(insn(opcode::ATOMIC_STORE, 1, 2, 0, atomic::OP_CMPXCHG))
+          .take(n)
+          .collect();
+      p.push(exit());
+      p
+    };
+
+    // 32768 cmpxchg is exactly 65536 fixups - the last one the C accepts.
+    // 32769 is one jump past it.
+    for n in [32768usize, 32769] {
+      let insns = build(n);
+      let code = Insn::encode_all(&insns);
+      let d = diff(&config, &code, &plain_inputs(insns.len()), 32 << 20);
+      assert!(d.is_same(), "{n} cmpxchg ({} jump fixups): {d}", n * 2);
+    }
+  }
+
+  /// AUDIT: every capacity from zero to just past the full output, for a
+  /// program that fills all four patch tables. The existing capacity test uses
+  /// six sizes and a two-instruction program, so it never lands inside the
+  /// epilogue, the dispatcher slot or the helper table - the places the port's
+  /// own comments call out as hazardous.
+  #[test]
+  fn audit_every_capacity_for_a_program_that_fills_the_patch_tables() {
+    let insns = vec![
+      insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+      insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+      insn(opcode::CALL, 0, 0, 0, 3),
+      insn(opcode::ATOMIC_STORE, 1, 2, 0, atomic::OP_CMPXCHG),
+      insn(cls::JMP | srcbit::IMM | jmp::JEQ, 1, 0, 1, 0),
+      insn(0xb7, 1, 0, 0, 1),
+      insn(opcode::JA, 0, 0, -3, 0),
+      exit(),
+    ];
+    let plan = vec![
+      leader(abi::region::STACK, 0, 0, 16, 0),
+      member(abi::region::STACK, 0, 8, 0),
+      none_entry(),
+      none_entry(),
+      none_entry(),
+      none_entry(),
+      none_entry(),
+      none_entry(),
+    ];
+    let hints = vec![1u8, 1, 0, 0, 0, 0, 0, 0];
+    let code = Insn::encode_all(&insns);
+    let inputs = TranslationInputs {
+      hints: &hints,
+      plan: &plan,
+      ..plain_inputs(insns.len())
+    };
+    for (name, config) in config_sweep(Target::Aarch64) {
+      let full = rust_len(&config, &insns);
+      for capacity in 0..full + 16 {
+        let d = diff(&config, &code, &inputs, capacity);
+        assert!(
+          d.is_same(),
+          "capacity {capacity}/{full} under {name:?}\n{d}"
+        );
+      }
+    }
+  }
+
+  /// AUDIT: every way the barrier pre-pass can close a group - the slot after a
+  /// jump/call/exit, a forward branch target, a backward branch target, and a
+  /// local function entry - with a leader/member pair straddling each.
+  #[test]
+  fn audit_every_barrier_source_closes_a_group() {
+    let mut bad: Vec<String> = Vec::new();
+    let ld = |dst: u8, off: i16| insn(cls::LDX | mode::MEM | size::DW, dst, 2, off, 0);
+
+    // leader; <separator>; member
+    let separators: Vec<(&str, Vec<Insn>)> = vec![
+      (
+        "conditional jump forward over the member",
+        vec![insn(cls::JMP | srcbit::IMM | jmp::JEQ, 1, 0, 1, 0)],
+      ),
+      (
+        "conditional jump onto the member",
+        vec![insn(cls::JMP | srcbit::IMM | jmp::JEQ, 1, 0, 0, 0)],
+      ),
+      ("ja onto the member", vec![insn(opcode::JA, 0, 0, 0, 0)]),
+      ("helper call", vec![insn(opcode::CALL, 0, 0, 0, 0)]),
+      (
+        "jmp32 conditional",
+        vec![insn(cls::JMP32 | srcbit::IMM | jmp::JNE, 1, 0, 0, 0)],
+      ),
+      ("plain alu, no barrier at all", vec![insn(0xb7, 4, 0, 0, 1)]),
+    ];
+
+    for (what, sep) in separators {
+      let mut insns = vec![ld(1, 0)];
+      insns.extend(sep.iter().copied());
+      insns.push(ld(3, 8));
+      insns.push(exit());
+      let n = insns.len();
+      let mut plan = vec![leader(abi::region::STACK, 0, 0, 16, 0)];
+      for _ in &sep {
+        plan.push(none_entry());
+      }
+      plan.push(member(abi::region::STACK, 0, 8, 0));
+      plan.push(none_entry());
+      assert_eq!(plan.len(), n);
+      audit_report(
+        what,
+        &insns,
+        &TranslationInputs {
+          plan: &plan,
+          ..plain_inputs(n)
+        },
+        &mut bad,
+      );
+    }
+
+    // A backward jump whose target is the member.
+    {
+      let insns = vec![
+        ld(1, 0),
+        ld(3, 8),
+        insn(cls::JMP | srcbit::IMM | jmp::JEQ, 1, 0, -2, 0),
+        exit(),
+      ];
+      let plan = vec![
+        leader(abi::region::STACK, 0, 0, 16, 0),
+        member(abi::region::STACK, 0, 8, 0),
+        none_entry(),
+        none_entry(),
+      ];
+      audit_report(
+        "backward branch target is the member",
+        &insns,
+        &TranslationInputs {
+          plan: &plan,
+          ..plain_inputs(4)
+        },
+        &mut bad,
+      );
+    }
+
+    // A local function entry between the two, inside one translation range.
+    {
+      let insns = vec![
+        insn(opcode::CALL, 0, 1, 0, 2),
+        insn(opcode::JA, 0, 0, -2, 0),
+        ld(1, 0),
+        ld(3, 8),
+        exit(),
+      ];
+      let plan = vec![
+        none_entry(),
+        none_entry(),
+        leader(abi::region::STACK, 0, 0, 16, 2),
+        member(abi::region::STACK, 0, 8, 2),
+        none_entry(),
+      ];
+      let ids = [7u32; 5];
+      audit_report(
+        "function entry lands on the member",
+        &insns,
+        &TranslationInputs {
+          plan: &plan,
+          resolver_ids: &ids,
+          ..plain_inputs(5)
+        },
+        &mut bad,
+      );
+    }
+
+    assert!(
+      bad.is_empty(),
+      "{} disagreements:\n{}",
+      bad.len(),
+      bad.join("\n")
+    );
+  }
+
+  /// AUDIT (informational): how far one eBPF instruction can expand, which
+  /// bounds whether the +-128 MiB unconditional-branch reach can be exceeded
+  /// inside the 65536-instruction program limit.
+  #[test]
+  fn audit_report_worst_case_expansion() {
+    let candidates: Vec<(&str, Insn)> = vec![
+      (
+        "ldxdw unknown region",
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, 4096, 0),
+      ),
+      (
+        "stxdw",
+        insn(cls::STX | mode::MEM | size::DW, 1, 2, 4096, 0),
+      ),
+      (
+        "stdw imm",
+        insn(cls::ST | mode::MEM | size::DW, 1, 0, 4096, i32::MIN),
+      ),
+      (
+        "atomic cmpxchg",
+        insn(opcode::ATOMIC_STORE, 1, 2, 4096, atomic::OP_CMPXCHG),
+      ),
+      ("helper call", insn(opcode::CALL, 0, 0, 0, 3)),
+      ("lddw", insn(opcode::LDDW, 1, 0, 0, 0x1234_5678)),
+    ];
+    let mut worst = 0usize;
+    for (name, config) in config_sweep(Target::Aarch64) {
+      for (what, i0) in &candidates {
+        let mut a = vec![insn(0xb7, 1, 0, 0, 0)];
+        let mut b = vec![insn(0xb7, 1, 0, 0, 0)];
+        for _ in 0..10 {
+          a.push(*i0);
+          b.push(*i0);
+          if i0.opcode == opcode::LDDW {
+            a.push(insn(0, 0, 0, 0, -1));
+            b.push(insn(0, 0, 0, 0, -1));
+          }
+        }
+        for _ in 0..10 {
+          b.push(*i0);
+          if i0.opcode == opcode::LDDW {
+            b.push(insn(0, 0, 0, 0, -1));
+          }
+        }
+        a.push(exit());
+        b.push(exit());
+        let per = (rust_len(&config, &b) - rust_len(&config, &a)) / 10;
+        if per > worst {
+          worst = per;
+          println!("worst so far: {per} bytes/insn for {what} under {name}");
+        }
+      }
+    }
+    let reach = worst * abi::MAX_INSTS as usize;
+    println!(
+      "worst-case expansion {worst} bytes/insn; {} instructions reach {} MiB",
+      abi::MAX_INSTS,
+      reach >> 20
+    );
+    // Which is why the 26-bit arm of `resolve_branch_immediate` can never fire
+    // for a loadable program, while the 19-bit arms (conditional branch, LDR
+    // literal, ADR) can and do - see the +-1 MiB tests above.
+    assert!(
+      reach < (128 << 20),
+      "a program can now exceed the +-128 MiB unconditional-branch reach; the \
+       26-bit relocation arm has become reachable and needs its own test"
+    );
+    assert!(reach > (1 << 20));
+  }
 }

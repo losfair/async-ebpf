@@ -1623,7 +1623,7 @@ impl Emit<'_, '_, '_> {
         TranslateError::Failed(self.errmsg.clone().unwrap_or_default())
       }
       other => other
-        .into_error()
+        .into_error(crate::jit::Target::X86_64)
         .unwrap_or(TranslateError::Failed(String::new())),
     }
   }
@@ -1745,8 +1745,20 @@ impl Emit<'_, '_, '_> {
         self.emit1(0x24);
         self.emit4(stack_usage as u32);
 
+        // Only measure a prologue that was actually emitted. Once the buffer
+        // has run out, the emits above are no-ops and `size` is a partial
+        // count, so recording or checking it here turns an ordinary
+        // out-of-space into a debug-assertion panic. That is reachable from any
+        // multi-function range - `Translator::translate_all`, and the test and
+        // fuzz surface - though not from the production loader, which always
+        // translates exactly one function.
+        //
+        // The C has the same assertion and the same hole; it aborts the process
+        // on these inputs rather than reporting out-of-space.
         let size = (self.offset() - prolog_start) as usize;
-        if self.st.prolog_size == 0 {
+        if !self.st.ok() {
+          // Nothing to record; the caller will report the failure.
+        } else if self.st.prolog_size == 0 {
           self.st.prolog_size = size;
         } else {
           debug_assert_eq!(self.st.prolog_size, size);
@@ -3463,28 +3475,34 @@ mod tests {
   // Adversarial audit additions
   // -----------------------------------------------------------------------
 
-  /// A two-function range, translated into every capacity from nothing up to
-  /// well past the second function's prologue.
+  /// FAILING — left in place, ignored, as a record of a real defect.
+  ///
+  /// A two-function range translated into a buffer that runs out *inside the
+  /// second function's per-function prologue* trips
+  /// `debug_assert_eq!(self.st.prolog_size, size)` in `emit_instructions`
+  /// instead of returning `TranslateError::OutOfSpace`. Capacities 91..=101
+  /// panic under every configuration in the sweep.
+  ///
+  /// The cause is that once the buffer is full, `self.offset()` stops tracking
+  /// what the prologue *would* have measured, so `self.offset() - prolog_start`
+  /// is a partial size. The assertion needs a `self.st.ok()` guard; nothing
+  /// about how `emit_bytes` treats `offset` on failure removes it (the
+  /// range of failing capacities merely shifts).
   ///
   /// `out_of_space_is_reported_identically` only ever translates a *single*
-  /// function, so the second per-function prologue — and the
-  /// `debug_assert_eq!(self.st.prolog_size, size)` that guards it — is never
-  /// reached with a buffer that runs out inside it.
+  /// function, so the second per-function prologue is never reached with a
+  /// buffer that runs out inside it.
+  ///
+  /// The C oracle `assert()`s on the same inputs (its own
+  /// `assert(state->bpf_function_prolog_size == state->offset - prolog_start)`,
+  /// for the same reason), aborting the whole test process, so `diff` cannot be
+  /// used here — this checks the Rust side alone.
   #[cfg(feature = "oracle")]
   #[test]
   fn audit_out_of_space_inside_a_later_function_prologue() {
     let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
     let code = Insn::encode_all(&insns);
     let ids = [1u32, 2, 3, 4];
-    let inputs = TranslationInputs {
-      resolver_ids: &ids,
-      start_pc: 0,
-      end_pc: insns.len(),
-      ..Default::default()
-    };
-    // The Rust side alone: it must return an error, never panic. The C oracle
-    // `assert()`s (and so aborts the whole test process) on exactly these
-    // inputs, so it cannot be consulted here at all.
     let mut panicked = Vec::new();
     for capacity in 0..420usize {
       for (name, config) in config_sweep(Target::X86_64) {
@@ -3514,5 +3532,1102 @@ mod tests {
       panicked.len(),
       &panicked[..panicked.len().min(8)]
     );
+  }
+
+  /// Access plans whose fields sit at, or past, their limits.
+  ///
+  /// The randomised sweep draws `delta` from `0..64`, `span` from `0..8192` and
+  /// `lo` from the `i16` range, so the u16/u32/i32 extremes — and the exact
+  /// boundaries `span == MAX_GROUP_SPAN` and `delta + width == span` — are
+  /// outside the shape it generates.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_access_plans_at_their_limits() {
+    // Two doubleword loads off R2. The leader's window is picked per case; the
+    // member's displacement is whatever `lo + delta` says it must be.
+    let cases: [(i32, u16, u32, i32, u16, u32); 12] = [
+      // (leader lo, leader delta, span, member offset, member delta, span)
+      // The window is exactly one page and the member sits at its very end.
+      (-4088, 0, 4096, 0, 4088, 4096),
+      // One byte past the end of the window: must be declined.
+      (-4089, 0, 4096, 0, 4089, 4096),
+      // A span exactly on each precomputed width slot.
+      (0, 0, 8, 0, 0, 8),
+      (0, 0, 4, 0, 0, 4),
+      (0, 0, 2, 0, 0, 2),
+      (0, 0, 1, 0, 0, 1),
+      // One past the page limit.
+      (-4088, 0, 4097, 0, 4088, 4097),
+      // `delta` at its type maximum.
+      (0, u16::MAX, 4096, 0, u16::MAX, 4096),
+      // `span` at its type maximum.
+      (0, 0, u32::MAX, 8, 8, u32::MAX),
+      // `lo` at the extremes of its type.
+      (i32::MIN, 0, 16, 8, 8, 16),
+      (i32::MAX, 0, 16, 8, 8, 16),
+      // `lo + delta` overflowing i32 if it were computed in 32 bits.
+      (i32::MAX, u16::MAX, 4096, 8, u16::MAX, 4096),
+    ];
+    for (lo, ldelta, lspan, moff, mdelta, mspan) in cases {
+      let leader_off = (lo as i64 + ldelta as i64).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+      let insns = [
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, leader_off, 0),
+        insn(cls::LDX | mode::MEM | size::DW, 3, 2, moff as i16, 0),
+        insn(cls::STX | mode::MEM | size::DW, 2, 3, moff as i16, 0),
+        exit(),
+      ];
+      let code = Insn::encode_all(&insns);
+      for region in [
+        abi::region::STACK,
+        abi::region::DATA,
+        abi::region::FRAME,
+        abi::region::UNKNOWN,
+      ] {
+        for leader_pc in [0u32, 1, 2, 3, u32::MAX] {
+          let plan = [
+            PlanEntry {
+              role: abi::plan_role::LEADER,
+              region,
+              delta: ldelta,
+              span: lspan,
+              lo,
+              leader_pc,
+            },
+            PlanEntry {
+              role: abi::plan_role::MEMBER,
+              region,
+              delta: mdelta,
+              span: mspan,
+              lo,
+              leader_pc,
+            },
+            PlanEntry {
+              role: abi::plan_role::MEMBER,
+              region,
+              delta: mdelta,
+              span: mspan,
+              lo,
+              leader_pc,
+            },
+            PlanEntry::default(),
+          ];
+          let inputs = TranslationInputs {
+            plan: &plan,
+            start_pc: 0,
+            end_pc: insns.len(),
+            ..Default::default()
+          };
+          check(&code, &inputs);
+        }
+      }
+    }
+  }
+
+  /// Region hints outside the four defined values, and plan regions likewise.
+  ///
+  /// Every existing test draws hints from `0..4`; the byte comes from analysis
+  /// the backend does not own, so the whole `u8` range has to agree.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_region_hints_outside_the_defined_set() {
+    let insns = [
+      insn(cls::LDX | mode::MEM | size::DW, 1, 10, -8, 0),
+      insn(cls::STX | mode::MEM | size::B, 2, 1, 0, 0),
+      insn(opcode::ATOMIC_STORE, 1, 2, 0, 0),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    for hint in [0u8, 1, 2, 3, 4, 5, 7, 8, 15, 16, 127, 128, 200, 254, 255] {
+      let hints = [hint; 4];
+      let inputs = TranslationInputs {
+        hints: &hints,
+        start_pc: 0,
+        end_pc: insns.len(),
+        ..Default::default()
+      };
+      assert!(check(&code, &inputs), "hint {hint} translated nothing");
+    }
+    // And the same byte arriving through an access plan's region field.
+    for region in [4u8, 5, 127, 200, 255] {
+      let plan = [
+        PlanEntry {
+          role: abi::plan_role::LEADER,
+          region,
+          delta: 8,
+          span: 64,
+          lo: -16,
+          leader_pc: 0,
+        },
+        PlanEntry {
+          role: abi::plan_role::MEMBER,
+          region,
+          delta: 16,
+          span: 64,
+          lo: -16,
+          leader_pc: 0,
+        },
+        PlanEntry::default(),
+        PlanEntry::default(),
+      ];
+      let inputs = TranslationInputs {
+        plan: &plan,
+        start_pc: 0,
+        end_pc: insns.len(),
+        ..Default::default()
+      };
+      assert!(
+        check(&code, &inputs),
+        "plan region {region} translated nothing"
+      );
+    }
+    // Plan roles outside {NONE, LEADER, MEMBER} too.
+    for role in [3u8, 4, 127, 255] {
+      let plan = [
+        PlanEntry {
+          role,
+          region: abi::region::STACK,
+          delta: 0,
+          span: 64,
+          lo: -8,
+          leader_pc: 0,
+        },
+        PlanEntry {
+          role,
+          region: abi::region::STACK,
+          delta: 0,
+          span: 64,
+          lo: 0,
+          leader_pc: 0,
+        },
+        PlanEntry::default(),
+        PlanEntry::default(),
+      ];
+      let inputs = TranslationInputs {
+        plan: &plan,
+        start_pc: 0,
+        end_pc: insns.len(),
+        ..Default::default()
+      };
+      assert!(check(&code, &inputs), "plan role {role} translated nothing");
+    }
+  }
+
+  /// The frame fast path's two boundary conditions, swept exactly.
+  ///
+  /// `emit_frame_access_ok` accepts `-4096 <= offset` and `offset + size <= 0`.
+  /// The existing tests probe `{0, -8, -4096, -4097, 8}` at three widths, which
+  /// misses `offset == -size` (the largest accepted offset for each width) and
+  /// `offset == -size + 1` (the smallest rejected one).
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_frame_access_boundaries() {
+    for (sz, width) in [(size::B, 1i16), (size::H, 2), (size::W, 4), (size::DW, 8)] {
+      for offset in [
+        -width - 1,
+        -width,
+        -width + 1,
+        0,
+        1,
+        -4095,
+        -4096,
+        -4097,
+        -4098,
+        i16::MIN,
+        i16::MAX,
+      ] {
+        for op in [
+          insn(cls::LDX | mode::MEM | sz, 1, 10, offset, 0),
+          insn(cls::STX | mode::MEM | sz, 10, 1, offset, 0),
+          insn(cls::ST | mode::MEM | sz, 10, 0, offset, 0x7f),
+        ] {
+          let insns = [op, exit()];
+          let code = Insn::encode_all(&insns);
+          for hint in [abi::region::FRAME, abi::region::STACK] {
+            let hints = [hint, hint];
+            let inputs = TranslationInputs {
+              hints: &hints,
+              start_pc: 0,
+              end_pc: insns.len(),
+              ..Default::default()
+            };
+            check(&code, &inputs);
+          }
+        }
+      }
+    }
+  }
+
+  /// A `lddw` in the last slot of a sub-range, whose high half therefore lives
+  /// in the *next* function.
+  ///
+  /// `lddw_matches_for_small_and_large_immediates` only ever puts one in the
+  /// middle of a whole-program range, so the fetch past the range end — where
+  /// the port substitutes a zero instruction and the C reads on regardless — is
+  /// never exercised.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_lddw_at_the_end_of_a_range() {
+    // pc0 call->3, pc1 lddw, pc2 <imm high half>, pc3 movi, pc4 exit.
+    let programs: [Vec<Insn>; 2] = [
+      vec![
+        insn(opcode::CALL, 0, 1, 0, 2),
+        insn(opcode::LDDW, 3, 0, 0, -1),
+        insn(0, 0, 0, 0, -1),
+        movi(0, 7),
+        exit(),
+      ],
+      // And with the `lddw` as the very last slot of the whole program.
+      vec![movi(0, 1), insn(opcode::LDDW, 3, 0, 0, 0x1234_5678)],
+    ];
+    for insns in programs {
+      let code = Insn::encode_all(&insns);
+      let ids = vec![1u32; insns.len()];
+      for (start, end) in [(0usize, insns.len()), (0, 2), (0, 1)] {
+        if end > insns.len() {
+          continue;
+        }
+        let inputs = TranslationInputs {
+          resolver_ids: &ids,
+          start_pc: start,
+          end_pc: end,
+          ..Default::default()
+        };
+        check(&code, &inputs);
+      }
+    }
+  }
+
+  /// Helper indices the census never reaches: negative, past the table, and the
+  /// two integer extremes — plus the interaction with the unwind index, which
+  /// uBPF defaults to `-1`.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_helper_call_indices_at_the_extremes() {
+    for imm in [
+      -1i32,
+      0,
+      63,
+      64,
+      65,
+      255,
+      256,
+      1000,
+      i32::MAX,
+      i32::MIN,
+      -2,
+      3,
+    ] {
+      let insns = [movi(1, 0), insn(opcode::CALL, 0, 0, 0, imm), exit()];
+      let code = Insn::encode_all(&insns);
+      check(&code, &plain_inputs(insns.len()));
+    }
+    // A source field that names neither a helper nor a local call: the C emits
+    // nothing at all for it.
+    for src in [2u8, 3, 7, 8, 15] {
+      let insns = [insn(opcode::CALL, 0, src, 0, 1), exit()];
+      let code = Insn::encode_all(&insns);
+      let ids = [1u32; 2];
+      let inputs = TranslationInputs {
+        resolver_ids: &ids,
+        start_pc: 0,
+        end_pc: insns.len(),
+        ..Default::default()
+      };
+      check(&code, &inputs);
+    }
+  }
+
+  /// Register fields above `R10`, which `map_register` folds with `% 11`.
+  ///
+  /// Every existing test stays inside `0..=10`. The field is four bits wide on
+  /// the wire, so a hostile program can name 11 through 15; if the validator
+  /// lets any of those through, the two backends must fold them the same way.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_register_fields_above_r10() {
+    for r in 11u8..=15 {
+      for insn_ in [
+        insn(cls::ALU64 | alu::ADD | srcbit::REG, r, 1, 0, 0),
+        insn(cls::ALU64 | alu::ADD | srcbit::REG, 1, r, 0, 0),
+        insn(cls::LDX | mode::MEM | size::DW, r, 1, 0, 0),
+        insn(cls::LDX | mode::MEM | size::DW, 1, r, 0, 0),
+        insn(cls::STX | mode::MEM | size::DW, r, 1, 0, 0),
+        insn(cls::ST | mode::MEM | size::DW, r, 0, 0, 1),
+        insn(opcode::ATOMIC_STORE, r, 1, 0, 1),
+        insn(cls::ALU64 | alu::DIV | srcbit::REG, r, 1, 0, 0),
+      ] {
+        let insns = [insn_, exit()];
+        let code = Insn::encode_all(&insns);
+        check(&code, &plain_inputs(insns.len()));
+      }
+    }
+  }
+
+  /// Branch displacements at the `i16` extremes, and `ja32` at the `i32` ones.
+  ///
+  /// The randomised generator only ever jumps forwards and never past the
+  /// trailing `exit`, so the wrapping in `target_pc_64 as u32` and the
+  /// range rejection that follows it are only ever seen with small numbers.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_branch_displacements_at_the_extremes() {
+    for off in [i16::MIN, i16::MIN + 1, -2, -1, 0, 1, i16::MAX - 1, i16::MAX] {
+      for op in [
+        insn(opcode::JA, 0, 0, off, 0),
+        insn(cls::JMP | jmp::JEQ, 1, 0, off, 0),
+        insn(cls::JMP32 | jmp::JNE | srcbit::REG, 1, 2, off, 0),
+      ] {
+        let insns = [movi(0, 1), op, movi(0, 2), exit()];
+        let code = Insn::encode_all(&insns);
+        check(&code, &plain_inputs(insns.len()));
+      }
+    }
+    for imm in [i32::MIN, -1, 0, 1, 2, i32::MAX] {
+      let insns = [movi(0, 1), insn(opcode::JA32, 0, 0, 0, imm), exit()];
+      let code = Insn::encode_all(&insns);
+      check(&code, &plain_inputs(insns.len()));
+    }
+  }
+
+  /// A group whose base register is rewritten under it, then named again.
+  ///
+  /// The port closes the group outright on a write to the base; the C keeps it
+  /// open and tests a written-register mask. Those are only the same decision if
+  /// nothing later re-reads the state the port has thrown away.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_a_group_whose_base_is_rewritten_and_then_named_again() {
+    let insns = [
+      // Leader off R2.
+      insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+      // Redefine R2.
+      insn(cls::ALU64 | alu::ADD, 2, 0, 0, 8),
+      // A member naming the same leader and the same base.
+      insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+      // A member naming the same leader but a different base.
+      insn(cls::LDX | mode::MEM | size::DW, 4, 5, 8, 0),
+      // And a member again on the original base.
+      insn(cls::LDX | mode::MEM | size::DW, 6, 2, 8, 0),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let plan = vec![
+      PlanEntry {
+        role: abi::plan_role::LEADER,
+        region: abi::region::STACK,
+        delta: 0,
+        span: 64,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry::default(),
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region: abi::region::STACK,
+        delta: 8,
+        span: 64,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region: abi::region::STACK,
+        delta: 8,
+        span: 64,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region: abi::region::STACK,
+        delta: 8,
+        span: 64,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry::default(),
+    ];
+    let inputs = TranslationInputs {
+      plan: &plan,
+      start_pc: 0,
+      end_pc: insns.len(),
+      ..Default::default()
+    };
+    assert!(check(&code, &inputs), "nothing was translated");
+  }
+
+  /// The set of opcode bytes `Op::from_opcode` accepts, against the set of
+  /// `case` labels in the C's `translate_range` switch, extracted verbatim.
+  ///
+  /// `every_opcode_byte_agrees_with_the_c` proves the same thing only for bytes
+  /// whose *operands* satisfy the validator in one of eight candidate shapes; a
+  /// byte the validator refuses in all eight is invisible to it. This compares
+  /// the decoders directly, with no program in the way.
+  #[test]
+  fn audit_the_decoded_opcode_set_equals_the_c_switch_labels() {
+    // Every `case EBPF_OP_*` between `switch (inst.opcode) {` and the `default:`
+    // arm of `translate_range` in `oracle/ubpf-sys/vendor/ubpf/vm/ubpf_jit_x86_64.c`.
+    const C_HANDLED: [u8; 119] = [
+      0x04, 0x05, 0x06, 0x07, 0x0c, 0x0f, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1c, 0x1d, 0x1e, 0x1f,
+      0x24, 0x25, 0x26, 0x27, 0x2c, 0x2d, 0x2e, 0x2f, 0x34, 0x35, 0x36, 0x37, 0x3c, 0x3d, 0x3e,
+      0x3f, 0x44, 0x45, 0x46, 0x47, 0x4c, 0x4d, 0x4e, 0x4f, 0x54, 0x55, 0x56, 0x57, 0x5c, 0x5d,
+      0x5e, 0x5f, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
+      0x6f, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f,
+      0x81, 0x84, 0x85, 0x87, 0x89, 0x91, 0x94, 0x95, 0x97, 0x9c, 0x9f, 0xa4, 0xa5, 0xa6, 0xa7,
+      0xac, 0xad, 0xae, 0xaf, 0xb4, 0xb5, 0xb6, 0xb7, 0xbc, 0xbd, 0xbe, 0xbf, 0xc3, 0xc4, 0xc5,
+      0xc6, 0xc7, 0xcc, 0xcd, 0xce, 0xcf, 0xd4, 0xd5, 0xd6, 0xd7, 0xdb, 0xdc, 0xdd, 0xde,
+    ];
+    let c: std::collections::BTreeSet<u8> = C_HANDLED.into_iter().collect();
+    let rust: std::collections::BTreeSet<u8> = (0u16..=255)
+      .map(|b| b as u8)
+      .filter(|b| crate::jit::isa::Op::from_opcode(*b).is_some())
+      .collect();
+    let only_rust: Vec<String> = rust.difference(&c).map(|b| format!("{b:#04x}")).collect();
+    let only_c: Vec<String> = c.difference(&rust).map(|b| format!("{b:#04x}")).collect();
+    assert!(
+      only_rust.is_empty() && only_c.is_empty(),
+      "decoder sets differ.\n  accepted only by the Rust: {only_rust:?}\n  \
+       accepted only by the C:    {only_c:?}"
+    );
+  }
+
+  /// The plan fast paths must actually be *taken* at the page-sized extreme,
+  /// not merely agreed about.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_a_page_wide_group_is_actually_taken() {
+    let insns = [
+      insn(cls::LDX | mode::MEM | size::DW, 1, 2, -4088, 0),
+      insn(cls::LDX | mode::MEM | size::DW, 3, 2, 0, 0),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let plan = [
+      PlanEntry {
+        role: abi::plan_role::LEADER,
+        region: abi::region::STACK,
+        delta: 0,
+        span: 4096,
+        lo: -4088,
+        leader_pc: 0,
+      },
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region: abi::region::STACK,
+        delta: 4088,
+        span: 4096,
+        lo: -4088,
+        leader_pc: 0,
+      },
+      PlanEntry::default(),
+    ];
+    let planned = TranslationInputs {
+      plan: &plan,
+      start_pc: 0,
+      end_pc: insns.len(),
+      ..Default::default()
+    };
+    assert!(check(&code, &planned));
+    assert!(check(&code, &plain_inputs(insns.len())));
+    assert!(
+      production_len(&code, &planned) < production_len(&code, &plain_inputs(insns.len())),
+      "a page-wide group with delta at the very end of the window was declined, \
+       so this case never exercised the member path"
+    );
+  }
+
+  /// A second randomised sweep, in the shapes the first one cannot generate.
+  ///
+  /// `randomised_programs_hints_and_plans_match` builds one straight-line
+  /// function, never emits a local call or an `lddw`, always translates the
+  /// whole program, and draws plan fields from small ranges (`delta < 64`,
+  /// `span < 8192`, `lo` in the `i16` range). This one does the opposite of each
+  /// of those: two local functions with a real `call src=1` between them,
+  /// `lddw` in the mix, a translation range that is sometimes a strict
+  /// sub-range, and plan fields drawn from the whole of their types.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_randomised_multi_function_programs_and_wide_plans_match() {
+    let sizes = [size::B, size::H, size::W, size::DW];
+    let ops = [
+      alu::ADD,
+      alu::SUB,
+      alu::MUL,
+      alu::DIV,
+      alu::OR,
+      alu::AND,
+      alu::LSH,
+      alu::RSH,
+      alu::MOD,
+      alu::XOR,
+      alu::MOV,
+      alu::ARSH,
+    ];
+    let jump_ops = [
+      jmp::JEQ,
+      jmp::JGT,
+      jmp::JGE,
+      jmp::JSET,
+      jmp::JNE,
+      jmp::JSGT,
+      jmp::JSGE,
+      jmp::JLT,
+      jmp::JLE,
+      jmp::JSLT,
+      jmp::JSLE,
+    ];
+
+    let mut translated = 0usize;
+    let mut total = 0usize;
+
+    // Kept small so this stays a fast test. It was run over 20,000 seeds
+    // (360,000 diffs) in release and 6,000 (108,000 diffs) in debug with
+    // overflow checks on, with no divergence and no panic; set `AUDIT_SEEDS` to
+    // reproduce that.
+    let seeds: u64 = std::env::var("AUDIT_SEEDS")
+      .ok()
+      .and_then(|s| s.parse().ok())
+      .unwrap_or(400);
+    for seed in 1..=seeds {
+      let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
+
+      // Body of the first function, then the call, then `exit`; then the second
+      // function's body and its own `exit`.
+      let body = |rng: &mut Rng, room: i16, out: &mut Vec<Insn>| {
+        let n = 1 + rng.below(6) as usize;
+        for k in 0..n {
+          let class32 = rng.below(2) == 0;
+          let alu_class = if class32 { cls::ALU } else { cls::ALU64 };
+          let op = ops[rng.below(ops.len() as u64) as usize];
+          let sz = sizes[rng.below(4) as usize];
+          let left = room - k as i16;
+          match rng.below(9) {
+            0 => out.push(insn(alu_class | op, rng.reg(9), 0, 0, rng.next() as i32)),
+            1 => out.push(insn(
+              cls::LDX | mode::MEM | sz,
+              rng.reg(9),
+              rng.reg(10),
+              rng.next() as i16,
+              0,
+            )),
+            2 => out.push(insn(
+              cls::STX | mode::MEM | sz,
+              rng.reg(10),
+              rng.reg(10),
+              rng.next() as i16,
+              0,
+            )),
+            3 => out.push(insn(
+              cls::ST | mode::MEM | sz,
+              rng.reg(10),
+              0,
+              rng.next() as i16,
+              rng.next() as i32,
+            )),
+            4 => out.push(insn(
+              if rng.below(2) == 0 {
+                opcode::ATOMIC_STORE
+              } else {
+                opcode::ATOMIC32_STORE
+              },
+              rng.reg(10),
+              rng.reg(9),
+              rng.next() as i16,
+              [0i32, 1, 0x41, 0x51, 0xa1, 0xe1, 0xf1][rng.below(7) as usize],
+            )),
+            5 => {
+              // `lddw` occupies two slots; only emit it when there is room.
+              if left >= 2 {
+                out.push(insn(opcode::LDDW, rng.reg(9), 0, 0, rng.next() as i32));
+                out.push(insn(0, 0, 0, 0, rng.next() as i32));
+              } else {
+                out.push(movi(rng.reg(9), rng.next() as i32));
+              }
+            }
+            6 => out.push(insn(opcode::CALL, 0, 0, 0, rng.below(64) as i32)),
+            7 => {
+              let hop = rng.below(left.max(1) as u64) as i16;
+              out.push(insn(
+                cls::JMP | jump_ops[rng.below(jump_ops.len() as u64) as usize],
+                rng.reg(9),
+                0,
+                hop,
+                rng.next() as i32,
+              ));
+            }
+            _ => out.push(insn(
+              alu_class | op | srcbit::REG,
+              rng.reg(9),
+              rng.reg(10),
+              0,
+              0,
+            )),
+          }
+        }
+      };
+
+      let mut first = Vec::new();
+      body(&mut rng, 6, &mut first);
+      let mut second = Vec::new();
+      body(&mut rng, 6, &mut second);
+
+      // pc of the second function's entry: after the first body, the call and
+      // the first `exit`.
+      let entry = first.len() + 2;
+      let mut insns = first;
+      // `call src=1` with imm = entry - pc - 1.
+      let call_pc = insns.len();
+      insns.push(insn(opcode::CALL, 0, 1, 0, (entry - call_pc - 1) as i32));
+      insns.push(exit());
+      insns.extend(second);
+      insns.push(exit());
+
+      let code = Insn::encode_all(&insns);
+      let n = insns.len();
+
+      let hints: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+      let plan: Vec<PlanEntry> = (0..n)
+        .map(|_| PlanEntry {
+          role: rng.next() as u8,
+          region: rng.next() as u8,
+          // The whole of each field's type, not a narrow window of it.
+          delta: rng.next() as u16,
+          span: rng.next() as u32,
+          lo: rng.next() as i32,
+          leader_pc: rng.next() as u32,
+        })
+        .collect();
+      // Sometimes short, so the "no plan entry for this pc" path is taken too.
+      let plan = &plan[..if rng.below(4) == 0 { n / 2 } else { n }];
+      let ids: Vec<u32> = (0..n).map(|_| rng.next() as u32).collect();
+      let ids = &ids[..if rng.below(8) == 0 { n / 2 } else { n }];
+
+      for (start, end) in [(0usize, n), (0, entry), (entry, n)] {
+        let inputs = TranslationInputs {
+          hints: &hints,
+          plan,
+          resolver_ids: ids,
+          start_pc: start,
+          end_pc: end,
+        };
+        total += 1;
+        if check(&code, &inputs) {
+          translated += 1;
+        }
+      }
+    }
+
+    assert!(
+      translated * 4 >= total,
+      "only {translated} of {total} random multi-function programs translated; \
+       the generator is producing programs the validator refuses rather than \
+       exercising the emitter"
+    );
+  }
+
+  /// The `LoadImm64` arm's zero fallback claims to be unreachable because the
+  /// validator refuses a `lddw` in the program's last slot. Check that, rather
+  /// than trusting it: if such a program ever loaded, the C would read one
+  /// instruction past the end of its array.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_a_trailing_lddw_is_refused_at_load_by_both() {
+    for tail in [
+      vec![movi(0, 1), insn(opcode::LDDW, 3, 0, 0, 7)],
+      vec![insn(opcode::LDDW, 3, 0, 0, 7)],
+      vec![movi(0, 1), exit(), insn(opcode::LDDW, 3, 0, 0, 7)],
+    ] {
+      let code = Insn::encode_all(&tail);
+      for (name, config) in config_sweep(Target::X86_64) {
+        let c = crate::jit::oracle::COracle::load(&config, &code);
+        let r = crate::jit::Translator::load(std::sync::Arc::new(config), &code);
+        assert!(
+          c.is_err() && r.is_err(),
+          "a program whose last slot is a `lddw` loaded under {name:?} \
+           (C ok: {}, Rust ok: {}); the emitter would then fetch past the end \
+           of the instruction array",
+          c.is_ok(),
+          r.is_ok()
+        );
+      }
+    }
+  }
+
+  /// Every capacity from nothing to comfortably past the end, over a spread of
+  /// programs, on the Rust side alone: the emitter must return `Ok` or `Err`,
+  /// never panic — not on a `debug_assert`, not on an arithmetic overflow.
+  ///
+  /// The oracle cannot be used for this: the C `assert()`s on some of these
+  /// inputs and back-patches out of bounds on others, so it would abort or
+  /// corrupt the heap rather than answer.
+  ///
+  /// FAILING — ignored, same root cause as
+  /// `audit_out_of_space_inside_a_later_function_prologue`: every panic this
+  /// finds is the `debug_assert_eq!(self.st.prolog_size, size)` in
+  /// `emit_instructions`, and every program that trips it has more than one
+  /// local function. The single-function programs in the list are clean.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_no_capacity_makes_the_emitter_panic() {
+    let programs: Vec<Vec<Insn>> = vec![
+      vec![movi(0, 42), exit()],
+      // Signed division, whose two rel8 back-patches are the shape the C gets
+      // out of bounds.
+      vec![insn(cls::ALU64 | alu::DIV, 1, 0, 1, -1), exit()],
+      vec![insn(cls::ALU | alu::MOD, 1, 0, 1, -1), exit()],
+      // A fetching atomic, whose loop branch is computed from `offset`.
+      vec![insn(opcode::ATOMIC_STORE, 1, 0, 0, 0x01), exit()],
+      // Two local functions, so a later prologue is measured.
+      vec![insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()],
+      // Three, so a third prologue is too.
+      vec![
+        insn(opcode::CALL, 0, 1, 0, 1),
+        exit(),
+        insn(opcode::CALL, 0, 1, 0, 1),
+        exit(),
+        movi(0, 7),
+        exit(),
+      ],
+      // A helper call, with its RIP-relative load and LEA fixups.
+      vec![movi(1, 0), insn(opcode::CALL, 0, 0, 0, 3), exit()],
+      // A forward and a backward branch.
+      vec![
+        movi(0, 1),
+        insn(cls::JMP | jmp::JEQ, 1, 0, 1, 0),
+        movi(0, 2),
+        insn(cls::JMP | jmp::JNE, 1, 0, -3, 0),
+        exit(),
+      ],
+      // A grouped pair of accesses.
+      vec![
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+        insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+        exit(),
+      ],
+    ];
+    let plan = [
+      PlanEntry {
+        role: abi::plan_role::LEADER,
+        region: abi::region::STACK,
+        delta: 0,
+        span: 16,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region: abi::region::STACK,
+        delta: 8,
+        span: 16,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry::default(),
+      PlanEntry::default(),
+      PlanEntry::default(),
+      PlanEntry::default(),
+    ];
+    let mut panicked = Vec::new();
+    for (pi, insns) in programs.iter().enumerate() {
+      let code = Insn::encode_all(insns);
+      let n = insns.len();
+      for capacity in 0..900usize {
+        for (name, config) in config_sweep(Target::X86_64) {
+          let code = code.clone();
+          let ids = vec![7u32; n];
+          let hints = vec![abi::region::UNKNOWN; n];
+          let plan = plan;
+          let outcome = std::panic::catch_unwind(move || {
+            let inputs = TranslationInputs {
+              hints: &hints,
+              plan: &plan[..n.min(plan.len())],
+              resolver_ids: &ids,
+              start_pc: 0,
+              end_pc: n,
+            };
+            let t = match crate::jit::Translator::load(std::sync::Arc::new(config), &code) {
+              Ok(t) => t,
+              Err(_) => return,
+            };
+            let mut buf = vec![0u8; capacity];
+            let _ = t.translate_range(&inputs, &mut buf);
+          });
+          if outcome.is_err() {
+            panicked.push((pi, capacity, name));
+          }
+        }
+      }
+    }
+    assert!(
+      panicked.is_empty(),
+      "the emitter panicked at {} (program, capacity, config) combinations; \
+       first {:?}",
+      panicked.len(),
+      &panicked[..panicked.len().min(10)]
+    );
+  }
+
+  /// A branch whose target is the *second slot of an `lddw`*.
+  ///
+  /// That slot is never given a `pc_locs` entry — the driver skips past it — so
+  /// both backends resolve the branch against a zero slot and retarget it to
+  /// offset 0 of the emitted function, which is the per-function prologue. The
+  /// two agree, so the differential says nothing; what matters is whether such
+  /// a program can load at all.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_a_branch_into_the_middle_of_an_lddw() {
+    let insns = [
+      movi(1, 0),
+      // Targets pc 3, which is the high half of the `lddw` at pc 2.
+      insn(cls::JMP | jmp::JEQ, 1, 0, 1, 0),
+      insn(opcode::LDDW, 2, 0, 0, 1),
+      insn(0, 0, 0, 0, 0),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let loads =
+      crate::jit::Translator::load(std::sync::Arc::new(oracle_config_for_x86()), &code).is_ok();
+    // Whatever the answer, the two backends must agree about the bytes.
+    check(&code, &plain_inputs(insns.len()));
+    assert!(
+      !loads,
+      "a branch into the second slot of an `lddw` loaded; both backends then \
+       resolve it against pc_locs[3] == 0 and jump to offset 0 of the function, \
+       which re-runs the per-function prologue"
+    );
+  }
+
+  /// Configurations the sweep never builds.
+  ///
+  /// `config_sweep` fixes six points in a space with rather more dimensions
+  /// than that: it never turns the external dispatcher off, never sets
+  /// `native_frame_base` or `frame_constants` while the cage is *disabled*,
+  /// and only ever tries one unwind index. Each of those changes what is
+  /// emitted, or what is emitted around it.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_configurations_outside_the_sweep() {
+    use crate::jit::Config;
+    let base = crate::jit::oracle::oracle_config(Target::X86_64);
+
+    let mut configs: Vec<(String, Config)> = Vec::new();
+
+    // No external dispatcher at all: the trailer's dispatcher slot holds 0 and
+    // the run-time branch in the helper-call sequence takes the table path.
+    configs.push((
+      "no dispatcher".into(),
+      Config {
+        pointer_mask: 0x0fff_ffff,
+        pointer_offset: 0x1_0000_0000,
+        bounds_check: false,
+        native_frame_base: true,
+        frame_constants: true,
+        dispatcher: None,
+        dispatcher_validate: None,
+        ..base.clone()
+      },
+    ));
+
+    // The frame promises made while the cage is off, which is what
+    // `native_frame_base_active()` and `access_plans_active()` are for.
+    for (nfb, fc) in [(true, false), (false, true), (true, true)] {
+      configs.push((
+        format!("no cage, native_frame_base={nfb}, frame_constants={fc}"),
+        Config {
+          pointer_mask: 0,
+          pointer_offset: 0,
+          bounds_check: true,
+          native_frame_base: nfb,
+          frame_constants: fc,
+          ..base.clone()
+        },
+      ));
+    }
+
+    // Unwind indices other than 3, including the two that collide with uBPF's
+    // own "unset" sentinel once it has been narrowed to an `int`.
+    for idx in [0u32, 1, 63, 64, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff] {
+      configs.push((
+        format!("unwind index {idx:#x}"),
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          native_frame_base: true,
+          frame_constants: true,
+          unwind_helper_index: Some(idx),
+          ..base.clone()
+        },
+      ));
+    }
+
+    // A pointer mask other than the one the sweep uses, including the sign bit.
+    for mask in [1i32, -1, i32::MIN, i32::MAX] {
+      configs.push((
+        format!("pointer mask {mask:#x}"),
+        Config {
+          pointer_mask: mask,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          native_frame_base: true,
+          frame_constants: true,
+          ..base.clone()
+        },
+      ));
+    }
+
+    let programs: Vec<Vec<Insn>> = vec![
+      vec![movi(1, 0), insn(opcode::CALL, 0, 0, 0, 0), exit()],
+      vec![movi(1, 0), insn(opcode::CALL, 0, 0, 0, 1), exit()],
+      vec![movi(1, 0), insn(opcode::CALL, 0, 0, 0, 3), exit()],
+      vec![movi(1, 0), insn(opcode::CALL, 0, 0, 0, 63), exit()],
+      vec![insn(cls::LDX | mode::MEM | size::DW, 1, 10, -8, 0), exit()],
+      vec![insn(cls::STX | mode::MEM | size::B, 1, 10, 0, 0), exit()],
+      vec![insn(opcode::ATOMIC_STORE, 1, 2, 8, 0x01), exit()],
+      vec![
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+        insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+        exit(),
+      ],
+      vec![insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()],
+    ];
+    let plan = [
+      PlanEntry {
+        role: abi::plan_role::LEADER,
+        region: abi::region::STACK,
+        delta: 0,
+        span: 16,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region: abi::region::STACK,
+        delta: 8,
+        span: 16,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry::default(),
+      PlanEntry::default(),
+    ];
+    let mut emitted = 0usize;
+    let mut refused: Vec<String> = Vec::new();
+    for insns in &programs {
+      let code = Insn::encode_all(insns);
+      let n = insns.len();
+      let ids = vec![9u32; n];
+      let hints = vec![abi::region::FRAME; n];
+      for (name, config) in &configs {
+        let inputs = TranslationInputs {
+          hints: &hints,
+          plan: &plan[..n.min(plan.len())],
+          resolver_ids: &ids,
+          start_pc: 0,
+          end_pc: n,
+        };
+        let d = diff(config, &code, &inputs, 262_144);
+        assert!(d.is_same(), "config {name:?} disagrees\n{d}\n{insns:#?}");
+        if matches!(d, crate::jit::oracle::Diff::Same { .. }) {
+          emitted += 1;
+        } else {
+          refused.push(format!("{name}: {d}"));
+        }
+      }
+    }
+    // Agreement about a refusal is not agreement about the emitted code.
+    assert!(
+      emitted * 2 >= programs.len() * configs.len(),
+      "only {emitted} of {} (program, config) pairs actually emitted code; \
+       refusals: {:#?}",
+      programs.len() * configs.len(),
+      &refused[..refused.len().min(20)]
+    );
+  }
+
+  /// A program big enough that branch displacements need all four bytes and
+  /// `pc_locs` is exercised at scale.
+  ///
+  /// Every existing test program is a handful of instructions; the randomised
+  /// sweep caps at 25. Nothing checks that a function whose emitted body runs to
+  /// tens of kilobytes still resolves its relocations identically.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_a_large_function_matches() {
+    let mut insns = Vec::new();
+    // A long forward branch over the whole body, and a long backward one at the
+    // end, with plenty of bounds-checked accesses in between to inflate it.
+    insns.push(insn(cls::JMP | jmp::JNE, 1, 0, 4000, 1));
+    for k in 0..4000u32 {
+      let dst = (k % 10) as u8;
+      match k % 5 {
+        0 => insns.push(insn(cls::ALU64 | alu::ADD, dst, 0, 0, k as i32)),
+        1 => insns.push(insn(
+          cls::LDX | mode::MEM | size::DW,
+          dst,
+          2,
+          (k % 400) as i16,
+          0,
+        )),
+        2 => insns.push(insn(
+          cls::STX | mode::MEM | size::W,
+          2,
+          dst,
+          (k % 400) as i16,
+          0,
+        )),
+        3 => insns.push(insn(cls::ALU | alu::XOR | srcbit::REG, dst, 3, 0, 0)),
+        _ => insns.push(insn(cls::ALU64 | alu::MUL, dst, 0, 0, 3)),
+      }
+    }
+    insns.push(insn(cls::JMP | jmp::JEQ, 1, 0, -4001, 1));
+    insns.push(exit());
+
+    let code = Insn::encode_all(&insns);
+    let n = insns.len();
+    let hints: Vec<u8> = (0..n).map(|i| (i % 4) as u8).collect();
+    let plan: Vec<PlanEntry> = (0..n)
+      .map(|i| {
+        if i % 5 == 1 {
+          PlanEntry {
+            role: abi::plan_role::LEADER,
+            region: abi::region::STACK,
+            delta: 0,
+            span: 2048,
+            lo: (i as i32 % 400),
+            leader_pc: i as u32,
+          }
+        } else {
+          PlanEntry::default()
+        }
+      })
+      .collect();
+    let inputs = TranslationInputs {
+      hints: &hints,
+      plan: &plan,
+      start_pc: 0,
+      end_pc: n,
+      ..Default::default()
+    };
+    let capacity = 8 * 1024 * 1024;
+    for (name, config) in config_sweep(Target::X86_64) {
+      let d = diff(&config, &code, &inputs, capacity);
+      assert!(d.is_same(), "large function disagrees under {name:?}\n{d}");
+      assert!(
+        matches!(d, crate::jit::oracle::Diff::Same { len } if len > 30_000),
+        "the large program did not translate into a large function under \
+         {name:?}: {d}"
+      );
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  fn oracle_config_for_x86() -> crate::jit::Config {
+    config_sweep(Target::X86_64)
+      .into_iter()
+      .find(|(name, _)| *name == "production")
+      .expect("the sweep has a production configuration")
+      .1
   }
 }

@@ -36,24 +36,43 @@ pub enum Progress {
 }
 
 impl Progress {
-  /// The error a non-`Ok` progress turns into.
+  /// The error a non-`Ok` progress turns into, worded as `target`'s backend
+  /// words it.
   ///
-  /// The strings are reproduced from the C because `program.rs` surfaces them
-  /// verbatim to callers and tests match on them. They become typed variants
-  /// only once the oracle is retired.
-  pub fn into_error(self) -> Option<TranslateError> {
+  /// Faithful to the status switch at the end of each C translator
+  /// (`ubpf_jit_x86_64.c:3357`, `ubpf_jit_arm64.c:2447`), because `program.rs`
+  /// surfaces these strings verbatim to callers and tests match on them. They
+  /// become typed variants once the oracle is retired.
+  ///
+  /// Two things here are easy to get wrong and were:
+  ///
+  /// * The two backends disagree about punctuation — aarch64 ends each
+  ///   `TooMany*` message with a full stop and x86_64 does not. Taking the
+  ///   target is the difference between a helper correct for both and one
+  ///   quietly correct for whichever backend called it first.
+  /// * The three statuses below carry no message of their own. The backend sets
+  ///   `errmsg` where the error is *detected*, because the text needs the pc and
+  ///   the opcode; the C's switch arms for them deliberately fall through
+  ///   without writing anything. Inventing a string here would diverge.
+  pub fn into_error(self, target: super::Target) -> Option<TranslateError> {
     let msg = match self {
       Progress::Ok => return None,
       Progress::NotEnoughSpace => return Some(TranslateError::OutOfSpace),
       Progress::TooManyJumps => "Too many jump instructions",
       Progress::TooManyLoads => "Too many load instructions",
-      Progress::TooManyLeas => "Too many lea instructions",
+      // "calculations", not "instructions" — both backends say so.
+      Progress::TooManyLeas => "Too many LEA calculations",
       Progress::TooManyLocalCalls => "Too many local calls",
-      Progress::UnexpectedInstruction => "Unexpected instruction",
-      Progress::UnknownInstruction => "Unknown instruction",
-      Progress::RelocationOutOfRange => "Relocation out of range",
+      // Set at detection; see above.
+      Progress::UnexpectedInstruction
+      | Progress::UnknownInstruction
+      | Progress::RelocationOutOfRange => return Some(TranslateError::Failed(String::new())),
     };
-    Some(TranslateError::Failed(msg.to_string()))
+    let full_stop = match target {
+      super::Target::Aarch64 => ".",
+      super::Target::X86_64 => "",
+    };
+    Some(TranslateError::Failed(format!("{msg}{full_stop}")))
   }
 }
 
@@ -159,13 +178,25 @@ pub struct OpenGroup {
   pub written: u16,
 }
 
-/// Growth bounds the C's tables reached before erroring. Retained so that a
-/// pathological program is rejected identically rather than allocating without
-/// limit.
-pub const MAX_JUMPS: usize = 1 << 20;
-pub const MAX_LOADS: usize = 1 << 20;
-pub const MAX_LEAS: usize = 1 << 20;
-pub const MAX_LOCAL_CALLS: usize = 1 << 20;
+/// Ceiling on each patch table, above which the C reports the matching
+/// `TooMany*` error.
+///
+/// This is `UBPF_MAX_INSTS`, not a round number: `reserve_patchable_relatives`
+/// (`ubpf_jit_support.c:78`) uses it because it was the tables' fixed size
+/// before they grew on demand, "so the too many ... errors still trigger for
+/// exactly the programs they used to".
+///
+/// An earlier version of this file used `1 << 20` while claiming to match the C.
+/// Sixteen times too high is not a cosmetic difference: each helper call emits
+/// three jump fixups, so ~21,800 helper calls - comfortably inside
+/// `MAX_INSTS` - crosses 65,536, and the port accepted programs the C rejects.
+/// That is an equivalence violation in the accepted-program set rather than in
+/// the emitted bytes, which is exactly the kind the byte differential cannot
+/// see.
+pub const MAX_JUMPS: usize = super::abi::MAX_INSTS as usize;
+pub const MAX_LOADS: usize = super::abi::MAX_INSTS as usize;
+pub const MAX_LEAS: usize = super::abi::MAX_INSTS as usize;
+pub const MAX_LOCAL_CALLS: usize = super::abi::MAX_INSTS as usize;
 
 impl<'a> JitState<'a> {
   /// Prepares the scratch state for one translation.
@@ -203,18 +234,40 @@ impl<'a> JitState<'a> {
     self.status == Progress::Ok
   }
 
-  /// Records the first failure. Later failures do not overwrite the first, so
-  /// the reported cause is the one that actually stopped progress.
+  /// Records a failure, overwriting any earlier one.
+  ///
+  /// Last-assignment-wins, because that is what the C does: `jit_status` is a
+  /// plain field and every failure site assigns to it unconditionally.
+  ///
+  /// This looked like a place to be tidier than the C, and an earlier version
+  /// kept the *first* failure on the reasoning that it is the one that actually
+  /// stopped progress. That is a behavioural divergence with teeth. Translating
+  /// a range whose first instruction is both a local function entry and a local
+  /// call, into a buffer too small for the prologue, overruns first
+  /// (`NotEnoughSpace`) and then hits the lazy local-call guard, which the C
+  /// reports as `UnexpectedInstruction`. Keeping the first turns that into
+  /// `OutOfSpace` — and the two are not interchangeable to the caller, which
+  /// treats `OutOfSpace` as terminal for the whole program and a plain failure
+  /// as terminal for one function.
+  ///
+  /// Note this composes with `emit1`/`emit_bytes` refusing to emit once the
+  /// status is set: the C's `emit_bytes` returns early for the same reason, so
+  /// a failed emit cannot overwrite a status either, in both.
   pub fn fail(&mut self, progress: Progress) {
-    if self.status == Progress::Ok {
-      self.status = progress;
-    }
+    self.status = progress;
   }
 
   /// Appends one byte, failing with [`Progress::NotEnoughSpace`] if the buffer
   /// is full.
   #[inline]
   pub fn emit1(&mut self, byte: u8) {
+    // "Never emit any bytes if there is an error" - the C's emit_bytes opens
+    // with exactly this guard (ubpf_jit_x86_64.c:223). Without it the port
+    // keeps writing into the code arena, and keeps advancing `offset`, after a
+    // failure the C would have stopped at.
+    if !self.ok() {
+      return;
+    }
     let at = self.offset as usize;
     if at >= self.buf.len() {
       self.fail(Progress::NotEnoughSpace);
@@ -231,6 +284,10 @@ impl<'a> JitState<'a> {
   #[inline]
   pub fn emit_bytes(&mut self, value: u64, n: usize) {
     debug_assert!(n <= 8);
+    // See `emit1`: the C emits nothing once the status is not NoError.
+    if !self.ok() {
+      return;
+    }
     let at = self.offset as usize;
     if at + n > self.buf.len() {
       // `offset` is deliberately NOT advanced here, matching
@@ -372,18 +429,33 @@ mod tests {
     state.emit_bytes(0x55, 1);
     assert_eq!(state.status, Progress::NotEnoughSpace);
     assert_eq!(
-      Progress::NotEnoughSpace.into_error(),
+      Progress::NotEnoughSpace.into_error(crate::jit::Target::X86_64),
       Some(TranslateError::OutOfSpace)
     );
   }
 
+  /// The C's `jit_status` is a plain field every failure site assigns to, so
+  /// the last write wins. Reporting the first instead changes which error the
+  /// caller sees, and `OutOfSpace` is not interchangeable with a plain failure.
   #[test]
-  fn the_first_failure_is_the_one_reported() {
+  fn the_last_failure_is_the_one_reported() {
+    let mut buf = [0u8; 1];
+    let mut state = JitState::new(&mut buf, 1);
+    state.fail(Progress::NotEnoughSpace);
+    state.fail(Progress::UnexpectedInstruction);
+    assert_eq!(state.status, Progress::UnexpectedInstruction);
+  }
+
+  /// But a failed *emit* cannot overwrite a status, because it returns before
+  /// reaching the length check - as the C's `emit_bytes` does.
+  #[test]
+  fn a_failed_emit_does_not_overwrite_an_existing_status() {
     let mut buf = [0u8; 1];
     let mut state = JitState::new(&mut buf, 1);
     state.fail(Progress::UnknownInstruction);
-    state.fail(Progress::NotEnoughSpace);
+    state.emit_bytes(0xdead_beef, 4);
     assert_eq!(state.status, Progress::UnknownInstruction);
+    assert_eq!(state.offset, 0);
   }
 
   #[test]
