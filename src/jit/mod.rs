@@ -301,12 +301,8 @@ impl Translator {
     // per-instruction loop does not run and its sub-program check finds no
     // local call. So the empty case has to be caught by whoever assembles the
     // program, which is this function.
-    //
-    // The message is a poor description of the problem and is deliberately left
-    // alone: it is the wording callers and tests already match on. Changing it
-    // is an interface change, not a wording fix.
     if code.is_empty() {
-      return Err(LoadError("out of memory".to_string()));
+      return Err(LoadError("program is empty".to_string()));
     }
     let insns = Insn::decode_all(code).expect("length checked above");
     if insns.len() > abi::MAX_INSTS as usize {

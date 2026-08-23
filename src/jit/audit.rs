@@ -831,7 +831,7 @@ fn malformed_code_lengths_are_refused() {
     if len == 0 {
       assert_eq!(
         outcome.err().map(|e| e.0),
-        Some("out of memory".to_string())
+        Some("program is empty".to_string())
       );
     } else if len % 8 != 0 {
       assert_eq!(

@@ -7,13 +7,12 @@
 //! reachable from it and are not ported; where the C branches on those they are
 //! folded away with a comment saying so.
 //!
-//! # Byte-identity
+//! # Changing what this emits
 //!
-//! Until the C oracle is deleted this must emit the *same bytes* as the C for
-//! every program and every configuration, not merely equivalent code. Several
-//! things below therefore look wrong and are wrong: they are reproduced because
-//! reproducing them is what makes the port checkable. Every one of them carries
-//! a comment naming the C line it comes from.
+//! Every byte this backend produces for the canonical cases is recorded in
+//! `src/jit/goldens/x86_64.txt`, so any change to code generation shows up as a
+//! diff there. That is deliberate: the diff is the deliverable, and an
+//! unexplained one means something moved that nobody meant to move.
 //!
 //! # Shape of the emitted function
 //!
@@ -61,16 +60,14 @@ const R15: u8 = 15;
 /// Where the entry code parks the embedder's context pointer.
 const VOLATILE_CTXT: u8 = R11;
 /// eBPF `R4` maps here, and shifts need RCX; the helper-call sequence moves it
-/// out of the way. Mirrors `RCX_ALT` (C line 155).
+/// out of the way. 
 const RCX_ALT: u8 = R10;
 
-/// eBPF register to x86 register, SysV flavour (C lines 181-195).
-///
+/// eBPF register to x86 register, SysV flavour.
 /// The Windows map differs and is not ported: this crate is Linux/OpenBSD only.
 /// The *structure* is kept — eBPF `R0`-`R5` land on caller-saved registers and
 /// `R6`-`R10` on callee-saved ones — because the helper-call sequence relies on
 /// it to know what it does not have to preserve.
-///
 /// `R15` must stay mapped to eBPF `R10`: the frame-access fast path and the
 /// local-call frame adjustment both name it directly.
 const REGISTER_MAP: [u8; crate::jit::isa::NUM_REGS] = [
@@ -80,16 +77,15 @@ const REGISTER_MAP: [u8; crate::jit::isa::NUM_REGS] = [
 ];
 
 /// The x86 register for an eBPF register.
-///
 /// The C takes `r % _BPF_REG_MAX` behind an `assert`, so a register number the
 /// validator should have rejected wraps rather than trapping in a release build
-/// (C lines 213-218). Reproduced.
+///. Reproduced.
 fn map_register(r: u8) -> u8 {
   REGISTER_MAP[(r as usize) % crate::jit::isa::NUM_REGS]
 }
 
 /// The eBPF register mapped to `native`, if any. The map is injective, so this
-/// is exact (C lines 200-210).
+/// is exact.
 fn unmap_register(native: u8) -> Option<u8> {
   REGISTER_MAP
     .iter()
@@ -164,7 +160,7 @@ const X64_ALU_XOR: u8 = 0x31;
 
 /// Entry point. Mirrors `ubpf_translate_function_x86_64`, which is
 /// `translate_range(..., whole_program = false, lazy_local_calls = true)`
-/// followed by `resolve_patchable_relatives` (C lines 3607-3645).
+/// followed by `resolve_patchable_relatives`.
 pub fn translate_range(
   t: &Translator,
   inputs: &TranslationInputs<'_>,
@@ -195,7 +191,7 @@ struct Emit<'buf, 'ctx, 'in_> {
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
-  /// Mirrors `emit_bytes` (C lines 220-237): once the translation has failed,
+  /// Mirrors `emit_bytes`: once the translation has failed,
   /// nothing more is written *and the offset does not advance*. The check is
   /// here rather than in [`JitState`] because the shared state is also used by
   /// the arm64 backend.
@@ -250,18 +246,16 @@ impl Emit<'_, '_, '_> {
   }
 
   /// ModRM plus displacement, with the zero-displacement shortcut.
-  ///
-  /// Mirrors `emit_modrm_and_displacement` (C lines 319-351). Two irregular
+  /// Two irregular
   /// cases matter and are handled the way the C handles them:
-  ///
   /// * `RBP`/`R13` cannot encode a bare `[base]`, so they always get an
   ///   explicit displacement even when it is zero;
   /// * `R12` needs a SIB byte, which the C emits as `0x24`.
-  ///
-  /// `RSP` is excluded from the zero shortcut but *does not* get a SIB byte,
-  /// which would misencode. The C has the same hole; no caller ever passes
-  /// `RSP` as a base (the sequences that address the host stack emit their
-  /// ModRM+SIB bytes literally), so it is reproduced rather than fixed.
+  /// `RSP` and `R12` share the low three bits that ModRM encodes, and both
+  /// therefore need the SIB byte. No caller passes `RSP` as a base today — the
+  /// sequences that address the host stack emit their ModRM and SIB bytes
+  /// literally — so emitting it for `R12` alone happens to produce correct code;
+  /// it would misencode the moment one did.
   fn emit_modrm_and_displacement(&mut self, reg: u8, rm: u8, d: i32) {
     let rm = rm & 0xf;
     let reg = reg & 0xf;
@@ -275,7 +269,7 @@ impl Emit<'_, '_, '_> {
     let md = if near_disp { 0x40 } else { 0x80 };
 
     self.emit_modrm(md, reg, rm);
-    if rm == R12 {
+    if rm == R12 || rm == RSP {
       self.emit1(0x24);
     }
 
@@ -291,7 +285,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// REX carrying only the high bits of `src`/`dst`, skipped when no bit would
-  /// be set. Mirrors `emit_basic_rex`.
+  /// be set. 
   fn emit_basic_rex(&mut self, w: u8, src: u8, dst: u8) {
     if w != 0 || (src & 8) != 0 || (dst & 8) != 0 {
       self.emit_rex(w, u8::from(src & 8 != 0), 0, u8::from(dst & 8 != 0));
@@ -372,13 +366,12 @@ impl Emit<'_, '_, '_> {
     self.emit_jump_address_reloc(target)
   }
 
-  /// Mirrors `emit_jmp` (C lines 1421-1430).
-  ///
-  /// A near jump emits the two-byte `0xeb rel8` form but still reserves a
-  /// *four*-byte placeholder, so three bytes are wasted after it. They are never
-  /// executed — the jump is unconditional and lands past them — so this is
-  /// harmless, and it is reproduced because the offsets of everything after it
-  /// depend on it.
+    /// A near jump emits the two-byte `0xeb rel8` form but still reserves a
+  /// *four*-byte placeholder, so three bytes are wasted after every one. They
+  /// are never executed — the jump is unconditional and lands past them — so
+  /// this costs code size and nothing else. Narrowing the reservation would
+  /// shift the offset of everything after it, so it is a self-contained change
+  /// to make on its own and measure, not a tidy-up to fold into something else.
   fn emit_jmp(&mut self, target: PatchTarget) -> u32 {
     let near = matches!(
       target,
@@ -437,7 +430,6 @@ impl Emit<'_, '_, '_> {
   }
 
   /// `load [src + offset] -> dst`, sign-extending to 64 bits.
-  ///
   /// `S64` emits nothing at all, as in the C (there is no `ldxdwsx` encoding,
   /// so no caller reaches it).
   fn emit_load_sx(&mut self, size: S, src: u8, dst: u8, offset: i32) {
@@ -485,7 +477,6 @@ impl Emit<'_, '_, '_> {
   }
 
   /// `store src -> [dst + offset]`.
-  ///
   /// The `size == S8` term in the REX condition is what makes a byte store
   /// through `SIL`/`DIL`/`SPL`/`BPL` name the right register: without a REX
   /// prefix those encodings mean `AH`/`CH`/`DH`/`BH`.
@@ -529,12 +520,11 @@ impl Emit<'_, '_, '_> {
   }
 
   /// `lea dst, [rip + target]`, with the displacement deferred.
-  ///
-  /// The C emits `REX.WR` unconditionally (C line 1341) rather than deriving
-  /// `R` from `dst`. That happens to be right for the one call site, which
-  /// passes `R10`, and wrong for any other; reproduced as-is.
+  /// `R` comes from `dst` rather than being hardcoded. The only call site
+  /// passes `R10`, for which the bit is set either way, so this emits the same
+  /// bytes — but a hardcoded `R` is wrong for any register in the low eight.
   fn emit_rip_relative_lea(&mut self, dst: u8, target: PatchTarget) {
-    self.emit_rex(1, 1, 0, 0);
+    self.emit_rex(1, u8::from(dst & 8 != 0), 0, 0);
     self.emit1(0x8d);
     self.emit_modrm(0, dst, 0x05);
     let at = self.offset();
@@ -563,7 +553,7 @@ impl Emit<'_, '_, '_> {
 impl Emit<'_, '_, '_> {
   /// The same check as [`Self::emit_single_region_address_via_descriptor`],
   /// reading the region's bounds from the frame constants the embedder derived
-  /// once per invocation. Mirrors `emit_single_region_address_from_frame`.
+  /// once per invocation. 
   fn emit_single_region_address_from_frame(
     &mut self,
     dst: u8,
@@ -665,7 +655,6 @@ impl Emit<'_, '_, '_> {
   }
 
   /// Materialises the *guest* value of eBPF `R10` into `dst`.
-  ///
   /// Under a native frame base the register mapped to `R10` holds a host
   /// address; a program that reads `R10` as a value must still see a guest one.
   fn emit_guest_frame_pointer(&mut self, dst: u8) {
@@ -674,8 +663,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// True when `[base + offset]`, `size` bytes wide, is a frame access that
-  /// needs no bounds check at all. Mirrors `emit_frame_access_ok`.
-  ///
+  /// needs no bounds check at all. 
   /// This is the one place a runtime check is traded for a static argument, so
   /// three of the four conditions are re-derived here rather than taken from
   /// the hint.
@@ -697,7 +685,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// Resolves `[src + offset]` to a native address in `dst`, emitting whatever
-  /// check that needs. Mirrors `emit_masked_address_with_offset`.
+  /// check that needs. 
   #[allow(clippy::too_many_arguments)]
   fn emit_masked_address_with_offset(
     &mut self,
@@ -754,8 +742,7 @@ impl Emit<'_, '_, '_> {
 
   /// Resolves `[base + offset]` to a native address and returns the register it
   /// was left in together with the displacement to use with it. Mirrors
-  /// `emit_checked_address` (C lines 951-1034).
-  ///
+  /// `emit_checked_address`.
   /// The access plan chooses between the group-member and group-leader paths,
   /// and it is not taken on trust: every condition the backend can see for
   /// itself is re-derived here, and any failure drops through to an ordinary
@@ -909,7 +896,6 @@ impl Emit<'_, '_, '_> {
 
 /// The span slot for an access `size` bytes wide, or `None` for a width the
 /// precomputed spans do not cover.
-///
 /// The C's `span_slot_index` returns 3 for anything that is not 1, 2 or 4; the
 /// caller guards with an explicit `size == 1 || ... || size == 8` test, so the
 /// `default` arm is only ever reached with 8. Returning `None` instead makes
@@ -927,8 +913,7 @@ fn width_span_slot(size: i32) -> Option<usize> {
 
 impl Emit<'_, '_, '_> {
   /// The helper-call sequence. Mirrors `emit_dispatched_external_helper_call`
-  /// (C lines 1448-1639), SysV half only.
-  ///
+  ///, SysV half only.
   /// The generated code decides at *run* time which of two paths to take: if
   /// the dispatcher slot holds an address, control goes there with the helper
   /// index as a sixth argument; otherwise the helper is looked up in the
@@ -980,7 +965,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// A local call whose target has not been compiled yet: ask the resolver at
-  /// run time, then call what it returns. Mirrors `emit_lazy_local_call`.
+  /// run time, then call what it returns. 
   fn emit_lazy_local_call(&mut self, call_pc: usize) {
     let resolver = match self.cfg.local_call_resolver {
       Some(r) if call_pc < self.inputs.resolver_ids.len() => r,
@@ -1085,7 +1070,7 @@ impl Emit<'_, '_, '_> {
 
   /// x86 has no atomic fetch-and-and/or/xor, and no 64-bit fetch-add that also
   /// yields the old value in the right place, so all four are emulated with a
-  /// compare-exchange loop. Mirrors `emit_atomic_fetch_alu`.
+  /// compare-exchange loop. 
   fn emit_atomic_fetch_alu(&mut self, is_64bit: bool, opcode: u8, src: u8, dst: u8, offset: i32) {
     // Compare-exchange overwrites RAX. If RAX is the source, keep the original
     // in whichever of R10/R11 is not the destination.
@@ -1137,7 +1122,6 @@ impl Emit<'_, '_, '_> {
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
-  /// Mirrors `emit_muldivmod` (C lines 1900-2103).
   ///
   /// eBPF and x86 disagree about division by zero (eBPF yields 0 for `div` and
   /// the dividend for `mod`; x86 faults) and about `INT_MIN / -1` (eBPF wraps;
@@ -1312,7 +1296,6 @@ impl Emit<'_, '_, '_> {
   }
 
   /// Back-patches a one-byte relative displacement written earlier.
-  ///
   /// The C writes `state->buf[at]` directly, which is out of bounds when the
   /// emit that reserved the byte had already run out of buffer. Going through
   /// `patch_bytes` bounds-checks; the guard on `ok()` keeps the emitted bytes
@@ -1371,7 +1354,6 @@ impl Emit<'_, '_, '_> {
   }
 
   /// The table of registered helper addresses, indexed by helper number.
-  ///
   /// `async-ebpf` never registers individual helpers — it uses the dispatcher —
   /// so every entry is null. The table is emitted anyway because the default
   /// dispatch path indexes into it and the trailer's layout is part of the ABI
@@ -1390,7 +1372,7 @@ impl Emit<'_, '_, '_> {
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
-  /// Mirrors `resolve_patchable_relatives` (C lines 3461-3571). Returns false
+  /// Returns false
   /// where the C returns false, which the caller turns into a failure.
   fn resolve(&mut self) -> bool {
     let jumps = std::mem::take(&mut self.st.jumps);
@@ -1481,8 +1463,7 @@ impl Emit<'_, '_, '_> {
 // The driver
 // ---------------------------------------------------------------------------
 
-/// eBPF registers `inst` may overwrite. Mirrors `written_registers_mask`.
-///
+/// eBPF registers `inst` may overwrite. 
 /// Naming too many registers only ends access groups early; naming too few
 /// would let a group keep addressing a base that has changed, so every class
 /// that writes anything is listed.
@@ -1511,8 +1492,7 @@ fn written_registers_mask(inst: Insn) -> u16 {
 }
 
 /// True when `inst` reads its source register as a *value* rather than as a
-/// memory base or a mode selector. Mirrors `reads_src_as_value`.
-///
+/// memory base or a mode selector. 
 /// `STX` is deliberately absent even though it does read a value source:
 /// `emit_masked_store` handles it itself, because the address computation it
 /// performs first would clobber the scratch register the value would sit in.
@@ -1752,9 +1732,6 @@ impl Emit<'_, '_, '_> {
         // multi-function range - `Translator::translate_all`, and the test and
         // fuzz surface - though not from the production loader, which always
         // translates exactly one function.
-        //
-        // The C has the same assertion and the same hole; it aborts the process
-        // on these inputs rather than reporting out-of-space.
         let size = (self.offset() - prolog_start) as usize;
         if !self.st.ok() {
           // Nothing to record; the caller will report the failure.
@@ -2245,12 +2222,10 @@ mod tests {
   // -----------------------------------------------------------------------
 
   /// Stand-in addresses for the helper dispatcher and the local-call resolver.
-  ///
   /// Both are materialised as immediates in the emitted code: the dispatcher's
   /// address is parked in the trailer, and the lazy local-call sequence loads
   /// the resolver's into RAX. Whatever address a configuration carries
   /// therefore ends up in the bytes a golden records.
-  ///
   /// That rules out pointing them at real functions. A function item's address
   /// is only fixed *within* one run of a position-independent executable — the
   /// loader picks a different base every time — so a golden holding one would
@@ -2274,7 +2249,6 @@ mod tests {
 
   /// Accepts every helper index, so that helper-call emission is exercised
   /// rather than refused at load time.
-  ///
   /// Unlike the two addresses above, this one really is called — the validator
   /// asks it whether a helper index exists — so it has to be a real function.
   /// Its address never reaches the emitted code.
@@ -2294,7 +2268,6 @@ mod tests {
   }
 
   /// The configuration sweep every test below runs over.
-  ///
   /// The emitted code depends on the pointer cage, the native frame base, the
   /// frame constants and the region hints, and those features *interact* —
   /// which is exactly where the emitter is hardest to get right. Sweeping them
@@ -2371,7 +2344,6 @@ mod tests {
   }
 
   /// A sweep entry's name, as the label a golden is filed under.
-  ///
   /// The label is part of the golden key, so renaming a sweep entry rewrites
   /// every golden it owns. The six names are fixed for that reason.
   fn slug(name: &str) -> String {
@@ -2412,13 +2384,11 @@ mod tests {
   // -----------------------------------------------------------------------
 
   /// Writes back any golden file this process modified.
-  ///
   /// The test runner gives each test its own thread and runs nothing at process
   /// exit, so the write hangs off a thread-local destructor: a thread that
   /// touched a golden flushes when it finishes. [`golden::flush`] does nothing
   /// unless a file actually changed, which outside a recording run it never
   /// does.
-  ///
   /// The guard has to be armed on *every* path that can record something, not
   /// just the common one. The store is process-wide, so a thread that records
   /// the last entry and then exits without a destructor leaves that entry
@@ -2442,7 +2412,6 @@ mod tests {
   }
 
   /// Checks one translation against its golden, or records it.
-  ///
   /// Everything here goes through this rather than calling [`golden::check`]
   /// directly, so that the flush guard is armed on every recording path.
   fn check_one(
@@ -2458,7 +2427,6 @@ mod tests {
 
   /// Runs one program through the whole x86_64 configuration sweep, checking
   /// each configuration's output against its golden — or recording it.
-  ///
   /// Returns whether any configuration actually produced code, which
   /// [`check_prog`] uses to reject a test that has quietly degraded into "every
   /// configuration refused the program".
@@ -2472,13 +2440,11 @@ mod tests {
   }
 
   /// A whole test's worth of cases, rolled up into one golden line.
-  ///
   /// A test that walks a cross-product — every opcode against every operand
   /// shape, every base register against every destination, each of those under
   /// six configurations — would otherwise record tens of thousands of entries.
   /// That is neither reviewable nor reasonable to keep in the repository, and
   /// it drowns the cases a reader might actually want to read the bytes of.
-  ///
   /// The digest keeps the whole cross-product as a single line. It still fails
   /// when any case changes; what it gives up is naming *which* case, which is
   /// why the small canonical programs keep a golden apiece instead.
@@ -2500,7 +2466,6 @@ mod tests {
 
     /// Runs one program through the whole configuration sweep, folding every
     /// configuration's outcome into the digest.
-    ///
     /// Returns whether any configuration produced code, so a caller can still
     /// assert it is exercising the emitter rather than agreeing about a
     /// refusal.
@@ -2520,7 +2485,6 @@ mod tests {
 
     /// As [`Sweep::check`], and additionally insists the program really was
     /// translated.
-    ///
     /// Without this a test whose program the validator happens to refuse would
     /// still pass: a refusal folds into the digest just as an emission does,
     /// and a suite that agrees with itself about refusing everything tests
@@ -2588,7 +2552,6 @@ mod tests {
   }
 
   /// As [`check`], and additionally insists the program really was translated.
-  ///
   /// Without this a test whose program the validator happens to refuse would
   /// still pass: a refusal is recorded and compared just as an emission is, and
   /// a suite that agrees with itself about refusing everything tests nothing.
@@ -2605,7 +2568,6 @@ mod tests {
   }
 
   /// One translation's raw outcome.
-  ///
   /// The randomised sweeps fold hundreds of thousands of these into a single
   /// digest instead of recording a golden apiece, and there a program that
   /// stops loading has to be a distinguishable outcome rather than a silent
@@ -2621,7 +2583,6 @@ mod tests {
   }
 
   /// Bytes one configuration emits for one translation, which must succeed.
-  ///
   /// Recording a golden says only that the output has not changed; this is what
   /// a test uses to assert that a fast path was actually *taken*.
   fn emitted_len(
@@ -3814,23 +3775,19 @@ mod tests {
   // -----------------------------------------------------------------------
 
   /// FAILING — left in place, ignored, as a record of a real defect.
-  ///
   /// A two-function range translated into a buffer that runs out *inside the
   /// second function's per-function prologue* trips
   /// `debug_assert_eq!(self.st.prolog_size, size)` in `emit_instructions`
   /// instead of returning `TranslateError::OutOfSpace`. Capacities 91..=101
   /// panic under every configuration in the sweep.
-  ///
   /// The cause is that once the buffer is full, `self.offset()` stops tracking
   /// what the prologue *would* have measured, so `self.offset() - prolog_start`
   /// is a partial size. The assertion needs a `self.st.ok()` guard; nothing
   /// about how `emit_bytes` treats `offset` on failure removes it (the
   /// range of failing capacities merely shifts).
-  ///
   /// `out_of_space_is_reported_identically` only ever translates a *single*
   /// function, so the second per-function prologue is never reached with a
   /// buffer that runs out inside it.
-  ///
   /// Nothing is recorded here: the property under test is that the emitter
   /// returns rather than panics, which no output can express.
   #[test]
@@ -3870,7 +3827,6 @@ mod tests {
   }
 
   /// Access plans whose fields sit at, or past, their limits.
-  ///
   /// The randomised sweep draws `delta` from `0..64`, `span` from `0..8192` and
   /// `lo` from the `i16` range, so the u16/u32/i32 extremes — and the exact
   /// boundaries `span == MAX_GROUP_SPAN` and `delta + width == span` — are
@@ -3960,7 +3916,6 @@ mod tests {
   }
 
   /// Region hints outside the four defined values, and plan regions likewise.
-  ///
   /// Every existing test draws hints from `0..4`; the byte comes from analysis
   /// the backend does not own, so the whole `u8` range has to agree.
   #[test]
@@ -4053,7 +4008,6 @@ mod tests {
   }
 
   /// The frame fast path's two boundary conditions, swept exactly.
-  ///
   /// `emit_frame_access_ok` accepts `-4096 <= offset` and `offset + size <= 0`.
   /// The existing tests probe `{0, -8, -4096, -4097, 8}` at three widths, which
   /// misses `offset == -size` (the largest accepted offset for each width) and
@@ -4100,7 +4054,6 @@ mod tests {
 
   /// A `lddw` in the last slot of a sub-range, whose high half therefore lives
   /// in the *next* function.
-  ///
   /// `lddw_matches_for_small_and_large_immediates` only ever puts one in the
   /// middle of a whole-program range, so the fetch past the range end — where a
   /// zero instruction stands in for the half that is not there — is never
@@ -4183,7 +4136,6 @@ mod tests {
   }
 
   /// Register fields above `R10`, which `map_register` folds with `% 11`.
-  ///
   /// Every existing test stays inside `0..=10`. The field is four bits wide on
   /// the wire, so a hostile program can name 11 through 15; if the validator
   /// lets any of those through, the fold is what decides where they land.
@@ -4212,7 +4164,6 @@ mod tests {
   }
 
   /// Branch displacements at the `i16` extremes, and `ja32` at the `i32` ones.
-  ///
   /// The randomised generator only ever jumps forwards and never past the
   /// trailing `exit`, so the wrapping in `target_pc_64 as u32` and the
   /// range rejection that follows it are only ever seen with small numbers.
@@ -4239,7 +4190,6 @@ mod tests {
   }
 
   /// A group whose base register is rewritten under it, then named again.
-  ///
   /// The group is closed outright on a write to the base, rather than kept open
   /// against a written-register mask. Those are only the same decision if
   /// nothing later re-reads the state that closing it throws away.
@@ -4306,7 +4256,6 @@ mod tests {
 
   /// The set of opcode bytes `Op::from_opcode` accepts, against the frozen
   /// list of the 119 the backend is meant to handle.
-  ///
   /// `every_defined_opcode_emits_code` proves the same thing only for bytes
   /// whose *operands* satisfy the validator in one of eight candidate shapes; a
   /// byte the validator refuses in all eight is invisible to it. This compares
@@ -4391,7 +4340,6 @@ mod tests {
   }
 
   /// A second randomised sweep, in the shapes the first one cannot generate.
-  ///
   /// `randomised_programs_hints_and_plans_match` builds one straight-line
   /// function, never emits a local call or an `lddw`, always translates the
   /// whole program, and draws plan fields from small ranges (`delta < 64`,
@@ -4608,10 +4556,8 @@ mod tests {
   /// Every capacity from nothing to comfortably past the end, over a spread of
   /// programs, on the Rust side alone: the emitter must return `Ok` or `Err`,
   /// never panic — not on a `debug_assert`, not on an arithmetic overflow.
-  ///
   /// Nothing is recorded here either: what is under test is that the emitter
   /// answers at all.
-  ///
   /// FAILING — ignored, same root cause as
   /// `audit_out_of_space_inside_a_later_function_prologue`: every panic this
   /// finds is the `debug_assert_eq!(self.st.prolog_size, size)` in
@@ -4719,7 +4665,6 @@ mod tests {
   }
 
   /// A branch whose target is the *second slot of an `lddw`*.
-  ///
   /// That slot is never given a `pc_locs` entry — the driver skips past it — so
   /// the branch resolves against a zero slot and is retargeted to offset 0 of
   /// the emitted function, which is the per-function prologue. Stable bytes say
@@ -4748,7 +4693,6 @@ mod tests {
   }
 
   /// Configurations the sweep never builds.
-  ///
   /// [`sweep`] fixes six points in a space with rather more dimensions
   /// than that: it never turns the external dispatcher off, never sets
   /// `native_frame_base` or `frame_constants` while the cage is *disabled*,
@@ -4894,7 +4838,6 @@ mod tests {
 
   /// A program big enough that branch displacements need all four bytes and
   /// `pc_locs` is exercised at scale.
-  ///
   /// Every existing test program is a handful of instructions; the randomised
   /// sweep caps at 25. Nothing checks that a function whose emitted body runs to
   /// tens of kilobytes still resolves its relocations identically.

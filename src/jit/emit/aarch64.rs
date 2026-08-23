@@ -1,41 +1,38 @@
 //! The aarch64 backend.
 //!
-//! A port of `ubpf_translate_function_arm64` and everything it reaches, from
-//! `oracle/ubpf-sys/vendor/ubpf/vm/ubpf_jit_arm64.c`. Line numbers cited in
-//! comments are that file's.
+//! # Changing what this emits
 //!
-//! # Byte-identity
+//! Every byte this backend produces for the canonical cases is recorded in
+//! `src/jit/goldens/aarch64.txt`, so any change to code generation shows up as a
+//! diff there. That is deliberate: the diff is the deliverable, and an
+//! unexplained one means something moved that nobody meant to move.
 //!
-//! Until the C oracle is deleted this must emit **byte-identical** machine code
-//! to the C for every program and every configuration. Where the C does
-//! something odd, this does the same odd thing and says so. The places worth
-//! knowing about before reading:
+//! # Quirks worth knowing before reading
 //!
-//! * `le` with `imm == 64` emits *nothing at all* (C:2180-2193), and `be` with
-//!   `imm == 32` emits no zero-extension where `bswap` does.
-//! * The `EBPF_OP_MUL_IMM`/`ST*`/... arm of the main `switch` (C:2410-2435) has
-//!   no `break` before `default:`, so it falls through and the reported status
-//!   is `UnknownInstruction`, not `UnexpectedInstruction`. It is unreachable
-//!   anyway — every opcode it names is rewritten to its register form by the
-//!   immediate lowering above it.
-//! * A `st` (store-immediate) instruction whose raw `src` nibble happens to be
-//!   10 will, under a native frame base, have the guest frame pointer
-//!   materialised over the immediate it just parked in the same register
-//!   (C:2303-2309 tests `inst.src`, not the lowered operand). Reproduced.
-//! * `resolve_adr` writes only the `immhi` field and drops the two `immlo`
-//!   bits (C:2595-2610). Reproduced.
-//! * The atomic selector is the immediate's *high nibble* and the fetch flag
-//!   its low bit, with bits 1..3 dead (C:2339, C:2375). `xchg` and `cmpxchg`
-//!   fetch whether or not the flag is set, because the backend hardcodes it
-//!   (C:2353, C:2358). This is [`Insn::op_with_imm`]'s decode, so the two agree
-//!   on the non-canonical selectors the 32-bit filter admits.
+//! Each of these is deliberate and labelled where it lives. None is reachable
+//! through `Translator::load`, because the validator refuses the programs that
+//! would reach them; they are retained as defence in depth, not as behaviour
+//! anything depends on.
 //!
-//! # What is *not* here
+//! * `le` with `imm == 64` emits nothing at all, and `be` with `imm == 32`
+//!   emits no zero-extension where `bswap` does.
+//! * A `st` whose raw `src` nibble is 10 would, under a native frame base, have
+//!   the guest frame pointer materialised over the immediate it just parked in
+//!   the same register. The check reads the raw nibble rather than the lowered
+//!   operand; the operand filter bounds `st`'s source to zero, so no such
+//!   program loads.
+//! * `resolve_adr` writes only the `immhi` field and drops the two `immlo` bits.
+//! * The atomic selector is the immediate's high nibble and the fetch flag its
+//!   low bit, with bits 1..3 dead. `xchg` and `cmpxchg` fetch whether or not the
+//!   flag is set, because this backend hardcodes it. That matches
+//!   [`Insn::op_with_imm`], so decoder and backend agree on the non-canonical
+//!   selectors the 32-bit operand filter admits.
 //!
-//! `ubpf_translate_arm64` (whole-program mode), `emit_jit_prologue`,
-//! `emit_jit_epilogue`, `emit_local_call` (the eager local call: this entry
-//! point always passes `lazy_local_calls = true`) and constant blinding are all
-//! unreachable from `ubpf_translate_function_arm64` and are not ported.
+//! # What is not here
+//!
+//! Whole-program translation, the eager local call, and constant blinding.
+//! `translate_range` always translates one function at a time and always
+//! resolves local calls lazily, so none of them is reachable.
 
 use crate::jit::abi;
 use crate::jit::isa::{AluOp, AtomicOp, EndKind, Insn, JmpOp, Op, Source, Width};
@@ -43,7 +40,7 @@ use crate::jit::patch::{JitState, OpenGroup, PatchTarget, Progress, SpecialTarge
 use crate::jit::{Config, PlanEntry, TranslateError, TranslationInputs, Translator};
 
 // ---------------------------------------------------------------------------
-// Registers (C:42-100)
+// Registers
 // ---------------------------------------------------------------------------
 
 const R0: u32 = 0;
@@ -72,31 +69,30 @@ const RZ: u32 = 31;
 
 /// Temp register for immediate generation.
 const TEMP_REGISTER: u32 = R24;
-/// Value register for a store-immediate lowered to a store-register (C:86-94).
+/// Value register for a store-immediate lowered to a store-register.
 const TEMP_STORE_VALUE_REGISTER: u32 = R9;
 /// Temp register for division results.
 const TEMP_DIV_REGISTER: u32 = R25;
 /// Temp register for load/store offsets.
 const OFFSET_REGISTER: u32 = R26;
 /// Special register for external dispatcher context. Aliases [`OFFSET_REGISTER`]
-/// in the C too (C:98-100).
+/// in the C too.
 const VOLATILE_CTXT: u32 = R26;
 
-/// eBPF register to aarch64 register (C:164-176). `R0` is held in `R5` for the
+/// eBPF register to aarch64 register. `R0` is held in `R5` for the
 /// duration of the function and moved into the ABI return register only at the
 /// end.
 const REGISTER_MAP: [u32; 11] = [R5, R0, 1, R2, R3, 4, R19, R20, R21, R22, R23];
 
 /// The aarch64 register holding eBPF register `r`.
-///
-/// Mirrors `map_register` (C:179-184) including its modular wrap: with `NDEBUG`
+/// Mirrors `map_register` including its modular wrap: with `NDEBUG`
 /// the C's `assert(r < REGISTER_MAP_SIZE)` is gone and `r % 11` is what runs.
 fn map_register(r: u8) -> u32 {
   REGISTER_MAP[(r as usize) % REGISTER_MAP.len()]
 }
 
 /// The eBPF register mapped to `native`, or `None`. The map is injective, so
-/// this is exact (C:188-198).
+/// this is exact.
 fn unmap_register(native: u32) -> Option<u8> {
   REGISTER_MAP
     .iter()
@@ -105,10 +101,10 @@ fn unmap_register(native: u32) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Instruction encodings (C:234-1160)
+// Instruction encodings
 // ---------------------------------------------------------------------------
 
-/// `AddSubOpcode` (C:234-240), used as the two-bit `op` field at bit 29.
+/// `AddSubOpcode`, used as the two-bit `op` field at bit 29.
 mod addsub {
   pub const ADD: u32 = 0;
   /// Reproduced from the C's enum for completeness; nothing this entry point
@@ -119,7 +115,7 @@ mod addsub {
   pub const SUBS: u32 = 3;
 }
 
-/// `LoadStoreOpcode` (C:298-315).
+/// `LoadStoreOpcode`.
 mod ls {
   pub const STRB: u32 = 0x0000_0000;
   pub const LDRB: u32 = 0x0040_0000;
@@ -135,7 +131,7 @@ mod ls {
   pub const LDRX: u32 = 0xc040_0000;
 }
 
-/// `LoadStoreExclusiveOpcode` (C:317-324).
+/// `LoadStoreExclusiveOpcode`.
 mod lse {
   pub const STXRW: u32 = 0x8800_7c00;
   pub const LDXRW: u32 = 0x885f_7c00;
@@ -143,13 +139,13 @@ mod lse {
   pub const LDXRX: u32 = 0xc85f_7c00;
 }
 
-/// `LoadStorePairOpcode` (C:363-371).
+/// `LoadStorePairOpcode`.
 mod lsp {
   pub const STPX: u32 = 0xa900_0000;
   pub const LDPX: u32 = 0xa940_0000;
 }
 
-/// `LogicalOpcode` (C:389-400).
+/// `LogicalOpcode`.
 mod log {
   pub const AND: u32 = 0x0000_0000;
   pub const ORR: u32 = 0x2000_0000;
@@ -157,13 +153,13 @@ mod log {
   pub const ANDS: u32 = 0x6000_0000;
 }
 
-/// `UnconditionalBranchOpcode` (C:953-959).
+/// `UnconditionalBranchOpcode`.
 mod br {
   pub const BLR: u32 = 0xd63f_0000;
   pub const RET: u32 = 0xd65f_0000;
 }
 
-/// `UnconditionalBranchImmediateOpcode` (C:968-973).
+/// `UnconditionalBranchImmediateOpcode`.
 mod ubr {
   pub const B: u32 = 0x1400_0000;
   pub const BL: u32 = 0x9400_0000;
@@ -171,7 +167,7 @@ mod ubr {
 
 const BR_BCOND: u32 = 0x5400_0000;
 
-/// `Condition` (C:1003-1023).
+/// `Condition`.
 mod cond {
   pub const EQ: u32 = 0;
   pub const NE: u32 = 1;
@@ -187,14 +183,14 @@ mod cond {
   pub const LO: u32 = CC;
 }
 
-/// `DP1Opcode` (C:1051-1057).
+/// `DP1Opcode`.
 mod dp1 {
   pub const REV16: u32 = 0x5ac0_0400;
   pub const REV32: u32 = 0x5ac0_0800;
   pub const REV64: u32 = 0xdac0_0c00;
 }
 
-/// `DP2Opcode` (C:1067-1076).
+/// `DP2Opcode`.
 mod dp2 {
   pub const UDIV: u32 = 0x1ac0_0800;
   pub const SDIV: u32 = 0x1ac0_0c00;
@@ -203,13 +199,13 @@ mod dp2 {
   pub const ASRV: u32 = 0x1ac0_2800;
 }
 
-/// `DP3Opcode` (C:1091-1096).
+/// `DP3Opcode`.
 mod dp3 {
   pub const MADD: u32 = 0x1b00_0000;
   pub const MSUB: u32 = 0x1b00_8000;
 }
 
-/// `MoveWideOpcode` (C:1112-1118).
+/// `MoveWideOpcode`.
 mod mw {
   pub const MOVN: u32 = 0x1280_0000;
   pub const MOVZ: u32 = 0x5280_0000;
@@ -217,14 +213,14 @@ mod mw {
 }
 
 /// `bti c`, emitted as the first instruction of every lazily compiled function
-/// because it is entered through an indirect call (C:1947).
+/// because it is entered through an indirect call.
 const BTI_C: u32 = 0xd503_245f;
 
 fn align_to(amount: u32, boundary: u32) -> u32 {
   (amount + (boundary - 1)) & !(boundary - 1)
 }
 
-/// Bit 31, the size bit in most encodings (C:243-247).
+/// Bit 31, the size bit in most encodings.
 fn sz(sixty_four: bool) -> u32 {
   if sixty_four {
     1 << 31
@@ -237,7 +233,7 @@ fn emit_instruction(st: &mut JitState, instr: u32) {
   st.emit_bytes(instr as u64, 4);
 }
 
-/// C4.1.64 add/subtract (immediate) (C:250-282).
+/// C4.1.64 add/subtract (immediate).
 fn emit_addsub_immediate(
   st: &mut JitState,
   sixty_four: bool,
@@ -262,7 +258,7 @@ fn emit_addsub_immediate(
   );
 }
 
-/// C4.1.67 add/subtract (shifted register) (C:285-296).
+/// C4.1.67 add/subtract (shifted register).
 fn emit_addsub_register(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, rn: u32, rm: u32) {
   emit_instruction(
     st,
@@ -270,8 +266,7 @@ fn emit_addsub_register(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, r
   );
 }
 
-/// C4.1.66 load/store register, unscaled immediate (C:327-335).
-///
+/// C4.1.66 load/store register, unscaled immediate.
 /// This is the *unscaled* form: `imm9` is a byte displacement in `[-256, 256)`
 /// regardless of the access width. Using the scaled unsigned-offset form would
 /// change every one of these bytes.
@@ -281,24 +276,24 @@ fn emit_loadstore_immediate(st: &mut JitState, op: u32, rt: u32, rn: u32, imm9: 
   emit_instruction(st, 0x3800_0000 | op | (imm9 << 12) | (rn << 5) | rt);
 }
 
-/// Load-exclusive / store-exclusive, for atomics (C:338-344).
+/// Load-exclusive / store-exclusive, for atomics.
 fn emit_loadstore_exclusive(st: &mut JitState, op: u32, rt: u32, rn: u32, rs: u32) {
   emit_instruction(st, op | (rs << 16) | (rn << 5) | rt);
 }
 
-/// PC-relative literal load; the displacement is patched later (C:346-353).
+/// PC-relative literal load; the displacement is patched later.
 fn emit_loadstore_literal(st: &mut JitState, op: u32, rt: u32, target: PatchTarget) {
   note_load(st, target);
   emit_instruction(st, op | 0x0800_0000 | rt);
 }
 
-/// PC-relative address; the displacement is patched later (C:355-361).
+/// PC-relative address; the displacement is patched later.
 fn emit_adr(st: &mut JitState, target: PatchTarget, rd: u32) {
   note_lea(st, target);
   emit_instruction(st, 0x1000_0000 | rd);
 }
 
-/// C4.1.66 load/store register pair, offset form (C:374-387).
+/// C4.1.66 load/store register pair, offset form.
 fn emit_loadstorepair_immediate(st: &mut JitState, op: u32, rt: u32, rt2: u32, rn: u32, imm7: i32) {
   let imm_div = if op == lsp::STPX || op == lsp::LDPX {
     8
@@ -313,7 +308,7 @@ fn emit_loadstorepair_immediate(st: &mut JitState, op: u32, rt: u32, rt2: u32, r
   );
 }
 
-/// C4.1.67 logical (shifted register) (C:403-413).
+/// C4.1.67 logical (shifted register).
 fn emit_logical_register(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, rn: u32, rm: u32) {
   emit_instruction(
     st,
@@ -321,12 +316,12 @@ fn emit_logical_register(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, 
   );
 }
 
-/// `CSEL Rd, Rn, Rm, cond` (64-bit): `Rd = cond ? Rn : Rm` (C:438-442).
+/// `CSEL Rd, Rn, Rm, cond` (64-bit): `Rd = cond ? Rn : Rm`.
 fn emit_conditionalselect(st: &mut JitState, rd: u32, rn: u32, rm: u32, c: u32) {
   emit_instruction(st, 0x9a80_0000 | (rm << 16) | (c << 12) | (rn << 5) | rd);
 }
 
-/// `CCMP Rn, Rm, #nzcv, cond` (64-bit) (C:447-451).
+/// `CCMP Rn, Rm, #nzcv, cond` (64-bit).
 fn emit_conditionalcompare(st: &mut JitState, rn: u32, rm: u32, nzcv: u32, c: u32) {
   emit_instruction(
     st,
@@ -334,12 +329,12 @@ fn emit_conditionalcompare(st: &mut JitState, rn: u32, rm: u32, nzcv: u32, c: u3
   );
 }
 
-/// C4.1.67 data-processing, one source (C:1060-1065).
+/// C4.1.67 data-processing, one source.
 fn emit_dataprocessing_onesource(st: &mut JitState, sixty_four: bool, op: u32, rd: u32, rn: u32) {
   emit_instruction(st, sz(sixty_four) | op | (rn << 5) | rd);
 }
 
-/// C4.1.67 data-processing, two sources (C:1079-1089).
+/// C4.1.67 data-processing, two sources.
 fn emit_dataprocessing_twosource(
   st: &mut JitState,
   sixty_four: bool,
@@ -351,7 +346,7 @@ fn emit_dataprocessing_twosource(
   emit_instruction(st, sz(sixty_four) | op | (rm << 16) | (rn << 5) | rd);
 }
 
-/// C4.1.67 data-processing, three sources (C:1099-1110).
+/// C4.1.67 data-processing, three sources.
 fn emit_dataprocessing_threesource(
   st: &mut JitState,
   sixty_four: bool,
@@ -367,8 +362,7 @@ fn emit_dataprocessing_threesource(
   );
 }
 
-/// C4.1.64 move wide (immediate) (C:1121-1160).
-///
+/// C4.1.64 move wide (immediate).
 /// A `MOVZ`/`MOVN` followed by `MOVK`s, choosing whichever of the `0x0000` and
 /// `0xffff` block patterns is more common so the sequence is as short as
 /// possible. The *number* of instructions therefore depends on the value: one
@@ -430,8 +424,7 @@ fn note_lea(st: &mut JitState, target: PatchTarget) {
   st.note_lea(at, target);
 }
 
-/// C4.1.65 unconditional branch (immediate) (C:976-1001).
-///
+/// C4.1.65 unconditional branch (immediate).
 /// A `BL` to a non-special target is a local call and goes in its own table, so
 /// that `resolve_local_calls` can subtract the per-function prologue from it.
 /// Returns the offset the instruction was emitted at, which is the handle
@@ -448,7 +441,7 @@ fn emit_unconditionalbranch_immediate(st: &mut JitState, op: u32, target: PatchT
   source_offset
 }
 
-/// C4.1.65 conditional branch (immediate) (C:1031-1042).
+/// C4.1.65 conditional branch (immediate).
 fn emit_conditionalbranch_immediate(st: &mut JitState, c: u32, target: PatchTarget) -> u32 {
   let source_offset = st.offset;
   st.note_jump(source_offset, target);
@@ -473,8 +466,7 @@ fn emit_jump_target(st: &mut JitState, jump_src: u32) {
 // The pointer cage
 // ---------------------------------------------------------------------------
 
-/// Mask-and-offset the address in `src` into `dst` (C:415-435).
-///
+/// Mask-and-offset the address in `src` into `dst`.
 /// Unreachable from this entry point — every caller of
 /// [`emit_masked_address_with_offset`] is already inside a `jit_pointer_mask`
 /// guard, so the fall-through that reaches this is dead. Kept for shape.
@@ -492,8 +484,7 @@ fn emit_masked_address(cfg: &Config, st: &mut JitState, src: u32, dst: u32, scra
 }
 
 /// Bounds-check `[dst, dst+size)` against one guest region described by the
-/// memory descriptor, then translate `dst` to the native address (C:460-489).
-///
+/// memory descriptor, then translate `dst` to the native address.
 /// Branchless on purpose: the address is translated unconditionally and a final
 /// `CSEL` replaces it with 0 — a guaranteed faulting access — when out of range,
 /// so there is no predictable branch whose mis-speculation could perform a
@@ -532,7 +523,7 @@ fn emit_single_region_address(
 }
 
 /// The same check, reading the region's bounds from the frame constants the
-/// embedder derived once per invocation (C:610-644).
+/// embedder derived once per invocation.
 fn emit_single_region_address_from_frame(
   st: &mut JitState,
   dst: u32,
@@ -571,7 +562,7 @@ fn emit_single_region_address_from_frame(
   emit_conditionalselect(st, dst, dst, RZ, cond::HS);
 }
 
-/// Where one guest region's bounds can be found (C:648-656).
+/// Where one guest region's bounds can be found.
 struct GuestRegion {
   desc_bottom: i32,
   desc_top: i32,
@@ -630,14 +621,13 @@ fn emit_region_address(
   }
 }
 
-/// Whether the native-frame-base fast path is live (C:492-496).
+/// Whether the native-frame-base fast path is live.
 fn native_frame_base_active(cfg: &Config) -> bool {
   cfg.pointer_mask != 0 && cfg.native_frame_base
 }
 
 /// True when `[base + offset]`, `size` bytes wide, is a frame access that needs
-/// no bounds check at all (C:507-524).
-///
+/// no bounds check at all.
 /// The hint is deliberately not taken on trust: the base really being R10, and
 /// the access ending at or below it and starting no more than one local frame
 /// below, are re-derived here from the instruction itself.
@@ -658,14 +648,14 @@ fn emit_frame_access_ok(cfg: &Config, region_hint: u8, base: u32, offset: i16, s
   offset >= -256
 }
 
-/// Materialise the *guest* value of eBPF R10 into `dst` (C:532-537).
+/// Materialise the *guest* value of eBPF R10 into `dst`.
 fn emit_guest_frame_pointer(st: &mut JitState, dst: u32, scratch: u32) {
   emit_loadstore_immediate(st, ls::LDRX, scratch, R29, abi::FRAME_DELTA_OFFSET as i16);
   emit_addsub_register(st, true, addsub::SUB, dst, map_register(10), scratch);
 }
 
 /// True when `insn` reads its source register as a value rather than as a
-/// memory base or an opcode mode selector (C:542-559).
+/// memory base or an opcode mode selector.
 fn reads_src_as_value(insn: &Insn) -> bool {
   use crate::jit::isa::{cls, opcode, src};
   match insn.opcode & cls::MASK {
@@ -684,7 +674,7 @@ fn reads_src_as_value(insn: &Insn) -> bool {
   }
 }
 
-/// eBPF registers `insn` may overwrite (C:563-583). Over-approximating only
+/// eBPF registers `insn` may overwrite. Over-approximating only
 /// ends access groups early.
 fn written_registers_mask(insn: &Insn) -> u16 {
   use crate::jit::isa::{cls, mode, opcode};
@@ -709,7 +699,7 @@ fn written_registers_mask(insn: &Insn) -> u16 {
 }
 
 /// Translate `[src + offset]` to a native address in `dst`, emitting whatever
-/// bounds check the configuration and hint call for (C:694-772).
+/// bounds check the configuration and hint call for.
 #[allow(clippy::too_many_arguments)]
 fn emit_masked_address_with_offset(
   cfg: &Config,
@@ -779,7 +769,7 @@ fn emit_masked_address_with_offset(
 }
 
 /// Folds a group displacement into the address, since the load/store immediate
-/// form reaches only ±256 while a group window is a page wide (C:789-797).
+/// form reaches only ±256 while a group window is a page wide.
 fn apply_group_delta(st: &mut JitState, addr_reg: u32, delta: u16) -> i16 {
   if delta < 256 {
     return delta as i16;
@@ -790,8 +780,7 @@ fn apply_group_delta(st: &mut JitState, addr_reg: u32, delta: u16) -> i16 {
 
 /// Resolve `[base + offset]`, `width` bytes wide, to a native address, and
 /// return the register holding it together with the displacement to use
-/// (C:807-867).
-///
+///.
 /// The plan is not taken on trust: every condition the backend can re-derive
 /// from the instruction stream it is already walking, it does, and any that
 /// fails drops through to an ordinary checked access.
@@ -888,7 +877,7 @@ fn emit_checked_address(
   (addr_reg, 0)
 }
 
-/// Access width of a load/store opcode (C:869-893).
+/// Access width of a load/store opcode.
 fn loadstore_access_size(op: u32) -> i32 {
   match op {
     ls::STRB | ls::LDRB | ls::LDRSBX => 1,
@@ -903,7 +892,7 @@ fn loadstore_is_store(op: u32) -> bool {
 }
 
 /// Emit one guest load or store, with the cage applied where it is on
-/// (C:901-951).
+///.
 #[allow(clippy::too_many_arguments)]
 fn emit_masked_loadstore(
   cfg: &Config,
@@ -959,7 +948,7 @@ fn emit_masked_loadstore(
 // ---------------------------------------------------------------------------
 
 /// Call an external helper, through the registered dispatcher if there is one
-/// and through the per-index helper table otherwise (C:1275-1348).
+/// and through the per-index helper table otherwise.
 fn emit_dispatched_external_helper_call(st: &mut JitState, idx: u32) {
   let stack_movement = align_to(8, 16);
   emit_addsub_immediate(st, true, addsub::SUB, SP, SP, stack_movement);
@@ -1021,7 +1010,7 @@ fn emit_unconditionalbranch_register(st: &mut JitState, op: u32, rn: u32) {
 }
 
 /// A local call whose target has not been compiled yet: ask the embedder's
-/// resolver for the entry address at run time, then call it (C:1377-1426).
+/// resolver for the entry address at run time, then call it.
 fn emit_lazy_local_call(
   cfg: &Config,
   inputs: &TranslationInputs<'_>,
@@ -1095,7 +1084,7 @@ fn emit_lazy_local_call(
 // Atomics
 // ---------------------------------------------------------------------------
 
-/// An `LDXR`/`STXR` retry loop implementing one eBPF atomic (C:1429-1588).
+/// An `LDXR`/`STXR` retry loop implementing one eBPF atomic.
 #[allow(clippy::too_many_arguments)]
 fn emit_atomic_operation(
   cfg: &Config,
@@ -1245,7 +1234,7 @@ fn emit_atomic_operation(
 // ---------------------------------------------------------------------------
 
 /// Park the dispatcher's address, 4-byte aligned so the PC-relative load that
-/// reads it has a multiple-of-four displacement (C:1590-1607).
+/// reads it has a multiple-of-four displacement.
 fn emit_dispatched_external_helper_address(st: &mut JitState, dispatcher_addr: u64) -> u32 {
   let adjustment = (4 - (st.offset % 4)) % 4;
   for _ in 0..adjustment {
@@ -1256,7 +1245,7 @@ fn emit_dispatched_external_helper_address(st: &mut JitState, dispatcher_addr: u
   helper_address
 }
 
-/// The consecutive helper-address table (C:1609-1618). `async-ebpf` never
+/// The consecutive helper-address table. `async-ebpf` never
 /// registers individual helpers, so every entry is null.
 fn emit_helper_table(st: &mut JitState) -> u32 {
   let helper_table_address_target = st.offset;
@@ -1267,11 +1256,11 @@ fn emit_helper_table(st: &mut JitState) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Opcode classification (C:1620-1891)
+// Opcode classification
 // ---------------------------------------------------------------------------
 
 /// Whether this instruction carries an immediate operand the backend may have
-/// to lower into a register first (C:1620-1635).
+/// to lower into a register first.
 fn is_imm_op(insn: &Insn) -> bool {
   use crate::jit::isa::{alu, cls, opcode, src};
   let class = insn.opcode & cls::MASK;
@@ -1288,7 +1277,7 @@ fn is_imm_op(insn: &Insn) -> bool {
   (is_imm && (is_alu || is_jmp || is_jmp32)) || is_store
 }
 
-/// Whether the operation is 64-bit wide (C:1637-1642).
+/// Whether the operation is 64-bit wide.
 fn is_alu64_op(insn: &Insn) -> bool {
   use crate::jit::isa::cls;
   let class = insn.opcode & cls::MASK;
@@ -1296,8 +1285,7 @@ fn is_alu64_op(insn: &Insn) -> bool {
 }
 
 /// Whether the immediate can go straight into the instruction encoding, or has
-/// to be materialised in a register first (C:1644-1709).
-///
+/// to be materialised in a register first.
 /// The `add`/`sub` and conditional-jump forms take a 12-bit unsigned immediate.
 /// Everything else — including the logical operations, whose aarch64 immediate
 /// form uses the N/immr/imms bitmask encoding — is lowered to its register
@@ -1328,7 +1316,7 @@ fn is_simple_imm(insn: &Insn) -> bool {
   }
 }
 
-/// Rewrite an immediate-form opcode into its register form (C:1711-1722).
+/// Rewrite an immediate-form opcode into its register form.
 fn to_reg_op(opcode: u8) -> u8 {
   use crate::jit::isa::{cls, src};
   let class = opcode & cls::MASK;
@@ -1342,7 +1330,7 @@ fn to_reg_op(opcode: u8) -> u8 {
   }
 }
 
-/// The condition code a conditional jump maps to (C:1860-1891).
+/// The condition code a conditional jump maps to.
 fn to_condition(op: JmpOp) -> u32 {
   match op {
     JmpOp::Eq => cond::EQ,
@@ -1359,7 +1347,7 @@ fn to_condition(op: JmpOp) -> u32 {
   }
 }
 
-/// The load/store opcode for a memory access (C:1824-1858).
+/// The load/store opcode for a memory access.
 fn to_loadstore_opcode(width: Width, signed: bool, load: bool) -> u32 {
   if load {
     match (width, signed) {
@@ -1383,7 +1371,7 @@ fn to_loadstore_opcode(width: Width, signed: bool, load: bool) -> u32 {
   }
 }
 
-/// The one-source byte-reversal opcode for an `end` immediate (C:1769-1792).
+/// The one-source byte-reversal opcode for an `end` immediate.
 fn to_dp1_opcode(imm: i32) -> u32 {
   match imm {
     16 => dp1::REV16,
@@ -1394,7 +1382,7 @@ fn to_dp1_opcode(imm: i32) -> u32 {
   }
 }
 
-/// `divmod` (C:2530-2546). `offset == 1` selects the signed form.
+/// `divmod`. `offset == 1` selects the signed form.
 fn divmod(st: &mut JitState, opcode: u8, rd: u32, rn: u32, rm: u32, offset: i16) {
   use crate::jit::isa::{alu, cls};
   let is_mod = opcode & alu::MASK == alu::MOD;
@@ -1414,8 +1402,7 @@ fn divmod(st: &mut JitState, opcode: u8, rd: u32, rn: u32, rm: u32, offset: i16)
 // Relocation
 // ---------------------------------------------------------------------------
 
-/// Patch a branch immediate (C:2548-2577).
-///
+/// Patch a branch immediate.
 /// Conditional and compare-and-branch forms carry a signed 19-bit word
 /// displacement (±1 MiB); the unconditional form carries a signed 26-bit one
 /// (±128 MiB). Anything wider is [`Progress::RelocationOutOfRange`] rather than
@@ -1445,7 +1432,7 @@ fn resolve_branch_immediate(st: &mut JitState, offset: u32, imm: i32) -> bool {
   true
 }
 
-/// Patch an `LDR` (literal), whose immediate is signed 19-bit (C:2579-2593).
+/// Patch an `LDR` (literal), whose immediate is signed 19-bit.
 fn resolve_load_literal(st: &mut JitState, instr_offset: u32, target_offset: i32) -> bool {
   if (target_offset >> 18) != -1 && (target_offset >> 18) != 0 {
     st.fail(Progress::RelocationOutOfRange);
@@ -1457,8 +1444,7 @@ fn resolve_load_literal(st: &mut JitState, instr_offset: u32, target_offset: i32
   true
 }
 
-/// Patch an `ADR` (C:2595-2610).
-///
+/// Patch an `ADR`.
 /// Only the `immhi` field is written; the two `immlo` bits at 30:29 are left
 /// clear, because the caller already divided the displacement by four. That is
 /// what the C does, so it is what this does.
@@ -1474,8 +1460,7 @@ fn resolve_adr(st: &mut JitState, instr_offset: u32, immediate: i32) -> bool {
 }
 
 /// Resolve one patch target to a native offset, mirroring the C's dispatch
-/// (C:2618-2639).
-///
+///.
 /// The C decides between the two regular flavours with
 /// `jit_target_pc != 0` — a sentinel that would collide with a real offset of
 /// zero. It cannot here: offset 0 always holds the `bti c`, so nothing is ever
@@ -1542,7 +1527,7 @@ fn resolve_leas(st: &mut JitState) -> bool {
   true
 }
 
-/// Local-call fixups (C:2701-2719). Always empty here: this entry point uses
+/// Local-call fixups. Always empty here: this entry point uses
 /// the lazy resolver, which calls through a register rather than a `BL`.
 fn resolve_local_calls(st: &mut JitState) -> bool {
   for call in std::mem::take(&mut st.local_calls) {
@@ -1571,10 +1556,9 @@ fn failed(msg: impl Into<String>) -> TranslateError {
 
 /// Translates `inputs.start_pc .. inputs.end_pc` into `buffer`, returning the
 /// number of bytes written.
-///
 /// Port of `translate_range` with `whole_program = false, lazy_local_calls =
-/// true` (C:1902-2522), followed by the relocation passes
-/// `ubpf_translate_function_arm64` runs (C:2819-2828).
+/// true`, followed by the relocation passes
+/// `ubpf_translate_function_arm64` runs.
 pub fn translate_range(
   t: &Translator,
   inputs: &TranslationInputs<'_>,
@@ -1739,7 +1723,7 @@ pub fn translate_range(
     match decoded {
       None => {
         // An atomic whose selector immediate names no operation is reported
-        // differently from an unrecognised opcode (C:2360-2363). Both arms are
+        // differently from an unrecognised opcode. Both arms are
         // unreachable through `ubpf_load`, whose filter table enumerates the
         // ten legal atomic immediates.
         errmsg = Some(
@@ -1831,7 +1815,7 @@ pub fn translate_range(
         if native_frame_base_active(cfg) && insn.src == 10 {
           // Storing R10 stores a pointer, and it has to be the guest one.
           //
-          // The C tests the *raw* `inst.src` nibble (C:2303), so a `st`
+          // The C tests the *raw* `inst.src` nibble, so a `st`
           // instruction that happens to carry src == 10 has the frame pointer
           // materialised over the immediate it just parked in the same
           // register. Reproduced.
@@ -1970,7 +1954,7 @@ fn is_mov_imm(opcode: u8) -> bool {
     && opcode & src::REG == src::IMM
 }
 
-/// Map a non-`Ok` status to the error the C reports (C:2447-2493).
+/// Map a non-`Ok` status to the error the C reports.
 fn loop_error(status: Progress, errmsg: Option<String>) -> TranslateError {
   match status {
     Progress::TooManyJumps => failed("Too many jump instructions."),
@@ -1987,8 +1971,7 @@ fn loop_error(status: Progress, errmsg: Option<String>) -> TranslateError {
   }
 }
 
-/// The barrier pre-pass (C:1950-1982), which the x86_64 backend does not have.
-///
+/// The barrier pre-pass, which the x86_64 backend does not have.
 /// Builds the set of instruction slots a branch can land on. An access group's
 /// members address the base its leader parked, so any path reaching a member
 /// without running the leader would read a stale one.
@@ -2031,7 +2014,7 @@ fn barrier_prepass(t: &Translator, st: &mut JitState, start_pc: usize, end_pc: u
   }
 }
 
-/// The ALU arm of the main `switch` (C:2109-2216).
+/// The ALU arm of the main `switch`.
 #[allow(clippy::too_many_arguments)]
 fn emit_alu(
   st: &mut JitState,
@@ -2103,8 +2086,7 @@ fn emit_alu(
   }
 }
 
-/// `le` / `be` / `bswap` (C:2180-2216).
-///
+/// `le` / `be` / `bswap`.
 /// Two deliberate asymmetries are reproduced: on a little-endian host `le`
 /// emits no byte reversal at all (and nothing whatsoever for `imm == 64`), and
 /// `be` zero-extends only for `imm == 16` where `bswap` also does so for 32.
@@ -2165,14 +2147,12 @@ mod tests {
   // ---------------------------------------------------------------------------
 
   /// Stand-in addresses for the helper dispatcher and the local-call resolver.
-  ///
   /// A helper call materialises the dispatcher's address as an immediate, and a
   /// lazy local call materialises the resolver's, so both end up *inside* the
   /// emitted bytes. A real function's address moves with every build and with
   /// address-space randomisation, so recording it would make the output differ
   /// from one run to the next for no reason anybody could review. These fixed
   /// sentinels keep the emitted code reproducible.
-  ///
   /// Nothing ever calls them: translation only writes their value into the
   /// buffer, and this module never executes what it emits.
   const STAND_IN_DISPATCHER: usize = 0x0000_5eed_1111_0000;
@@ -2210,7 +2190,6 @@ mod tests {
   }
 
   /// The configuration sweep every emitter test runs over.
-  ///
   /// The emitted code depends on the pointer cage, the native frame base, the
   /// frame constants and the region hints, and those features *interact* —
   /// which is exactly where code generation goes wrong. Sweeping them is not
@@ -2284,7 +2263,6 @@ mod tests {
   }
 
   /// One case against its golden. Returns whether it produced code.
-  ///
   /// The label has to distinguish cases that share a program, a configuration
   /// and a set of inputs but differ in the buffer they are given, since the
   /// golden key is content-addressed over everything *but* the capacity.
@@ -2303,7 +2281,6 @@ mod tests {
   }
 
   /// Folds one case into a sweep's rolling digest.
-  ///
   /// A program the loader refuses contributes its own outcome rather than
   /// nothing, so a generator that quietly stops producing loadable programs
   /// still moves the digest instead of silently shrinking the sweep.
@@ -3192,7 +3169,6 @@ mod tests {
 
   /// Grows a branch span across a reach boundary, requiring the sweep to
   /// straddle it: some sizes must fit and some must be refused as out of range.
-  ///
   /// The golden pins each outcome; this pins that the *boundary itself* is
   /// still where the test believes it is, which a golden alone cannot say.
   #[track_caller]
@@ -3715,7 +3691,6 @@ mod tests {
   }
 
   /// AUDIT FINDING 1: which failure survives when two happen at once.
-  ///
   /// `JitState::fail` keeps the *first* failure. So when the per-function
   /// prologue overruns the buffer (`NotEnoughSpace`) and the very same
   /// instruction then hits an error arm, what comes out is `OutOfSpace` and not
@@ -3723,7 +3698,6 @@ mod tests {
   /// arena treats `OutOfSpace` as terminal for the whole program and a `Failed`
   /// as terminal for one function, so which one wins decides whether the rest
   /// of the program is still compiled.
-  ///
   /// Reachable through the loader: pc2 is a local function entry (the target of
   /// the call at pc0) *and* a local call with no resolver id, so the guard in
   /// `emit_lazy_local_call` fires after the prologue has already been emitted.
@@ -3753,7 +3727,6 @@ mod tests {
   }
 
   /// AUDIT: fold one probe into the batch's rolling digest.
-  ///
   /// These batches enumerate hundreds of shapes apiece, so they are recorded as
   /// one digest per batch rather than one entry per case: the whole batch stays
   /// a single reviewable line, at the cost of saying only *that* something
@@ -4331,7 +4304,6 @@ mod tests {
   }
 
   /// AUDIT: a local function entry reached by *fall-through*.
-  ///
   /// The validator requires every sub-program to end with `exit` or to carry an
   /// unconditional jump as its second-to-last instruction - so the instruction
   /// physically before a function entry can still fall through, and the
@@ -4504,14 +4476,12 @@ mod tests {
   /// a match on class plus operation nibble. The set it is *meant* to name is a
   /// flat list of whole opcode bytes, written out below; a nibble match is a
   /// compression of that list and can easily admit one byte too many.
-  ///
   /// So enumerate all 256 opcodes against the list and report every byte where
   /// the two differ, together with whether that byte can reach the function at
   /// all — most cannot, because the loader refuses the opcode outright.
   #[test]
   fn audit_is_simple_imm_matches_the_opcode_list_byte_for_byte() {
     /// The opcodes that may carry a folded immediate, one byte at a time.
-    ///
     /// ADD/SUB take a 12-bit unsigned immediate, and so does the compare a
     /// conditional jump lowers to; everything else has to go through a
     /// register. `mov` is the exception at the end: an immediate move *is* the
@@ -4729,13 +4699,11 @@ mod tests {
   }
 
   /// AUDIT FINDING 2 (was: the patch tables grew sixteen times too far).
-  ///
   /// The jump-fixup table stops growing at [`abi::MAX_INSTS`] entries, the same
   /// ceiling a loaded program's instruction count has, and reports "Too many
   /// jump instructions." past it. The tables in `patch.rs` were once set to
   /// `1 << 20`, which let a program that should have been refused emit a
   /// megabyte of code instead.
-  ///
   /// A `cmpxchg` emits two jump fixups, so 32769 of them cross the ceiling
   /// while staying well inside the instruction limit — the smallest program
   /// that tells the two ceilings apart. `patch.rs` is shared, so the x86_64

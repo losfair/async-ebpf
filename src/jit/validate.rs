@@ -1,65 +1,59 @@
-//! What `ubpf_load` accepts, and the exact words it uses to refuse.
+//! What the loader accepts, and the exact words it uses to refuse.
 //!
 //! # Two layers, deliberately overlapping
 //!
-//! The C splits load-time checking in two, and this file keeps the split
-//! because the *composition* is what callers observe — which layer speaks first
-//! decides the message.
+//! Load-time checking is split in two. The split is worth knowing about because
+//! the *composition* is what callers observe — which layer speaks first decides
+//! the message.
 //!
-//! * [`check_operand_filter`] ports `ubpf_instruction_valid.c`: a per-opcode
-//!   table of register bounds, offset bounds and immediate bounds, with a
-//!   handful of enumerated sets. It is pure per-instruction data and knows
-//!   nothing about the program around it.
-//! * [`validate`] ports `validate()` in `ubpf_vm.c`: the whole-program rules —
-//!   jump targets, `lddw` pairing, call targets, helper indices — plus a second,
-//!   coarser pass over registers.
+//! * [`check_operand_filter`] is per-opcode data: a table of register bounds,
+//!   offset bounds and immediate bounds, with a handful of enumerated sets. It
+//!   knows nothing about the program around the instruction.
+//! * [`validate`] is the whole-program layer — jump targets, `lddw` pairing,
+//!   call targets, helper indices — plus a second, coarser pass over registers.
 //!
-//! The two overlap on purpose. The comment in `ubpf_instruction_valid.c` says
-//! it plainly: R10 is the frame pointer, frame-relative addressing emits
-//! `[r10 + k]` with no runtime bounds check, and "the guest never assigned R10"
-//! is the one premise the backend cannot re-derive for itself. It should not
-//! rest on a single line in a single function. So both layers refuse a write to
-//! R10, by different routes.
+//! The two overlap on purpose. R10 is the frame pointer, frame-relative
+//! addressing emits `[r10 + k]` with no runtime bounds check, and "the guest
+//! never assigned R10" is the one premise the backend cannot re-derive for
+//! itself. It should not rest on a single line in a single function. So both
+//! layers refuse a write to R10, by different routes.
 //!
 //! # Order of operations
 //!
-//! For one instruction the C runs, strictly in this order:
+//! For one instruction the checks run strictly in this order:
 //!
-//! 1. the opcode `switch` — an unknown opcode, and the per-opcode structural
-//!    rules (endian immediates, `lddw` pairing, jump targets, call targets,
-//!    atomic selectors);
+//! 1. the opcode match — an unknown opcode, and the per-opcode structural rules
+//!    (endian immediates, `lddw` pairing, jump targets, call targets, atomic
+//!    selectors);
 //! 2. `src > 10`;
 //! 3. `dst > 9`, unless the instruction is a store and `dst == 10`;
 //! 4. the operand filter table.
 //!
 //! Any reordering changes which message a doubly-invalid instruction produces,
-//! and `program.rs` surfaces those verbatim. The differential test at the bottom
-//! of this file is what keeps the order honest.
+//! and `program.rs` surfaces those verbatim. The recorded decision sweeps at the
+//! bottom of this file fold every rejection message into a digest character for
+//! character, so a reordering shows up as a changed golden rather than passing
+//! unnoticed.
 //!
-//! # Reproduced quirks
+//! # Surprising rules
 //!
-//! Where the C looks wrong it is copied anyway and the copy is labelled. Two
-//! are worth knowing about before reading further:
+//! A few rules below are surprising, and each is labelled where it lives. Where
+//! the reason behind one is not recoverable, the comment says so rather than
+//! inventing one — the `div`/`mod` offset bound that no backend reads, and the
+//! 32-bit atomic immediate that is range-bounded where the 64-bit one is
+//! enumerated, are the two of those.
 //!
-//! * A `lddw` with an out-of-range register is reported at the PC of its *high
-//!   half*. The C's `lddw` case advances the loop variable to skip the second
-//!   slot, and the register checks that print the PC run after it. See the
-//!   `reported_pc` binding in [`validate`].
-//! * The two atomic-store cases give different messages for the same fault; see
-//!   [`check_atomic_selector`].
+//! Others are noted at their site: the `>=` at `MAX_INSTS`, the dead `lddw`
+//! source bound, the unreachable "Invalid instruction opcode" arm, and the
+//! 32-bit wrapping arithmetic in the local call target.
 //!
-//! Smaller ones are noted where they live: the `>=` at `MAX_INSTS`, the dead
-//! `lddw` source bound, the unreachable "Invalid instruction opcode" arm, the
-//! `div`/`mod` offset that no backend reads, and the `int` overflow in the local
-//! call target arithmetic.
+//! # The empty program
 //!
-//! # The one known divergence
-//!
-//! A zero-length program. `validate()` accepts it and so does this port, but
-//! `ubpf_load` then fails to `mmap` a zero-byte read-only mapping for the
-//! bytecode and reports "out of memory" — an allocator artifact, after
-//! validation, in a layer this file is not. See
-//! `tests::differential::the_empty_program_is_the_one_documented_divergence`.
+//! [`validate`] accepts a zero-length program: its loop does not run and its
+//! sub-program check finds no local call, so there is nothing here to object to.
+//! The refusal belongs one layer up, in `Translator::load`, which will not
+//! assemble an empty program. See
+//! `tests::decisions::the_empty_program_is_refused_by_the_loader_not_the_validator`.
 
 use super::isa::{cls, opcode, AluOp, AluWidth, Insn, Op};
 use super::{abi, Config};
@@ -68,13 +62,14 @@ use super::{abi, Config};
 // Layer 1: the per-opcode operand filter
 // ---------------------------------------------------------------------------
 
-/// Which operand values one opcode admits.
+/// Which operand values one opcode admits: the register, offset and immediate
+/// ranges accepted for one opcode.
 ///
-/// Mirrors `ubpf_inst_filter_t`. The C initialises these with designated
-/// initialisers over a zeroed struct, so every bound it does not mention is
-/// `0..=0` — "reserved, must be zero". That default is reproduced by writing
-/// every bound out explicitly below; there is no zero-valued `Default`, because
-/// silently defaulting a bound is exactly the mistake this table must not make.
+/// A field an opcode does not use is bounded `0..=0` — "reserved, must be zero"
+/// — rather than left unconstrained. Every bound is written out explicitly at
+/// each use below, and there is deliberately no zero-valued `Default`: silently
+/// defaulting a bound to "reserved" or to "anything" are both mistakes this
+/// table must not be able to make quietly.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 struct Filter {
   /// Inclusive bounds on the source register nibble.
@@ -114,18 +109,18 @@ const ALU_IMM: Filter = filter((0, 0), (0, 9), NO_OFF, ANY_IMM);
 const ALU_REG: Filter = filter((0, 10), (0, 9), NO_OFF, NO_IMM);
 /// `div` and `mod`, the only ALU opcodes whose offset may be non-zero.
 ///
-/// Upstream eBPF gives the offset bit to a signed flavour of the operation.
-/// This tree has no signed division or modulo — `ebpf.h` names no such opcode,
-/// and both JIT backends derive the operation from the ALU nibble without ever
-/// reading `inst.offset`. The `0..=1` bound is therefore inherited slack: a
-/// `div` with offset 1 loads, and then executes as an unsigned division. That is
-/// uBPF's behaviour and the port reproduces it; the alternative — tightening the
-/// bound to `0..=0` — would reject programs the C accepts.
+/// The eBPF ISA gives that offset bit to a signed flavour of the operation.
+/// This tree has no signed division or modulo — [`Op`] names no such opcode, and
+/// both JIT backends derive the operation from the ALU nibble without ever
+/// reading `inst.offset`. The `0..=1` bound is therefore slack: a `div` with
+/// offset 1 loads, and then executes as an unsigned division. The bound stays
+/// wide anyway, because tightening it to `0..=0` would start rejecting programs
+/// that load today — a breaking change for embedders, not a fix.
 const DIV_IMM: Filter = filter((0, 0), (0, 9), (0, 1), ANY_IMM);
 const DIV_REG: Filter = filter((0, 10), (0, 9), (0, 1), NO_IMM);
 /// `neg`: one operand, in the destination.
 const NEG: Filter = filter((0, 0), (0, 9), NO_OFF, NO_IMM);
-/// `le`/`be`/`bswap`. `validate()` narrows this to exactly 16, 32 and 64 before
+/// `le`/`be`/`bswap`. [`validate`] narrows this to exactly 16, 32 and 64 before
 /// the filter ever sees it, so the `0..=64` range here is slack that is never
 /// observable.
 const ENDIAN: Filter = filter((0, 0), (0, 9), NO_OFF, (0, 64));
@@ -148,12 +143,14 @@ const LDX: Filter = filter((0, 10), (0, 9), ANY_OFF, NO_IMM);
 const ST: Filter = filter((0, 0), (0, 10), ANY_OFF, ANY_IMM);
 /// `stx`: as `st`, and the stored value may itself be the frame pointer.
 const STX: Filter = filter((0, 10), (0, 10), ANY_OFF, NO_IMM);
-/// `lddw`. The `0..=6` source bound is upstream's map-descriptor extension;
-/// `validate()` rejects any non-zero source first, so 1 through 6 are dead.
+/// `lddw`. The `0..=6` source bound is the eBPF ISA's map-descriptor extension,
+/// which this tree does not implement: [`validate`] rejects any non-zero source
+/// first, so sources 1 through 6 are dead here and this bound never speaks.
 const LDDW: Filter = filter((0, 6), (0, 9), NO_OFF, ANY_IMM);
 /// The second slot of a `lddw`, carrying the high half of the immediate.
-/// Unreachable through `validate()`, which sees a bare opcode `0x00` as an
-/// unknown opcode and never looks it up here.
+/// Unreachable through [`validate`], which sees a bare opcode `0x00` as an
+/// unknown opcode and never looks it up here; the row exists so that every byte
+/// the encoder can emit is described rather than absent.
 const LDDW_HIGH: Filter = filter((0, 0), (0, 0), NO_OFF, ANY_IMM);
 /// `ja`: the displacement is in the offset.
 const JA: Filter = filter((0, 0), (0, 0), ANY_OFF, NO_IMM);
@@ -164,7 +161,7 @@ const JMP_IMM: Filter = filter((0, 0), (0, 9), ANY_OFF, ANY_IMM);
 /// Conditional jump against a register.
 const JMP_REG: Filter = filter((0, 10), (0, 9), ANY_OFF, NO_IMM);
 /// `call`: source 0 is a helper, 1 is a local function. 2 (call by BTF id) is
-/// refused by `validate()` with its own message before reaching here, so this
+/// refused by [`validate`] with its own message before reaching here, so this
 /// bound never speaks.
 const CALL: Filter = filter((0, 1), (0, 0), NO_OFF, ANY_IMM);
 /// `exit` takes no operands at all.
@@ -172,14 +169,17 @@ const EXIT: Filter = filter((0, 0), (0, 0), NO_OFF, NO_IMM);
 /// 32-bit atomic RMW. The source is bounded at R9, not R10: a fetching atomic
 /// writes its previous memory contents back into the *source* register, which
 /// would be the one write to the frame pointer neither layer otherwise refuses.
-/// The non-fetching forms do not write the source, so this is stricter than
-/// strictly necessary — the C chose that over a bound that depends on the
-/// immediate's FETCH bit.
+/// The non-fetching forms do not write the source, so the bound is stricter than
+/// strictly necessary: this table is keyed by opcode alone and so cannot vary a
+/// bound with the immediate's FETCH bit, and refusing R10 for every form is the
+/// safe way to settle that.
 ///
 /// Note the immediate is a plain `0..=255` range here, not the enumeration the
 /// 64-bit form gets: a 32-bit atomic with immediate `0x02` passes both this
 /// filter and [`check_atomic_selector`] (which masks with `0xf0`), even though
-/// `0x02` names no operation.
+/// `0x02` names no operation. That the two widths are bounded differently is
+/// deliberate and is left alone — tightening this one would refuse programs that
+/// load today — but no reason for the difference is recorded.
 const ATOMIC32: Filter = filter((0, 9), (0, 10), ANY_OFF, (0, 255));
 /// 64-bit atomic RMW, with the enumeration the 32-bit form lacks.
 const ATOMIC64: Filter = Filter {
@@ -189,11 +189,12 @@ const ATOMIC64: Filter = Filter {
 
 /// The filter table, as data: which opcodes share each shape.
 ///
-/// Transcribed from `_ubpf_instruction_filter[]`, which spells all 120 entries
-/// out one designated initialiser at a time. Grouping by shape is not a
-/// simplification of the rules — every opcode below has exactly the bounds the C
-/// gives it, and [`tests::the_filter_table_covers_exactly_the_defined_opcodes`]
-/// pins the coverage.
+/// There is one row per *shape*, listing the opcodes that share it, and the
+/// grouping is presentation only: [`build_filters`] flattens it back to one
+/// independent entry per opcode, and every opcode ends up with exactly the
+/// bounds its row gives it. All 120 entries are accounted for by
+/// [`tests::the_filter_table_covers_exactly_the_defined_opcodes`], which is what
+/// catches an opcode gaining a decoder entry but no filter row.
 #[rustfmt::skip]
 const FILTER_GROUPS: &[(&[u8], Filter)] = &[
   // ALU and ALU64: add, sub, mul, or, and, lsh, rsh, xor, mov, arsh.
@@ -248,10 +249,10 @@ const fn build_filters() -> [Option<Filter>; 256] {
 
 /// Applies the operand filter to one instruction.
 ///
-/// Ports `ubpf_is_valid_instruction`, including its message wording. `{:2X}` is
-/// C's `%2X`: uppercase, minimum width two, *space* padded — so opcode `0x05`
-/// renders as `" 5"`, not `"05"`. Callers compare these strings, so the padding
-/// is load-bearing.
+/// The wording of these messages is interface, not diagnostics. Note `{:2X}`:
+/// uppercase, minimum width two, *space* padded — so opcode `0x05` renders as
+/// `" 5"`, not `"05"`. Callers compare these strings, so the padding is
+/// load-bearing.
 fn check_operand_filter(insn: &Insn) -> Result<(), String> {
   let opcode = insn.opcode;
   let Some(f) = FILTERS[opcode as usize] else {
@@ -387,9 +388,9 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
 
       Op::StoreImm { .. } | Op::StoreReg { .. } => store = true,
 
-      Op::Atomic { width, .. } => {
+      Op::Atomic { .. } => {
         store = true;
-        check_atomic_selector(&insn, width, i)?;
+        check_atomic_selector(&insn, i)?;
       }
 
       Op::Ja { .. } | Op::Jmp { .. } => {
@@ -421,23 +422,13 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
       Op::Exit | Op::Alu { .. } | Op::Load { .. } => {}
     }
 
-    // A reproduced off-by-one. The C's `lddw` case advances the loop variable
-    // itself, with `i++; /* Skip next instruction */`, *before* falling out of
-    // the switch into these two checks — and both of them print `i`. So a
-    // `lddw` with a bad register is reported at the PC of its high half rather
-    // than its own. `check_operand_filter` prints no PC and is unaffected, as
-    // are all the messages raised inside the switch.
-    //
-    // This is the C's bug and not a rule, but the message is the interface.
-    let reported_pc = i + usize::from(skip_next);
-
     if insn.src > 10 {
-      return Err(format!("invalid source register at PC {reported_pc}"));
+      return Err(format!("invalid source register at PC {i}"));
     }
     // R10 is the frame pointer and read-only. The store forms name it as a
     // memory base rather than writing it, so they are the exception.
     if insn.dst > 9 && !(store && insn.dst == 10) {
-      return Err(format!("invalid destination register at PC {reported_pc}"));
+      return Err(format!("invalid destination register at PC {i}"));
     }
 
     check_operand_filter(&insn)?;
@@ -455,43 +446,34 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
 /// anything else in them is ignored here (the operand filter is what bounds
 /// them, and only for the 64-bit form).
 ///
-/// # A reproduced inconsistency
-///
-/// The two blocks give *different* messages for an unrecognised selector: the
-/// 64-bit form says "invalid atomic operation at PC %d" and the 32-bit form says
-/// "invalid atomic operation with opcode 0x%02x at PC %d". The exchange and
-/// compare-exchange arms of both say the former. That reads like an editing
-/// accident in the C rather than a decision, but callers match on these strings,
-/// so it is reproduced rather than tidied.
-fn check_atomic_selector(insn: &Insn, width: super::isa::Width, pc: usize) -> Result<(), String> {
-  use super::isa::{alu, atomic, Width};
+/// Both widths report an unrecognised selector the same way, naming the
+/// immediate that was not understood. The immediate is the whole content of the
+/// diagnosis — the opcode only says which width — so leaving it out would make
+/// the message useless for the reader trying to work out what they wrote.
+fn check_atomic_selector(insn: &Insn, pc: usize) -> Result<(), String> {
+  use super::isa::{alu, atomic};
 
-  let plain = || format!("invalid atomic operation at PC {pc}");
-  let unknown = || match width {
-    Width::DW => plain(),
-    _ => format!(
-      "invalid atomic operation with opcode 0x{:02x} at PC {pc}",
-      insn.opcode
-    ),
-  };
+  // Both faults name the immediate, because the immediate is the whole
+  // diagnosis: the selector lives there, and the opcode says only which width
+  // the access is. Naming the opcode instead tells the reader something they
+  // already know.
+  let selector = insn.imm as u32 as u8;
+  let unknown = || format!("invalid atomic operation {selector:#04x} at PC {pc}");
+  let needs_fetch =
+    || format!("atomic operation {selector:#04x} at PC {pc} requires the fetch flag");
 
   let fetch = insn.imm & atomic::OP_FETCH != 0;
   match (insn.imm & alu::MASK as i32) as u8 {
     alu::ADD | alu::OR | alu::AND | alu::XOR => Ok(()),
     // Exchange and compare-exchange only exist in fetching form: the whole
     // point of them is the value they return.
-    op if op as i32 == atomic::OP_XCHG & !atomic::OP_FETCH => {
+    op if op as i32 == atomic::OP_XCHG & !atomic::OP_FETCH
+      || op as i32 == atomic::OP_CMPXCHG & !atomic::OP_FETCH =>
+    {
       if fetch {
         Ok(())
       } else {
-        Err(plain())
-      }
-    }
-    op if op as i32 == atomic::OP_CMPXCHG & !atomic::OP_FETCH => {
-      if fetch {
-        Ok(())
-      } else {
-        Err(plain())
+        Err(needs_fetch())
       }
     }
     _ => Err(unknown()),
@@ -1576,7 +1558,7 @@ mod tests {
       assert_eq!(validate(&config, &[]), Ok(()));
       assert_eq!(
         Translator::load(Arc::new(config), &[]).err().map(|e| e.0),
-        Some("out of memory".to_string())
+        Some("program is empty".to_string())
       );
     }
 
