@@ -410,6 +410,13 @@ impl<'a, 'b, 'c> DerefMut for MutableUserMemory<'a, 'b, 'c> {
 
 impl<'a, 'b> HelperScope<'a, 'b> {
   /// Posts an async task to be run between timeslices.
+  ///
+  /// # Panics
+  ///
+  /// Panics if called from a context that cannot post a task - an async task's
+  /// own completion callback, most notably - or if this invocation has already
+  /// posted one. Both are helper bugs rather than anything a guest can provoke:
+  /// a guest chooses *which* helper runs, not how that helper uses its scope.
   pub fn post_task(
     &self,
     task: impl Future<Output = impl FnOnce(&HelperScope) -> Result<u64, ()> + 'static> + 'static,
@@ -1030,7 +1037,22 @@ impl GlobalEnv {
   /// Initializes global state and installs signal handlers.
   ///
   /// # Safety
+  ///
   /// Must be called in a process that can install SIGUSR1/SIGSEGV handlers.
+  ///
+  /// The effect is **process-wide**, not scoped to this crate's threads: it
+  /// replaces whatever dispositions SIGUSR1 and SIGSEGV had. Notably that
+  /// includes the SIGSEGV handler Rust's standard library installs to report
+  /// thread stack overflow, so a host stack overflow reports as a plain
+  /// segmentation fault while this is installed. The previous SIGSEGV
+  /// disposition is kept and restored for any fault this crate determines is
+  /// not its own, so another component's handler still sees those - but it does
+  /// not see them *first*, and a component that needs to run before this one
+  /// cannot be accommodated.
+  ///
+  /// An embedder sharing the process with another SIGSEGV user - a garbage
+  /// collector, another JIT, a crash reporter, a `userfaultfd`-style mapper -
+  /// should know this before calling.
   pub unsafe fn new() -> Self {
     static INIT: Once = Once::new();
 
@@ -1426,6 +1448,38 @@ impl Program {
       .get(&info.signature)
       .and_then(|compilation| compilation.entrypoint())
       .map(|entrypoint| entrypoint.code_ptr)
+  }
+
+  /// Debug-only check that this frame holds nothing a cancellation would
+  /// strand, immediately before it suspends the guest.
+  ///
+  /// The crate declares no `unwind` feature, so `force_unwind_slow` on a
+  /// started, suspended coroutine panics from inside a `Drop` inside a
+  /// scopeguard - an abort. `CoDropper::drop` is what keeps every cancelled
+  /// `run` away from that, by force-resetting the coroutine instead of
+  /// unwinding it. The consequence is that cancelling a run abandons the
+  /// coroutine stack *without running a single destructor* on it, which is
+  /// sound only while none of the frames that can be live at a suspension owns
+  /// anything that needs dropping.
+  ///
+  /// That holds today, but narrowly: `cached_resolver_target` takes borrows of
+  /// both `resolvers` and `sections`, and stays sound only because both `Ref`s
+  /// die when it returns, one line before the suspension. Hoisting the suspend
+  /// into it - or holding either borrow across it - would leak the borrow on
+  /// the first cancelled run and panic every later `borrow_mut` on that cell,
+  /// from JIT-adjacent code, for the life of the program. This turns that from
+  /// an argument in a comment into something a debug build fails on.
+  fn debug_assert_nothing_to_drop_across_suspend(&self) {
+    debug_assert!(
+      self.unbound.resolvers.try_borrow_mut().is_ok(),
+      "a `resolvers` borrow is live across a suspension; a cancelled run would \
+       abandon it without dropping it"
+    );
+    debug_assert!(
+      self.unbound.sections.try_borrow_mut().is_ok(),
+      "a `sections` borrow is live across a suspension; a cancelled run would \
+       abandon it without dropping it"
+    );
   }
 
   fn protect_code_pages(&self, executable_len: usize) -> Result<(), RuntimeError> {
@@ -1864,6 +1918,14 @@ impl Program {
         }
 
         let ret = co.0.resume(resume_input);
+        // The coroutine is suspended here, which is exactly the state a
+        // cancellation abandons without running destructors. Checked on the
+        // host stack rather than at the suspension sites themselves: those run
+        // on the 16 KiB coroutine stack, where a failing assertion overruns
+        // into the guard page and reports as a bare SIGSEGV instead of saying
+        // what went wrong. This also covers every suspension point at once -
+        // helper dispatch, the lazy local-call resolver, and preemption.
+        self.debug_assert_nothing_to_drop_across_suspend();
         ACTIVE_PROGRAM.with(|x| x.set(std::ptr::null()));
         let next_yielder = ACTIVE_JIT_CODE_ZONE.with(|x| {
           x.valid.store(false, Ordering::Relaxed);
@@ -2211,6 +2273,11 @@ impl ProgramLoader {
   /// ("jit: code translation failed") regardless of this limit; raising it
   /// past 1 MiB only adds room for more or larger sections within that
   /// per-section ceiling. x86-64 has no such per-section constraint.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `limit` is zero, is not a multiple of 64 KiB, or does not fit in
+  /// a `u32`.
   pub fn with_code_size_limit(mut self, limit: usize) -> Self {
     assert!(
       limit > 0 && limit % (64 * 1024) == 0,
