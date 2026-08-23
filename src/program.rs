@@ -525,10 +525,6 @@ impl<'a, 'b> HelperScope<'a, 'b> {
   }
 }
 
-#[derive(Copy, Clone)]
-struct AssumeSend<T>(T);
-unsafe impl<T> Send for AssumeSend<T> {}
-
 /// Native backing for one invocation's guest stack, in its own mapping with a
 /// `PROT_NONE` page on each side.
 ///
@@ -766,7 +762,22 @@ enum PreemptionState {
   Shutdown,
 }
 
-type PreemptionStateSignal = (Mutex<PreemptionState>, Condvar);
+/// The per-thread handle onto that thread's preemption watcher.
+struct PreemptionStateSignal {
+  state: Mutex<PreemptionState>,
+  changed: Condvar,
+  /// Set when the watcher stops for any reason other than an orderly shutdown -
+  /// a failed `tgkill`/`pthread_kill`, or a panic in the watcher itself.
+  ///
+  /// Preemption is asynchronous and has no cooperative fallback, so a watcher
+  /// that has stopped means a guest resumed on this thread can hold the OS
+  /// thread for as long as it likes: the reactor and timer wheel stop with it,
+  /// and there is no await point at which the run could be cancelled. The
+  /// thread never gets a watcher back either, because `init_thread` sees the
+  /// `WATCHER` slot already filled and returns early. `Program::run` reads this
+  /// and refuses to start rather than wedging the runtime.
+  watcher_failed: AtomicBool,
+}
 
 thread_local! {
   static RUST_TID: ThreadId = std::thread::current().id();
@@ -774,7 +785,11 @@ thread_local! {
   static ACTIVE_JIT_CODE_ZONE: ActiveJitCodeZone = ActiveJitCodeZone::default();
   static EXEC_CONTEXT_POOL: RefCell<Vec<ExecContext>> = Default::default();
   static PENDING_ASYNC_TASK: RefCell<Option<PendingAsyncTask>> = RefCell::new(None);
-  static PREEMPTION_STATE: Arc<PreemptionStateSignal> = Arc::new((Mutex::new(PreemptionState::Inactive), Condvar::new()));
+  static PREEMPTION_STATE: Arc<PreemptionStateSignal> = Arc::new(PreemptionStateSignal {
+    state: Mutex::new(PreemptionState::Inactive),
+    changed: Condvar::new(),
+    watcher_failed: AtomicBool::new(false),
+  });
   static LOADING_PROGRAM_LOADER: Cell<*const ProgramLoader> = const { Cell::new(std::ptr::null()) };
   static ACTIVE_PROGRAM: Cell<*const Program> = const { Cell::new(std::ptr::null()) };
 }
@@ -872,6 +887,32 @@ pub struct UnboundProgram {
 }
 
 /// A program pinned to a specific thread and ready to execute.
+///
+/// Pinned in earnest: this must stay neither `Send` nor `Sync`, because the
+/// future [`Program::run`] returns borrows it, and that future must not be
+/// spawnable onto a work-stealing executor. A guest suspends inside the SIGUSR1
+/// handler, so resuming it on a second worker would run the `sigreturn` and the
+/// unblocking `sigprocmask` on a thread that never took the signal - leaving
+/// SIGUSR1 and SIGSEGV blocked forever on the thread that did, with neither
+/// preemption nor guest fault handling. The watcher would also still be
+/// signalling the original thread, and the pooled `ExecContext` would migrate
+/// with it.
+///
+/// `ThreadEnv`'s `PhantomData<*const ()>` and the `Rc` in `data` are what
+/// establish this today; the doctests pin it so a future change to either has
+/// to come with a decision about the above rather than silently making the
+/// future spawnable. A wrapper asserting `Send` over the live coroutine used to
+/// stand here instead, which hid exactly this reasoning.
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<async_ebpf::Program>();
+/// ```
+///
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<async_ebpf::Program>();
+/// ```
 pub struct Program {
   unbound: UnboundProgram,
   data: RefCell<HashMap<TypeId, Rc<dyn Any>>>,
@@ -1041,8 +1082,23 @@ impl GlobalEnv {
     impl Drop for DeferDrop {
       fn drop(&mut self) {
         let x = &self.0;
-        *x.0.lock() = PreemptionState::Shutdown;
-        x.1.notify_one();
+        *x.state.lock() = PreemptionState::Shutdown;
+        x.changed.notify_one();
+      }
+    }
+
+    /// Marks the watcher as failed unless it left through the shutdown arm.
+    /// Covers a panic in the watcher as well as the signal failure below, since
+    /// either leaves the thread just as unpreemptible.
+    struct WatcherExitGuard {
+      shared: Arc<PreemptionStateSignal>,
+      orderly: bool,
+    }
+    impl Drop for WatcherExitGuard {
+      fn drop(&mut self) {
+        if !self.orderly {
+          self.shared.watcher_failed.store(true, Ordering::SeqCst);
+        }
       }
     }
 
@@ -1065,16 +1121,23 @@ impl GlobalEnv {
       std::thread::Builder::new()
         .name("preempt-watcher".to_string())
         .spawn(move || {
-          let mut state = preemption_state.0.lock();
+          let mut exit = WatcherExitGuard {
+            shared: preemption_state.clone(),
+            orderly: false,
+          };
+          let mut state = preemption_state.state.lock();
           let _ = ready_tx.send(());
           loop {
             match *state {
-              PreemptionState::Shutdown => break,
+              PreemptionState::Shutdown => {
+                exit.orderly = true;
+                break;
+              }
               PreemptionState::Inactive => {
-                preemption_state.1.wait(&mut state);
+                preemption_state.changed.wait(&mut state);
               }
               PreemptionState::Armed(_) => {
-                let timeout = preemption_state.1.wait_while_for(
+                let timeout = preemption_state.changed.wait_while_for(
                   &mut state,
                   |x| matches!(x, PreemptionState::Armed(_)),
                   async_preemption_interval,
@@ -1085,12 +1148,19 @@ impl GlobalEnv {
                       *state = PreemptionState::Inactive;
                     }
                     PreemptionState::Armed(_) => {
+                      // The thread is now unpreemptible for the rest of its
+                      // life, and `init_thread` will not replace this watcher.
+                      // Leave the guard set to failed so `run` refuses work
+                      // here rather than letting a guest wedge the runtime.
                       if signal_native_thread(target_thread, libc::SIGUSR1) != 0 {
                         break;
                       }
                     }
                     PreemptionState::Inactive => {}
-                    PreemptionState::Shutdown => break,
+                    PreemptionState::Shutdown => {
+                      exit.orderly = true;
+                      break;
+                    }
                   }
                 }
               }
@@ -1125,44 +1195,81 @@ impl UnboundProgram {
   }
 }
 
-pub struct PreemptionEnabled(());
+/// Arms asynchronous preemption for **the current thread**, until dropped.
+///
+/// This is a thread-local arming token, not a transferable capability: the
+/// state it flips lives in a thread-local, and the watcher it wakes signals the
+/// thread that called [`GlobalEnv::init_thread`]. Sending it elsewhere and
+/// running a program there would leave that thread unarmed and unpreemptible -
+/// the guest would hold the OS thread, stopping the reactor and the timer wheel
+/// with it - so the token is deliberately neither `Send` nor `Sync` and cannot
+/// leave the thread that created it. [`ThreadEnv`] is `!Send` for the same
+/// reason; before this marker existed the token derived from it silently was
+/// not.
+pub struct PreemptionEnabled {
+  /// The thread this token armed, checked on drop.
+  armed_on: ThreadId,
+  /// `*const ()` is neither `Send` nor `Sync`, which is inherited here.
+  ///
+  /// ```compile_fail
+  /// fn send<T: Send>() {}
+  /// send::<async_ebpf::PreemptionEnabled>();
+  /// ```
+  ///
+  /// ```compile_fail
+  /// fn sync<T: Sync>() {}
+  /// sync::<async_ebpf::PreemptionEnabled>();
+  /// ```
+  _not_send_sync: PhantomData<*const ()>,
+}
 
 impl PreemptionEnabled {
   pub fn new(_: ThreadEnv) -> Self {
     PREEMPTION_STATE.with(|x| {
       let mut notify = false;
       {
-        let mut st = x.0.lock();
+        let mut st = x.state.lock();
         let next = match *st {
           PreemptionState::Inactive => {
             notify = true;
             PreemptionState::Armed(1)
           }
-          PreemptionState::Armed(n) => PreemptionState::Armed(n + 1),
-          PreemptionState::Shutdown => unreachable!(),
+          PreemptionState::Armed(n) => PreemptionState::Armed(n.saturating_add(1)),
+          // The watcher for this thread has already stopped. Arming is then a
+          // no-op rather than a process-killing panic on what is only ever an
+          // embedder sequencing mistake; `Program::run` is where an unarmed
+          // thread is reported, and it reports it as an error.
+          PreemptionState::Shutdown => PreemptionState::Shutdown,
         };
         *st = next;
       }
 
       if notify {
-        x.1.notify_one();
+        x.changed.notify_one();
       }
     });
-    Self(())
+    Self {
+      armed_on: RUST_TID.with(|x| *x),
+      _not_send_sync: PhantomData,
+    }
   }
 }
 
 impl Drop for PreemptionEnabled {
   fn drop(&mut self) {
+    debug_assert_eq!(
+      self.armed_on,
+      RUST_TID.with(|x| *x),
+      "a PreemptionEnabled was dropped on a thread other than the one it armed"
+    );
     PREEMPTION_STATE.with(|x| {
-      let mut st = x.0.lock();
+      let mut st = x.state.lock();
       let next = match *st {
         PreemptionState::Armed(1) => PreemptionState::Armed(0),
-        PreemptionState::Armed(n) => {
-          assert!(n > 1);
-          PreemptionState::Armed(n - 1)
-        }
-        PreemptionState::Inactive | PreemptionState::Shutdown => unreachable!(),
+        PreemptionState::Armed(n) => PreemptionState::Armed(n.saturating_sub(1)),
+        // Either the watcher shut down under us, or arming was a no-op above.
+        // Neither is worth killing the process over on the way out.
+        other @ (PreemptionState::Inactive | PreemptionState::Shutdown) => other,
       };
       *st = next;
     });
@@ -1594,6 +1701,18 @@ impl Program {
       return Err(err);
     }
 
+    // Preemption is asynchronous with no cooperative fallback, so a stopped
+    // watcher means nothing can interrupt a guest on this thread. Refuse the
+    // run: a program that never returns would otherwise hold the OS thread, and
+    // with the reactor and timer wheel stopped there is no await point left at
+    // which the caller could time it out or cancel it.
+    if PREEMPTION_STATE.with(|x| x.watcher_failed.load(Ordering::SeqCst)) {
+      return Err(RuntimeError::PlatformError(
+        "the preemption watcher for this thread has stopped, so a program run \
+         here could not be preempted",
+      ));
+    }
+
     let Some(section_index) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));
     };
@@ -1660,7 +1779,7 @@ impl Program {
       let memory = memory;
       let memory_ptr = &memory as *const JitMemory as usize;
 
-      let mut co = AssumeSend(CoDropper(Coroutine::with_stack(
+      let mut co = CoDropper(Coroutine::with_stack(
         &mut ctx.native_stack,
         move |yielder, _input| unsafe {
           ACTIVE_JIT_CODE_ZONE.with(|x| {
@@ -1679,11 +1798,11 @@ impl Program {
             memory_ptr,
           )
         },
-      )));
+      ));
 
       let mut last_yield_time: Option<Instant> = None;
       let mut last_throttle_time: Option<Instant> = None;
-      let mut yielder: Option<AssumeSend<NonNull<Yielder<u64, Dispatch>>>> = None;
+      let mut yielder: Option<NonNull<Yielder<u64, Dispatch>>> = None;
       let mut resume_input: u64 = 0;
       let mut did_throttle = false;
       let mut rust_tid_sigusr1_counter = (RUST_TID.with(|x| *x), SIGUSR1_COUNTER.with(|x| x.get()));
@@ -1698,7 +1817,7 @@ impl Program {
             self.unbound.code_base,
             self.unbound.code_base + self.unbound.code_size,
           ));
-          x.yielder.set(yielder.map(|x| x.0));
+          x.yielder.set(yielder);
           x.pointer_cage_protected_range
             .set((0, POINTER_CAGE_PROTECTED_WINDOW));
           compiler_fence(Ordering::Release);
@@ -1730,12 +1849,12 @@ impl Program {
           .map_err(|_| RuntimeError::AsyncHelperError(helper_name))?;
         }
 
-        let ret = co.0 .0.resume(resume_input);
+        let ret = co.0.resume(resume_input);
         ACTIVE_PROGRAM.with(|x| x.set(std::ptr::null()));
         let next_yielder = ACTIVE_JIT_CODE_ZONE.with(|x| {
           x.valid.store(false, Ordering::Relaxed);
           compiler_fence(Ordering::Release);
-          let yielder = x.yielder.get().map(AssumeSend);
+          let yielder = x.yielder.get();
           x.yielder.set(None);
           x.code_range.set((0, 0));
           x.pointer_cage_protected_range.set((0, 0));
