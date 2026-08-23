@@ -230,6 +230,27 @@ fn translate(
   )
 }
 
+/// Every function range in a loaded program, as the runtime's own layout pass
+/// computes them: pc 0, then each local callee entry, each running to the next.
+///
+/// A fuzzer that hands the emitter a whole program instead gets one range
+/// refusal and never reaches the code generator at all — which is how a corpus
+/// full of local calls can stop testing `emit_lazy_local_call` without any test
+/// going red.
+fn function_ranges(t: &Translator) -> Vec<(usize, usize)> {
+  let num = t.insns().len();
+  let mut starts: Vec<usize> = (0..num).filter(|&pc| t.is_local_func_entry(pc)).collect();
+  starts.push(0);
+  starts.sort_unstable();
+  starts.dedup();
+  starts
+    .iter()
+    .enumerate()
+    .map(|(i, &start)| (start, starts.get(i + 1).copied().unwrap_or(num)))
+    .filter(|&(start, end)| start < end)
+    .collect()
+}
+
 /// xorshift64*, so the corpus is reproducible without a dependency.
 struct Rng(u64);
 
@@ -543,6 +564,11 @@ fn hostile_plan(rng: &mut Rng, len: usize) -> Vec<PlanEntry> {
 /// arithmetic overflow counts.
 static LOADED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static TRANSLATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Successful translations of a function belonging to a program that has more
+/// than one. Counted separately because the shapes built around local calls are
+/// the ones that stop reaching the emitter first, and the plain
+/// [`TRANSLATED`] floor is carried by the three shapes that never emit a call.
+static SPLIT_TRANSLATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[test]
 fn no_hostile_program_makes_the_translator_panic() {
@@ -581,37 +607,46 @@ fn no_hostile_program_makes_the_translator_panic() {
       LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       let num = translator.insns().len();
 
-      // The runtime always passes a full-program range, but the analysis
-      // inputs are attacker-influenced, so vary them freely.
+      // One range per function, as the runtime compiles them. Two of the five
+      // generator shapes are built around local calls, so handing the whole
+      // program over would refuse the range and never reach the emitter — and
+      // `emit_lazy_local_call` is exactly what the hostile `resolver_ids`
+      // below are aimed at.
+      let ranges = function_ranges(&translator);
       let hints: Vec<u8> = (0..num).map(|_| (rng.next() % 6) as u8).collect();
       let plan = hostile_plan(&mut rng, num);
       let resolver_ids: Vec<u32> = (0..num).map(|_| rng.next() as u32).collect();
 
-      for buf_len in [0usize, 1, 7, 64, 4096, 1 << 16] {
-        let mut buf = vec![0u8; buf_len];
-        let inputs = TranslationInputs {
-          hints: &hints,
-          plan: &plan,
-          resolver_ids: &resolver_ids,
-          start_pc: 0,
-          end_pc: num,
-        };
-        if translator.translate_range(&inputs, &mut buf).is_ok() {
-          TRANSLATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      for &(start_pc, end_pc) in &ranges {
+        for buf_len in [0usize, 1, 7, 64, 4096, 1 << 16] {
+          let mut buf = vec![0u8; buf_len];
+          let inputs = TranslationInputs {
+            hints: &hints,
+            plan: &plan,
+            resolver_ids: &resolver_ids,
+            start_pc,
+            end_pc,
+          };
+          if translator.translate_range(&inputs, &mut buf).is_ok() {
+            TRANSLATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if ranges.len() > 1 {
+              SPLIT_TRANSLATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+          }
         }
-      }
 
-      // Truncated analysis inputs: these are indexed by pc against a length
-      // it was told, so a short slice is the classic out-of-bounds.
-      let mut buf = vec![0u8; 1 << 16];
-      let inputs = TranslationInputs {
-        hints: &hints[..num / 2],
-        plan: &plan[..num / 2],
-        resolver_ids: &resolver_ids[..num / 2],
-        start_pc: 0,
-        end_pc: num,
-      };
-      let _ = translator.translate_range(&inputs, &mut buf);
+        // Truncated analysis inputs: these are indexed by pc against a length
+        // it was told, so a short slice is the classic out-of-bounds.
+        let mut buf = vec![0u8; 1 << 16];
+        let inputs = TranslationInputs {
+          hints: &hints[..num / 2],
+          plan: &plan[..num / 2],
+          resolver_ids: &resolver_ids[..num / 2],
+          start_pc,
+          end_pc,
+        };
+        let _ = translator.translate_range(&inputs, &mut buf);
+      }
     }
   }
   // A fuzz test whose corpus stops reaching the emitters is worse than no
@@ -626,6 +661,16 @@ fn no_hostile_program_makes_the_translator_panic() {
     loaded > floor && translated > floor,
     "the generator stopped producing loadable programs: {loaded} loaded, \
      {translated} translated, floor {floor}"
+  );
+  // And specifically that the local-call shapes still reach the emitter. They
+  // are two of the five, so the floor above stays green without them — which is
+  // exactly what happened when the whole program was handed over as one range
+  // and every multi-function corpus entry stopped at the range check.
+  let split = SPLIT_TRANSLATED.load(std::sync::atomic::Ordering::Relaxed);
+  assert!(
+    split > floor,
+    "only {split} functions of multi-function programs translated (floor \
+     {floor}); the corpus is no longer exercising lazy local calls"
   );
 }
 

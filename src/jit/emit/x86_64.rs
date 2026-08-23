@@ -184,6 +184,14 @@ struct Emit<'buf, 'ctx, 'in_> {
   retpoline_loc: u32,
   /// `call rel32` displacement fields awaiting [`Self::retpoline_loc`]. Kept
   /// here rather than in the shared state because the thunk is x86_64's alone.
+  ///
+  /// Unbounded, where the shared tables have a `TooMany*` ceiling — see
+  /// [`MAX_JUMPS`](crate::jit::patch::MAX_JUMPS). It does not need one: exactly
+  /// one entry is pushed per helper `call`, so its length is bounded by the
+  /// instruction count the loader already enforces, and four bytes each puts
+  /// the worst case at a quarter of a megabyte. The ceilings exist to stop a
+  /// table growing *faster* than one entry per instruction, which is what the
+  /// old three-fixups-per-helper-call sequence did.
   retpoline_calls: Vec<u32>,
 }
 

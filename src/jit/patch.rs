@@ -167,19 +167,26 @@ pub struct OpenGroup {
   pub written: u16,
 }
 
-/// Ceiling on each patch table, above which translation stops with the matching
-/// `TooMany*` error.
+/// Ceiling on each of the two tables *here*, above which translation stops with
+/// the matching `TooMany*` error.
 ///
 /// [`MAX_INSTS`](super::abi::MAX_INSTS) — 65,536 — rather than a round number of
 /// the tables' own, so no program the loader accepts can need more fixups than
 /// the ceiling allows.
 ///
-/// This used to bind. A helper call emitted three jump fixups of its own — the
-/// branch past the default dispatcher, the branch past the external one, and
-/// the retpoline call — so around 21,800 helper calls crossed the ceiling in a
-/// program comfortably inside the instruction limit. With the per-index helper
-/// table gone a helper call emits none, and what is left is roughly one fixup
-/// per branch instruction.
+/// Two caveats, both introduced by removing the per-index helper table:
+///
+/// * This used to bind, and no longer does for helper calls. Each emitted three
+///   jump fixups of its own — the branch past the default dispatcher, the branch
+///   past the external one, and the retpoline call — so around 21,800 of them
+///   crossed the ceiling in a program comfortably inside the instruction limit.
+///   A helper call now records no jump fixup at all, and what is left is roughly
+///   one per branch instruction. That is a deliberate widening: programs that
+///   were refused for it now compile.
+/// * These ceilings cover the shared tables and nothing else. x86_64 keeps its
+///   retpoline call sites in a table of its own, on `Emit` rather than here,
+///   and does not bound it — see the field's own note for why it does not need
+///   to.
 ///
 /// The exact value still matters. An earlier version used `1 << 20`, sixteen
 /// times higher, which changed nothing about the bytes emitted for any program

@@ -4181,6 +4181,82 @@ mod tests {
     finish_sweep(digest, "audit-group-interactions");
   }
 
+  /// AUDIT: two shapes that survived the removal of multi-function ranges.
+  ///
+  /// `audit_fallthrough_into_a_local_function_entry` covered both, and went
+  /// with the bypass jump it was written for — but neither depends on a range
+  /// holding more than one function:
+  ///
+  /// * A function whose last instruction is not `exit`. The validator accepts
+  ///   it, because a sub-program may instead carry an unconditional jump in its
+  ///   second-to-last slot, and nothing else here emits one.
+  /// * A plan whose leader sits *outside* the translated range. The member is
+  ///   the first instruction of its own function and names a leader in the
+  ///   caller's buffer, which the backend cannot have run — so the plan must be
+  ///   declined and an ordinary checked access emitted instead.
+  #[test]
+  fn audit_function_shapes_from_the_deleted_fallthrough_sweep() {
+    let mut digest = SweepDigest::new();
+    let ld = |dst: u8, off: i16| insn(cls::LDX | mode::MEM | size::DW, dst, 2, off, 0);
+    let ids = [4u32; 5];
+
+    // pc0 calls pc3; pc1 is the unconditional jump that satisfies the
+    // validator; the function at 0..3 therefore ends on `movi`, not `exit`.
+    let insns = vec![
+      insn(opcode::CALL, 0, 1, 0, 2),
+      insn(opcode::JA, 0, 0, -2, 0),
+      insn(0xb7, 1, 0, 0, 7),
+      insn(0xb7, 2, 0, 0, 9),
+      exit(),
+    ];
+    for (start, end) in [(0usize, 3usize), (3, 5)] {
+      audit_case(
+        &mut digest,
+        &format!("function not ending in exit, range {start}..{end}"),
+        &insns,
+        &TranslationInputs {
+          resolver_ids: &ids,
+          start_pc: start,
+          end_pc: end,
+          ..Default::default()
+        },
+      );
+    }
+
+    // The leader is at pc2, in the caller's function; the member is at pc3,
+    // which begins the callee and is the first instruction of its own buffer.
+    let plan = vec![
+      none_entry(),
+      none_entry(),
+      leader(abi::region::STACK, 0, 0, 16, 2),
+      member(abi::region::STACK, 0, 8, 2),
+      none_entry(),
+    ];
+    let insns2 = vec![
+      insn(opcode::CALL, 0, 1, 0, 2),
+      insn(opcode::JA, 0, 0, -2, 0),
+      ld(1, 0),
+      ld(3, 8),
+      exit(),
+    ];
+    for (start, end) in [(0usize, 3usize), (3, 5)] {
+      audit_case(
+        &mut digest,
+        &format!("leader outside the range, {start}..{end}"),
+        &insns2,
+        &TranslationInputs {
+          plan: &plan,
+          resolver_ids: &ids,
+          start_pc: start,
+          end_pc: end,
+          ..Default::default()
+        },
+      );
+    }
+
+    finish_sweep(digest, "audit-shapes-from-the-fallthrough-sweep");
+  }
+
   /// AUDIT: a region-hint array shorter than the program.
   #[test]
   fn audit_short_hint_array() {
