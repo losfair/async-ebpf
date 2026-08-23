@@ -279,6 +279,19 @@ impl Translator {
     if code.len() % 8 != 0 {
       return Err(LoadError("code_len must be a multiple of 8".to_string()));
     }
+    // The C accepts a zero-length program in `validate()` — the loop does not
+    // run and the sub-program check finds no local call — and then fails in
+    // `ubpf_load` itself, where the read-only bytecode mapping asks for
+    // `mmap(NULL, 0, ...)`, gets EINVAL, and reports "out of memory".
+    //
+    // That message is an allocator artifact rather than a judgement about the
+    // program, so it does not belong in the validator; but this function is the
+    // analogue of `ubpf_load`, which is where it happens in the C, so it
+    // belongs here. Rejecting it keeps the divergence allowlist empty, which
+    // was the point of having one.
+    if code.is_empty() {
+      return Err(LoadError("out of memory".to_string()));
+    }
     let insns = Insn::decode_all(code).expect("length checked above");
     if insns.len() > abi::MAX_INSTS as usize {
       return Err(LoadError(format!(

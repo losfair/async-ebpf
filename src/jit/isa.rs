@@ -521,17 +521,28 @@ impl Insn {
   pub fn op_with_imm(self) -> Option<Op> {
     match self.op()? {
       Op::Atomic { width, .. } => {
+        // The selector is the immediate's *high nibble*, and the fetch flag is
+        // its low bit. Everything in between is ignored.
+        //
+        // That matters more than it looks. Clearing only the fetch bit — the
+        // obvious reading — decodes every canonical selector correctly and then
+        // diverges on the non-canonical ones the C happily accepts: `imm = 0x02`
+        // masks to `ALU_OP_ADD` and emits a plain atomic add, and `imm = 0xe0`
+        // is an `xchg` without the fetch flag. The validator's filter for
+        // 32-bit atomics bounds the immediate at `0..=255` rather than
+        // enumerating legal values, so both of those reach the backend on a
+        // program that loads. A stricter decode here turns them into
+        // `UnknownInstruction` where the C emits code — a byte-level
+        // divergence, on an input a fuzzer reaches quickly.
         let fetch = self.imm & atomic::OP_FETCH != 0;
-        let op = match self.imm {
-          i if i == atomic::OP_XCHG => AtomicOp::Xchg,
-          i if i == atomic::OP_CMPXCHG => AtomicOp::Cmpxchg,
-          i => match (i & !atomic::OP_FETCH) as u8 {
-            alu::ADD => AtomicOp::Add,
-            alu::OR => AtomicOp::Or,
-            alu::AND => AtomicOp::And,
-            alu::XOR => AtomicOp::Xor,
-            _ => return None,
-          },
+        let op = match (self.imm & alu::MASK as i32) as u8 {
+          alu::ADD => AtomicOp::Add,
+          alu::OR => AtomicOp::Or,
+          alu::AND => AtomicOp::And,
+          alu::XOR => AtomicOp::Xor,
+          sel if sel == (atomic::OP_XCHG & !atomic::OP_FETCH) as u8 => AtomicOp::Xchg,
+          sel if sel == (atomic::OP_CMPXCHG & !atomic::OP_FETCH) as u8 => AtomicOp::Cmpxchg,
+          _ => return None,
         };
         Some(Op::Atomic { width, op, fetch })
       }
@@ -639,6 +650,59 @@ mod tests {
     );
     // `mul` has no atomic form.
     assert_eq!(mk(alu::MUL as i32).op_with_imm(), None);
+  }
+
+  #[test]
+  fn the_atomic_selector_is_the_high_nibble_and_ignores_the_middle_bits() {
+    // Regression. The C computes `fetch = imm & 1` and switches on
+    // `imm & 0xf0`, so bits 1-3 are dead. Decoding by clearing only the fetch
+    // bit gets every canonical selector right and then diverges on exactly the
+    // non-canonical ones the validator lets through for 32-bit atomics, where
+    // its filter bounds the immediate at 0..=255 instead of enumerating.
+    let mk = |imm| Insn {
+      opcode: opcode::ATOMIC32_STORE,
+      dst: 1,
+      src: 2,
+      offset: 0,
+      imm,
+    };
+    // Middle bits set: still a plain add, not an unknown instruction.
+    assert_eq!(
+      mk(0x02).op_with_imm(),
+      Some(Op::Atomic {
+        width: Width::W,
+        op: AtomicOp::Add,
+        fetch: false
+      })
+    );
+    assert_eq!(
+      mk(0x0f).op_with_imm(),
+      Some(Op::Atomic {
+        width: Width::W,
+        op: AtomicOp::Add,
+        fetch: true
+      })
+    );
+    // xchg and cmpxchg without the fetch bit are still xchg and cmpxchg.
+    assert_eq!(
+      mk(0xe0).op_with_imm(),
+      Some(Op::Atomic {
+        width: Width::W,
+        op: AtomicOp::Xchg,
+        fetch: false
+      })
+    );
+    assert_eq!(
+      mk(0xf0).op_with_imm(),
+      Some(Op::Atomic {
+        width: Width::W,
+        op: AtomicOp::Cmpxchg,
+        fetch: false
+      })
+    );
+    // A high nibble that names nothing is still rejected.
+    assert_eq!(mk(0x30).op_with_imm(), None);
+    assert_eq!(mk(0xb0).op_with_imm(), None);
   }
 
   #[test]
