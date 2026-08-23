@@ -529,11 +529,12 @@ static TRANSLATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 #[test]
 fn no_hostile_program_makes_the_translator_panic() {
   // Miri interprets rather than executes, so a sweep sized for native runs
-  // takes hours there. Shrink it instead of skipping: what Miri contributes
-  // here is undefined-behaviour detection inside the emitters, and a few dozen
-  // hostile programs exercise the same code paths as eight thousand. The
-  // coverage floor below scales with it so the test still refuses to pass
-  // vacuously.
+  // takes hours there - this one and the opcode census below timed a CI job out
+  // at thirty minutes. CI no longer runs Miri at all, so nothing here depends
+  // on these branches; they exist so that running `cargo miri test` by hand
+  // stays feasible (the census drops from 23.7 minutes to about 90 seconds)
+  // rather than appearing to hang. The coverage floor below scales with the
+  // count, so a reduced run still refuses to pass vacuously.
   let iterations: u32 = if cfg!(miri) { 60 } else { 8000 };
   let mut rng = Rng(0x1234_5678_9abc_def0);
   for target in [Target::X86_64, Target::Aarch64] {
@@ -647,8 +648,8 @@ fn no_hostile_translation_range_makes_the_translator_panic() {
 #[test]
 fn every_opcode_byte_loads_or_is_refused_without_panicking() {
   // See `no_hostile_program_makes_the_translator_panic`: under Miri the full
-  // cross-product is ~100k load attempts and takes hours. Every opcode byte is
-  // still covered; only the operand corners per byte are thinned.
+  // cross-product is ~100k load attempts and took 23.7 minutes. Every opcode
+  // byte is still covered; only the operand corners per byte are thinned.
   let (dst_src, offsets, imms): (&[(u8, u8)], &[i16], &[i32]) = if cfg!(miri) {
     (&[(0, 0), (10, 10)], &[0, i16::MIN], &[0, i32::MIN])
   } else {

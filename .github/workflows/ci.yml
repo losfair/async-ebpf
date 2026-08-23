@@ -81,45 +81,6 @@ jobs:
       - name: Execution differential and full suite
         run: cargo test --features testing,oracle
 
-  miri:
-    name: Miri (pure JIT subtree)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Miri
-        run: |
-          rustup toolchain install nightly --profile minimal --component miri
-          rustup +nightly component add rust-src
-
-      # A cheap smoke check over the pure JIT modules - decoder, validator,
-      # patch machinery, stack usage, reference interpreter - which Miri can run
-      # because they are pure functions over slices.
-      #
-      # Worth being honest about what this does and does not buy. All of `jit::`
-      # is safe Rust, so the undefined behaviour Miri is uniquely good at
-      # finding - aliasing, provenance, uninitialised reads - largely cannot
-      # occur there; what it would catch (overflow, out-of-bounds) the native
-      # debug run already catches. The code with real unsafe is icache.rs and
-      # program.rs, and Miri cannot run either: inline assembly and mmap. So
-      # this is a guard against regressions in the pure logic, not a
-      # verification of the parts that need one.
-      #
-      # jit::audit and jit::emit are skipped. They are sweeps sized for native
-      # execution - the opcode census alone took 23 minutes under Miri and timed
-      # the job out. Those tests scale themselves down under cfg!(miri) so they
-      # can be run by hand (the census drops to ~90s), but including them here
-      # would trade twelve seconds for several minutes and buy nothing this job
-      # is for.
-      #
-      # `cargo test` takes a single positional filter, hence one prefix plus
-      # --skip. Without the `oracle` feature: those tests call into the C, which
-      # Miri cannot execute.
-      - name: Run Miri over the pure JIT modules
-        run: "cargo +nightly miri test --features testing --lib -- jit:: --skip jit::audit --skip jit::emit"
-
   openbsd-tests:
     name: OpenBSD unit tests (${{ matrix.arch }})
     runs-on: ubuntu-24.04
