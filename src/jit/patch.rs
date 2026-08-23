@@ -233,11 +233,19 @@ impl<'a> JitState<'a> {
     debug_assert!(n <= 8);
     let at = self.offset as usize;
     if at + n > self.buf.len() {
+      // `offset` is deliberately NOT advanced here, matching
+      // `emit_bytes` in the C backends (`ubpf_jit_x86_64.c:221`), which sets
+      // `jit_status` and returns without touching it.
+      //
+      // An earlier version of this advanced `offset` past the end, on the
+      // theory that the final size report should say how much room would have
+      // been needed. That theory was wrong about the C and wrong in itself:
+      // `offset` is what the emitters measure spans with, so a failed emit that
+      // moves it corrupts every later measurement taken from it. Concretely, a
+      // buffer that runs out inside a *second* function's prologue then
+      // produced a partial `prolog_size`, tripping a debug assertion instead of
+      // reporting `OutOfSpace`.
       self.fail(Progress::NotEnoughSpace);
-      // The C advances `offset` past the end so that the *final* size report
-      // still says how much room would have been needed. Matching that keeps
-      // the out-of-space path byte-compatible.
-      self.offset = self.offset.saturating_add(n as u32);
       return;
     }
     self.buf[at..at + n].copy_from_slice(&value.to_le_bytes()[..n]);
@@ -430,5 +438,50 @@ mod tests {
       state.jumps[1].target,
       PatchTarget::Special(SpecialTarget::Exit)
     );
+  }
+}
+
+#[cfg(test)]
+mod out_of_space_tests {
+  use super::*;
+
+  /// Regression: a failed emit must not move `offset`.
+  ///
+  /// The emitters measure spans - notably each function's prologue size - by
+  /// differencing `offset`. If a failed emit advances it, every later
+  /// measurement taken from it is wrong, and the symptom is a debug assertion
+  /// firing somewhere unrelated rather than a clean `OutOfSpace`.
+  ///
+  /// This matches `emit_bytes` in both C backends, which sets the status and
+  /// returns without touching `offset`.
+  #[test]
+  fn a_failed_emit_leaves_the_offset_where_it_was() {
+    let mut buf = [0u8; 4];
+    let mut state = JitState::new(&mut buf, 1);
+    state.emit_bytes(0x1122_3344, 4);
+    assert_eq!(state.offset, 4);
+
+    state.emit_bytes(0xaa, 1);
+    assert_eq!(state.status, Progress::NotEnoughSpace);
+    assert_eq!(
+      state.offset, 4,
+      "a failed emit moved the offset, which corrupts every span measured from it"
+    );
+
+    // And it stays put across further failed emits, so a span differenced
+    // across a run of them is zero rather than arbitrary.
+    state.emit_bytes(0xbbbb, 2);
+    assert_eq!(state.offset, 4);
+  }
+
+  #[test]
+  fn a_failed_single_byte_emit_also_leaves_the_offset_alone() {
+    let mut buf = [0u8; 1];
+    let mut state = JitState::new(&mut buf, 1);
+    state.emit1(0x90);
+    assert_eq!(state.offset, 1);
+    state.emit1(0x90);
+    assert_eq!(state.status, Progress::NotEnoughSpace);
+    assert_eq!(state.offset, 1);
   }
 }
