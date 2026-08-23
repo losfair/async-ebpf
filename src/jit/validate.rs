@@ -720,20 +720,31 @@ mod tests {
   }
 
   // -------------------------------------------------------------------------
-  // The differential against the C
+  // What the loader accepts, recorded
   // -------------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
-  mod differential {
+  /// Generated and enumerated programs, with every accept/reject decision — and
+  /// the exact wording of every rejection — rolled into checked-in digests.
+  ///
+  /// What the validator accepts is a security boundary: loosening it silently
+  /// lets a program through that the emitters were never written to handle, and
+  /// tightening it silently breaks embedders. Neither shows up in a behavioural
+  /// test, because the programs involved are ones nobody writes on purpose.
+  ///
+  /// So the decisions are pinned instead. Each sweep below folds its outcomes
+  /// into one digest — acceptance, and the rejection message character for
+  /// character — and any change to any of them fails the sweep. The message is
+  /// part of it because embedders match on those strings.
+  mod decisions {
     use super::*;
-    use crate::jit::oracle::{oracle_config, COracle};
-    use crate::jit::{Target, Translator};
+    use crate::jit::golden::{self, SweepDigest};
+    use crate::jit::{Target, TranslateError, Translator};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::sync::Arc;
 
-    /// Programs compared per configuration in the default run. The full sweep
-    /// is behind `#[ignore]`; `ASYNC_EBPF_VALIDATE_PROGRAMS` overrides both.
+    /// Programs decided per configuration in the default run. The full sweep is
+    /// behind `#[ignore]`; `ASYNC_EBPF_VALIDATE_PROGRAMS` overrides both.
     const DEFAULT_PROGRAMS: usize = 12_000;
     const EXHAUSTIVE_PROGRAMS: usize = 120_000;
 
@@ -753,6 +764,36 @@ mod tests {
         .unwrap_or(default)
     }
 
+    /// Whether this run is the one the goldens describe: the default seed, the
+    /// default program count, and nothing overridden from the environment.
+    fn is_the_recorded_run(
+      programs: usize,
+      default_programs: usize,
+      s: u64,
+      default_seed: u64,
+    ) -> bool {
+      programs == default_programs && s == default_seed
+    }
+
+    /// Accepts every helper index, so that `call <imm>` resolves and the rules
+    /// past it are reached.
+    unsafe extern "C" fn accept_every_helper(_index: u32, _vm: *const std::ffi::c_void) -> bool {
+      true
+    }
+
+    /// Never called: the validator only asks whether a dispatcher is present.
+    unsafe extern "C" fn never_called_dispatcher(
+      _: u64,
+      _: u64,
+      _: u64,
+      _: u64,
+      _: u64,
+      _: u32,
+      _: *mut std::ffi::c_void,
+    ) -> u64 {
+      unreachable!("validation never executes anything")
+    }
+
     /// The two configurations that change what `validate` accepts.
     ///
     /// Nothing else in [`Config`] reaches the validator: the pointer cage, the
@@ -761,30 +802,42 @@ mod tests {
     /// `call <imm>` resolves at all.
     fn configs() -> Vec<(&'static str, Config)> {
       vec![
-        ("dispatcher registered", oracle_config(Target::X86_64)),
+        (
+          "dispatcher registered",
+          Config {
+            target: Target::X86_64,
+            dispatcher: Some(never_called_dispatcher),
+            dispatcher_validate: Some(accept_every_helper),
+            ..Default::default()
+          },
+        ),
         ("no dispatcher", Config::default()),
       ]
     }
 
-    /// Runs one program through both validators and asserts they agree.
-    #[track_caller]
-    fn compare(config: &Config, label: &str, insns: &[Insn]) {
+    /// Folds one program's load decision into a digest.
+    ///
+    /// The decision is recorded in the same shape as a translation outcome, so
+    /// that one sweep mechanism covers both: acceptance is an empty success,
+    /// and a rejection carries its message verbatim, so a wording change shows
+    /// up as a changed digest rather than passing unnoticed.
+    fn add_decision(digest: &mut SweepDigest, config: &Config, insns: &[Insn]) {
       let code = Insn::encode_all(insns);
-      let c = COracle::load(config, &code).err();
-      let rust = Translator::load(Arc::new(config.clone()), &code)
-        .err()
-        .map(|e| e.0);
-      if c != rust {
-        let listing = insns
-          .iter()
-          .enumerate()
-          .map(|(i, insn)| format!("    {i:4}: {insn:?}"))
-          .collect::<Vec<_>>()
-          .join("\n");
-        panic!(
-          "validators disagree under {label}\n     C: {c:?}\n  Rust: {rust:?}\n  program:\n{listing}"
-        );
-      }
+      let outcome = match Translator::load(Arc::new(config.clone()), &code) {
+        Ok(_) => Ok(Vec::new()),
+        Err(e) => Err(TranslateError::Failed(e.0)),
+      };
+      digest.add(&outcome);
+    }
+
+    /// Closes a sweep and writes it back.
+    ///
+    /// The store is keyed by architecture and these decisions are the same on
+    /// every one of them, so they all land in one file under a `validate-`
+    /// prefix rather than being recorded twice.
+    fn finish(digest: SweepDigest, label: &str) {
+      digest.finish(label, Target::X86_64);
+      golden::flush();
     }
 
     // --- generation ------------------------------------------------------
@@ -1178,22 +1231,31 @@ mod tests {
         .collect()
     }
 
-    /// The whole differential: `programs` generated programs per configuration.
-    fn run_differential(programs: usize, seed: u64) {
+    /// `programs` generated programs, decided under both configurations.
+    ///
+    /// A quarter are left valid, a quarter are pure noise, and half carry
+    /// exactly one corruption of an otherwise valid program — one at a time, so
+    /// the *first* rule to fire is the one under test rather than everything
+    /// collapsing onto whatever the earliest instruction violates.
+    fn run_generated(programs: usize, seed: u64) -> SweepDigest {
       let mut rng = StdRng::seed_from_u64(seed);
       let configs = configs();
       let dispatcher_config = &configs[0].1;
+      let mut digest = SweepDigest::new();
 
       for n in 0..programs {
         let valid = generate_valid(&mut rng);
 
         // The happy path is an assertion, not a hope: with a dispatcher
         // registered, everything `generate_valid` produces must load. If this
-        // fires the generator is wrong, and the agreement checks below would be
-        // testing rejection paths only.
+        // fires the generator is wrong, and the sweep below would be recording
+        // rejection paths only.
         let code = Insn::encode_all(&valid);
-        if let Err(e) = COracle::load(dispatcher_config, &code) {
-          panic!("generator produced a program the C rejects: {e}\n{valid:#?}");
+        if let Err(e) = Translator::load(Arc::new(dispatcher_config.clone()), &code) {
+          panic!(
+            "generator produced a program the loader rejects: {}\n{valid:#?}",
+            e.0
+          );
         }
 
         let program = match n % 4 {
@@ -1206,24 +1268,51 @@ mod tests {
           }
         };
 
-        for (label, config) in &configs {
-          compare(config, label, &program);
+        for (_, config) in &configs {
+          add_decision(&mut digest, config, &program);
         }
+      }
+      digest
+    }
+
+    #[test]
+    fn generated_programs_are_decided_as_recorded() {
+      let programs = program_count(DEFAULT_PROGRAMS);
+      let s = seed(0x5eed_1234_abcd_0001);
+      let digest = run_generated(programs, s);
+      // A sweep in which nothing was accepted, or in which nothing was
+      // rejected, would pin an answer to a question nobody asked.
+      let (cases, accepted) = (digest.cases(), digest.translated());
+      assert!(
+        accepted > cases / 8 && accepted < cases,
+        "{accepted} of {cases} programs were accepted; the generator has \
+         stopped producing a mix of valid and invalid programs"
+      );
+      if is_the_recorded_run(programs, DEFAULT_PROGRAMS, s, 0x5eed_1234_abcd_0001) {
+        finish(digest, "validate-generated-programs");
       }
     }
 
+    /// The long run, ten times the volume from a different corner of the space.
+    ///
+    /// It carries no golden of its own: it is not part of any ordinary run, so
+    /// a recorded expectation for it would go stale unnoticed. What it checks is
+    /// that the loader reaches a decision for every one of a hundred and twenty
+    /// thousand programs without panicking, and that the generator is still
+    /// producing a mixture.
+    ///
+    /// `cargo test --features testing --lib jit::validate -- --ignored`
     #[test]
-    fn the_validators_agree_on_generated_programs() {
-      run_differential(program_count(DEFAULT_PROGRAMS), seed(0x5eed_1234_abcd_0001));
-    }
-
-    /// The long run. `cargo test --features oracle --lib jit::validate -- --ignored`
-    #[test]
-    #[ignore = "slow; the default test covers the same generators at lower volume"]
-    fn the_validators_agree_on_many_generated_programs() {
-      run_differential(
+    #[ignore = "slow; the recorded sweep covers the same generators at lower volume"]
+    fn many_generated_programs_are_all_decided() {
+      let digest = run_generated(
         program_count(EXHAUSTIVE_PROGRAMS),
         seed(0x5eed_1234_abcd_0002),
+      );
+      let (cases, accepted) = (digest.cases(), digest.translated());
+      assert!(
+        accepted > cases / 8 && accepted < cases,
+        "{accepted} of {cases} programs were accepted"
       );
     }
 
@@ -1236,24 +1325,28 @@ mod tests {
     /// value out of range) — which is what actually pins the per-opcode
     /// register bounds and the order the two register checks run in.
     #[test]
-    fn the_validators_agree_on_every_opcode_and_register_pairing() {
-      let config = oracle_config(Target::X86_64);
+    fn every_opcode_and_register_pairing_is_decided_as_recorded() {
+      let config = configs().remove(0).1;
+      let mut digest = SweepDigest::new();
       for opcode in 0u8..=255 {
         for dst in 0u8..=15 {
           for src in [0u8, 9, 10, 11] {
             for (offset, imm) in [(0i16, 0i32), (1, 16)] {
               let program = [insn(opcode, dst, src, offset, imm), exit()];
-              compare(&config, "dispatcher registered", &program);
+              add_decision(&mut digest, &config, &program);
             }
           }
         }
       }
+      assert_eq!(digest.cases(), 256 * 16 * 4 * 2);
+      assert!(digest.translated() > 0, "no pairing was accepted at all");
+      finish(digest, "validate-opcode-register-pairings");
     }
 
     /// The offset and immediate bounds, per opcode.
     #[test]
-    fn the_validators_agree_on_every_opcode_and_operand_extreme() {
-      let config = oracle_config(Target::X86_64);
+    fn every_opcode_and_operand_extreme_is_decided_as_recorded() {
+      let config = configs().remove(0).1;
       let offsets = [0i16, 1, 2, 8, 16, 32, -1, i16::MIN, i16::MAX];
       let imms = [
         0i32,
@@ -1274,20 +1367,29 @@ mod tests {
         i32::MIN,
         i32::MAX,
       ];
+      let mut digest = SweepDigest::new();
       for opcode in 0u8..=255 {
         for offset in offsets {
           for imm in imms {
             let program = [insn(opcode, 0, 0, offset, imm), exit()];
-            compare(&config, "dispatcher registered", &program);
+            add_decision(&mut digest, &config, &program);
           }
         }
       }
+      assert_eq!(digest.cases(), 256 * offsets.len() * imms.len());
+      assert!(digest.translated() > 0, "no operand extreme was accepted");
+      finish(digest, "validate-opcode-operand-extremes");
     }
 
     /// The `MAX_INSTS` boundary, which the generators never reach.
+    ///
+    /// The ceiling itself is asserted outright rather than only digested: a
+    /// program of exactly [`abi::MAX_INSTS`] instructions is one too many, and
+    /// that is the boundary an embedder actually runs into.
     #[test]
-    fn the_validators_agree_at_the_instruction_limit() {
-      let config = oracle_config(Target::X86_64);
+    fn the_instruction_limit_is_decided_as_recorded() {
+      let config = configs().remove(0).1;
+      let mut digest = SweepDigest::new();
       for len in [
         abi::MAX_INSTS as usize - 1,
         abi::MAX_INSTS as usize,
@@ -1295,14 +1397,20 @@ mod tests {
       ] {
         let mut program = vec![insn(0xb7, 0, 0, 0, 0); len];
         *program.last_mut().unwrap() = exit();
-        compare(&config, "dispatcher registered", &program);
+        add_decision(&mut digest, &config, &program);
       }
+      assert_eq!(
+        digest.translated(),
+        1,
+        "exactly one of the three lengths is inside the {} instruction ceiling",
+        abi::MAX_INSTS
+      );
+      finish(digest, "validate-instruction-limit");
     }
 
     /// Hand-written cases for rules the generators reach rarely or never.
     #[test]
-    fn the_validators_agree_on_hand_picked_corner_cases() {
-      let config = oracle_config(Target::X86_64);
+    fn hand_picked_corner_cases_are_decided_as_recorded() {
       let cases: Vec<Vec<Insn>> = vec![
         // A jump to itself.
         vec![insn(opcode::JA, 0, 0, -1, 0), exit()],
@@ -1354,12 +1462,15 @@ mod tests {
           exit(),
         ],
       ];
-      let _ = &config;
+      let mut digest = SweepDigest::new();
+      let n = cases.len();
       for program in cases {
-        for (label, config) in configs() {
-          compare(&config, label, &program);
+        for (_, config) in configs() {
+          add_decision(&mut digest, &config, &program);
         }
       }
+      assert_eq!(digest.cases(), n * 2);
+      finish(digest, "validate-corner-cases");
     }
 
     /// `lddw` and its high half, exhaustively over the fields that matter.
@@ -1370,8 +1481,9 @@ mod tests {
     /// also where the C's reported PC goes off by one, so both halves' register
     /// nibbles are swept.
     #[test]
-    fn the_validators_agree_on_every_lddw_pairing() {
-      let config = oracle_config(Target::X86_64);
+    fn every_lddw_pairing_is_decided_as_recorded() {
+      let config = configs().remove(0).1;
+      let mut digest = SweepDigest::new();
       for dst in 0u8..=15 {
         for src in [0u8, 1, 6, 7, 10, 11] {
           for high_opcode in [0u8, 0x95, 0x18, 0x01] {
@@ -1383,13 +1495,16 @@ mod tests {
                     insn(high_opcode, high_dst, high_src, high_offset, -1),
                     exit(),
                   ];
-                  compare(&config, "dispatcher registered", &program);
+                  add_decision(&mut digest, &config, &program);
                 }
               }
             }
           }
         }
       }
+      assert_eq!(digest.cases(), 16 * 6 * 4 * 3 * 3 * 3);
+      assert!(digest.translated() > 0, "no lddw pairing was accepted");
+      finish(digest, "validate-lddw-pairings");
     }
 
     /// Every four-instruction program over an alphabet chosen to stress the
@@ -1402,8 +1517,8 @@ mod tests {
     /// exhaustively is what actually covers the boundary arithmetic — including
     /// calls that target the middle of a `lddw` and parts of length one.
     #[test]
-    fn the_validators_agree_on_every_short_program_over_a_control_flow_alphabet() {
-      let config = oracle_config(Target::X86_64);
+    fn every_short_program_over_a_control_flow_alphabet_is_decided_as_recorded() {
+      let config = configs().remove(0).1;
       let no_dispatcher = Config::default();
       let alphabet: Vec<Insn> = vec![
         insn(0xb7, 0, 0, 0, 0),
@@ -1422,48 +1537,43 @@ mod tests {
         insn(0, 0, 0, 0, 9),
       ];
       let n = alphabet.len();
+      let mut digest = SweepDigest::new();
       for a in 0..n {
         for b in 0..n {
           for c in 0..n {
             for d in 0..n {
               let program = [alphabet[a], alphabet[b], alphabet[c], alphabet[d]];
-              compare(&config, "dispatcher registered", &program);
+              add_decision(&mut digest, &config, &program);
               // The alphabet contains a helper call, which is the one thing the
               // configuration changes, so it is worth both passes here.
-              compare(&no_dispatcher, "no dispatcher", &program);
+              add_decision(&mut digest, &no_dispatcher, &program);
             }
           }
         }
       }
+      assert_eq!(digest.cases(), n.pow(4) * 2);
+      assert!(
+        digest.translated() > 0,
+        "no four-instruction program was accepted"
+      );
+      finish(digest, "validate-control-flow-alphabet");
     }
 
-    /// The zero-length program: the one input where this port and the C
-    /// disagree, and why that disagreement is not this file's to fix.
+    /// The zero-length program, and which layer refuses it.
     ///
-    /// `validate()` accepts an empty program — its loop does not run and the
-    /// sub-program check finds no local call. Both validators agree on that.
-    /// What differs is one layer up: `ubpf_load` stores the bytecode in a
-    /// read-only mapping (`readonly_bytecode_enabled` defaults on), and
-    /// `mmap(NULL, 0, ...)` fails with `EINVAL`, which `ubpf_load` reports as
-    /// "out of memory". So the C refuses the empty program for an allocator
-    /// reason that has nothing to do with validity, after validation has already
-    /// passed.
+    /// [`validate`] accepts an empty program: its loop does not run and the
+    /// sub-program check finds no local call. There is nothing invalid about
+    /// it, and saying otherwise here would put an allocation failure inside a
+    /// validator — a lie about which layer refused and why.
     ///
-    /// The validator proper accepts it, exactly as the C's `validate()` does —
-    /// putting an allocation failure in a validator would be a lie about which
-    /// layer refused. `Translator::load`, the analogue of `ubpf_load` and the
-    /// layer where the C actually fails, carries the rejection instead, so the
-    /// two agree end to end and the divergence allowlist stays empty.
+    /// The refusal belongs one layer up, in [`Translator::load`], which cannot
+    /// give out a zero-length mapping for the bytecode and reports "out of
+    /// memory". That message is the one embedders see, so it is pinned
+    /// literally rather than digested.
     #[test]
-    fn the_empty_program_is_refused_at_the_same_layer_as_the_c() {
-      let config = oracle_config(Target::X86_64);
-      assert_eq!(
-        COracle::load(&config, &[]).err().as_deref(),
-        Some("out of memory")
-      );
-      // This file's job: agree with the C's `validate()`, which accepts.
+    fn the_empty_program_is_refused_by_the_loader_not_the_validator() {
+      let config = configs().remove(0).1;
       assert_eq!(validate(&config, &[]), Ok(()));
-      // And the loader as a whole agrees with `ubpf_load`, which does not.
       assert_eq!(
         Translator::load(Arc::new(config), &[]).err().map(|e| e.0),
         Some("out of memory".to_string())
@@ -1472,14 +1582,25 @@ mod tests {
 
     /// Every atomic selector, at both widths, against both opcodes.
     #[test]
-    fn the_validators_agree_on_every_atomic_selector() {
-      let config = oracle_config(Target::X86_64);
+    fn every_atomic_selector_is_decided_as_recorded() {
+      let config = configs().remove(0).1;
+      let mut digest = SweepDigest::new();
       for opcode in [0xc3u8, 0xdb] {
         for imm in -1i32..=0x120 {
           let program = [insn(opcode, 1, 2, 0, imm), exit()];
-          compare(&config, "dispatcher registered", &program);
+          add_decision(&mut digest, &config, &program);
         }
       }
+      assert_eq!(digest.cases(), 2 * 0x122);
+      // Both the accepted and the refused selectors have to be represented, or
+      // the sweep has stopped straddling the filter it exists to pin.
+      assert!(
+        digest.translated() > 0 && digest.translated() < digest.cases(),
+        "{} of {} selectors were accepted",
+        digest.translated(),
+        digest.cases()
+      );
+      finish(digest, "validate-atomic-selectors");
     }
   }
 }

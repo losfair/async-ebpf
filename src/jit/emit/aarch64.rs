@@ -2139,12 +2139,12 @@ fn emit_end(st: &mut JitState, kind: EndKind, imm: i32, sixty_four: bool, dst: u
   }
 }
 
-#[cfg(all(test, feature = "oracle"))]
+#[cfg(test)]
 mod tests {
   use super::*;
+  use crate::jit::golden::{self, SweepDigest};
   use crate::jit::isa::{alu, atomic, cls, jmp, mode, opcode, size, src as srcbit};
-  use crate::jit::oracle::{config_sweep, diff, plain_inputs, Diff};
-  use crate::jit::Target;
+  use crate::jit::{Dispatcher, LocalCallResolver, Target};
 
   fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Insn {
     Insn {
@@ -2160,50 +2160,209 @@ mod tests {
     insn(opcode::EXIT, 0, 0, 0, 0)
   }
 
-  /// Runs one program through every aarch64 configuration and asserts the C and
-  /// the Rust emit the same bytes.
+  // ---------------------------------------------------------------------------
+  // The harness
+  // ---------------------------------------------------------------------------
+
+  /// Stand-in addresses for the helper dispatcher and the local-call resolver.
+  ///
+  /// A helper call materialises the dispatcher's address as an immediate, and a
+  /// lazy local call materialises the resolver's, so both end up *inside* the
+  /// emitted bytes. A real function's address moves with every build and with
+  /// address-space randomisation, so recording it would make the output differ
+  /// from one run to the next for no reason anybody could review. These fixed
+  /// sentinels keep the emitted code reproducible.
+  ///
+  /// Nothing ever calls them: translation only writes their value into the
+  /// buffer, and this module never executes what it emits.
+  const STAND_IN_DISPATCHER: usize = 0x0000_5eed_1111_0000;
+  const STAND_IN_RESOLVER: usize = 0x0000_5eed_2222_0000;
+
+  fn stand_in_dispatcher() -> Dispatcher {
+    // SAFETY: the address is only ever materialised as an immediate. Producing
+    // a function pointer from an integer is well defined; calling it would not
+    // be, and nothing here does.
+    unsafe { std::mem::transmute::<usize, Dispatcher>(STAND_IN_DISPATCHER) }
+  }
+
+  fn stand_in_resolver() -> LocalCallResolver {
+    // SAFETY: as for the dispatcher above.
+    unsafe { std::mem::transmute::<usize, LocalCallResolver>(STAND_IN_RESOLVER) }
+  }
+
+  /// Admits every helper index, so that helper-call emission is exercised
+  /// rather than refused at load. This one is a real function, because the
+  /// validator calls it.
+  unsafe extern "C" fn accept_every_helper(_index: u32, _vm: *const std::ffi::c_void) -> bool {
+    true
+  }
+
+  /// Builds [`TranslationInputs`] covering a whole program with no hints or
+  /// plan.
+  fn plain_inputs(num_insns: usize) -> TranslationInputs<'static> {
+    TranslationInputs {
+      hints: &[],
+      plan: &[],
+      resolver_ids: &[],
+      start_pc: 0,
+      end_pc: num_insns,
+    }
+  }
+
+  /// The configuration sweep every emitter test runs over.
+  ///
+  /// The emitted code depends on the pointer cage, the native frame base, the
+  /// frame constants and the region hints, and those features *interact* —
+  /// which is exactly where code generation goes wrong. Sweeping them is not
+  /// optional.
+  fn config_sweep(target: Target) -> Vec<(&'static str, Config)> {
+    let base = Config {
+      target,
+      dispatcher: Some(stand_in_dispatcher()),
+      dispatcher_validate: Some(accept_every_helper),
+      local_call_resolver: Some(stand_in_resolver()),
+      ..Default::default()
+    };
+    vec![
+      (
+        "no cage",
+        Config {
+          pointer_mask: 0,
+          pointer_offset: 0,
+          bounds_check: true,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage only",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage + native frame base",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          native_frame_base: true,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage + frame constants",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          frame_constants: true,
+          ..base.clone()
+        },
+      ),
+      (
+        // What `async-ebpf` actually runs.
+        "production",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          native_frame_base: true,
+          frame_constants: true,
+          ..base.clone()
+        },
+      ),
+      (
+        "production + unwind helper",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          native_frame_base: true,
+          frame_constants: true,
+          unwind_helper_index: Some(3),
+          ..base
+        },
+      ),
+    ]
+  }
+
+  /// One case against its golden. Returns whether it produced code.
+  ///
+  /// The label has to distinguish cases that share a program, a configuration
+  /// and a set of inputs but differ in the buffer they are given, since the
+  /// golden key is content-addressed over everything *but* the capacity.
+  fn golden_case(
+    label: &str,
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) -> bool {
+    let translated = golden::check(label, config, code, inputs, capacity);
+    // The test runner does not run process-exit hooks, so a recording run has
+    // to write the file back as it goes.
+    golden::flush();
+    translated
+  }
+
+  /// Folds one case into a sweep's rolling digest.
+  ///
+  /// A program the loader refuses contributes its own outcome rather than
+  /// nothing, so a generator that quietly stops producing loadable programs
+  /// still moves the digest instead of silently shrinking the sweep.
+  fn sweep_case(
+    digest: &mut SweepDigest,
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) {
+    let out = golden::translate_one(config, code, inputs, capacity)
+      .unwrap_or_else(|| Err(TranslateError::Failed("refused at load".into())));
+    digest.add(&out);
+  }
+
+  /// Closes a sweep and writes it back, as [`golden_case`] does for one case.
+  fn finish_sweep(digest: SweepDigest, label: &str) {
+    digest.finish(label, Target::Aarch64);
+    golden::flush();
+  }
+
+  /// Runs one program through every aarch64 configuration, against the goldens.
   #[track_caller]
   fn check(what: &str, insns: &[Insn]) {
     check_with(what, insns, &plain_inputs(insns.len()));
   }
 
-  /// Asserts agreement *and* that real code came out, so a test cannot pass by
-  /// both sides failing for a reason the test did not intend.
+  /// Checks the goldens *and* that real code came out, so a test cannot pass by
+  /// quietly degrading into a program that is refused for a reason it never
+  /// meant to exercise.
   #[track_caller]
   fn check_with(what: &str, insns: &[Insn], inputs: &TranslationInputs<'_>) {
-    for d in outcomes(insns, inputs) {
-      assert!(
-        matches!(d.1, Diff::Same { .. }),
-        "{what} under {:?}: {}",
-        d.0,
-        d.1
-      );
-    }
-  }
-
-  /// Asserts that both backends refuse the program, in the same way.
-  #[track_caller]
-  fn check_rejected(what: &str, insns: &[Insn], inputs: &TranslationInputs<'_>) {
-    for d in outcomes(insns, inputs) {
-      assert!(
-        matches!(d.1, Diff::SameError(_)),
-        "{what} under {:?}: {}",
-        d.0,
-        d.1
-      );
-    }
-  }
-
-  fn outcomes(
-    insns: &[Insn],
-    inputs: &TranslationInputs<'_>,
-  ) -> Vec<(&'static str, crate::jit::oracle::Diff)> {
     let code = Insn::encode_all(insns);
     let capacity = 262144.max(insns.len() * 512);
-    config_sweep(Target::Aarch64)
-      .into_iter()
-      .map(|(name, config)| (name, diff(&config, &code, inputs, capacity)))
-      .collect()
+    for (name, config) in config_sweep(Target::Aarch64) {
+      assert!(
+        golden_case(&format!("{what}/{name}"), &config, &code, inputs, capacity),
+        "{what} under {name:?} produced no code"
+      );
+    }
+  }
+
+  /// Asserts that every configuration refuses the program.
+  #[track_caller]
+  fn check_rejected(what: &str, insns: &[Insn], inputs: &TranslationInputs<'_>) {
+    let code = Insn::encode_all(insns);
+    let capacity = 262144.max(insns.len() * 512);
+    for (name, config) in config_sweep(Target::Aarch64) {
+      assert!(
+        !golden_case(&format!("{what}/{name}"), &config, &code, inputs, capacity),
+        "{what} under {name:?} emitted code where a refusal was expected"
+      );
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -2282,8 +2441,8 @@ mod tests {
   #[test]
   fn movsx_uses_the_offset_field_to_pick_a_width() {
     let mut program = Vec::new();
-    // A 32-bit MOVSX has no 32-bit sign-extension form, and `ubpf_load`
-    // refuses `offset == 32` there.
+    // A 32-bit MOVSX has no 32-bit sign-extension form, and the loader refuses
+    // `offset == 32` there.
     for (class, offsets) in [
       (cls::ALU, &[0i16, 8, 16][..]),
       (cls::ALU64, &[0, 8, 16, 32][..]),
@@ -2478,19 +2637,28 @@ mod tests {
       insn(cls::LDX | mode::MEM | size::DW, 1, 10, -300, 0),
       exit(),
     ];
+    // Sixteen hint pairings across six configurations: a cross-product, so one
+    // digest rather than ninety-six entries.
+    let code = Insn::encode_all(&insns);
+    let mut digest = SweepDigest::new();
     for a in 0..4u8 {
       for b in 0..4u8 {
         let hints = vec![a, b, a, b, a, 0];
-        check_with(
-          &format!("hints {a}/{b}"),
-          &insns,
-          &TranslationInputs {
-            hints: &hints,
-            ..plain_inputs(insns.len())
-          },
-        );
+        let inputs = TranslationInputs {
+          hints: &hints,
+          ..plain_inputs(insns.len())
+        };
+        for (_, config) in config_sweep(Target::Aarch64) {
+          sweep_case(&mut digest, &config, &code, &inputs, 65536);
+        }
       }
     }
+    assert_eq!(
+      digest.translated(),
+      digest.cases(),
+      "every hint pairing must translate"
+    );
+    finish_sweep(digest, "region-hints");
   }
 
   // -------------------------------------------------------------------------
@@ -2528,9 +2696,10 @@ mod tests {
   fn non_canonical_atomic_selectors_at_thirty_two_bits() {
     // The 32-bit atomic filter bounds the immediate at 0..=255 rather than
     // enumerating legal values (the doubleword one does enumerate), so
-    // selectors no compiler emits still load at this width. The C switches on
-    // `imm & 0xf0` and takes the fetch flag from bit 0, which leaves bits 1..3
-    // dead: `0x02` is a plain atomic add and `0x0f` a fetching one.
+    // selectors no compiler emits still load at this width. The backend
+    // switches on `imm & 0xf0` and takes the fetch flag from bit 0, which
+    // leaves bits 1..3 dead: `0x02` is a plain atomic add and `0x0f` a fetching
+    // one. Both are recorded, so the dead bits staying dead is pinned.
     let mut program = Vec::new();
     for imm in [
       0x02i32, 0x0f, 0x0e, 0x41, 0x4f, 0x5e, 0xa2, 0xe1, 0xf1, 0xff,
@@ -2546,12 +2715,13 @@ mod tests {
   }
 
   #[test]
-  fn an_atomic_selector_naming_no_operation_is_refused_identically() {
+  fn an_atomic_selector_naming_no_operation_is_refused() {
     // `validate()` masks the selector the same way the backend does and refuses
     // any high nibble it does not name, plus `xchg`/`cmpxchg` without the fetch
-    // bit. So the backend's own `Unknown atomic operation` arm - which this
-    // port reproduces - is in fact unreachable through `ubpf_load`; what these
-    // inputs establish is that the two agree on refusing them.
+    // bit. So the backend's own `Unknown atomic operation` arm is in fact
+    // unreachable through the loader; what these inputs establish is that the
+    // refusal happens at load, where it can still be reported cleanly, rather
+    // than half-way through emitting code.
     for imm in [
       0x10i32, 0x20, 0x30, 0x60, 0x70, 0x80, 0x90, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0xe2, 0xf2,
     ] {
@@ -2599,7 +2769,7 @@ mod tests {
   }
 
   #[test]
-  fn a_local_call_without_a_resolver_id_is_rejected_identically() {
+  fn a_local_call_without_a_resolver_id_is_rejected() {
     let insns = vec![insn(opcode::CALL, 0, 1, 0, 1), exit(), exit()];
     check_rejected(
       "local call, no ids",
@@ -2642,7 +2812,7 @@ mod tests {
   }
 
   #[test]
-  fn a_jump_out_of_the_translation_range_is_refused_identically() {
+  fn a_jump_out_of_the_translation_range_is_refused() {
     let insns = vec![
       insn(opcode::CALL, 0, 1, 0, 1),
       exit(),
@@ -2663,7 +2833,7 @@ mod tests {
   }
 
   #[test]
-  fn an_invalid_range_is_refused_identically() {
+  fn an_invalid_range_is_refused() {
     let insns = vec![insn(0xb7, 0, 0, 0, 1), exit()];
     for (start, end) in [(0usize, 0usize), (1, 2), (0, 3)] {
       check_rejected(
@@ -2781,9 +2951,10 @@ mod tests {
 
   #[test]
   fn hostile_plans_fall_back_to_an_ordinary_checked_access() {
-    // Each of these must be rejected by the backend's own re-derivation and
-    // produce the same bytes as no plan at all would - which is what comparing
-    // against the C establishes, since the C rejects them for the same reasons.
+    // Each of these must be rejected by the backend's own re-derivation, which
+    // means it emits exactly what no plan at all would: an ordinary checked
+    // access. A plan that is wrong - or hostile - costs speed and nothing else,
+    // and the recorded bytes are what holds that claim up.
     let cases: Vec<(&str, Vec<Insn>, Vec<PlanEntry>)> = vec![
       (
         "member names a leader that never ran",
@@ -3008,6 +3179,61 @@ mod tests {
       .expect("the probe must translate")
   }
 
+  /// The raw outcome of one translation, for tests that classify a *failure*
+  /// rather than only pinning it.
+  fn outcome(
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) -> Result<Vec<u8>, TranslateError> {
+    let t =
+      Translator::load(std::sync::Arc::new(config.clone()), code).expect("the program must load");
+    let mut buf = vec![0u8; capacity];
+    t.translate_range(inputs, &mut buf).map(|len| {
+      buf.truncate(len);
+      buf
+    })
+  }
+
+  /// Grows a branch span across a reach boundary, requiring the sweep to
+  /// straddle it: some sizes must fit and some must be refused as out of range.
+  ///
+  /// The golden pins each outcome; this pins that the *boundary itself* is
+  /// still where the test believes it is, which a golden alone cannot say.
+  #[track_caller]
+  fn straddle(
+    what: &str,
+    config: &Config,
+    range: std::ops::RangeInclusive<usize>,
+    build: impl Fn(usize) -> Vec<Insn>,
+  ) {
+    let capacity = (1 << 21) + (1 << 16);
+    let mut saw_success = false;
+    let mut saw_out_of_range = false;
+    for n in range {
+      let insns = build(n);
+      let code = Insn::encode_all(&insns);
+      let inputs = plain_inputs(insns.len());
+      golden_case(&format!("{what} n={n}"), config, &code, &inputs, capacity);
+      match outcome(config, &code, &inputs, capacity) {
+        Ok(_) => saw_success = true,
+        Err(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
+          saw_out_of_range = true
+        }
+        other => panic!("{what}: n = {n} failed unexpectedly: {other:?}"),
+      }
+    }
+    assert!(
+      saw_success,
+      "{what}: never fitted; the boundary was not straddled"
+    );
+    assert!(
+      saw_out_of_range,
+      "{what}: never overflowed; the boundary was not straddled"
+    );
+  }
+
   /// `jeq r1, 0, +n; <n fillers>; exit`
   fn long_forward_branch(n: usize) -> Vec<Insn> {
     let mut p = vec![insn(cls::JMP | srcbit::IMM | jmp::JEQ, 1, 0, n as i16, 0)];
@@ -3017,10 +3243,10 @@ mod tests {
   }
 
   #[test]
-  fn a_conditional_branch_straddling_one_mebibyte_agrees_on_both_sides() {
+  fn a_conditional_branch_straddling_one_mebibyte_is_pinned_either_side() {
     // A conditional branch carries a signed 19-bit word displacement, so it
-    // reaches +-1 MiB. Grow the span across that boundary and require the two
-    // backends to agree on the failure as well as on the success.
+    // reaches +-1 MiB. Grow the span across that boundary and require both the
+    // success and the refusal to be pinned.
     let (_, config) = config_sweep(Target::Aarch64)
       .into_iter()
       .find(|(name, _)| *name == "cage only")
@@ -3032,34 +3258,16 @@ mod tests {
     assert!(per > 0, "the filler must grow the output");
     let boundary = (1 << 20) / per;
 
-    let mut saw_success = false;
-    let mut saw_out_of_range = false;
-    for n in boundary - 2..=boundary + 2 {
-      let insns = long_forward_branch(n);
-      let code = Insn::encode_all(&insns);
-      let d = diff(
-        &config,
-        &code,
-        &plain_inputs(insns.len()),
-        (1 << 21) + (1 << 16),
-      );
-      match &d {
-        Diff::Same { .. } => saw_success = true,
-        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
-          saw_out_of_range = true
-        }
-        other => panic!("n = {n}: {other}"),
-      }
-    }
-    assert!(saw_success, "never fitted; the boundary was not straddled");
-    assert!(
-      saw_out_of_range,
-      "never overflowed; the boundary was not straddled"
+    straddle(
+      "conditional branch at 1 MiB",
+      &config,
+      boundary - 2..=boundary + 2,
+      long_forward_branch,
     );
   }
 
   #[test]
-  fn a_literal_load_straddling_one_mebibyte_agrees_on_both_sides() {
+  fn a_literal_load_straddling_one_mebibyte_is_pinned_either_side() {
     // The dispatcher address and the helper table are parked after all the
     // code, and a helper call reaches them with an LDR (literal) and an ADR -
     // both signed 19-bit, so both stop reaching at 1 MiB.
@@ -3080,29 +3288,11 @@ mod tests {
     let per = (rust_len(&config, &build(200)) - rust_len(&config, &build(100))) / 100;
     let boundary = (1 << 20) / per;
 
-    let mut saw_success = false;
-    let mut saw_out_of_range = false;
-    for n in boundary - 2..=boundary + 2 {
-      let insns = build(n);
-      let code = Insn::encode_all(&insns);
-      let d = diff(
-        &config,
-        &code,
-        &plain_inputs(insns.len()),
-        (1 << 21) + (1 << 16),
-      );
-      match &d {
-        Diff::Same { .. } => saw_success = true,
-        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
-          saw_out_of_range = true
-        }
-        other => panic!("n = {n}: {other}"),
-      }
-    }
-    assert!(saw_success, "never fitted; the boundary was not straddled");
-    assert!(
-      saw_out_of_range,
-      "never overflowed; the boundary was not straddled"
+    straddle(
+      "literal load at 1 MiB",
+      &config,
+      boundary - 2..=boundary + 2,
+      build,
     );
   }
 
@@ -3201,7 +3391,7 @@ mod tests {
   ];
   const RANDOM_OFFSETS: [i16; 10] = [0, 1, -1, 8, 255, 256, -256, -257, 4095, -4096];
 
-  /// One random instruction, kept inside what `ubpf_load` accepts so that most
+  /// One random instruction, kept inside what the loader accepts so that most
   /// generated programs actually translate. Jumps are emitted with a zero
   /// offset and retargeted once the program's instruction boundaries are known.
   fn random_insn(rng: &mut Rng) -> Insn {
@@ -3326,11 +3516,13 @@ mod tests {
   /// keep the suite fast. It has been run at 1500 programs across five seeds -
   /// 45,000 differential translations - with no disagreement.
   #[test]
-  fn randomised_programs_with_random_hints_and_plans_agree() {
-    let seed = env_u64("FUZZ_SEED", 0x2545_f491_4f6c_dd1d);
-    let count = env_u64("FUZZ_N", 400) as usize;
+  fn randomised_programs_with_random_hints_and_plans_are_pinned() {
+    const SEED: u64 = 0x2545_f491_4f6c_dd1d;
+    const COUNT: usize = 400;
+    let seed = env_u64("FUZZ_SEED", SEED);
+    let count = env_u64("FUZZ_N", COUNT as u64) as usize;
     let mut rng = Rng(seed);
-    let mut translated = 0usize;
+    let mut digest = SweepDigest::new();
     for _ in 0..count {
       let len = 4 + rng.below(24);
 
@@ -3389,22 +3581,21 @@ mod tests {
         end_pc: program.len(),
       };
       let code = Insn::encode_all(&program);
-      for (name, config) in config_sweep(Target::Aarch64) {
-        let d = diff(&config, &code, &inputs, 262144);
-        assert!(
-          d.is_same(),
-          "randomised program disagrees under {name:?}\n{d}"
-        );
-        if matches!(d, Diff::Same { .. }) {
-          translated += 1;
-        }
+      for (_, config) in config_sweep(Target::Aarch64) {
+        sweep_case(&mut digest, &config, &code, &inputs, 262144);
       }
     }
     // A run in which nothing translated would prove nothing.
+    let translated = digest.translated();
     assert!(
       translated * 10 > 2000,
       "only {translated} randomised translations produced code"
     );
+    // A run cranked up through the environment explores a different corner of
+    // the space and has no golden of its own; only the default sweep is pinned.
+    if (seed, count) == (SEED, COUNT) {
+      finish_sweep(digest, "randomised-programs");
+    }
   }
 
   #[test]
@@ -3414,7 +3605,7 @@ mod tests {
     // that shape - several functions, calls into each of them, and each range
     // translated on its own.
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let mut translated = 0usize;
+    let mut digest = SweepDigest::new();
 
     for _ in 0..150 {
       let functions = 2 + rng.below(3);
@@ -3463,19 +3654,14 @@ mod tests {
           start_pc: bounds[w],
           end_pc: bounds[w + 1],
         };
-        for (name, config) in config_sweep(Target::Aarch64) {
-          let d = diff(&config, &code, &inputs, 262144);
-          assert!(
-            d.is_same(),
-            "randomised multi-function program disagrees under {name:?}\n{d}"
-          );
-          if matches!(d, Diff::Same { .. }) {
-            translated += 1;
-          }
+        for (_, config) in config_sweep(Target::Aarch64) {
+          sweep_case(&mut digest, &config, &code, &inputs, 262144);
         }
       }
     }
+    let translated = digest.translated();
     assert!(translated > 1000, "only {translated} ranges produced code");
+    finish_sweep(digest, "randomised-multi-function-programs");
   }
 
   // -------------------------------------------------------------------------
@@ -3483,12 +3669,17 @@ mod tests {
   // -------------------------------------------------------------------------
 
   #[test]
-  fn running_out_of_space_is_reported_identically() {
+  fn running_out_of_space_is_reported_as_recorded() {
     let code = Insn::encode_all(&[insn(0xb7, 0, 0, 0, 42), exit()]);
     for (name, config) in config_sweep(Target::Aarch64) {
       for capacity in [0usize, 4, 8, 64, 128, 512] {
-        let d = diff(&config, &code, &plain_inputs(2), capacity);
-        assert!(d.is_same(), "capacity {capacity} under {name:?}\n{d}");
+        golden_case(
+          &format!("out of space/{name}/cap {capacity}"),
+          &config,
+          &code,
+          &plain_inputs(2),
+          capacity,
+        );
       }
     }
   }
@@ -3519,27 +3710,30 @@ mod tests {
       end_pc: 4,
       ..Default::default()
     };
-    for (name, config) in config_sweep(Target::Aarch64) {
+    let mut digest = SweepDigest::new();
+    for (_, config) in config_sweep(Target::Aarch64) {
       for capacity in 0usize..64 {
-        let d = diff(&config, &code, &inputs, capacity);
-        assert!(d.is_same(), "capacity {capacity} under {name:?}\n{d}");
+        sweep_case(&mut digest, &config, &code, &inputs, capacity);
       }
     }
+    assert_eq!(digest.cases(), 64 * 6);
+    finish_sweep(digest, "audit-escaping-jump-capacity");
   }
 
-  /// AUDIT FINDING 1 (fails): `JitState::fail` keeps the *first* failure, but
-  /// the C assigns `state->jit_status` directly, so the *last* assignment wins.
+  /// AUDIT FINDING 1: which failure survives when two happen at once.
   ///
-  /// When the per-function prologue overruns the buffer (`NotEnoughSpace`) and
-  /// the same instruction then hits an error arm, the C's status is overwritten
-  /// and it reports the instruction error; this port keeps `NotEnoughSpace` and
-  /// reports `OutOfSpace`. The two are not interchangeable: the caller's code
+  /// `JitState::fail` keeps the *first* failure. So when the per-function
+  /// prologue overruns the buffer (`NotEnoughSpace`) and the very same
+  /// instruction then hits an error arm, what comes out is `OutOfSpace` and not
+  /// the instruction error. The two are not interchangeable: the caller's code
   /// arena treats `OutOfSpace` as terminal for the whole program and a `Failed`
-  /// as terminal for one function.
+  /// as terminal for one function, so which one wins decides whether the rest
+  /// of the program is still compiled.
   ///
   /// Reachable through the loader: pc2 is a local function entry (the target of
   /// the call at pc0) *and* a local call with no resolver id, so the guard in
   /// `emit_lazy_local_call` fires after the prologue has already been emitted.
+  /// Every buffer size either side of that point is recorded.
   #[test]
   fn audit_a_full_buffer_masks_a_later_error() {
     let insns = vec![
@@ -3554,42 +3748,39 @@ mod tests {
       end_pc: 4,
       ..Default::default()
     };
-    for (name, config) in config_sweep(Target::Aarch64) {
+    let mut digest = SweepDigest::new();
+    for (_, config) in config_sweep(Target::Aarch64) {
       for capacity in 0usize..=64 {
-        let d = diff(&config, &code, &inputs, capacity);
-        assert!(d.is_same(), "capacity {capacity} under {name:?}\n{d}");
+        sweep_case(&mut digest, &config, &code, &inputs, capacity);
       }
     }
+    assert_eq!(digest.cases(), 65 * 6);
+    finish_sweep(digest, "audit-full-buffer-masks-a-later-error");
   }
 
-  /// AUDIT: report (do not assert) every disagreement, so one run surfaces all.
-  fn audit_report(
+  /// AUDIT: fold one probe into the batch's rolling digest.
+  ///
+  /// These batches enumerate hundreds of shapes apiece, so they are recorded as
+  /// one digest per batch rather than one entry per case: the whole batch stays
+  /// a single reviewable line, at the cost of saying only *that* something
+  /// changed rather than which shape.
+  fn audit_case(
+    digest: &mut SweepDigest,
     what: &str,
     insns: &[Insn],
     inputs: &TranslationInputs<'_>,
-    bad: &mut Vec<String>,
   ) {
-    if std::env::var("AUDIT_VERBOSE").is_ok() {
-      let code0 = Insn::encode_all(insns);
-      let cap0 = 262144.max(insns.len() * 512);
-      let (n0, c0) = config_sweep(Target::Aarch64).into_iter().next().unwrap();
-      println!("  [{what}] {n0}: {}", diff(&c0, &code0, inputs, cap0));
-    }
     let code = Insn::encode_all(insns);
     let capacity = 262144.max(insns.len() * 512);
-    for (name, config) in config_sweep(Target::Aarch64) {
-      let d = diff(&config, &code, &inputs.clone(), capacity);
-      match &d {
-        Diff::Same { .. } => {}
-        Diff::SameError(_) => {}
-        _ => bad.push(format!("DISAGREE {what} under {name}: {d}")),
-      }
+    let _ = what;
+    for (_, config) in config_sweep(Target::Aarch64) {
+      sweep_case(digest, &config, &code, inputs, capacity);
     }
   }
 
   #[test]
   fn audit_probe_batch() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     // --- B: extreme load/store offsets -------------------------------------
     for &off in &[
@@ -3628,14 +3819,14 @@ mod tests {
       let n = p.len();
       for hint in [0u8, 1, 2, 3] {
         let hints = vec![hint; n];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("offset {off} hint {hint}"),
           &p,
           &TranslationInputs {
             hints: &hints,
             ..plain_inputs(n)
           },
-          &mut bad,
         );
       }
     }
@@ -3655,18 +3846,23 @@ mod tests {
       }
       p.push(exit());
       let n = p.len();
-      audit_report(
+      audit_case(
+        &mut digest,
         &format!("atomic offset {off}"),
         &p,
         &plain_inputs(n),
-        &mut bad,
       );
     }
 
     // --- D: call immediates outside 0..64 ----------------------------------
     for &idx in &[-1i32, i32::MIN, i32::MAX, 64, 65, 1000, 0x7fff_ffff] {
       let p = vec![insn(opcode::CALL, 0, 0, 0, idx), exit()];
-      audit_report(&format!("call imm {idx}"), &p, &plain_inputs(2), &mut bad);
+      audit_case(
+        &mut digest,
+        &format!("call imm {idx}"),
+        &p,
+        &plain_inputs(2),
+      );
     }
 
     // --- F: region hints outside 0..=3 -------------------------------------
@@ -3678,23 +3874,18 @@ mod tests {
         exit(),
       ];
       let hints = vec![hint; 4];
-      audit_report(
+      audit_case(
+        &mut digest,
         &format!("hint {hint}"),
         &p,
         &TranslationInputs {
           hints: &hints,
           ..plain_inputs(4)
         },
-        &mut bad,
       );
     }
 
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-probe-batch");
   }
 
   /// AUDIT: the existing fuzzer draws offsets, plan deltas, spans, lo bounds
@@ -3702,11 +3893,12 @@ mod tests {
   /// domain of each field, including the values a hostile embedder could pass.
   #[test]
   fn audit_wide_randomised_plans_and_offsets() {
-    let seed = env_u64("AUDIT_SEED", 0xdead_beef_1234_5678);
-    let count = env_u64("AUDIT_N", 500) as usize;
+    const SEED: u64 = 0xdead_beef_1234_5678;
+    const COUNT: usize = 500;
+    let seed = env_u64("AUDIT_SEED", SEED);
+    let count = env_u64("AUDIT_N", COUNT as u64) as usize;
     let mut rng = Rng(seed);
-    let mut translated = 0usize;
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     const WIDE_OFFSETS: [i16; 16] = [
       i16::MIN,
@@ -3800,34 +3992,24 @@ mod tests {
         end_pc: n,
       };
       let code = Insn::encode_all(&program);
-      for (name, config) in config_sweep(Target::Aarch64) {
-        let d = diff(&config, &code, &inputs, 262144);
-        match &d {
-          Diff::Same { .. } => translated += 1,
-          Diff::SameError(_) => {}
-          _ => bad.push(format!(
-            "{name}: {d}\n  program: {program:?}\n  plan: {plan:?}\n  hints: {hints:?}"
-          )),
-        }
-        if !bad.is_empty() {
-          break;
-        }
-      }
-      if !bad.is_empty() {
-        break;
+      for (_, config) in config_sweep(Target::Aarch64) {
+        sweep_case(&mut digest, &config, &code, &inputs, 262144);
       }
     }
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let translated = digest.translated();
     assert!(
       translated > 100,
       "only {translated} translations produced code"
     );
+    if (seed, count) == (SEED, COUNT) {
+      finish_sweep(digest, "audit-wide-randomised-plans");
+    }
   }
 
   /// AUDIT: well-formed groups at every boundary of span/delta/lo/width.
   #[test]
   fn audit_group_boundaries() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     let widths = [(size::B, 1i32), (size::H, 2), (size::W, 4), (size::DW, 8)];
 
@@ -3860,31 +4042,26 @@ mod tests {
             ];
             // The leader's own access must fit its window too, or it is refused
             // - which is itself worth checking, so do not skip it.
-            audit_report(
+            audit_case(
+              &mut digest,
               &format!("group span {span} delta {d} lo {lo} width {w}"),
               &insns,
               &TranslationInputs {
                 plan: &plan,
                 ..plain_inputs(3)
               },
-              &mut bad,
             );
           }
         }
       }
     }
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-group-boundaries");
   }
 
   /// AUDIT: plan shapes the existing hostile-plan table does not name.
   #[test]
   fn audit_more_hostile_plans() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
     let g = two_access_group(0, 8);
 
     let cases: Vec<(&str, Vec<PlanEntry>)> = vec![
@@ -4037,7 +4214,8 @@ mod tests {
     for (what, plan) in cases {
       for hint in [0u8, 1, 2, 3] {
         let hints = vec![hint; g.len()];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("{what} hint {hint}"),
           &g,
           &TranslationInputs {
@@ -4045,23 +4223,17 @@ mod tests {
             hints: &hints,
             ..plain_inputs(g.len())
           },
-          &mut bad,
         );
       }
     }
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-more-hostile-plans");
   }
 
   /// AUDIT: a leader whose access is also a frame access, and a group crossing
   /// a `lddw` (whose second slot the loop skips).
   #[test]
   fn audit_group_interactions() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     // The frame fast path preempts the plan entirely.
     {
@@ -4077,7 +4249,8 @@ mod tests {
       ];
       for hint in [0u8, 1, 2, 3] {
         let hints = vec![hint; 3];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("frame-eligible leader hint {hint}"),
           &insns,
           &TranslationInputs {
@@ -4085,7 +4258,6 @@ mod tests {
             hints: &hints,
             ..plain_inputs(3)
           },
-          &mut bad,
         );
       }
     }
@@ -4109,14 +4281,14 @@ mod tests {
           member(abi::region::STACK, 0, 8, 0),
           none_entry(),
         ];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("group across a lddw writing r{lddw_dst}"),
           &insns,
           &TranslationInputs {
             plan: &plan,
             ..plain_inputs(5)
           },
-          &mut bad,
         );
       }
     }
@@ -4135,14 +4307,14 @@ mod tests {
         member(abi::region::STACK, 0, 8, 0),
         none_entry(),
       ];
-      audit_report(
+      audit_case(
+        &mut digest,
         "ja lands on the member",
         &insns,
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(4)
         },
-        &mut bad,
       );
     }
 
@@ -4150,23 +4322,18 @@ mod tests {
     {
       let insns = vec![insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0), exit()];
       let plan = vec![leader(abi::region::STACK, 0, 0, 16, 0), none_entry()];
-      audit_report(
+      audit_case(
+        &mut digest,
         "leader at the end of the range",
         &insns,
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(2)
         },
-        &mut bad,
       );
     }
 
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-group-interactions");
   }
 
   /// AUDIT: a local function entry reached by *fall-through*.
@@ -4178,7 +4345,7 @@ mod tests {
   /// existing test reaches it.
   #[test]
   fn audit_fallthrough_into_a_local_function_entry() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
     // pc0 calls pc3; pc1 is the unconditional jump that satisfies the
     // validator; pc2 falls through into the function entry at pc3.
     let insns = vec![
@@ -4189,17 +4356,18 @@ mod tests {
       exit(),
     ];
     let ids = [4u32; 5];
-    audit_report(
+    audit_case(
+      &mut digest,
       "fallthrough entry, whole program",
       &insns,
       &TranslationInputs {
         resolver_ids: &ids,
         ..plain_inputs(5)
       },
-      &mut bad,
     );
     for (start, end) in [(0usize, 3usize), (3, 5)] {
-      audit_report(
+      audit_case(
+        &mut digest,
         &format!("fallthrough entry, range {start}..{end}"),
         &insns,
         &TranslationInputs {
@@ -4208,7 +4376,6 @@ mod tests {
           end_pc: end,
           ..Default::default()
         },
-        &mut bad,
       );
     }
 
@@ -4227,7 +4394,8 @@ mod tests {
       insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
       exit(),
     ];
-    audit_report(
+    audit_case(
+      &mut digest,
       "fallthrough entry with a group across it",
       &insns2,
       &TranslationInputs {
@@ -4235,21 +4403,15 @@ mod tests {
         resolver_ids: &ids,
         ..plain_inputs(5)
       },
-      &mut bad,
     );
 
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-fallthrough-entry");
   }
 
   /// AUDIT: a region-hint array shorter than the program.
   #[test]
   fn audit_short_hint_array() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
     let insns = vec![
       insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
       insn(cls::LDX | mode::MEM | size::W, 1, 10, -8, 0),
@@ -4259,23 +4421,18 @@ mod tests {
     for n in 0..=4usize {
       for fill in [0u8, 1, 2, 3] {
         let hints = vec![fill; n];
-        audit_report(
+        audit_case(
+          &mut digest,
           &format!("hints len {n} fill {fill}"),
           &insns,
           &TranslationInputs {
             hints: &hints,
             ..plain_inputs(4)
           },
-          &mut bad,
         );
       }
     }
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-short-hint-array");
   }
 
   /// AUDIT: the *backward* conditional-branch boundary. The existing test only
@@ -4310,27 +4467,12 @@ mod tests {
       "the offset field must reach the target"
     );
 
-    let mut saw_success = false;
-    let mut saw_out_of_range = false;
-    for n in boundary - 2..=boundary + 2 {
-      let insns = build(n);
-      let code = Insn::encode_all(&insns);
-      let d = diff(
-        &config,
-        &code,
-        &plain_inputs(insns.len()),
-        (1 << 21) + (1 << 16),
-      );
-      match &d {
-        Diff::Same { .. } => saw_success = true,
-        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
-          saw_out_of_range = true
-        }
-        other => panic!("n = {n}: {other}"),
-      }
-    }
-    assert!(saw_success, "never fitted");
-    assert!(saw_out_of_range, "never overflowed");
+    straddle(
+      "backward conditional branch at 1 MiB",
+      &config,
+      boundary - 2..=boundary + 2,
+      build,
+    );
   }
 
   /// AUDIT: the unwind helper emits a conditional branch to the epilogue, which
@@ -4355,37 +4497,32 @@ mod tests {
     assert!(per > 0);
     let boundary = (1 << 20) / per;
 
-    let mut saw_success = false;
-    let mut saw_out_of_range = false;
-    for n in boundary - 3..=boundary + 3 {
-      let insns = build(n);
-      let code = Insn::encode_all(&insns);
-      let d = diff(
-        &config,
-        &code,
-        &plain_inputs(insns.len()),
-        (1 << 21) + (1 << 16),
-      );
-      match &d {
-        Diff::Same { .. } => saw_success = true,
-        Diff::SameError(TranslateError::Failed(msg)) if msg.starts_with("Branch or load") => {
-          saw_out_of_range = true
-        }
-        other => panic!("n = {n}: {other}"),
-      }
-    }
-    assert!(saw_success, "never fitted");
-    assert!(saw_out_of_range, "never overflowed");
+    straddle(
+      "unwind branch to the epilogue at 1 MiB",
+      &config,
+      boundary - 3..=boundary + 3,
+      build,
+    );
   }
 
-  /// AUDIT: `is_simple_imm` in the C is a `switch` over *whole opcode bytes*;
-  /// the port rewrote it as a match on class + operation nibble. Enumerate all
-  /// 256 opcodes and report every byte where the two disagree, together with
-  /// whether that byte can reach the function at all.
+  /// AUDIT: `is_simple_imm` decides whether an immediate can be folded into the
+  /// instruction instead of materialised into a register, and it is written as
+  /// a match on class plus operation nibble. The set it is *meant* to name is a
+  /// flat list of whole opcode bytes, written out below; a nibble match is a
+  /// compression of that list and can easily admit one byte too many.
+  ///
+  /// So enumerate all 256 opcodes against the list and report every byte where
+  /// the two differ, together with whether that byte can reach the function at
+  /// all — most cannot, because the loader refuses the opcode outright.
   #[test]
-  fn audit_is_simple_imm_matches_the_c_switch_byte_for_byte() {
-    // Transcription of the C's switch (ubpf_jit_arm64.c:1644-1709).
-    fn c_is_simple_imm(op: u8, imm: i32) -> bool {
+  fn audit_is_simple_imm_matches_the_opcode_list_byte_for_byte() {
+    /// The opcodes that may carry a folded immediate, one byte at a time.
+    ///
+    /// ADD/SUB take a 12-bit unsigned immediate, and so does the compare a
+    /// conditional jump lowers to; everything else has to go through a
+    /// register. `mov` is the exception at the end: an immediate move *is* the
+    /// materialisation, so it is always "simple".
+    fn expected_is_simple_imm(op: u8, imm: i32) -> bool {
       const RANGED: [u8; 24] = [
         0x04, 0x07, 0x14, 0x17, // ADD/SUB IMM, both widths
         0x15, 0x25, 0x35, 0x55, 0x65, 0x75, 0xa5, 0xb5, 0xc5, 0xd5, // JMP  *_IMM
@@ -4403,8 +4540,8 @@ mod tests {
       for imm in [-1i32, 0, 0x7ff, 0xfff, 0x1000, i32::MIN, i32::MAX] {
         let i = insn(op, 1, 2, 0, imm);
         let rust = is_simple_imm(&i);
-        let c = c_is_simple_imm(op, imm);
-        if rust == c {
+        let expected = expected_is_simple_imm(op, imm);
+        if rust == expected {
           continue;
         }
         // The function is only consulted for an instruction `is_imm_op` admits
@@ -4429,7 +4566,8 @@ mod tests {
     );
     assert!(
       disagree_reachable.is_empty(),
-      "is_simple_imm disagrees with the C on defined, consulted opcodes: {disagree_reachable:02x?}"
+      "is_simple_imm folds an immediate for a defined, consulted opcode that is \
+       not on the list — or refuses one that is: {disagree_reachable:02x?}"
     );
   }
 
@@ -4442,11 +4580,15 @@ mod tests {
       let insns = vec![insn(cls::ST | mode::MEM | sz, 1, 10, 0, 0x1234), exit()];
       let code = Insn::encode_all(&insns);
       for (name, config) in config_sweep(Target::Aarch64) {
-        let d = diff(&config, &code, &plain_inputs(2), 65536);
-        assert!(d.is_same(), "st src=10 under {name}: {d}");
         assert!(
-          matches!(d, Diff::SameError(_)),
-          "st src=10 under {name} translated: {d}"
+          !golden_case(
+            &format!("st src=10 width {sz}/{name}"),
+            &config,
+            &code,
+            &plain_inputs(2),
+            65536
+          ),
+          "st src=10 under {name} translated; the loader is expected to refuse it"
         );
       }
     }
@@ -4500,11 +4642,12 @@ mod tests {
   /// exactly one function per range.
   #[test]
   fn audit_wide_multi_function_ranges_with_plans_and_hints() {
-    let seed = env_u64("AUDIT_SEED", 0x1357_9bdf_2468_ace0);
-    let count = env_u64("AUDIT_N", 400) as usize;
+    const SEED: u64 = 0x1357_9bdf_2468_ace0;
+    const COUNT: usize = 400;
+    let seed = env_u64("AUDIT_SEED", SEED);
+    let count = env_u64("AUDIT_N", COUNT as u64) as usize;
     let mut rng = Rng(seed);
-    let mut translated = 0usize;
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
 
     for _ in 0..count {
       let functions = 2 + rng.below(4);
@@ -4575,51 +4718,36 @@ mod tests {
             start_pc: bounds[a],
             end_pc: bounds[b],
           };
-          for (name, config) in config_sweep(Target::Aarch64) {
-            let d = diff(&config, &code, &inputs, 262144);
-            match &d {
-              Diff::Same { .. } => translated += 1,
-              Diff::SameError(_) => {}
-              _ => bad.push(format!(
-                "{name} range {}..{}: {d}\n  program: {program:?}\n  plan: {plan:?}\n  hints: {hints:?}",
-                bounds[a], bounds[b]
-              )),
-            }
-          }
-          if !bad.is_empty() {
-            break;
+          for (_, config) in config_sweep(Target::Aarch64) {
+            sweep_case(&mut digest, &config, &code, &inputs, 262144);
           }
         }
-        if !bad.is_empty() {
-          break;
-        }
-      }
-      if !bad.is_empty() {
-        break;
       }
     }
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let translated = digest.translated();
     assert!(
       translated > 200,
       "only {translated} translations produced code"
     );
+    if (seed, count) == (SEED, COUNT) {
+      finish_sweep(digest, "audit-wide-multi-function-ranges");
+    }
   }
 
-  /// AUDIT FINDING 2 (fails): the patch-table ceilings do not match the C.
+  /// AUDIT FINDING 2 (was: the patch tables grew sixteen times too far).
   ///
-  /// `reserve_patchable_relatives` refuses to grow past `UBPF_MAX_INSTS`
-  /// (65536) entries, so the C reports "Too many jump instructions." on the
-  /// 65537th jump fixup. `patch.rs` sets `MAX_JUMPS` (and the other three) to
-  /// `1 << 20` while its doc comment claims they are "the same bounds the C
-  /// grew to". They are 16x too large.
+  /// The jump-fixup table stops growing at [`abi::MAX_INSTS`] entries, the same
+  /// ceiling a loaded program's instruction count has, and reports "Too many
+  /// jump instructions." past it. The tables in `patch.rs` were once set to
+  /// `1 << 20`, which let a program that should have been refused emit a
+  /// megabyte of code instead.
   ///
-  /// A `cmpxchg` emits two jump fixups, so 32769 of them cross the C's ceiling
-  /// while staying well inside the 65536-instruction program limit: the C
-  /// rejects the program and this port emits a megabyte of code for it.
-  ///
-  /// `patch.rs` is shared, so the x86_64 backend inherits the same gap.
+  /// A `cmpxchg` emits two jump fixups, so 32769 of them cross the ceiling
+  /// while staying well inside the instruction limit — the smallest program
+  /// that tells the two ceilings apart. `patch.rs` is shared, so the x86_64
+  /// backend is bounded by the same numbers.
   #[test]
-  fn audit_the_patch_table_ceilings_match_the_c() {
+  fn audit_the_patch_table_ceilings_hold_at_the_instruction_limit() {
     let (_, config) = config_sweep(Target::Aarch64)
       .into_iter()
       .find(|(name, _)| *name == "no cage")
@@ -4634,21 +4762,42 @@ mod tests {
       p
     };
 
-    // 32768 cmpxchg is exactly 65536 fixups - the last one the C accepts.
-    // 32769 is one jump past it.
-    for n in [32768usize, 32769] {
+    // 32768 cmpxchg is exactly 65536 fixups - the last one the ceiling admits.
+    // 32769 is one jump past it, and must be refused.
+    for (n, fits) in [(32768usize, true), (32769, false)] {
       let insns = build(n);
       let code = Insn::encode_all(&insns);
-      let d = diff(&config, &code, &plain_inputs(insns.len()), 32 << 20);
-      assert!(d.is_same(), "{n} cmpxchg ({} jump fixups): {d}", n * 2);
+      let inputs = plain_inputs(insns.len());
+      let capacity = 32 << 20;
+      assert_eq!(
+        golden_case(
+          &format!("cmpxchg storm n={n}"),
+          &config,
+          &code,
+          &inputs,
+          capacity
+        ),
+        fits,
+        "{n} cmpxchg is {} jump fixups against a ceiling of {}",
+        n * 2,
+        abi::MAX_INSTS
+      );
+      if !fits {
+        assert_eq!(
+          outcome(&config, &code, &inputs, capacity),
+          Err(TranslateError::Failed("Too many jump instructions.".into())),
+          "the {}th jump fixup must be refused by name",
+          n * 2
+        );
+      }
     }
   }
 
   /// AUDIT: every capacity from zero to just past the full output, for a
   /// program that fills all four patch tables. The existing capacity test uses
   /// six sizes and a two-instruction program, so it never lands inside the
-  /// epilogue, the dispatcher slot or the helper table - the places the port's
-  /// own comments call out as hazardous.
+  /// epilogue, the dispatcher slot or the helper table - the places where a
+  /// truncated buffer is most likely to be handled badly.
   #[test]
   fn audit_every_capacity_for_a_program_that_fills_the_patch_tables() {
     let insns = vec![
@@ -4678,16 +4827,22 @@ mod tests {
       plan: &plan,
       ..plain_inputs(insns.len())
     };
-    for (name, config) in config_sweep(Target::Aarch64) {
+    // Every capacity in the sweep is one entry, so this one rolls up into a
+    // digest rather than several thousand lines of mostly "out of space".
+    let mut digest = SweepDigest::new();
+    for (_, config) in config_sweep(Target::Aarch64) {
       let full = rust_len(&config, &insns);
       for capacity in 0..full + 16 {
-        let d = diff(&config, &code, &inputs, capacity);
-        assert!(
-          d.is_same(),
-          "capacity {capacity}/{full} under {name:?}\n{d}"
-        );
+        sweep_case(&mut digest, &config, &code, &inputs, capacity);
       }
+      // The last sixteen capacities are past the full output, so the sweep has
+      // to contain successes as well as refusals.
+      assert!(
+        digest.translated() > 0,
+        "no capacity in the sweep was large enough to translate {full} bytes"
+      );
     }
+    finish_sweep(digest, "audit-every-capacity");
   }
 
   /// AUDIT: every way the barrier pre-pass can close a group - the slot after a
@@ -4695,7 +4850,7 @@ mod tests {
   /// local function entry - with a leader/member pair straddling each.
   #[test]
   fn audit_every_barrier_source_closes_a_group() {
-    let mut bad: Vec<String> = Vec::new();
+    let mut digest = SweepDigest::new();
     let ld = |dst: u8, off: i16| insn(cls::LDX | mode::MEM | size::DW, dst, 2, off, 0);
 
     // leader; <separator>; member
@@ -4730,14 +4885,14 @@ mod tests {
       plan.push(member(abi::region::STACK, 0, 8, 0));
       plan.push(none_entry());
       assert_eq!(plan.len(), n);
-      audit_report(
+      audit_case(
+        &mut digest,
         what,
         &insns,
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(n)
         },
-        &mut bad,
       );
     }
 
@@ -4755,14 +4910,14 @@ mod tests {
         none_entry(),
         none_entry(),
       ];
-      audit_report(
+      audit_case(
+        &mut digest,
         "backward branch target is the member",
         &insns,
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(4)
         },
-        &mut bad,
       );
     }
 
@@ -4783,7 +4938,8 @@ mod tests {
         none_entry(),
       ];
       let ids = [7u32; 5];
-      audit_report(
+      audit_case(
+        &mut digest,
         "function entry lands on the member",
         &insns,
         &TranslationInputs {
@@ -4791,16 +4947,10 @@ mod tests {
           resolver_ids: &ids,
           ..plain_inputs(5)
         },
-        &mut bad,
       );
     }
 
-    assert!(
-      bad.is_empty(),
-      "{} disagreements:\n{}",
-      bad.len(),
-      bad.join("\n")
-    );
+    finish_sweep(digest, "audit-barrier-sources");
   }
 
   /// AUDIT (informational): how far one eBPF instruction can expand, which

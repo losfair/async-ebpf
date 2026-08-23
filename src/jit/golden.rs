@@ -115,6 +115,18 @@ struct Store {
   dirty: bool,
 }
 
+/// Takes the store lock, ignoring poisoning.
+///
+/// A golden mismatch reports by panicking, and a panic while the lock is held
+/// poisons it. The data behind it is a plain map that was only being read, so
+/// it is still perfectly good — but `unwrap()` on the next lock would turn one
+/// honest mismatch into a second panic, and `flush` runs from a `Drop`, where a
+/// panic aborts the process. That is how a single reportable failure became a
+/// SIGABRT and a screenful of unrelated ones.
+fn lock(m: &'static Mutex<Store>) -> std::sync::MutexGuard<'static, Store> {
+  m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn store(target: Target) -> &'static Mutex<Store> {
   use std::sync::OnceLock;
   static X86: OnceLock<Mutex<Store>> = OnceLock::new();
@@ -150,7 +162,7 @@ fn store(target: Target) -> &'static Mutex<Store> {
 /// process exit, because Rust's test runner does not run atexit hooks reliably.
 pub fn flush() {
   for target in [Target::X86_64, Target::Aarch64] {
-    let mut guard = store(target).lock().unwrap();
+    let mut guard = lock(store(target));
     if pruning() {
       let seen = guard.seen.clone();
       let before = guard.entries.len();
@@ -162,15 +174,19 @@ pub fn flush() {
     if !guard.dirty {
       continue;
     }
-    assert!(
-      guard.entries.len() <= MAX_ENTRIES,
-      "{:?} golden file would hold {} entries, over the {MAX_ENTRIES} ceiling.\n\n\
-       `check` is for a bounded set of named cases. A test looping over a large \
-       cross-product should fold its outcomes into a `SweepDigest` instead, \
-       which records one line however many cases it covers.",
-      target,
-      guard.entries.len()
-    );
+    // Reported rather than asserted: `flush` runs from a `Drop` guard, where a
+    // panic aborts the process instead of failing a test.
+    if guard.entries.len() > MAX_ENTRIES {
+      eprintln!(
+        "{:?} golden file would hold {} entries, over the {MAX_ENTRIES} ceiling.\n\n\
+         `check` is for a bounded set of named cases. A test looping over a large \
+         cross-product should fold its outcomes into a `SweepDigest` instead, \
+         which records one line however many cases it covers.",
+        target,
+        guard.entries.len()
+      );
+      panic!("golden file over the {MAX_ENTRIES}-entry ceiling");
+    }
     let path = golden_path(target);
     let _ = std::fs::create_dir_all(path.parent().unwrap());
     let mut out = String::new();
@@ -275,15 +291,26 @@ pub fn check(
   inputs: &TranslationInputs<'_>,
   capacity: usize,
 ) -> bool {
-  let Some(out) = translate_one(config, code, inputs, capacity) else {
-    return false;
+  // A program refused at load is recorded too, with its refusal message. It
+  // would be easy to return early here and record nothing - the caller's own
+  // assertion already covers "was it refused?" - but then a case that is still
+  // refused for a newly *different* reason reads as unchanged, and cases whose
+  // whole purpose is to be refused would contribute nothing to the file at all.
+  let (translated, digest) = match Translator::load(std::sync::Arc::new(config.clone()), code) {
+    Err(e) => (false, format!("load-err:{}", e.0)),
+    Ok(translator) => {
+      let mut buf = vec![0u8; capacity];
+      let out = translator.translate_range(inputs, &mut buf).map(|len| {
+        buf.truncate(len);
+        buf
+      });
+      (out.is_ok(), outcome_digest(&out))
+    }
   };
-  let translated = out.is_ok();
 
   let k = key(label, config, code, inputs);
-  let digest = outcome_digest(&out);
 
-  let mut guard = store(config.target).lock().unwrap();
+  let mut guard = lock(store(config.target));
   guard.seen.insert(k.clone());
   if updating() {
     if guard.entries.get(&k) != Some(&digest) {
@@ -292,16 +319,22 @@ pub fn check(
     }
     return translated;
   }
-  match guard.entries.get(&k) {
-    Some(expected) if *expected == digest => translated,
-    Some(expected) => panic!(
+  let verdict = match guard.entries.get(&k) {
+    Some(expected) if *expected == digest => Ok(translated),
+    Some(expected) => Err(Some(expected.clone())),
+    None => Err(None),
+  };
+  drop(guard);
+  match verdict {
+    Ok(translated) => translated,
+    Err(Some(expected)) => panic!(
       "golden mismatch for {label} on {:?}\n  expected: {expected}\n  actual:   {digest}\n\n\
        Code generation changed. If that was intended, regenerate with\n  \
        ASYNC_EBPF_UPDATE_GOLDENS=1 cargo test --features testing\n\
        and make the resulting diff part of the change being reviewed.",
       config.target
     ),
-    None => panic!(
+    Err(None) => panic!(
       "no golden recorded for {label} on {:?} (key {k})\n\n\
        This input is new. Record it with\n  \
        ASYNC_EBPF_UPDATE_GOLDENS=1 cargo test --features testing",
@@ -368,7 +401,7 @@ impl SweepDigest {
   pub fn finish(self, label: &str, target: Target) {
     let digest = format!("{}:{}:{}", self.cases, self.translated, self.hasher.finish());
     let k = format!("sweep.{label}");
-    let mut guard = store(target).lock().unwrap();
+    let mut guard = lock(store(target));
     guard.seen.insert(k.clone());
     if updating() {
       if guard.entries.get(&k) != Some(&digest) {
@@ -377,16 +410,22 @@ impl SweepDigest {
       }
       return;
     }
-    match guard.entries.get(&k) {
-      Some(expected) if *expected == digest => {}
-      Some(expected) => panic!(
+    let verdict = match guard.entries.get(&k) {
+      Some(expected) if *expected == digest => Ok(()),
+      Some(expected) => Err(Some(expected.clone())),
+      None => Err(None),
+    };
+    drop(guard);
+    match verdict {
+      Ok(()) => {}
+      Err(Some(expected)) => panic!(
         "sweep golden mismatch for {label} on {target:?}\n  expected: {expected}\n  actual:   {digest}\n\n\
          The three fields are case count, successful-translation count, and a digest\n\
          over every outcome. A change in the first two means the sweep itself\n\
          changed; a change only in the third means code generation did.\n\n\
          Regenerate with ASYNC_EBPF_UPDATE_GOLDENS=1 cargo test --features testing"
       ),
-      None => panic!("no sweep golden recorded for {label} on {target:?}"),
+      Err(None) => panic!("no sweep golden recorded for {label} on {target:?}"),
     }
   }
 }
@@ -460,6 +499,45 @@ mod tests {
 
     // And the same input must be stable across calls.
     assert_eq!(k, key("t", &base, &code, &plain));
+  }
+
+  /// A program refused at load must be recorded, and distinguishably.
+  ///
+  /// Deliberately does not go through [`check`]: that would mean setting the
+  /// update environment variable, and the test runner shares one environment
+  /// across threads, so every test running concurrently would briefly see
+  /// update mode and record instead of verifying.
+  #[test]
+  fn a_load_refusal_is_recorded_and_is_distinct() {
+    use crate::jit::isa::{opcode, Insn};
+    // A jump past the end of the program: refused at load, not at translation.
+    let code = Insn::encode_all(&[
+      Insn { opcode: opcode::JA, dst: 0, src: 0, offset: 99, imm: 0 },
+      Insn { opcode: opcode::EXIT, dst: 0, src: 0, offset: 0, imm: 0 },
+    ]);
+    let config = Config::default();
+    let err = match Translator::load(std::sync::Arc::new(config.clone()), &code) {
+      Err(e) => e,
+      Ok(_) => panic!("a jump past the end must be refused at load"),
+    };
+    assert!(!err.0.is_empty(), "a refusal carried no message");
+
+    // The shape `check` records for it, and its distinctness from every
+    // translation outcome.
+    let recorded = format!("load-err:{}", err.0);
+    assert!(recorded.starts_with("load-err:"));
+    assert_ne!(recorded, outcome_digest(&Err(TranslateError::OutOfSpace)));
+    assert_ne!(recorded, outcome_digest(&Ok(vec![])));
+    assert_ne!(
+      recorded,
+      outcome_digest(&Err(TranslateError::Failed(err.0.clone()))),
+      "a load refusal must not read the same as a translation failure carrying \
+       the same message"
+    );
+
+    // And `check` reports it as not translated, whichever mode it is in.
+    let inputs = TranslationInputs { start_pc: 0, end_pc: 2, ..Default::default() };
+    assert!(super::translate_one(&config, &code, &inputs, 4096).is_none());
   }
 
   #[test]

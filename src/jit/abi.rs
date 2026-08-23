@@ -185,19 +185,33 @@ mod tests {
     assert_eq!(DERIVED_DATA_BASE + 6, DERIVED_SLOTS);
   }
 
-  /// The C is still in the tree as the oracle; assert this module agrees with
-  /// it rather than trusting that it was transcribed correctly.
-  #[cfg(feature = "oracle")]
+  /// The numbers themselves, written out.
+  ///
+  /// Every constant below is part of the contract with loaded programs and with
+  /// the entry trampolines: change one and previously valid programs are
+  /// refused, or the stack the guest is given stops matching the stack the
+  /// prologue reserves. None of them can be derived from anything else in the
+  /// tree, so restating them here is what makes an edit to one of them a
+  /// deliberate act rather than a typo nobody notices.
   #[test]
-  fn the_constants_match_the_c_headers() {
-    assert_eq!(
-      LOCAL_FUNCTION_STACK_SIZE as u32,
-      ubpf_sys::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE
-    );
-    assert_eq!(MAX_GROUP_SPAN, ubpf_sys::UBPF_MAX_GROUP_SPAN);
-    assert_eq!(MAX_INSTS, ubpf_sys::UBPF_MAX_INSTS);
-    assert_eq!(MAX_EXT_FUNCS, ubpf_sys::UBPF_MAX_EXT_FUNCS);
-    assert_eq!(MAX_CALL_DEPTH, ubpf_sys::UBPF_MAX_CALL_DEPTH);
-    assert_eq!(EBPF_STACK_SIZE, ubpf_sys::UBPF_EBPF_STACK_SIZE);
+  fn the_constants_are_the_ones_the_contract_names() {
+    // One local eBPF function's stack frame, and the eight-deep call chain
+    // built out of it: together they are the whole guest stack.
+    assert_eq!(LOCAL_FUNCTION_STACK_SIZE, 4096);
+    assert_eq!(MAX_CALL_DEPTH, 8);
+    assert_eq!(EBPF_STACK_SIZE, 32768);
+
+    // The widest window one bounds check may cover, so that a checked group
+    // can never straddle more than a page.
+    assert_eq!(MAX_GROUP_SPAN, 4096);
+
+    // The instruction ceiling a loaded program may not reach: 65536 is refused,
+    // 65535 is accepted. It also bounds every patch table, since no accepted
+    // program can need more fixups than it has instructions.
+    assert_eq!(MAX_INSTS, 65536);
+
+    // Helper indices run 0..64, which is what makes the helper address table a
+    // fixed-size block the emitted code can index without a bounds check.
+    assert_eq!(MAX_EXT_FUNCS, 64);
   }
 }

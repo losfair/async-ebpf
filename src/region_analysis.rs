@@ -2,9 +2,10 @@
 //!
 //! Classifies the pointer operand of every load (`LDX`) instruction as pointing
 //! into the per-invocation stack, the shared read-only data region, or neither
-//! ("unknown"). The JIT consumes the result (via `ubpf_set_region_hints`) to
-//! emit a single-region bounds check and address translation for confidently
-//! classified loads, instead of probing both regions.
+//! ("unknown"). The JIT consumes the result as
+//! [`crate::jit::TranslationInputs::hints`], and emits a single-region bounds
+//! check and address translation for confidently classified loads instead of
+//! probing both regions.
 //!
 //! ## Provenance
 //!
@@ -359,9 +360,10 @@ pub(crate) struct FunctionRegionAnalysis {
 
 /// Analyzes the pointer region of every memory access in one code section.
 ///
-/// `code` is the relocated bytecode (8 bytes per slot, matching uBPF's
-/// `vm->insts` indexing; `lddw` occupies two slots). `data_lo`/`data_hi` are the
-/// guest data region bounds used to recognize relocated data pointers.
+/// `code` is the relocated bytecode, 8 bytes per slot, indexed the same way the
+/// JIT indexes it — `lddw` occupies two slots, and the second is not an
+/// instruction. `data_lo`/`data_hi` are the guest data region bounds used to
+/// recognize relocated data pointers.
 #[cfg(any(test, feature = "testing"))]
 pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   let num_slots = code.len() / 8;
@@ -984,8 +986,8 @@ fn add_imm_kind(a: RegKind, imm: i32) -> RegKind {
   }
 }
 
-/// One entry per instruction slot, handed to the JIT alongside the region
-/// hints. See `ubpf_set_access_plan()` for what the backend does with it.
+/// One entry per instruction slot, handed to the JIT alongside the region hints
+/// as [`crate::jit::TranslationInputs::plan`].
 ///
 /// A *group* is a run of memory accesses sharing one base register, so all of
 /// their addresses lie within a bounded window around that register's value.
@@ -997,13 +999,8 @@ fn add_imm_kind(a: RegKind, imm: i32) -> RegKind {
 /// The plan is advisory. The backend re-derives every condition it can see for
 /// itself and emits an ordinary checked access when any of them fails, so a
 /// wrong plan costs speed, not safety.
-/// The plan entry type is [`crate::jit::PlanEntry`] itself.
-///
-/// It used to be declared twice — once here and once for the C FFI — with
-/// three `const _` assertions in `program.rs` tying the two together field by
-/// field, because the analysis built one and the backend read the other through
-/// a pointer cast. With the backend in Rust there is one type and the
-/// assertions are gone.
+/// The plan entry type is [`crate::jit::PlanEntry`] itself: the analysis builds
+/// the same struct the backend reads, so there is nothing to keep in step.
 pub(crate) use crate::jit::PlanEntry;
 
 pub(crate) const PLAN_ROLE_LEADER: u8 = 1;

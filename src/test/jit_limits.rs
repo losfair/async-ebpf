@@ -8,10 +8,12 @@
 //! `ProgramLoader`, because the loader's own 1 MiB code buffer rejects
 //! oversized programs before the relocation logic is ever reached.
 //!
-//! They used to go through the raw uBPF bindings, and could only check the
-//! host's own backend. Translation is pure computation over a byte buffer, so
-//! the Rust translator will emit aarch64 code on any host — which means this
-//! now runs everywhere instead of only on arm64 CI.
+//! These are the end-to-end shape of the limit: a whole program, loaded and
+//! translated, refused or not. The *bytes* either side of the same boundary are
+//! pinned separately, by the straddle tests in [`crate::jit::emit::aarch64`],
+//! which walk the last few sizes that fit and the first few that do not and
+//! record each one. Between them, a branch that stops encoding and a branch
+//! that encodes the wrong displacement are both caught.
 
 use std::sync::Arc;
 
@@ -25,6 +27,11 @@ const UNWIND_HELPER_INDEX: u32 = 1;
 const EBPF_OP_MOV64_IMM: u8 = 0xb7;
 const EBPF_OP_ATOMIC_STORE: u8 = 0xdb;
 
+/// Bytes the translated output is allowed to occupy. Well past what any of
+/// these programs needs, so running out of buffer never masks the range check
+/// these tests are about.
+const CAPACITY: usize = 16 << 20;
+
 fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Insn {
   Insn {
     opcode,
@@ -35,6 +42,12 @@ fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Insn {
   }
 }
 
+/// A stand-in dispatcher.
+///
+/// Never called: these tests translate and never execute what they emit. Its
+/// address does reach the emitted code as an immediate, which is why the tests
+/// here assert outcomes rather than bytes — a function's address moves with
+/// every build.
 unsafe extern "C" fn stub_dispatcher(
   _arg1: u64,
   _arg2: u64,
@@ -86,7 +99,7 @@ fn translate(target: Target, prog: &[Insn]) -> Result<usize, TranslateError> {
     end_pc: prog.len(),
     ..Default::default()
   };
-  let mut buf = vec![0u8; 16 << 20];
+  let mut buf = vec![0u8; CAPACITY];
   translator.translate_range(&inputs, &mut buf)
 }
 
@@ -95,13 +108,17 @@ fn an_out_of_range_conditional_branch_is_refused() {
   let prog = oversized_program(65000);
   let err = translate(Target::Aarch64, &prog)
     .expect_err("expected translation to fail for an out-of-range conditional branch");
-  match err {
-    TranslateError::Failed(msg) => assert!(
-      msg.contains("out of range"),
-      "translation failed for an unexpected reason: {msg}"
+  // The exact wording, not merely that something failed: it is what an
+  // embedder sees, and it names which reach was exceeded.
+  assert_eq!(
+    err,
+    TranslateError::Failed(
+      "Branch or load target out of range in the JIT'd code (the program is too large for \
+       arm64 PC-relative addressing)."
+        .to_string()
     ),
-    TranslateError::OutOfSpace => panic!("ran out of buffer rather than reaching the range check"),
-  }
+    "translation failed for an unexpected reason"
+  );
 }
 
 /// The complement, so the test above is known to be measuring the branch range
@@ -109,7 +126,17 @@ fn an_out_of_range_conditional_branch_is_refused() {
 #[test]
 fn a_program_just_inside_the_branch_range_still_translates() {
   let prog = oversized_program(1000);
-  translate(Target::Aarch64, &prog).expect("a program well inside the range must translate");
+  let len =
+    translate(Target::Aarch64, &prog).expect("a program well inside the range must translate");
+  // ...and the two sizes really do sit either side of the reach rather than
+  // both being far from it: this one fills a healthy fraction of the 1 MiB a
+  // conditional branch spans, so the refusal above is the boundary being
+  // crossed and not some unrelated cap.
+  assert!(
+    (1 << 14..1 << 20).contains(&len),
+    "the in-range program emitted {len} bytes, which is no longer a useful \
+     distance below the 1 MiB conditional-branch reach"
+  );
 }
 
 /// x86_64 has a 32-bit displacement on conditional branches, so the same
@@ -119,35 +146,4 @@ fn a_program_just_inside_the_branch_range_still_translates() {
 fn the_same_program_translates_for_x86_64() {
   let prog = oversized_program(65000);
   translate(Target::X86_64, &prog).expect("x86_64 has the reach for this program");
-}
-
-/// The vendored C must agree, on both counts.
-#[cfg(feature = "oracle")]
-#[test]
-fn the_c_agrees_about_the_relocation_range() {
-  use crate::jit::oracle::COracle;
-
-  for (filler, should_fail) in [(65000usize, true), (1000, false)] {
-    let prog = oversized_program(filler);
-    let code = Insn::encode_all(&prog);
-    let cfg = config(Target::Aarch64);
-    let c = COracle::load(&cfg, &code).expect("the program must load in the C");
-    let inputs = TranslationInputs {
-      start_pc: 0,
-      end_pc: prog.len(),
-      ..Default::default()
-    };
-    let c_out = c.translate(Target::Aarch64, &inputs, 16 << 20);
-    let rust_out = translate(Target::Aarch64, &prog);
-    assert_eq!(
-      c_out.is_err(),
-      should_fail,
-      "the C disagreed about whether {filler} filler instructions overflow the branch range"
-    );
-    assert_eq!(
-      c_out.map(|v| v.len()),
-      rust_out,
-      "backends disagree for {filler} filler instructions"
-    );
-  }
 }

@@ -1,23 +1,22 @@
 //! Per-local-function guest stack usage.
 //!
-//! # Why this is so much smaller than the C
+//! Every local function is charged the same fixed frame,
+//! [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`], regardless of what it
+//! actually uses. Nothing inspects the instruction stream, so this file is
+//! almost entirely a constant behind a lookup.
 //!
-//! uBPF supports a custom stack-usage calculator registered through
-//! `ubpf_register_stack_usage_calculator`, and carries a three-state memo table
-//! (`UNKNOWN` / `CUSTOM` / `DEFAULT`) per instruction slot to cache its answers.
+//! That the answer is uniform is what makes the runtime's stack budget a matter
+//! of arithmetic rather than analysis: the deepest accepted call chain consumes
+//! exactly `MAX_LOCAL_CALL_DEPTH` frames, which is how `program.rs` sizes the
+//! guest stack window and how it justifies the unchecked frame-access window
+//! below `R10`. A per-function calculation would make the
+//! frame budget depend on which functions are on the stack, and both of those
+//! arguments would have to be redone.
 //!
-//! `async-ebpf` never registers one. That symbol is not among the twenty-one it
-//! reaches, so `vm->stack_usage_calculator` is always NULL, every entry resolves
-//! to `UBPF_STACK_USAGE_DEFAULT`, and `ubpf_stack_usage_for_local_func` returns
-//! `UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE` unconditionally. The memo table, the
-//! three-state enum and the calculator indirection are all dead weight behind a
-//! constant.
-//!
-//! The one piece of live behaviour is the 16-byte alignment check, which is
-//! retained: it is a load-bearing invariant for the generated prologue, and if
-//! [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`] were ever changed to something
-//! unaligned the failure would otherwise be a misaligned native stack rather
-//! than a diagnostic.
+//! The 16-byte alignment check below is load-bearing: the generated prologue
+//! subtracts this size from the native stack pointer, so an unaligned value
+//! would show up as a misaligned native stack in generated code rather than as
+//! a diagnostic here.
 
 use super::abi;
 use super::isa::Insn;
@@ -38,8 +37,8 @@ impl StackUsage {
 
   /// Guest stack bytes charged to the local function beginning at `pc`.
   ///
-  /// Mirrors `ubpf_stack_usage_for_local_func` under the configuration
-  /// `async-ebpf` actually uses.
+  /// The same for every function; `pc` and `insns` are taken so that a
+  /// per-function calculation would not change the signature.
   pub fn for_function(&self, _insns: &[Insn], pc: usize) -> u16 {
     debug_assert!(
       pc < self.num_insns,

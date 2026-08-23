@@ -43,8 +43,9 @@ const NATIVE_STACK_SIZE: usize = 16384;
 pub(crate) const MAX_CALLDATA_SIZE: usize = 512;
 
 /// Guest stack the deepest accepted local call chain can consume below the entry
-/// frame: every local function is charged one uBPF frame, and the loader caps
-/// the call graph at [`MAX_LOCAL_CALL_DEPTH`] frames.
+/// frame: every local function is charged one fixed-size frame
+/// ([`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`]), and the loader caps the
+/// call graph at [`MAX_LOCAL_CALL_DEPTH`] frames.
 const LOCAL_CALL_FRAME_BUDGET: usize =
   MAX_LOCAL_CALL_DEPTH * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
 
@@ -66,7 +67,7 @@ const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 /// This is the one place the runtime trades a per-access check for a static
 /// argument, so the argument is worth spelling out. `R10` starts at
 /// `stack_top - calldata`, rounded down to 8, and drops one
-/// `UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE` frame per local call. The loader accepts
+/// [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`] frame per local call. The loader accepts
 /// at most [`MAX_LOCAL_CALL_DEPTH`] frames, so the deepest reachable frame
 /// pointer sits `(MAX_LOCAL_CALL_DEPTH - 1)` frames below entry, and what is
 /// left of the window below *that* is the displacement any frame is allowed to
@@ -129,8 +130,9 @@ std::arch::global_asm!(
 async_ebpf_entry_trampoline:
     // rdi = target, rsi = ctx, rcx = guest stack bottom, r8 = guest stack len,
     // [rsp + 8] = JitMemory descriptor. The entry target is staged through r9
-    // and then rcx, neither of which uBPF maps to an eBPF register, so it can
-    // be called after the register scrub below. r11 is uBPF's VOLATILE_CTXT.
+    // and then rcx, neither of which the backend maps to an eBPF register, so
+    // it can be called after the register scrub below. r11 is the backend's
+    // volatile context register.
     mov r9, rdi
     mov rax, [rsp + 8]
     push rbp
@@ -140,12 +142,13 @@ async_ebpf_entry_trampoline:
     push r14
     push r15
     // r15 carries eBPF r10, and it carries the *native* frame pointer rather
-    // than the guest one - see ubpf_set_native_frame_base(). Guest-to-native
-    // translation for the stack region is the affine shift
-    // `native_base - guest_bottom`, so applying it once here to the entry frame
-    // is enough: the backend only ever adds and subtracts frame sizes from r10,
-    // and that commutes with the shift. What it buys is a frame access emitted
-    // as one native instruction instead of a bounds check and a translation.
+    // than the guest one - this is what `jit::Config::native_frame_base`
+    // promises the backend. Guest-to-native translation for the stack region is
+    // the affine shift `native_base - guest_bottom`, so applying it once here to
+    // the entry frame is enough: the backend only ever adds and subtracts frame
+    // sizes from r10, and that commutes with the shift. What it buys is a frame
+    // access emitted as one native instruction instead of a bounds check and a
+    // translation.
     //
     // rdx is free by here (the guest sees it scrubbed below), so use it to
     // carry the delta into the frame slot the backend reads when a program
@@ -164,8 +167,9 @@ async_ebpf_entry_trampoline:
     mov [rbp - 8], rax
     mov [rbp - 40], rdx
     // Copy JitMemory::derived - the twelve bounds-check constants - into the
-    // frame, where the backend reads them off rbp without a descriptor load.
-    // See ubpf_set_frame_constants(). xmm0 keeps this to twelve instructions
+    // frame, where the backend reads them off rbp without a descriptor load -
+    // this is what `jit::Config::frame_constants` promises. The layout is
+    // `jit::abi::derived_slot`. xmm0 keeps this to twelve instructions
     // without disturbing any of the registers still carrying guest state; the
     // guest has no way to name an xmm register, and these are guest-space
     // bounds rather than host addresses, but it is cleared afterwards anyway.
@@ -190,7 +194,7 @@ async_ebpf_entry_trampoline:
     mov qword ptr [rbp - 144], 0
     mov rcx, r9
     mov r11, rdi
-    // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
+    // Scrub every register the guest can name (the backend maps eBPF r0-r10 to
     // rax/rdi/rsi/rdx/r10/r8/rbx/r12/r13/r14/r15) except r1 (ctx) and r10
     // (frame pointer). Without this the guest reads host addresses left behind
     // by this trampoline and by our caller's callee-saved registers.
@@ -241,7 +245,8 @@ async_ebpf_entry_trampoline:
     stp x25, x26, [sp, #48]
     mov x29, sp
     // x23 carries eBPF r10, and it carries the *native* frame pointer rather
-    // than the guest one - see ubpf_set_native_frame_base(). Guest-to-native
+    // than the guest one - this is what `jit::Config::native_frame_base`
+    // promises the backend. Guest-to-native
     // translation for the stack region is the affine shift
     // `native_base - guest_bottom`, so applying it once here to the entry frame
     // is enough: the backend only ever adds and subtracts frame sizes from r10,
@@ -258,7 +263,8 @@ async_ebpf_entry_trampoline:
     str x7, [x29, #-40]
     // The twelve derived bounds-check constants, copied from JitMemory::derived
     // into [x29-136, x29-40) where the backend reads them off the frame pointer
-    // without a descriptor load. See ubpf_set_frame_constants().
+    // without a descriptor load, as `jit::Config::frame_constants` promises.
+    // The layout is `jit::abi::derived_slot`.
     ldp x7, x16, [x6, #48]
     stp x7, x16, [x29, #-136]
     ldp x7, x16, [x6, #64]
@@ -278,7 +284,7 @@ async_ebpf_entry_trampoline:
     mov x7, xzr
     mov x16, xzr
     mov x26, x0
-    // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
+    // Scrub every register the guest can name (the backend maps eBPF r0-r10 to
     // x5/x0-x4/x19-x23) except r1 (ctx) and r10 (frame pointer), plus the
     // descriptor still held in x6. Without this the guest reads host addresses
     // left behind by our caller's callee-saved registers.
@@ -576,7 +582,8 @@ impl ExecContext {
 }
 
 /// Access widths a single guest memory instruction can have, in the order the
-/// backend's span slots expect (`span_slot_index` in `ubpf_jit_x86_64.c`).
+/// backend's span slots expect. Mirrors [`crate::jit::abi::ACCESS_WIDTHS`],
+/// which is what `jit::abi::span_slot_index` indexes with.
 const ACCESS_WIDTHS: [usize; 4] = [1, 2, 4, 8];
 
 #[repr(C)]
@@ -590,13 +597,14 @@ struct JitMemory {
   /// Everything a single-region bounds check needs, derived once here instead
   /// of being rebuilt from the fields above at every guest memory access. The
   /// entry trampoline copies the block into the frame, where the backend reads
-  /// it off `RBP` directly. See `ubpf_set_frame_constants()` for the layout.
+  /// it off `RBP` directly. See [`crate::jit::abi::derived_slot`] for the
+  /// layout.
   derived: [usize; 12],
 }
 
 /// The entry trampoline reaches into this layout with literal displacements,
-/// and so does the JIT backend (`JIT_MEMORY_*` in `ubpf_jit_x86_64.c`). Nothing
-/// else ties the three together, so tie them here.
+/// and so does the JIT backend (see [`crate::jit::abi::memory`]). Nothing else
+/// ties the three together, so tie them here.
 const _: () = {
   assert!(std::mem::offset_of!(JitMemory, stack_guest_bottom) == 0);
   assert!(std::mem::offset_of!(JitMemory, stack_guest_top) == 8);
@@ -1436,7 +1444,7 @@ impl Program {
             err
           }
           TranslateError::Failed(errmsg) => RuntimeError::InvalidArgumentOwned(format!(
-            "ubpf: code translation failed for function [{}, {}): {errmsg}",
+            "jit: code translation failed for function [{}, {}): {errmsg}",
             function.start_pc, function.end_pc,
           )),
         };
@@ -1814,9 +1822,10 @@ impl Program {
 
 /// The JIT configuration this runtime always uses.
 ///
-/// uBPF spread this across a dozen setters mutating a VM struct, with nothing
-/// preventing an incoherent combination; it is built once here instead. The
-/// pointer cage subsumes uBPF's own bounds checks, which is why they are off.
+/// Built once, so the settings that only make sense together cannot drift
+/// apart. `bounds_check` is off because the pointer cage already bounds every
+/// guest access, and `native_frame_base`/`frame_constants` are on because both
+/// entry trampolines above establish exactly the frame the backend expects.
 fn jit_config(cage: &PointerCage) -> crate::jit::Config {
   crate::jit::Config {
     target: crate::jit::Target::host(),
@@ -1878,9 +1887,8 @@ unsafe fn translate_function_into(
   buffer: *mut u8,
   capacity: usize,
 ) -> Result<usize, TranslateError> {
-  // The analysis inputs are borrowed for exactly this call. uBPF stashed them as
-  // raw pointers in the VM and cleared them afterwards; borrowing removes the
-  // lifetime hazard that dance was working around.
+  // The analysis inputs describe this one range under this one specialization,
+  // and are borrowed for exactly this call.
   let jit_inputs = crate::jit::TranslationInputs {
     hints: inputs.hints,
     plan: inputs.plan,
@@ -1974,7 +1982,7 @@ impl ProgramLoader {
   /// JIT have a ±1 MiB range, and a section's helper calls reference a
   /// literal pool at the end of that section's code. Any single ELF section
   /// whose jitted code exceeds ~1 MiB is therefore rejected at load time
-  /// ("ubpf: code translation failed") regardless of this limit; raising it
+  /// ("jit: code translation failed") regardless of this limit; raising it
   /// past 1 MiB only adds room for more or larger sections within that
   /// per-section ceiling. x86-64 has no such per-section constraint.
   pub fn with_code_size_limit(mut self, limit: usize) -> Self {
@@ -2083,7 +2091,7 @@ impl ProgramLoader {
         Err(err) => {
           tracing::error!(section_name, error = %err, "failed to load code");
           return Err(RuntimeError::InvalidArgumentOwned(format!(
-            "ubpf: code load failed: {err}"
+            "jit: code load failed: {err}"
           )));
         }
       };

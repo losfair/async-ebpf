@@ -1,19 +1,20 @@
 //! What guest code can observe in its own registers.
 //!
 //! The runtime hands control to JIT-compiled guest code with host state still
-//! in machine registers unless the entry trampoline clears it, and uBPF's
-//! uninitialized-register check is off, so a program that simply reads a
-//! register it was never given sees whatever was left there.
+//! in machine registers unless the entry trampoline clears it. Nothing rejects
+//! a read of a register that was never assigned, so a program that simply reads
+//! one sees whatever was left there.
 
 use crate::test::raw_elf::{run_raw, Insn};
 
 /// Every eBPF register except `r1` (the context) and `r10` (the frame pointer)
 /// must read zero at entry.
 ///
-/// uBPF maps several of them to registers the entry path uses: the entrypoint's
-/// own native code address, the guest memory descriptor, the randomized guest
-/// stack bounds, and the Rust caller's callee-saved registers. Leaking any of
-/// those hands the guest host addresses and the pointer cage's layout.
+/// The backend maps several of them onto native registers the entry path uses:
+/// the entrypoint's own native code address, the guest memory descriptor, the
+/// randomized guest stack bounds, and the Rust caller's callee-saved registers.
+/// Leaking any of those hands the guest host addresses and the pointer cage's
+/// layout.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn entry_registers_are_scrubbed() {
@@ -57,8 +58,8 @@ async fn entry_context_and_frame_pointer_survive_the_scrub() {
 ///
 /// Local calls are resolved lazily through a host callback, and its return
 /// value — the callee's native code address — arrives in the host ABI return
-/// register, which uBPF maps to eBPF `r0`. The call sequence preserves `r0`
-/// across the resolver instead, matching a direct local call.
+/// register, which the backend maps to eBPF `r0`. The call sequence preserves
+/// `r0` across the resolver instead, matching a direct local call.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn local_call_preserves_r0() {

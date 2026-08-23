@@ -54,7 +54,7 @@ impl EbpfInsn {
 }
 
 /// Validates that local eBPF calls cannot recurse or exceed the statically
-/// supported call depth before the bytecode is handed to uBPF's JIT.
+/// supported call depth, before the bytecode is handed to the JIT.
 pub(crate) fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
   crate::function_analysis::validate_local_call_graph(code)
 }

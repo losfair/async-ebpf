@@ -1,27 +1,27 @@
-//! The code buffer, the patch tables, and the open-access-group bookkeeping.
-//!
-//! Port of `ubpf_jit_support.{c,h}`, minus the parts nothing reaches:
-//! constant-blinding seed generation (`ubpf_toggle_constant_blinding` is not in
-//! the reachable seam) and the malloc/realloc growth dance, which is what a
-//! `Vec` already does.
+//! The code buffer, the patch tables, and the open-access-group bookkeeping
+//! that the two backends share.
 //!
 //! # Why the two backends share this and not the driver
 //!
-//! `translate_range` in the two C backends shares only its preamble checks;
-//! after that arm64 runs a barrier pre-pass x86_64 does not have, and the two
-//! loops have drifted before — the arm64 jump-sentinel bug lived in exactly that
-//! gap. Unifying them would be a refactor performed during a port that is
-//! required to be byte-identical, so each backend keeps its own loop and shares
-//! only the state below.
+//! The two `translate_range` implementations have almost nothing in common past
+//! their preamble checks: aarch64 runs a barrier pre-pass x86_64 does not have,
+//! and the per-opcode work is entirely architecture-specific. What they do share
+//! is bookkeeping — where the next byte goes, which sites still need a fixup,
+//! whether an access group is open — and that is what lives here.
+//!
+//! The two loops have drifted apart before; the aarch64 jump-sentinel bug lived
+//! in exactly the gap between them. Unifying them is a real option, but it is a
+//! restructuring of both backends rather than a comment-level tidy, so for now
+//! each keeps its own loop and shares only the state below.
 
 use super::TranslateError;
 
 /// How far a translation got, and why it stopped.
 ///
-/// Mirrors `enum JitProgress`. Everything except [`Progress::Ok`] aborts the
-/// translation; [`Progress::NotEnoughSpace`] is the one that must stay
-/// distinguishable, because the caller's code arena treats it as terminal for
-/// the whole program rather than for one function.
+/// Everything except [`Progress::Ok`] aborts the translation;
+/// [`Progress::NotEnoughSpace`] is the one that must stay distinguishable,
+/// because the caller's code arena treats it as terminal for the whole program
+/// rather than for one function.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Progress {
   Ok,
@@ -39,10 +39,9 @@ impl Progress {
   /// The error a non-`Ok` progress turns into, worded as `target`'s backend
   /// words it.
   ///
-  /// Faithful to the status switch at the end of each C translator
-  /// (`ubpf_jit_x86_64.c:3357`, `ubpf_jit_arm64.c:2447`), because `program.rs`
-  /// surfaces these strings verbatim to callers and tests match on them. They
-  /// become typed variants once the oracle is retired.
+  /// `program.rs` surfaces these strings verbatim to callers and tests match on
+  /// them, so the wording is part of the interface. They would be better as
+  /// typed variants.
   ///
   /// Two things here are easy to get wrong and were:
   ///
@@ -50,17 +49,20 @@ impl Progress {
   ///   `TooMany*` message with a full stop and x86_64 does not. Taking the
   ///   target is the difference between a helper correct for both and one
   ///   quietly correct for whichever backend called it first.
-  /// * The three statuses below carry no message of their own. The backend sets
-  ///   `errmsg` where the error is *detected*, because the text needs the pc and
-  ///   the opcode; the C's switch arms for them deliberately fall through
-  ///   without writing anything. Inventing a string here would diverge.
+  /// * The three statuses below carry no message of their own, and must not be
+  ///   given one here. Their text needs the pc and the opcode, neither of which
+  ///   this function has, so the backend records an `errmsg` where the error is
+  ///   *detected* and substitutes it before this helper is ever consulted.
+  ///   Returning an empty string is how that arrangement stays visible: a
+  ///   plausible-looking string invented here would silently become the message
+  ///   for any path that forgot to record one.
   pub fn into_error(self, target: super::Target) -> Option<TranslateError> {
     let msg = match self {
       Progress::Ok => return None,
       Progress::NotEnoughSpace => return Some(TranslateError::OutOfSpace),
       Progress::TooManyJumps => "Too many jump instructions",
       Progress::TooManyLoads => "Too many load instructions",
-      // "calculations", not "instructions" — both backends say so.
+      // "calculations", not "instructions", in both backends' wording.
       Progress::TooManyLeas => "Too many LEA calculations",
       Progress::TooManyLocalCalls => "Too many local calls",
       // Set at detection; see above.
@@ -77,10 +79,6 @@ impl Progress {
 }
 
 /// A control-flow target whose location is not yet known.
-///
-/// The C models this as a tagged union with a `bool is_special`; an enum says
-/// the same thing without the discipline of keeping the tag and the payload in
-/// step.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PatchTarget {
   /// One of the generated stubs, whose offset the state records.
@@ -91,7 +89,7 @@ pub enum PatchTarget {
   JitOffset { offset: u32, near: bool },
 }
 
-/// The generated stubs a patchable target can name. Mirrors `enum SpecialTarget`.
+/// The generated stubs a patchable target can name.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum SpecialTarget {
   Exit,
@@ -112,14 +110,15 @@ pub struct PatchableRelative {
 
 /// The scratch state for one translation.
 ///
-/// Port of `struct jit_state`. The four patch tables are `Vec`s rather than
-/// hand-grown arrays, so `reserve_patchable_relatives` and its capacity fields
-/// have no analogue here — but the *limits* those capacities implied are gone
-/// too, which would be a behaviour change, so the `TooMany*` progress values are
-/// retained and checked against the same bounds the C grew to.
+/// The four patch tables are `Vec`s and grow on demand, so nothing here forces
+/// a `TooMany*` failure by running out of room. The limits are still enforced
+/// explicitly — see [`MAX_JUMPS`] and friends — because which programs the JIT
+/// accepts is a property callers depend on, and dropping the ceilings just
+/// because the storage no longer needs them would quietly widen it.
 pub struct JitState<'a> {
   /// The output buffer. Writes past its end set [`Progress::NotEnoughSpace`]
-  /// rather than panicking, matching the C's `emit_bytes` guard.
+  /// rather than panicking: running out of code space is an ordinary outcome
+  /// the caller handles, not a bug.
   pub buf: &'a mut [u8],
   /// Bytes emitted so far.
   pub offset: u32,
@@ -178,21 +177,20 @@ pub struct OpenGroup {
   pub written: u16,
 }
 
-/// Ceiling on each patch table, above which the C reports the matching
+/// Ceiling on each patch table, above which translation stops with the matching
 /// `TooMany*` error.
 ///
-/// This is `UBPF_MAX_INSTS`, not a round number: `reserve_patchable_relatives`
-/// (`ubpf_jit_support.c:78`) uses it because it was the tables' fixed size
-/// before they grew on demand, "so the too many ... errors still trigger for
-/// exactly the programs they used to".
+/// [`MAX_INSTS`](super::abi::MAX_INSTS) — 65,536 — rather than a round number of
+/// the tables' own. It is a real limit and not a formality: a fixup is not one
+/// per instruction, because each helper call emits three jump fixups on its own,
+/// so around 21,800 helper calls cross the ceiling, and a program that size is
+/// comfortably inside the instruction limit.
 ///
-/// An earlier version of this file used `1 << 20` while claiming to match the C.
-/// Sixteen times too high is not a cosmetic difference: each helper call emits
-/// three jump fixups, so ~21,800 helper calls - comfortably inside
-/// `MAX_INSTS` - crosses 65,536, and the port accepted programs the C rejects.
-/// That is an equivalence violation in the accepted-program set rather than in
-/// the emitted bytes, which is exactly the kind the byte differential cannot
-/// see.
+/// That is also why the exact value matters. An earlier version used `1 << 20`,
+/// sixteen times higher, which changed nothing about the bytes emitted for any
+/// program that compiled and everything about which programs compiled at all —
+/// the kind of difference a test that compares generated code cannot see, and
+/// only a test that loads an oversized program will.
 pub const MAX_JUMPS: usize = super::abi::MAX_INSTS as usize;
 pub const MAX_LOADS: usize = super::abi::MAX_INSTS as usize;
 pub const MAX_LEAS: usize = super::abi::MAX_INSTS as usize;
@@ -202,14 +200,14 @@ impl<'a> JitState<'a> {
   /// Prepares the scratch state for one translation.
   ///
   /// `pc_locs` is indexed by absolute eBPF pc, so it is sized from the whole
-  /// program even when only a range is being translated. Mirrors
-  /// `initialize_jit_state_result`.
+  /// program even when only a range is being translated.
   pub fn new(buf: &'a mut [u8], num_insts: usize) -> Self {
     Self {
       buf,
       offset: 0,
-      // The C over-allocates by one so a jump to the instruction one past the
-      // end - which `exit` fixups use - has a slot.
+      // One slot longer than the program: a jump to the instruction one past
+      // the end - which `exit` fixups use - has to have somewhere to record
+      // its native offset.
       pc_locs: vec![0; num_insts + 1],
       exit_loc: 0,
       entry_loc: 0,
@@ -236,23 +234,20 @@ impl<'a> JitState<'a> {
 
   /// Records a failure, overwriting any earlier one.
   ///
-  /// Last-assignment-wins, because that is what the C does: `jit_status` is a
-  /// plain field and every failure site assigns to it unconditionally.
-  ///
-  /// This looked like a place to be tidier than the C, and an earlier version
-  /// kept the *first* failure on the reasoning that it is the one that actually
-  /// stopped progress. That is a behavioural divergence with teeth. Translating
-  /// a range whose first instruction is both a local function entry and a local
+  /// Last assignment wins, deliberately. An earlier version kept the *first*
+  /// failure, on the reasoning that it is the one that actually stopped
+  /// progress; that is wrong, and the counterexample has teeth. Translating a
+  /// range whose first instruction is both a local function entry and a local
   /// call, into a buffer too small for the prologue, overruns first
-  /// (`NotEnoughSpace`) and then hits the lazy local-call guard, which the C
-  /// reports as `UnexpectedInstruction`. Keeping the first turns that into
-  /// `OutOfSpace` — and the two are not interchangeable to the caller, which
-  /// treats `OutOfSpace` as terminal for the whole program and a plain failure
-  /// as terminal for one function.
+  /// (`NotEnoughSpace`) and then hits the lazy local-call guard
+  /// (`UnexpectedInstruction`). Keeping the first reports `OutOfSpace` for a
+  /// function that would not have translated into any buffer — and the two are
+  /// not interchangeable to the caller, which treats `OutOfSpace` as terminal
+  /// for the whole program and a plain failure as terminal for one function.
   ///
-  /// Note this composes with `emit1`/`emit_bytes` refusing to emit once the
-  /// status is set: the C's `emit_bytes` returns early for the same reason, so
-  /// a failed emit cannot overwrite a status either, in both.
+  /// This composes with `emit1`/`emit_bytes` refusing to emit once the status
+  /// is set, so a failed *emit* still cannot overwrite an earlier status: only
+  /// a check that actually ran can.
   pub fn fail(&mut self, progress: Progress) {
     self.status = progress;
   }
@@ -261,10 +256,10 @@ impl<'a> JitState<'a> {
   /// is full.
   #[inline]
   pub fn emit1(&mut self, byte: u8) {
-    // "Never emit any bytes if there is an error" - the C's emit_bytes opens
-    // with exactly this guard (ubpf_jit_x86_64.c:223). Without it the port
-    // keeps writing into the code arena, and keeps advancing `offset`, after a
-    // failure the C would have stopped at.
+    // Never emit any bytes once there is an error. Without this guard the
+    // emitters keep writing into the code arena, and keep advancing `offset`,
+    // past the point where the output stopped being meaningful - and the
+    // caller is handed a byte count for a buffer full of half a function.
     if !self.ok() {
       return;
     }
@@ -277,26 +272,24 @@ impl<'a> JitState<'a> {
     self.offset += 1;
   }
 
-  /// Appends `n` little-endian bytes of `value`.
+  /// Appends the low `n` little-endian bytes of `value`.
   ///
-  /// Mirrors `emit_bytes`: the C writes a fixed-width integer through a memcpy,
-  /// so only the low `n` bytes are used and the rest are discarded.
+  /// Any higher bytes are discarded rather than being an error, so callers can
+  /// pass a widened value and name the field width separately.
   #[inline]
   pub fn emit_bytes(&mut self, value: u64, n: usize) {
     debug_assert!(n <= 8);
-    // See `emit1`: the C emits nothing once the status is not NoError.
+    // See `emit1`: nothing is emitted once the status is not Ok.
     if !self.ok() {
       return;
     }
     let at = self.offset as usize;
     if at + n > self.buf.len() {
-      // `offset` is deliberately NOT advanced here, matching
-      // `emit_bytes` in the C backends (`ubpf_jit_x86_64.c:221`), which sets
-      // `jit_status` and returns without touching it.
+      // `offset` is deliberately NOT advanced here.
       //
       // An earlier version of this advanced `offset` past the end, on the
       // theory that the final size report should say how much room would have
-      // been needed. That theory was wrong about the C and wrong in itself:
+      // been needed. That is wrong:
       // `offset` is what the emitters measure spans with, so a failed emit that
       // moves it corrupts every later measurement taken from it. Concretely, a
       // buffer that runs out inside a *second* function's prologue then
@@ -335,8 +328,7 @@ impl<'a> JitState<'a> {
     u64::from_le_bytes(raw)
   }
 
-  /// Records a deferred jump fixup. Mirrors `emit_patchable_relative` against
-  /// the jumps table.
+  /// Records a deferred jump fixup.
   pub fn note_jump(&mut self, offset_loc: u32, target: PatchTarget) {
     if self.jumps.len() >= MAX_JUMPS {
       self.fail(Progress::TooManyJumps);
@@ -345,7 +337,7 @@ impl<'a> JitState<'a> {
     self.jumps.push(PatchableRelative { offset_loc, target });
   }
 
-  /// Records a deferred load fixup. Mirrors `note_load`.
+  /// Records a deferred load fixup.
   pub fn note_load(&mut self, offset_loc: u32, target: PatchTarget) {
     if self.loads.len() >= MAX_LOADS {
       self.fail(Progress::TooManyLoads);
@@ -354,7 +346,7 @@ impl<'a> JitState<'a> {
     self.loads.push(PatchableRelative { offset_loc, target });
   }
 
-  /// Records a deferred lea fixup. Mirrors `note_lea`.
+  /// Records a deferred lea fixup.
   pub fn note_lea(&mut self, offset_loc: u32, target: PatchTarget) {
     if self.leas.len() >= MAX_LEAS {
       self.fail(Progress::TooManyLeas);
@@ -376,9 +368,8 @@ impl<'a> JitState<'a> {
 
   /// Retargets every jump fixup that was emitted at `src` to `target`.
   ///
-  /// Mirrors `modify_patchable_relatives_target`. Used where a jump is emitted
-  /// before its real destination is known — the `exit` path retargets to the
-  /// unwind stub once it has been placed.
+  /// Used where a jump is emitted before its real destination is known — the
+  /// `exit` path retargets to the unwind stub once it has been placed.
   pub fn retarget_jumps(&mut self, src: u32, target: PatchTarget) {
     for entry in &mut self.jumps {
       if entry.offset_loc == src {
@@ -434,9 +425,9 @@ mod tests {
     );
   }
 
-  /// The C's `jit_status` is a plain field every failure site assigns to, so
-  /// the last write wins. Reporting the first instead changes which error the
-  /// caller sees, and `OutOfSpace` is not interchangeable with a plain failure.
+  /// The last failure recorded is the one reported. Keeping the first instead
+  /// changes which error the caller sees, and `OutOfSpace` is not
+  /// interchangeable with a plain failure.
   #[test]
   fn the_last_failure_is_the_one_reported() {
     let mut buf = [0u8; 1];
@@ -447,7 +438,7 @@ mod tests {
   }
 
   /// But a failed *emit* cannot overwrite a status, because it returns before
-  /// reaching the length check - as the C's `emit_bytes` does.
+  /// reaching the length check.
   #[test]
   fn a_failed_emit_does_not_overwrite_an_existing_status() {
     let mut buf = [0u8; 1];
@@ -524,8 +515,6 @@ mod out_of_space_tests {
   /// measurement taken from it is wrong, and the symptom is a debug assertion
   /// firing somewhere unrelated rather than a clean `OutOfSpace`.
   ///
-  /// This matches `emit_bytes` in both C backends, which sets the status and
-  /// returns without touching `offset`.
   #[test]
   fn a_failed_emit_leaves_the_offset_where_it_was() {
     let mut buf = [0u8; 4];

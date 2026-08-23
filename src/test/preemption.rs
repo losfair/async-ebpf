@@ -34,9 +34,9 @@ const EXPECTED_LOCAL_CALL_SUM: i64 =
 /// The guest source for the plain loop, with [`LOOP_ITERS`] substituted in.
 ///
 /// The iteration count is interpolated rather than written twice: the expected
-/// results below are computed from the constant, so a literal in the C source
-/// that drifted from it would make the tests fail in a way that looks like a
-/// runtime bug.
+/// results below are computed from the constant, so a literal in the guest's C
+/// source that drifted from it would make the tests fail in a way that looks
+/// like a runtime bug.
 fn stateful_loop_source() -> Vec<u8> {
   STATEFUL_LOOP_TEMPLATE
     .replace("{ITERS}", &LOOP_ITERS.to_string())

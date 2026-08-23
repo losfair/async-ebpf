@@ -2211,17 +2211,16 @@ impl Emit<'_, '_, '_> {
 mod tests {
   use super::*;
 
-  // Everything below the register-map test needs the C to compare against, so
-  // it is all gated on the oracle feature; without it this module still builds
-  // and still checks the one property that needs no oracle.
-  #[cfg(feature = "oracle")]
-  use crate::jit::isa::{alu, jmp, mode, size, src as srcbit, Insn};
-  #[cfg(feature = "oracle")]
-  use crate::jit::oracle::{config_sweep, diff, plain_inputs};
-  #[cfg(feature = "oracle")]
-  use crate::jit::Target;
+  use std::sync::Arc;
 
-  #[cfg(feature = "oracle")]
+  use crate::jit::golden;
+  use crate::jit::isa::{alu, jmp, mode, size, src as srcbit, Insn};
+  use crate::jit::{Dispatcher, LocalCallResolver, Target};
+
+  // -----------------------------------------------------------------------
+  // Instructions
+  // -----------------------------------------------------------------------
+
   fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Insn {
     Insn {
       opcode,
@@ -2232,62 +2231,419 @@ mod tests {
     }
   }
 
-  #[cfg(feature = "oracle")]
   fn exit() -> Insn {
     insn(opcode::EXIT, 0, 0, 0, 0)
   }
 
   /// `mov64 dst, imm`
-  #[cfg(feature = "oracle")]
   fn movi(dst: u8, imm: i32) -> Insn {
     insn(cls::ALU64 | alu::MOV, dst, 0, 0, imm)
   }
 
-  /// Runs one program through the whole x86_64 configuration sweep and asserts
-  /// the C and Rust backends agreed — on the emitted bytes, or on the refusal.
+  // -----------------------------------------------------------------------
+  // Configurations
+  // -----------------------------------------------------------------------
+
+  /// Stand-in addresses for the helper dispatcher and the local-call resolver.
+  ///
+  /// Both are materialised as immediates in the emitted code: the dispatcher's
+  /// address is parked in the trailer, and the lazy local-call sequence loads
+  /// the resolver's into RAX. Whatever address a configuration carries
+  /// therefore ends up in the bytes a golden records.
+  ///
+  /// That rules out pointing them at real functions. A function item's address
+  /// is only fixed *within* one run of a position-independent executable — the
+  /// loader picks a different base every time — so a golden holding one would
+  /// churn on every run. These are fixed sentinels instead. Nothing here
+  /// executes translated code, so they are never called, and only two things
+  /// about them matter: that they are non-null, and that they are the same on
+  /// every run.
+  const DISPATCHER_ADDRESS: usize = 0x0000_7f00_d15b_a000;
+  const RESOLVER_ADDRESS: usize = 0x0000_7f00_0e50_1000;
+
+  fn dispatcher() -> Dispatcher {
+    // SAFETY: never called. The value is materialised as an immediate and
+    // compared as bytes, which is all any test here does with it.
+    unsafe { std::mem::transmute::<usize, Dispatcher>(DISPATCHER_ADDRESS) }
+  }
+
+  fn local_call_resolver() -> LocalCallResolver {
+    // SAFETY: as above.
+    unsafe { std::mem::transmute::<usize, LocalCallResolver>(RESOLVER_ADDRESS) }
+  }
+
+  /// Accepts every helper index, so that helper-call emission is exercised
+  /// rather than refused at load time.
+  ///
+  /// Unlike the two addresses above, this one really is called — the validator
+  /// asks it whether a helper index exists — so it has to be a real function.
+  /// Its address never reaches the emitted code.
+  unsafe extern "C" fn accept_every_helper(_idx: u32, _vm: *const std::ffi::c_void) -> bool {
+    true
+  }
+
+  /// The configuration every sweep entry is built from.
+  fn base_config(target: Target) -> Config {
+    Config {
+      target,
+      dispatcher: Some(dispatcher()),
+      dispatcher_validate: Some(accept_every_helper),
+      local_call_resolver: Some(local_call_resolver()),
+      ..Default::default()
+    }
+  }
+
+  /// The configuration sweep every test below runs over.
+  ///
+  /// The emitted code depends on the pointer cage, the native frame base, the
+  /// frame constants and the region hints, and those features *interact* —
+  /// which is exactly where the emitter is hardest to get right. Sweeping them
+  /// is not optional.
+  fn sweep(target: Target) -> Vec<(&'static str, Config)> {
+    let base = base_config(target);
+    vec![
+      (
+        "no cage",
+        Config {
+          pointer_mask: 0,
+          pointer_offset: 0,
+          bounds_check: true,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage only",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage + native frame base",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          native_frame_base: true,
+          ..base.clone()
+        },
+      ),
+      (
+        "cage + frame constants",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          frame_constants: true,
+          ..base.clone()
+        },
+      ),
+      (
+        // What `async-ebpf` actually runs.
+        "production",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          native_frame_base: true,
+          frame_constants: true,
+          ..base.clone()
+        },
+      ),
+      (
+        "production + unwind helper",
+        Config {
+          pointer_mask: 0x0fff_ffff,
+          pointer_offset: 0x1_0000_0000,
+          bounds_check: false,
+          native_frame_base: true,
+          frame_constants: true,
+          unwind_helper_index: Some(3),
+          ..base
+        },
+      ),
+    ]
+  }
+
+  /// The one configuration `async-ebpf` actually runs.
+  fn production_config() -> Config {
+    sweep(Target::X86_64)
+      .into_iter()
+      .find(|(name, _)| *name == "production")
+      .expect("the sweep has a production configuration")
+      .1
+  }
+
+  /// A sweep entry's name, as the label a golden is filed under.
+  ///
+  /// The label is part of the golden key, so renaming a sweep entry rewrites
+  /// every golden it owns. The six names are fixed for that reason.
+  fn slug(name: &str) -> String {
+    let mut out = String::new();
+    let mut pending = false;
+    for c in name.chars() {
+      if c.is_ascii_alphanumeric() {
+        if pending && !out.is_empty() {
+          out.push('-');
+        }
+        out.push(c.to_ascii_lowercase());
+        pending = false;
+      } else {
+        pending = true;
+      }
+    }
+    out
+  }
+
+  /// [`TranslationInputs`] covering a whole program, with no hints or plan.
+  fn plain_inputs(num_insns: usize) -> TranslationInputs<'static> {
+    TranslationInputs {
+      hints: &[],
+      plan: &[],
+      resolver_ids: &[],
+      start_pc: 0,
+      end_pc: num_insns,
+    }
+  }
+
+  /// The buffer every check translates into: comfortably more than anything
+  /// here needs, so that a golden records a whole function rather than an
+  /// out-of-space refusal.
+  const CAPACITY: usize = 262_144;
+
+  // -----------------------------------------------------------------------
+  // Goldens
+  // -----------------------------------------------------------------------
+
+  /// Writes back any golden file this process modified.
+  ///
+  /// The test runner gives each test its own thread and runs nothing at process
+  /// exit, so the write hangs off a thread-local destructor: a thread that
+  /// touched a golden flushes when it finishes. [`golden::flush`] does nothing
+  /// unless a file actually changed, which outside a recording run it never
+  /// does.
+  ///
+  /// The guard has to be armed on *every* path that can record something, not
+  /// just the common one. The store is process-wide, so a thread that records
+  /// the last entry and then exits without a destructor leaves that entry
+  /// unwritten unless some other armed thread happens to outlive it — which is
+  /// a race, and one that silently drops exactly the entries a recording run
+  /// exists to produce.
+  struct FlushGoldens;
+
+  impl Drop for FlushGoldens {
+    fn drop(&mut self) {
+      golden::flush();
+    }
+  }
+
+  thread_local! {
+    static FLUSH_GOLDENS: FlushGoldens = const { FlushGoldens };
+  }
+
+  fn arm_flush() {
+    FLUSH_GOLDENS.with(|_| ());
+  }
+
+  /// Checks one translation against its golden, or records it.
+  ///
+  /// Everything here goes through this rather than calling [`golden::check`]
+  /// directly, so that the flush guard is armed on every recording path.
+  fn check_one(
+    label: &str,
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) -> bool {
+    arm_flush();
+    golden::check(label, config, code, inputs, capacity)
+  }
+
+  /// Runs one program through the whole x86_64 configuration sweep, checking
+  /// each configuration's output against its golden — or recording it.
   ///
   /// Returns whether any configuration actually produced code, which
-  /// [`check_prog`] uses to reject a test that has quietly degraded into "both
-  /// sides rejected the program at load".
-  #[cfg(feature = "oracle")]
+  /// [`check_prog`] uses to reject a test that has quietly degraded into "every
+  /// configuration refused the program".
   #[track_caller]
   fn check(code: &[u8], inputs: &TranslationInputs<'_>) -> bool {
-    let capacity = 262_144;
     let mut emitted = false;
-    let mut outcomes = Vec::new();
-    for (name, config) in config_sweep(Target::X86_64) {
-      let d = diff(&config, code, inputs, capacity);
-      assert!(d.is_same(), "x86_64 backends disagree under {name:?}\n{d}");
-      emitted |= matches!(d, crate::jit::oracle::Diff::Same { .. });
-      outcomes.push(format!("  {name}: {d}"));
-    }
-    if !emitted {
-      LAST_OUTCOMES.with(|c| *c.borrow_mut() = outcomes.join("\n"));
+    for (name, config) in sweep(Target::X86_64) {
+      emitted |= check_one(&slug(name), &config, code, inputs, CAPACITY);
     }
     emitted
   }
 
-  // Why the last `check` produced no code, for the assertion message.
-  #[cfg(feature = "oracle")]
-  thread_local! {
-    static LAST_OUTCOMES: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+  /// A whole test's worth of cases, rolled up into one golden line.
+  ///
+  /// A test that walks a cross-product — every opcode against every operand
+  /// shape, every base register against every destination, each of those under
+  /// six configurations — would otherwise record tens of thousands of entries.
+  /// That is neither reviewable nor reasonable to keep in the repository, and
+  /// it drowns the cases a reader might actually want to read the bytes of.
+  ///
+  /// The digest keeps the whole cross-product as a single line. It still fails
+  /// when any case changes; what it gives up is naming *which* case, which is
+  /// why the small canonical programs keep a golden apiece instead.
+  struct Sweep {
+    digest: golden::SweepDigest,
+    translated: usize,
+    cases: usize,
+  }
+
+  impl Sweep {
+    fn new() -> Self {
+      arm_flush();
+      Self {
+        digest: golden::SweepDigest::new(),
+        translated: 0,
+        cases: 0,
+      }
+    }
+
+    /// Runs one program through the whole configuration sweep, folding every
+    /// configuration's outcome into the digest.
+    ///
+    /// Returns whether any configuration produced code, so a caller can still
+    /// assert it is exercising the emitter rather than agreeing about a
+    /// refusal.
+    fn check(&mut self, code: &[u8], inputs: &TranslationInputs<'_>) -> bool {
+      let mut emitted = false;
+      for (_, config) in sweep(Target::X86_64) {
+        let out = emit_outcome(&config, code, inputs);
+        emitted |= out.is_ok();
+        self.digest.add(&out);
+      }
+      self.cases += 1;
+      if emitted {
+        self.translated += 1;
+      }
+      emitted
+    }
+
+    /// As [`Sweep::check`], and additionally insists the program really was
+    /// translated.
+    ///
+    /// Without this a test whose program the validator happens to refuse would
+    /// still pass: a refusal folds into the digest just as an emission does,
+    /// and a suite that agrees with itself about refusing everything tests
+    /// nothing.
+    #[track_caller]
+    fn check_prog(&mut self, insns: &[Insn]) {
+      let code = Insn::encode_all(insns);
+      let inputs = plain_inputs(insns.len());
+      assert!(
+        self.check(&code, &inputs),
+        "no configuration translated this program; it is being rejected rather \
+         than exercising the emitter:\n{insns:#?}\n{}",
+        refusal_report(&code, &inputs)
+      );
+    }
+
+    /// Programs where some configuration produced code, and programs tried.
+    fn translated(&self) -> usize {
+      self.translated
+    }
+
+    fn cases(&self) -> usize {
+      self.cases
+    }
+
+    /// Records or checks the rolled-up digest.
+    fn finish(self, label: &str) {
+      self.digest.finish(label, Target::X86_64);
+    }
+
+    /// As [`Sweep::finish`], for a sweep that ignores each case's outcome as it
+    /// goes: without a per-case assertion, something has to insist the sweep
+    /// reached the emitter at all rather than being refused throughout.
+    fn finish_exercised(self, label: &str) {
+      assert!(
+        self.translated > 0,
+        "not one of the {} programs in `{label}` translated under any \
+         configuration; the sweep is recording refusals rather than code",
+        self.cases
+      );
+      self.digest.finish(label, Target::X86_64);
+    }
+  }
+
+  /// Why no configuration translated a program, recomputed for the assertion
+  /// message. Only ever called on the failing path.
+  fn refusal_report(code: &[u8], inputs: &TranslationInputs<'_>) -> String {
+    sweep(Target::X86_64)
+      .into_iter()
+      .map(|(name, config)| {
+        let what = match Translator::load(Arc::new(config), code) {
+          Err(e) => format!("refused at load: {e}"),
+          Ok(t) => {
+            let mut buf = vec![0u8; CAPACITY];
+            match t.translate_range(inputs, &mut buf) {
+              Ok(len) => format!("translated {len} bytes"),
+              Err(e) => format!("refused while translating: {e}"),
+            }
+          }
+        };
+        format!("  {name}: {what}")
+      })
+      .collect::<Vec<_>>()
+      .join("\n")
   }
 
   /// As [`check`], and additionally insists the program really was translated.
   ///
   /// Without this a test whose program the validator happens to refuse would
-  /// still pass — both sides having produced nothing is agreement, and it is
-  /// exactly the kind of agreement that tests nothing.
-  #[cfg(feature = "oracle")]
+  /// still pass: a refusal is recorded and compared just as an emission is, and
+  /// a suite that agrees with itself about refusing everything tests nothing.
   #[track_caller]
   fn check_prog(insns: &[Insn]) {
     let code = Insn::encode_all(insns);
+    let inputs = plain_inputs(insns.len());
     assert!(
-      check(&code, &plain_inputs(insns.len())),
+      check(&code, &inputs),
       "no configuration translated this program; it is being rejected rather \
        than exercising the emitter:\n{insns:#?}\n{}",
-      LAST_OUTCOMES.with(|c| c.borrow().clone())
+      refusal_report(&code, &inputs)
     );
+  }
+
+  /// One translation's raw outcome.
+  ///
+  /// The randomised sweeps fold hundreds of thousands of these into a single
+  /// digest instead of recording a golden apiece, and there a program that
+  /// stops loading has to be a distinguishable outcome rather than a silent
+  /// skip.
+  fn emit_outcome(
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+  ) -> Result<Vec<u8>, TranslateError> {
+    arm_flush();
+    golden::translate_one(config, code, inputs, CAPACITY)
+      .unwrap_or_else(|| Err(TranslateError::Failed("did not load".to_string())))
+  }
+
+  /// Bytes one configuration emits for one translation, which must succeed.
+  ///
+  /// Recording a golden says only that the output has not changed; this is what
+  /// a test uses to assert that a fast path was actually *taken*.
+  fn emitted_len(
+    config: &Config,
+    code: &[u8],
+    inputs: &TranslationInputs<'_>,
+    capacity: usize,
+  ) -> usize {
+    let t = Translator::load(Arc::new(config.clone()), code).expect("program must load");
+    let mut buf = vec![0u8; capacity];
+    t.translate_range(inputs, &mut buf).expect("must translate")
+  }
+
+  /// As [`emitted_len`], under the production configuration.
+  fn production_len(code: &[u8], inputs: &TranslationInputs<'_>) -> usize {
+    emitted_len(&production_config(), code, inputs, CAPACITY)
   }
 
   // -----------------------------------------------------------------------
@@ -2313,7 +2669,6 @@ mod tests {
     assert_eq!(unmap_register(R9), None);
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn the_minimal_program_matches() {
     check_prog(&[movi(0, 42), exit()]);
@@ -2323,9 +2678,9 @@ mod tests {
   // ALU
   // -----------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn every_alu_op_matches_at_both_widths_and_both_sources() {
+    let mut s = Sweep::new();
     let ops = [
       alu::ADD,
       alu::SUB,
@@ -2345,92 +2700,98 @@ mod tests {
         // The register forms take no immediate and the immediate forms take no
         // source register; the validator refuses anything else.
         for imm in [0i32, 1, 7, -1, i32::MIN, i32::MAX] {
-          check_prog(&[insn(class | op, 1, 0, 0, imm), exit()]);
+          s.check_prog(&[insn(class | op, 1, 0, 0, imm), exit()]);
         }
         for src in [0u8, 2, 9, 10] {
-          check_prog(&[insn(class | op | srcbit::REG, 1, src, 0, 0), exit()]);
+          s.check_prog(&[insn(class | op | srcbit::REG, 1, src, 0, 0), exit()]);
         }
       }
     }
+    s.finish("every_alu_op_matches_at_both_widths_and_both_sources");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn signed_division_and_modulo_match() {
+    let mut s = Sweep::new();
     for class in [cls::ALU, cls::ALU64] {
       for op in [alu::DIV, alu::MOD] {
         // `offset == 1` selects the signed flavour (RFC 9669), which is where
         // the INT_MIN / -1 fixup lives.
         for imm in [1i32, -1, 3, 0] {
-          check_prog(&[insn(class | op, 1, 0, 1, imm), exit()]);
+          s.check_prog(&[insn(class | op, 1, 0, 1, imm), exit()]);
         }
-        check_prog(&[insn(class | op | srcbit::REG, 1, 2, 1, 0), exit()]);
+        s.check_prog(&[insn(class | op | srcbit::REG, 1, 2, 1, 0), exit()]);
       }
     }
+    s.finish("signed_division_and_modulo_match");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn muldivmod_matches_for_every_destination_register() {
+    let mut s = Sweep::new();
     // The sequence pushes RAX and RDX conditionally on the destination, so each
     // eBPF register that maps onto one of them takes a different path.
     for dst in 0..10u8 {
       for op in [alu::MUL, alu::DIV, alu::MOD] {
-        check_prog(&[insn(cls::ALU64 | op, dst, 0, 0, 7), exit()]);
-        check_prog(&[insn(cls::ALU64 | op | srcbit::REG, dst, 2, 0, 0), exit()]);
-        check_prog(&[insn(cls::ALU | op, dst, 0, 0, 7), exit()]);
+        s.check_prog(&[insn(cls::ALU64 | op, dst, 0, 0, 7), exit()]);
+        s.check_prog(&[insn(cls::ALU64 | op | srcbit::REG, dst, 2, 0, 0), exit()]);
+        s.check_prog(&[insn(cls::ALU | op, dst, 0, 0, 7), exit()]);
       }
     }
+    s.finish("muldivmod_matches_for_every_destination_register");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn neg_matches_at_both_widths() {
+    let mut s = Sweep::new();
     for dst in 0..10u8 {
-      check_prog(&[insn(cls::ALU | alu::NEG, dst, 0, 0, 0), exit()]);
-      check_prog(&[insn(cls::ALU64 | alu::NEG, dst, 0, 0, 0), exit()]);
+      s.check_prog(&[insn(cls::ALU | alu::NEG, dst, 0, 0, 0), exit()]);
+      s.check_prog(&[insn(cls::ALU64 | alu::NEG, dst, 0, 0, 0), exit()]);
     }
+    s.finish("neg_matches_at_both_widths");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn sign_extending_moves_match() {
+    let mut s = Sweep::new();
     for offset in [0i16, 8, 16, 32] {
       for dst in 0..10u8 {
-        check_prog(&[
+        s.check_prog(&[
           insn(cls::ALU64 | alu::MOV | srcbit::REG, dst, 2, offset, 0),
           exit(),
         ]);
         // The 32-bit form only defines 8 and 16.
         if offset != 32 {
-          check_prog(&[
+          s.check_prog(&[
             insn(cls::ALU | alu::MOV | srcbit::REG, dst, 2, offset, 0),
             exit(),
           ]);
         }
       }
     }
+    s.finish("sign_extending_moves_match");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn byte_order_conversions_match_at_every_width() {
+    let mut s = Sweep::new();
     for imm in [16i32, 32, 64] {
       for dst in 0..10u8 {
-        check_prog(&[insn(opcode::LE, dst, 0, 0, imm), exit()]);
-        check_prog(&[insn(opcode::BE, dst, 0, 0, imm), exit()]);
-        check_prog(&[insn(opcode::BSWAP, dst, 0, 0, imm), exit()]);
+        s.check_prog(&[insn(opcode::LE, dst, 0, 0, imm), exit()]);
+        s.check_prog(&[insn(opcode::BE, dst, 0, 0, imm), exit()]);
+        s.check_prog(&[insn(opcode::BSWAP, dst, 0, 0, imm), exit()]);
       }
     }
+    s.finish("byte_order_conversions_match_at_every_width");
   }
 
   // -----------------------------------------------------------------------
   // Jumps
   // -----------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn every_conditional_jump_matches_at_both_widths_and_both_sources() {
+    let mut s = Sweep::new();
     let ops = [
       jmp::JEQ,
       jmp::JGT,
@@ -2449,15 +2810,15 @@ mod tests {
         // Immediate form: no source register. Register form: no immediate.
         for (src, imm) in [(0u8, 7i32), (2, 0)] {
           let source = if src == 0 { srcbit::IMM } else { srcbit::REG };
-          check_prog(&[
+          s.check_prog(&[
             insn(class | op | source, 1, src, 1, imm),
             movi(0, 1),
             exit(),
           ]);
           // A backward branch, which exercises the negative displacement. It
-          // has to reach past the instruction before it: uBPF refuses a
-          // displacement of -1 as an infinite loop.
-          check_prog(&[
+          // has to reach past the instruction before it: the validator refuses
+          // a displacement of -1 as an infinite loop.
+          s.check_prog(&[
             movi(0, 1),
             movi(0, 2),
             insn(class | op | source, 1, src, -2, imm),
@@ -2466,9 +2827,9 @@ mod tests {
         }
       }
     }
+    s.finish("every_conditional_jump_matches_at_both_widths_and_both_sources");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn unconditional_jumps_match_in_both_encodings() {
     check_prog(&[insn(opcode::JA, 0, 0, 1, 0), movi(0, 1), exit()]);
@@ -2477,10 +2838,10 @@ mod tests {
     check_prog(&[insn(opcode::JA, 0, 0, 0, 0), exit()]);
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_jump_out_of_the_translation_range_is_rejected_the_same_way() {
-    // The whole program loads; only the sub-range translation refuses it.
+    // The whole program loads; only the sub-range translation refuses it, and
+    // it must refuse it under every configuration.
     let insns = [insn(opcode::JA, 0, 0, 1, 0), movi(0, 1), exit()];
     let code = Insn::encode_all(&insns);
     let inputs = TranslationInputs {
@@ -2490,7 +2851,7 @@ mod tests {
     };
     assert!(
       !check(&code, &inputs),
-      "the branch leaves the range, so neither backend may translate it"
+      "the branch leaves the range, so no configuration may translate it"
     );
   }
 
@@ -2498,31 +2859,33 @@ mod tests {
   // Memory
   // -----------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn loads_and_stores_match_at_every_width() {
+    let mut s = Sweep::new();
     for sz in [size::B, size::H, size::W, size::DW] {
       for offset in [0i16, 1, 8, -8, 127, 128, -128, -129, 4096, -4096] {
-        check_prog(&[insn(cls::LDX | mode::MEM | sz, 1, 2, offset, 0), exit()]);
-        check_prog(&[insn(cls::STX | mode::MEM | sz, 1, 2, offset, 0), exit()]);
-        check_prog(&[insn(cls::ST | mode::MEM | sz, 1, 0, offset, 0x55), exit()]);
+        s.check_prog(&[insn(cls::LDX | mode::MEM | sz, 1, 2, offset, 0), exit()]);
+        s.check_prog(&[insn(cls::STX | mode::MEM | sz, 1, 2, offset, 0), exit()]);
+        s.check_prog(&[insn(cls::ST | mode::MEM | sz, 1, 0, offset, 0x55), exit()]);
       }
     }
+    s.finish("loads_and_stores_match_at_every_width");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn sign_extending_loads_match() {
+    let mut s = Sweep::new();
     for sz in [size::B, size::H, size::W] {
       for offset in [0i16, 4, -4, 1000] {
-        check_prog(&[insn(cls::LDX | mode::MEMSX | sz, 1, 2, offset, 0), exit()]);
+        s.check_prog(&[insn(cls::LDX | mode::MEMSX | sz, 1, 2, offset, 0), exit()]);
       }
     }
+    s.finish("sign_extending_loads_match");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn memory_access_matches_for_every_base_and_destination_register() {
+    let mut s = Sweep::new();
     // R6-R9 map onto RBX/R12/R13/R14 and R10 onto R15: R12 needs a SIB byte as
     // a base and R13 needs an explicit zero displacement, and the byte forms of
     // RSI/RDI need a REX prefix to name SIL/DIL. This is where a hand-written
@@ -2530,11 +2893,11 @@ mod tests {
     for base in 0..11u8 {
       for other in [0u8, 1, 6, 7, 8, 9] {
         // A load may read through R10 but may not write it.
-        check_prog(&[
+        s.check_prog(&[
           insn(cls::LDX | mode::MEM | size::B, other, base, 0, 0),
           exit(),
         ]);
-        check_prog(&[
+        s.check_prog(&[
           insn(cls::LDX | mode::MEM | size::DW, other, base, 0, 0),
           exit(),
         ]);
@@ -2542,36 +2905,38 @@ mod tests {
       for other in 0..11u8 {
         // A store may name R10 on either side; storing it exercises the
         // guest-frame-pointer recovery.
-        check_prog(&[
+        s.check_prog(&[
           insn(cls::STX | mode::MEM | size::B, base, other, 0, 0),
           exit(),
         ]);
-        check_prog(&[
+        s.check_prog(&[
           insn(cls::STX | mode::MEM | size::DW, base, other, 0, 0),
           exit(),
         ]);
       }
     }
+    s.finish("memory_access_matches_for_every_base_and_destination_register");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn store_immediates_match_for_every_base_register() {
+    let mut s = Sweep::new();
     for base in 0..11u8 {
       for sz in [size::B, size::H, size::W, size::DW] {
-        check_prog(&[insn(cls::ST | mode::MEM | sz, base, 0, 0, -1), exit()]);
-        check_prog(&[insn(cls::ST | mode::MEM | sz, base, 0, 16, 0x1234), exit()]);
+        s.check_prog(&[insn(cls::ST | mode::MEM | sz, base, 0, 0, -1), exit()]);
+        s.check_prog(&[insn(cls::ST | mode::MEM | sz, base, 0, 16, 0x1234), exit()]);
       }
     }
+    s.finish("store_immediates_match_for_every_base_register");
   }
 
   // -----------------------------------------------------------------------
   // Atomics
   // -----------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn every_atomic_matches_at_both_widths() {
+    let mut s = Sweep::new();
     let selectors = [
       alu::ADD as i32,
       alu::OR as i32,
@@ -2587,21 +2952,21 @@ mod tests {
     for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
       for sel in selectors {
         for offset in [0i16, 8, -8] {
-          check_prog(&[insn(op, 1, 2, offset, sel), exit()]);
+          s.check_prog(&[insn(op, 1, 2, offset, sel), exit()]);
         }
       }
     }
+    s.finish("every_atomic_matches_at_both_widths");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn non_canonical_atomic_selectors_match() {
-    // The C switches on `imm & 0xf0` and reads the fetch flag out of bit 0, so
-    // bits 1 through 3 are dead and several immediates that name no operation
-    // in the ISA still emit code. The validator's filter for 32-bit atomics
-    // bounds the immediate at 0..=255 rather than enumerating it, so these
-    // reach the backend on programs that load — and a decode that is merely
-    // "correct" rather than identical diverges here.
+    let mut s = Sweep::new();
+    // The atomic decode switches on `imm & 0xf0` and reads the fetch flag out
+    // of bit 0, so bits 1 through 3 are dead and several immediates that name
+    // no operation in the ISA still emit code. The validator's filter for
+    // 32-bit atomics bounds the immediate at 0..=255 rather than enumerating
+    // it, so these reach the backend on programs that load.
     //
     //   0x02  -> plain atomic add, no fetch
     //   0x0f  -> atomic add *with* fetch
@@ -2612,8 +2977,7 @@ mod tests {
     // 0xe0 and 0xf0 — exchange and compare-exchange with the fetch flag clear —
     // are included too, but the *validator* refuses those at both widths, so
     // they never reach the emitter through a program that loads. The backend
-    // would handle them; this only checks the two sides agree about the
-    // refusal.
+    // would handle them; here that refusal is what is pinned.
     for sel in [
       0x02i32, 0x0f, 0xe0, 0xf0, 0x4e, 0x53, 0xa8, 0xff, 0xe3, 0xf3,
     ] {
@@ -2622,24 +2986,25 @@ mod tests {
           let insns = [insn(op, 1, 2, offset, sel), exit()];
           let code = Insn::encode_all(&insns);
           // The 64-bit form's filter enumerates its immediates, so some of
-          // these load only at 32-bit width; agreement is what matters, and
-          // `check` asserts it either way.
-          check(&code, &plain_inputs(insns.len()));
+          // these load only at 32-bit width; `check` pins whichever way each
+          // one goes.
+          s.check(&code, &plain_inputs(insns.len()));
         }
       }
     }
     // At 32-bit width every one of them must actually translate, which is what
-    // makes this test more than an agreement about refusals.
+    // makes this test more than a record of refusals.
     for sel in [0x02i32, 0x0f, 0x4e, 0x53, 0xa8, 0xe3, 0xff] {
-      check_prog(&[insn(opcode::ATOMIC32_STORE, 1, 2, 0, sel), exit()]);
+      s.check_prog(&[insn(opcode::ATOMIC32_STORE, 1, 2, 0, sel), exit()]);
     }
+    s.finish("non_canonical_atomic_selectors_match");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn an_unknown_atomic_selector_is_refused_identically() {
-    // `imm & 0xf0` landing on a nibble the switch does not name is the one
-    // place the C abandons translation mid-instruction and returns without
+    let mut s = Sweep::new();
+    // `imm & 0xf0` landing on a nibble the decode does not name is the one
+    // place translation is abandoned mid-instruction, returning without
     // emitting an epilogue at all.
     for sel in [
       0x10i32, 0x20, 0x30, 0x60, 0x70, 0x80, 0x90, 0xb0, 0xc0, 0xd0,
@@ -2647,30 +3012,31 @@ mod tests {
       for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
         let insns = [insn(op, 1, 2, 0, sel), exit()];
         let code = Insn::encode_all(&insns);
-        check(&code, &plain_inputs(insns.len()));
+        s.check(&code, &plain_inputs(insns.len()));
       }
     }
+    s.finish("an_unknown_atomic_selector_is_refused_identically");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn fetching_atomics_match_when_the_source_is_r0() {
+    let mut s = Sweep::new();
     // R0 maps to RAX, which the compare-exchange loop clobbers, so the sequence
     // takes a different path and shuffles through R10/R11 instead.
     for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
       for sel in [alu::ADD as i32 | 1, alu::XOR as i32 | 1] {
         for dst in 0..10u8 {
-          check_prog(&[insn(op, dst, 0, 0, sel), exit()]);
+          s.check_prog(&[insn(op, dst, 0, 0, sel), exit()]);
         }
       }
     }
+    s.finish("fetching_atomics_match_when_the_source_is_r0");
   }
 
   // -----------------------------------------------------------------------
   // Calls
   // -----------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn helper_calls_match() {
     for idx in [0i32, 1, 3, 63] {
@@ -2678,21 +3044,19 @@ mod tests {
     }
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_local_call_without_a_resolver_id_fails_the_same_way() {
-    // With no resolver ids the C never registers the resolver at all, so the
-    // lazy local call is refused.
+    // A lazy local call needs a resolver id for its call site; with none, there
+    // is nothing to resolve the call against and it is refused.
     let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
     let code = Insn::encode_all(&insns);
     assert!(
       !check(&code, &plain_inputs(insns.len())),
-      "with no resolver ids the C never registers the resolver, so the lazy \
-       local call must be refused"
+      "with no resolver ids there is nothing to resolve the call against, so \
+       the lazy local call must be refused"
     );
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_local_call_with_a_resolver_id_matches() {
     let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
@@ -2707,7 +3071,6 @@ mod tests {
     assert!(check(&code, &inputs));
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn translating_one_local_function_of_a_program_matches() {
     // Two functions; translate only the second, which is a strict sub-range.
@@ -2731,7 +3094,6 @@ mod tests {
     }
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_range_that_is_not_a_function_boundary_is_rejected_the_same_way() {
     let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
@@ -2749,18 +3111,17 @@ mod tests {
     }
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_fallthrough_into_a_local_function_entry_matches() {
     // The instruction before the entry falls through, so a jump around the
     // per-function prologue has to be emitted.
     // Reaching a local function entry by falling into it takes some arranging.
-    // uBPF requires each sub-program to end in EXIT or to carry an
+    // The validator requires each sub-program to end in EXIT or to carry an
     // unconditional jump in its second-to-last slot, and refuses a jump that
-    // crosses a sub-program boundary — but `ubpf_instruction_has_fallthrough`
-    // reports true for everything except EXIT, so a sub-program ending in a
-    // `ja` followed by an ordinary instruction both validates and falls
-    // through. That is the shape the backend's bypass jump exists for.
+    // crosses a sub-program boundary — but only EXIT counts as not falling
+    // through, so a sub-program ending in a `ja` followed by an ordinary
+    // instruction both validates and falls through. That is the shape the
+    // backend's bypass jump exists for.
     let insns = [
       insn(opcode::CALL, 0, 1, 0, 2),
       insn(opcode::JA, 0, 0, 0, 0),
@@ -2779,7 +3140,7 @@ mod tests {
     assert!(
       check(&code, &inputs),
       "nothing was translated\n{}",
-      LAST_OUTCOMES.with(|c| c.borrow().clone())
+      refusal_report(&code, &inputs)
     );
   }
 
@@ -2787,7 +3148,6 @@ mod tests {
   // lddw
   // -----------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn lddw_matches_for_small_and_large_immediates() {
     for (lo, hi) in [
@@ -2809,9 +3169,9 @@ mod tests {
   // Region hints and access plans
   // -----------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn every_region_hint_matches() {
+    let mut s = Sweep::new();
     for hint in [
       abi::region::UNKNOWN,
       abi::region::STACK,
@@ -2830,14 +3190,14 @@ mod tests {
               end_pc: insns.len(),
               ..Default::default()
             };
-            assert!(check(&code, &inputs), "nothing was translated");
+            assert!(s.check(&code, &inputs), "nothing was translated");
           }
         }
       }
     }
+    s.finish("every_region_hint_matches");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_well_formed_access_plan_matches() {
     // Two loads off R2 at +0 and +8, grouped: the first leads, the second
@@ -2878,30 +3238,11 @@ mod tests {
     }
   }
 
-  /// Bytes the production configuration emits for one translation.
-  ///
-  /// Only meaningful once [`check`] has established the C emits the same count;
-  /// it exists so a test can assert that a fast path was *taken*, not merely
-  /// that both backends agreed about not taking it.
-  #[cfg(feature = "oracle")]
-  fn production_len(code: &[u8], inputs: &TranslationInputs<'_>) -> usize {
-    let config = config_sweep(Target::X86_64)
-      .into_iter()
-      .find(|(name, _)| *name == "production")
-      .expect("the sweep has a production configuration")
-      .1;
-    let t =
-      crate::jit::Translator::load(std::sync::Arc::new(config), code).expect("program must load");
-    let mut buf = vec![0u8; 262_144];
-    t.translate_range(inputs, &mut buf).expect("must translate")
-  }
-
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_well_formed_access_plan_is_actually_taken() {
-    // Agreement is not enough on its own: a plan the backend silently declined
-    // would agree with a C that declined it too, and neither the leader nor the
-    // member path would ever be exercised. A grouped pair has to come out
+    // A recorded golden is not enough on its own: a plan the backend silently
+    // declined would record perfectly stable bytes, and neither the leader nor
+    // the member path would ever be exercised. A grouped pair has to come out
     // shorter than the same pair checked one access at a time.
     let insns = [
       insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
@@ -2947,7 +3288,6 @@ mod tests {
     );
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn the_frame_hint_is_actually_taken() {
     // Same argument as above for the one hint that removes the check rather
@@ -2972,9 +3312,9 @@ mod tests {
     );
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn stores_match_under_every_region_hint() {
+    let mut s = Sweep::new();
     // The store paths are not the load paths: a store is pinned to the stack
     // region whatever the hint says, and the immediate form swaps the address
     // and scratch registers around.
@@ -3000,31 +3340,32 @@ mod tests {
                 end_pc: insns.len(),
                 ..Default::default()
               };
-              assert!(check(&code, &inputs), "nothing was translated");
+              assert!(s.check(&code, &inputs), "nothing was translated");
             }
           }
         }
       }
     }
+    s.finish("stores_match_under_every_region_hint");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn atomics_match_for_every_base_register() {
+    let mut s = Sweep::new();
     // The cage rewrites the base into R11 and the scratch is RCX, so a base
     // that already maps onto one of them would collide; none does, and this is
     // what checks that.
     for base in 0..11u8 {
       for src in 0..10u8 {
         for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
-          check_prog(&[insn(op, base, src, 0, 0), exit()]);
-          check_prog(&[insn(op, base, src, 8, 0x01), exit()]);
+          s.check_prog(&[insn(op, base, src, 0, 0), exit()]);
+          s.check_prog(&[insn(op, base, src, 8, 0x01), exit()]);
         }
       }
     }
+    s.finish("atomics_match_for_every_base_register");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_hostile_access_plan_is_declined_identically() {
     let insns = [
@@ -3035,8 +3376,8 @@ mod tests {
     ];
     let code = Insn::encode_all(&insns);
 
-    // Every one of these should make the backend fall back to a checked access,
-    // and the C has to fall back in exactly the same places.
+    // Every one of these must make the backend fall back to a checked access,
+    // at exactly the places the plan stops being self-consistent.
     let hostile: [[PlanEntry; 4]; 8] = [
       // A span of zero.
       plan3(abi::plan_role::LEADER, abi::region::STACK, 0, 0, 0, 0),
@@ -3068,7 +3409,6 @@ mod tests {
 
   /// Builds a three-instruction plan whose first entry carries the parameters
   /// under test and whose second is a member of it.
-  #[cfg(feature = "oracle")]
   fn plan3(role: u8, region: u8, delta: u16, span: u32, lo: i32, leader_pc: u32) -> [PlanEntry; 4] {
     [
       PlanEntry {
@@ -3099,7 +3439,6 @@ mod tests {
     ]
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn a_group_broken_by_a_barrier_or_a_redefined_base_is_declined_identically() {
     // A branch lands between the leader and the member, and separately the base
@@ -3154,13 +3493,12 @@ mod tests {
   // Exhaustive opcode census
   // -----------------------------------------------------------------------
 
-  #[cfg(feature = "oracle")]
   #[test]
-  fn every_opcode_byte_agrees_with_the_c() {
-    // The C switches on the raw opcode byte with a `default` that reports an
-    // unknown instruction. Sweeping all 256 values is what proves the Rust
-    // `match` over `Op` covers exactly the same set, including the encodings
-    // neither accepts.
+  fn every_defined_opcode_emits_code() {
+    let mut s = Sweep::new();
+    // Translation switches on the raw opcode byte, with everything unhandled
+    // reported as an unknown instruction. Sweeping all 256 values is what pins
+    // the boundary of that set, including the encodings it must refuse.
     // Each opcode admits a different operand shape, so every byte is tried
     // against a spread of them: one that suits an immediate form, one a
     // register form, one an endian width, one a branch displacement, and so on.
@@ -3194,7 +3532,7 @@ mod tests {
           end_pc: insns.len(),
           ..Default::default()
         };
-        covered |= check(&code, &inputs);
+        covered |= s.check(&code, &inputs);
       }
       if covered {
         translated += 1;
@@ -3202,37 +3540,49 @@ mod tests {
     }
     // Most of the census is meant to *emit* something; if the operands chosen
     // above ever stopped satisfying the validator this would quietly become a
-    // test that only the rejections agree.
+    // test that only pins refusals.
     assert!(
       translated >= 110,
       "only {translated} of the 119 defined opcode bytes were translated at \
-       all; the census has degraded into a test that only rejections agree"
+       all; the census has degraded into a record of refusals"
     );
+    s.finish("every_defined_opcode_emits_code");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn out_of_space_is_reported_identically() {
+    // A buffer too small for the whole function must come back as
+    // `OutOfSpace`, and the capacity at which that stops happening is itself
+    // worth pinning: it moves whenever the prologue or the trailer changes
+    // size. That makes this a sweep over capacities rather than a set of named
+    // cases — and the capacity is not part of a golden key, so a rolled-up
+    // digest is also the only shape that does not collide with itself.
     let insns = [movi(0, 42), exit()];
     let code = Insn::encode_all(&insns);
     let inputs = plain_inputs(insns.len());
+    let mut digest = golden::SweepDigest::new();
+    arm_flush();
     for capacity in [0usize, 1, 8, 64, 512, 600] {
-      for (name, config) in config_sweep(Target::X86_64) {
-        let d = diff(&config, &code, &inputs, capacity);
-        assert!(
-          d.is_same(),
-          "capacity {capacity} under {name:?} disagrees\n{d}"
+      for (_, config) in sweep(Target::X86_64) {
+        digest.add(
+          &golden::translate_one(&config, &code, &inputs, capacity)
+            .expect("the program loads under every configuration"),
         );
       }
     }
+    // The largest capacity is over the whole function, so this cannot degrade
+    // into a sweep that only ever records `OutOfSpace`.
+    assert!(
+      digest.translated() > 0,
+      "no capacity was large enough to translate the program"
+    );
+    digest.finish("out_of_space_is_reported_identically", Target::X86_64);
   }
 
   /// A deterministic xorshift, so a failure is reproducible from the seed
   /// printed in the assertion.
-  #[cfg(feature = "oracle")]
   struct Rng(u64);
 
-  #[cfg(feature = "oracle")]
   impl Rng {
     fn next(&mut self) -> u64 {
       self.0 ^= self.0 << 13;
@@ -3248,7 +3598,6 @@ mod tests {
     }
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn randomised_programs_hints_and_plans_match() {
     // The hand-written cases above each aim at one path. This aims at their
@@ -3256,7 +3605,7 @@ mod tests {
     // member, a hint that contradicts the plan's region, a group closed by a
     // branch nobody was thinking about. The plans are generated without regard
     // for whether they are sane, which is the point — a wrong or hostile plan
-    // has to be declined by both backends in exactly the same places.
+    // has to be declined, not obeyed.
     //
     // The seed range is kept small so this stays a fast test; it was run over
     // 60,000 seeds (360,000 diffs) while the port was being written, with no
@@ -3275,9 +3624,9 @@ mod tests {
       alu::MOV,
       alu::ARSH,
     ];
-    // Deliberately includes non-canonical selectors: the C masks with 0xf0 and
-    // reads the fetch flag out of bit 0, so 0x02, 0x0f, 0xe0 and 0xf0 all name
-    // operations even though the ISA does not spell them that way.
+    // Deliberately includes non-canonical selectors: the decode masks with
+    // 0xf0 and reads the fetch flag out of bit 0, so 0x02, 0x0f, 0xe0 and 0xf0
+    // all name operations even though the ISA does not spell them that way.
     let atomic_selectors = [
       0i32, 1, 0x02, 0x0f, 0x40, 0x41, 0x4e, 0x50, 0x51, 0xa0, 0xa1, 0xe1, 0xe3, 0xf1, 0xff, 0x30,
     ];
@@ -3296,8 +3645,7 @@ mod tests {
       jmp::JSLE,
     ];
 
-    let mut translated = 0usize;
-    let mut total = 0usize;
+    let mut s = Sweep::new();
 
     for seed in 1..=500u64 {
       let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
@@ -3439,23 +3787,19 @@ mod tests {
         end_pc: insns.len(),
       };
 
-      total += 1;
-      // `check` panics with the differing offset and the program if the two
-      // backends disagree, so the seed is only needed for the summary below.
-      if check(&code, &inputs) {
-        translated += 1;
-      }
+      s.check(&code, &inputs);
     }
 
     assert!(
-      translated * 2 >= total,
-      "only {translated} of {total} random programs translated; the generator \
-       is producing programs the validator refuses rather than exercising the \
-       emitter"
+      s.translated() * 2 >= s.cases(),
+      "only {} of {} random programs translated; the generator is producing \
+       programs the validator refuses rather than exercising the emitter",
+      s.translated(),
+      s.cases()
     );
+    s.finish("randomised_programs_hints_and_plans_match");
   }
 
-  #[cfg(feature = "oracle")]
   #[test]
   fn deep_register_pressure_matches() {
     // Every eBPF register as both source and destination of a 64-bit ALU op,
@@ -3493,11 +3837,8 @@ mod tests {
   /// function, so the second per-function prologue is never reached with a
   /// buffer that runs out inside it.
   ///
-  /// The C oracle `assert()`s on the same inputs (its own
-  /// `assert(state->bpf_function_prolog_size == state->offset - prolog_start)`,
-  /// for the same reason), aborting the whole test process, so `diff` cannot be
-  /// used here — this checks the Rust side alone.
-  #[cfg(feature = "oracle")]
+  /// Nothing is recorded here: the property under test is that the emitter
+  /// returns rather than panics, which no output can express.
   #[test]
   fn audit_out_of_space_inside_a_later_function_prologue() {
     let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
@@ -3505,7 +3846,7 @@ mod tests {
     let ids = [1u32, 2, 3, 4];
     let mut panicked = Vec::new();
     for capacity in 0..420usize {
-      for (name, config) in config_sweep(Target::X86_64) {
+      for (name, config) in sweep(Target::X86_64) {
         let code = code.clone();
         let ids = ids;
         let outcome = std::panic::catch_unwind(move || {
@@ -3540,9 +3881,9 @@ mod tests {
   /// `lo` from the `i16` range, so the u16/u32/i32 extremes — and the exact
   /// boundaries `span == MAX_GROUP_SPAN` and `delta + width == span` — are
   /// outside the shape it generates.
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_access_plans_at_their_limits() {
+    let mut s = Sweep::new();
     // Two doubleword loads off R2. The leader's window is picked per case; the
     // member's displacement is whatever `lo + delta` says it must be.
     let cases: [(i32, u16, u32, i32, u16, u32); 12] = [
@@ -3617,19 +3958,20 @@ mod tests {
             end_pc: insns.len(),
             ..Default::default()
           };
-          check(&code, &inputs);
+          s.check(&code, &inputs);
         }
       }
     }
+    s.finish_exercised("audit_access_plans_at_their_limits");
   }
 
   /// Region hints outside the four defined values, and plan regions likewise.
   ///
   /// Every existing test draws hints from `0..4`; the byte comes from analysis
   /// the backend does not own, so the whole `u8` range has to agree.
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_region_hints_outside_the_defined_set() {
+    let mut s = Sweep::new();
     let insns = [
       insn(cls::LDX | mode::MEM | size::DW, 1, 10, -8, 0),
       insn(cls::STX | mode::MEM | size::B, 2, 1, 0, 0),
@@ -3645,7 +3987,7 @@ mod tests {
         end_pc: insns.len(),
         ..Default::default()
       };
-      assert!(check(&code, &inputs), "hint {hint} translated nothing");
+      assert!(s.check(&code, &inputs), "hint {hint} translated nothing");
     }
     // And the same byte arriving through an access plan's region field.
     for region in [4u8, 5, 127, 200, 255] {
@@ -3676,7 +4018,7 @@ mod tests {
         ..Default::default()
       };
       assert!(
-        check(&code, &inputs),
+        s.check(&code, &inputs),
         "plan region {region} translated nothing"
       );
     }
@@ -3708,8 +4050,12 @@ mod tests {
         end_pc: insns.len(),
         ..Default::default()
       };
-      assert!(check(&code, &inputs), "plan role {role} translated nothing");
+      assert!(
+        s.check(&code, &inputs),
+        "plan role {role} translated nothing"
+      );
     }
+    s.finish("audit_region_hints_outside_the_defined_set");
   }
 
   /// The frame fast path's two boundary conditions, swept exactly.
@@ -3718,9 +4064,9 @@ mod tests {
   /// The existing tests probe `{0, -8, -4096, -4097, 8}` at three widths, which
   /// misses `offset == -size` (the largest accepted offset for each width) and
   /// `offset == -size + 1` (the smallest rejected one).
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_frame_access_boundaries() {
+    let mut s = Sweep::new();
     for (sz, width) in [(size::B, 1i16), (size::H, 2), (size::W, 4), (size::DW, 8)] {
       for offset in [
         -width - 1,
@@ -3750,23 +4096,24 @@ mod tests {
               end_pc: insns.len(),
               ..Default::default()
             };
-            check(&code, &inputs);
+            s.check(&code, &inputs);
           }
         }
       }
     }
+    s.finish_exercised("audit_frame_access_boundaries");
   }
 
   /// A `lddw` in the last slot of a sub-range, whose high half therefore lives
   /// in the *next* function.
   ///
   /// `lddw_matches_for_small_and_large_immediates` only ever puts one in the
-  /// middle of a whole-program range, so the fetch past the range end — where
-  /// the port substitutes a zero instruction and the C reads on regardless — is
-  /// never exercised.
-  #[cfg(feature = "oracle")]
+  /// middle of a whole-program range, so the fetch past the range end — where a
+  /// zero instruction stands in for the half that is not there — is never
+  /// exercised.
   #[test]
   fn audit_lddw_at_the_end_of_a_range() {
+    let mut s = Sweep::new();
     // pc0 call->3, pc1 lddw, pc2 <imm high half>, pc3 movi, pc4 exit.
     let programs: [Vec<Insn>; 2] = [
       vec![
@@ -3792,17 +4139,20 @@ mod tests {
           end_pc: end,
           ..Default::default()
         };
-        check(&code, &inputs);
+        s.check(&code, &inputs);
       }
     }
+    // Nothing here translates: the validator refuses every one of these,
+    // and the digest is what pins that refusal.
+    s.finish("audit_lddw_at_the_end_of_a_range");
   }
 
   /// Helper indices the census never reaches: negative, past the table, and the
-  /// two integer extremes — plus the interaction with the unwind index, which
-  /// uBPF defaults to `-1`.
-  #[cfg(feature = "oracle")]
+  /// two integer extremes — plus the interaction with the unwind index, whose
+  /// unset state is `-1`.
   #[test]
   fn audit_helper_call_indices_at_the_extremes() {
+    let mut s = Sweep::new();
     for imm in [
       -1i32,
       0,
@@ -3819,10 +4169,10 @@ mod tests {
     ] {
       let insns = [movi(1, 0), insn(opcode::CALL, 0, 0, 0, imm), exit()];
       let code = Insn::encode_all(&insns);
-      check(&code, &plain_inputs(insns.len()));
+      s.check(&code, &plain_inputs(insns.len()));
     }
-    // A source field that names neither a helper nor a local call: the C emits
-    // nothing at all for it.
+    // A source field that names neither a helper nor a local call, for which
+    // nothing at all is emitted.
     for src in [2u8, 3, 7, 8, 15] {
       let insns = [insn(opcode::CALL, 0, src, 0, 1), exit()];
       let code = Insn::encode_all(&insns);
@@ -3833,18 +4183,19 @@ mod tests {
         end_pc: insns.len(),
         ..Default::default()
       };
-      check(&code, &inputs);
+      s.check(&code, &inputs);
     }
+    s.finish_exercised("audit_helper_call_indices_at_the_extremes");
   }
 
   /// Register fields above `R10`, which `map_register` folds with `% 11`.
   ///
   /// Every existing test stays inside `0..=10`. The field is four bits wide on
   /// the wire, so a hostile program can name 11 through 15; if the validator
-  /// lets any of those through, the two backends must fold them the same way.
-  #[cfg(feature = "oracle")]
+  /// lets any of those through, the fold is what decides where they land.
   #[test]
   fn audit_register_fields_above_r10() {
+    let mut s = Sweep::new();
     for r in 11u8..=15 {
       for insn_ in [
         insn(cls::ALU64 | alu::ADD | srcbit::REG, r, 1, 0, 0),
@@ -3858,9 +4209,12 @@ mod tests {
       ] {
         let insns = [insn_, exit()];
         let code = Insn::encode_all(&insns);
-        check(&code, &plain_inputs(insns.len()));
+        s.check(&code, &plain_inputs(insns.len()));
       }
     }
+    // Nothing here translates: the validator refuses every one of these,
+    // and the digest is what pins that refusal.
+    s.finish("audit_register_fields_above_r10");
   }
 
   /// Branch displacements at the `i16` extremes, and `ja32` at the `i32` ones.
@@ -3868,9 +4222,9 @@ mod tests {
   /// The randomised generator only ever jumps forwards and never past the
   /// trailing `exit`, so the wrapping in `target_pc_64 as u32` and the
   /// range rejection that follows it are only ever seen with small numbers.
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_branch_displacements_at_the_extremes() {
+    let mut s = Sweep::new();
     for off in [i16::MIN, i16::MIN + 1, -2, -1, 0, 1, i16::MAX - 1, i16::MAX] {
       for op in [
         insn(opcode::JA, 0, 0, off, 0),
@@ -3879,22 +4233,22 @@ mod tests {
       ] {
         let insns = [movi(0, 1), op, movi(0, 2), exit()];
         let code = Insn::encode_all(&insns);
-        check(&code, &plain_inputs(insns.len()));
+        s.check(&code, &plain_inputs(insns.len()));
       }
     }
     for imm in [i32::MIN, -1, 0, 1, 2, i32::MAX] {
       let insns = [movi(0, 1), insn(opcode::JA32, 0, 0, 0, imm), exit()];
       let code = Insn::encode_all(&insns);
-      check(&code, &plain_inputs(insns.len()));
+      s.check(&code, &plain_inputs(insns.len()));
     }
+    s.finish_exercised("audit_branch_displacements_at_the_extremes");
   }
 
   /// A group whose base register is rewritten under it, then named again.
   ///
-  /// The port closes the group outright on a write to the base; the C keeps it
-  /// open and tests a written-register mask. Those are only the same decision if
-  /// nothing later re-reads the state the port has thrown away.
-  #[cfg(feature = "oracle")]
+  /// The group is closed outright on a write to the base, rather than kept open
+  /// against a written-register mask. Those are only the same decision if
+  /// nothing later re-reads the state that closing it throws away.
   #[test]
   fn audit_a_group_whose_base_is_rewritten_and_then_named_again() {
     let insns = [
@@ -3956,18 +4310,19 @@ mod tests {
     assert!(check(&code, &inputs), "nothing was translated");
   }
 
-  /// The set of opcode bytes `Op::from_opcode` accepts, against the set of
-  /// `case` labels in the C's `translate_range` switch, extracted verbatim.
+  /// The set of opcode bytes `Op::from_opcode` accepts, against the frozen
+  /// list of the 119 the backend is meant to handle.
   ///
-  /// `every_opcode_byte_agrees_with_the_c` proves the same thing only for bytes
+  /// `every_defined_opcode_emits_code` proves the same thing only for bytes
   /// whose *operands* satisfy the validator in one of eight candidate shapes; a
   /// byte the validator refuses in all eight is invisible to it. This compares
-  /// the decoders directly, with no program in the way.
+  /// the decoder against the list directly, with no program in the way.
   #[test]
-  fn audit_the_decoded_opcode_set_equals_the_c_switch_labels() {
-    // Every `case EBPF_OP_*` between `switch (inst.opcode) {` and the `default:`
-    // arm of `translate_range` in `oracle/ubpf-sys/vendor/ubpf/vm/ubpf_jit_x86_64.c`.
-    const C_HANDLED: [u8; 119] = [
+  fn audit_the_decoded_opcode_set_matches_what_the_emitter_handles() {
+    // Every opcode byte translation has an arm for. A byte added here without a
+    // corresponding arm, or the other way round, is what this test exists to
+    // catch.
+    const HANDLED: [u8; 119] = [
       0x04, 0x05, 0x06, 0x07, 0x0c, 0x0f, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1c, 0x1d, 0x1e, 0x1f,
       0x24, 0x25, 0x26, 0x27, 0x2c, 0x2d, 0x2e, 0x2f, 0x34, 0x35, 0x36, 0x37, 0x3c, 0x3d, 0x3e,
       0x3f, 0x44, 0x45, 0x46, 0x47, 0x4c, 0x4d, 0x4e, 0x4f, 0x54, 0x55, 0x56, 0x57, 0x5c, 0x5d,
@@ -3977,23 +4332,28 @@ mod tests {
       0xac, 0xad, 0xae, 0xaf, 0xb4, 0xb5, 0xb6, 0xb7, 0xbc, 0xbd, 0xbe, 0xbf, 0xc3, 0xc4, 0xc5,
       0xc6, 0xc7, 0xcc, 0xcd, 0xce, 0xcf, 0xd4, 0xd5, 0xd6, 0xd7, 0xdb, 0xdc, 0xdd, 0xde,
     ];
-    let c: std::collections::BTreeSet<u8> = C_HANDLED.into_iter().collect();
-    let rust: std::collections::BTreeSet<u8> = (0u16..=255)
+    let expected: std::collections::BTreeSet<u8> = HANDLED.into_iter().collect();
+    let decoded: std::collections::BTreeSet<u8> = (0u16..=255)
       .map(|b| b as u8)
       .filter(|b| crate::jit::isa::Op::from_opcode(*b).is_some())
       .collect();
-    let only_rust: Vec<String> = rust.difference(&c).map(|b| format!("{b:#04x}")).collect();
-    let only_c: Vec<String> = c.difference(&rust).map(|b| format!("{b:#04x}")).collect();
+    let extra: Vec<String> = decoded
+      .difference(&expected)
+      .map(|b| format!("{b:#04x}"))
+      .collect();
+    let missing: Vec<String> = expected
+      .difference(&decoded)
+      .map(|b| format!("{b:#04x}"))
+      .collect();
     assert!(
-      only_rust.is_empty() && only_c.is_empty(),
-      "decoder sets differ.\n  accepted only by the Rust: {only_rust:?}\n  \
-       accepted only by the C:    {only_c:?}"
+      extra.is_empty() && missing.is_empty(),
+      "the decoded opcode set has moved.\n  decoded but not listed: {extra:?}\n  \
+       listed but not decoded: {missing:?}"
     );
   }
 
   /// The plan fast paths must actually be *taken* at the page-sized extreme,
   /// not merely agreed about.
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_a_page_wide_group_is_actually_taken() {
     let insns = [
@@ -4045,7 +4405,6 @@ mod tests {
   /// of those: two local functions with a real `call src=1` between them,
   /// `lddw` in the mix, a translation range that is sometimes a strict
   /// sub-range, and plan fields drawn from the whole of their types.
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_randomised_multi_function_programs_and_wide_plans_match() {
     let sizes = [size::B, size::H, size::W, size::DW];
@@ -4077,17 +4436,19 @@ mod tests {
       jmp::JSLE,
     ];
 
-    let mut translated = 0usize;
-    let mut total = 0usize;
+    let mut s = Sweep::new();
 
-    // Kept small so this stays a fast test. It was run over 20,000 seeds
-    // (360,000 diffs) in release and 6,000 (108,000 diffs) in debug with
-    // overflow checks on, with no divergence and no panic; set `AUDIT_SEEDS` to
-    // reproduce that.
+    // Kept small so this stays a fast test. It has been run over 20,000 seeds
+    // in release and 6,000 in debug with overflow checks on, with no panic and
+    // no unexplained refusal; set `AUDIT_SEEDS` to reproduce that. The rolled-up
+    // golden covers a fixed number of cases, so it is only compared at the
+    // default count — a widened run still exercises the emitter, it just has
+    // nothing to compare itself against.
+    const DEFAULT_SEEDS: u64 = 400;
     let seeds: u64 = std::env::var("AUDIT_SEEDS")
       .ok()
       .and_then(|s| s.parse().ok())
-      .unwrap_or(400);
+      .unwrap_or(DEFAULT_SEEDS);
     for seed in 1..=seeds {
       let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
 
@@ -4210,44 +4571,41 @@ mod tests {
           start_pc: start,
           end_pc: end,
         };
-        total += 1;
-        if check(&code, &inputs) {
-          translated += 1;
-        }
+        s.check(&code, &inputs);
       }
     }
 
     assert!(
-      translated * 4 >= total,
-      "only {translated} of {total} random multi-function programs translated; \
-       the generator is producing programs the validator refuses rather than \
-       exercising the emitter"
+      s.translated() * 4 >= s.cases(),
+      "only {} of {} random multi-function programs translated; the generator \
+       is producing programs the validator refuses rather than exercising the \
+       emitter",
+      s.translated(),
+      s.cases()
     );
+    if seeds == DEFAULT_SEEDS {
+      s.finish("audit_randomised_multi_function_programs_and_wide_plans_match");
+    }
   }
 
   /// The `LoadImm64` arm's zero fallback claims to be unreachable because the
   /// validator refuses a `lddw` in the program's last slot. Check that, rather
-  /// than trusting it: if such a program ever loaded, the C would read one
-  /// instruction past the end of its array.
-  #[cfg(feature = "oracle")]
+  /// than trusting it: the fallback is the only thing standing between such a
+  /// program and a read past the end of the instruction array.
   #[test]
-  fn audit_a_trailing_lddw_is_refused_at_load_by_both() {
+  fn audit_a_trailing_lddw_is_refused_at_load() {
     for tail in [
       vec![movi(0, 1), insn(opcode::LDDW, 3, 0, 0, 7)],
       vec![insn(opcode::LDDW, 3, 0, 0, 7)],
       vec![movi(0, 1), exit(), insn(opcode::LDDW, 3, 0, 0, 7)],
     ] {
       let code = Insn::encode_all(&tail);
-      for (name, config) in config_sweep(Target::X86_64) {
-        let c = crate::jit::oracle::COracle::load(&config, &code);
-        let r = crate::jit::Translator::load(std::sync::Arc::new(config), &code);
+      for (name, config) in sweep(Target::X86_64) {
+        let loaded = Translator::load(Arc::new(config), &code);
         assert!(
-          c.is_err() && r.is_err(),
-          "a program whose last slot is a `lddw` loaded under {name:?} \
-           (C ok: {}, Rust ok: {}); the emitter would then fetch past the end \
-           of the instruction array",
-          c.is_ok(),
-          r.is_ok()
+          loaded.is_err(),
+          "a program whose last slot is a `lddw` loaded under {name:?}; the \
+           emitter would then fetch past the end of the instruction array"
         );
       }
     }
@@ -4257,22 +4615,21 @@ mod tests {
   /// programs, on the Rust side alone: the emitter must return `Ok` or `Err`,
   /// never panic — not on a `debug_assert`, not on an arithmetic overflow.
   ///
-  /// The oracle cannot be used for this: the C `assert()`s on some of these
-  /// inputs and back-patches out of bounds on others, so it would abort or
-  /// corrupt the heap rather than answer.
+  /// Nothing is recorded here either: what is under test is that the emitter
+  /// answers at all.
   ///
   /// FAILING — ignored, same root cause as
   /// `audit_out_of_space_inside_a_later_function_prologue`: every panic this
   /// finds is the `debug_assert_eq!(self.st.prolog_size, size)` in
   /// `emit_instructions`, and every program that trips it has more than one
   /// local function. The single-function programs in the list are clean.
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_no_capacity_makes_the_emitter_panic() {
     let programs: Vec<Vec<Insn>> = vec![
       vec![movi(0, 42), exit()],
-      // Signed division, whose two rel8 back-patches are the shape the C gets
-      // out of bounds.
+      // Signed division, whose two rel8 back-patches are the shape that lands
+      // out of bounds when the buffer ends between emitting the branch and
+      // patching it.
       vec![insn(cls::ALU64 | alu::DIV, 1, 0, 1, -1), exit()],
       vec![insn(cls::ALU | alu::MOD, 1, 0, 1, -1), exit()],
       // A fetching atomic, whose loop branch is computed from `offset`.
@@ -4332,7 +4689,7 @@ mod tests {
       let code = Insn::encode_all(insns);
       let n = insns.len();
       for capacity in 0..900usize {
-        for (name, config) in config_sweep(Target::X86_64) {
+        for (name, config) in sweep(Target::X86_64) {
           let code = code.clone();
           let ids = vec![7u32; n];
           let hints = vec![abi::region::UNKNOWN; n];
@@ -4370,11 +4727,10 @@ mod tests {
   /// A branch whose target is the *second slot of an `lddw`*.
   ///
   /// That slot is never given a `pc_locs` entry — the driver skips past it — so
-  /// both backends resolve the branch against a zero slot and retarget it to
-  /// offset 0 of the emitted function, which is the per-function prologue. The
-  /// two agree, so the differential says nothing; what matters is whether such
-  /// a program can load at all.
-  #[cfg(feature = "oracle")]
+  /// the branch resolves against a zero slot and is retargeted to offset 0 of
+  /// the emitted function, which is the per-function prologue. Stable bytes say
+  /// nothing about that; what matters is whether such a program can load at
+  /// all.
   #[test]
   fn audit_a_branch_into_the_middle_of_an_lddw() {
     let insns = [
@@ -4386,30 +4742,27 @@ mod tests {
       exit(),
     ];
     let code = Insn::encode_all(&insns);
-    let loads =
-      crate::jit::Translator::load(std::sync::Arc::new(oracle_config_for_x86()), &code).is_ok();
-    // Whatever the answer, the two backends must agree about the bytes.
+    let loads = Translator::load(Arc::new(production_config()), &code).is_ok();
+    // Whatever the answer, the emitted bytes are pinned.
     check(&code, &plain_inputs(insns.len()));
     assert!(
       !loads,
-      "a branch into the second slot of an `lddw` loaded; both backends then \
-       resolve it against pc_locs[3] == 0 and jump to offset 0 of the function, \
+      "a branch into the second slot of an `lddw` loaded; the branch is then \
+       resolved against pc_locs[3] == 0 and jumps to offset 0 of the function, \
        which re-runs the per-function prologue"
     );
   }
 
   /// Configurations the sweep never builds.
   ///
-  /// `config_sweep` fixes six points in a space with rather more dimensions
+  /// [`sweep`] fixes six points in a space with rather more dimensions
   /// than that: it never turns the external dispatcher off, never sets
   /// `native_frame_base` or `frame_constants` while the cage is *disabled*,
   /// and only ever tries one unwind index. Each of those changes what is
   /// emitted, or what is emitted around it.
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_configurations_outside_the_sweep() {
-    use crate::jit::Config;
-    let base = crate::jit::oracle::oracle_config(Target::X86_64);
+    let base = base_config(Target::X86_64);
 
     let mut configs: Vec<(String, Config)> = Vec::new();
 
@@ -4445,8 +4798,8 @@ mod tests {
       ));
     }
 
-    // Unwind indices other than 3, including the two that collide with uBPF's
-    // own "unset" sentinel once it has been narrowed to an `int`.
+    // Unwind indices other than 3, including the two that collide with the
+    // "unset" sentinel once it has been narrowed to an `int`.
     for idx in [0u32, 1, 63, 64, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff] {
       configs.push((
         format!("unwind index {idx:#x}"),
@@ -4514,6 +4867,8 @@ mod tests {
     ];
     let mut emitted = 0usize;
     let mut refused: Vec<String> = Vec::new();
+    let mut digest = golden::SweepDigest::new();
+    arm_flush();
     for insns in &programs {
       let code = Insn::encode_all(insns);
       let n = insns.len();
@@ -4527,15 +4882,16 @@ mod tests {
           start_pc: 0,
           end_pc: n,
         };
-        let d = diff(config, &code, &inputs, 262_144);
-        assert!(d.is_same(), "config {name:?} disagrees\n{d}\n{insns:#?}");
-        if matches!(d, crate::jit::oracle::Diff::Same { .. }) {
+        let out = emit_outcome(config, &code, &inputs);
+        if out.is_ok() {
           emitted += 1;
         } else {
-          refused.push(format!("{name}: {d}"));
+          refused.push(format!("{name}: {out:?}"));
         }
+        digest.add(&out);
       }
     }
+    digest.finish("audit_configurations_outside_the_sweep", Target::X86_64);
     // Agreement about a refusal is not agreement about the emitted code.
     assert!(
       emitted * 2 >= programs.len() * configs.len(),
@@ -4552,7 +4908,6 @@ mod tests {
   /// Every existing test program is a handful of instructions; the randomised
   /// sweep caps at 25. Nothing checks that a function whose emitted body runs to
   /// tens of kilobytes still resolves its relocations identically.
-  #[cfg(feature = "oracle")]
   #[test]
   fn audit_a_large_function_matches() {
     let mut insns = Vec::new();
@@ -4611,23 +4966,17 @@ mod tests {
       ..Default::default()
     };
     let capacity = 8 * 1024 * 1024;
-    for (name, config) in config_sweep(Target::X86_64) {
-      let d = diff(&config, &code, &inputs, capacity);
-      assert!(d.is_same(), "large function disagrees under {name:?}\n{d}");
+    for (name, config) in sweep(Target::X86_64) {
       assert!(
-        matches!(d, crate::jit::oracle::Diff::Same { len } if len > 30_000),
+        check_one(&slug(name), &config, &code, &inputs, capacity),
+        "the large function did not translate under {name:?}"
+      );
+      let len = emitted_len(&config, &code, &inputs, capacity);
+      assert!(
+        len > 30_000,
         "the large program did not translate into a large function under \
-         {name:?}: {d}"
+         {name:?}: {len} bytes"
       );
     }
-  }
-
-  #[cfg(feature = "oracle")]
-  fn oracle_config_for_x86() -> crate::jit::Config {
-    config_sweep(Target::X86_64)
-      .into_iter()
-      .find(|(name, _)| *name == "production")
-      .expect("the sweep has a production configuration")
-      .1
   }
 }

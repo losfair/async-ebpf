@@ -27,11 +27,10 @@ fn sub64_reg(dst: u8, src: u8) -> Insn {
   Insn::raw(EBPF_OP_SUB64_REG, dst, src, 0, 0)
 }
 
-/// `lddw` names `BPF_REG_10` as a legal destination in the opcode filter table
-/// (`_ubpf_instruction_filter`), so the only thing refusing `lddw r10, imm64`
-/// is `validate()`'s `store` rule. If it ever stopped doing so the guest would
-/// choose `R15` outright and every Tier F access would be an arbitrary host
-/// access.
+/// The opcode filter table names `R10` as a legal destination for `lddw`, so
+/// the only thing refusing `lddw r10, imm64` is `validate`'s `store` rule. If
+/// it ever stopped doing so the guest would overwrite the native frame pointer
+/// outright and every frame access would become an arbitrary host access.
 #[tokio::test]
 async fn lddw_into_the_frame_pointer_is_refused() {
   let code = vec![
@@ -45,11 +44,11 @@ async fn lddw_into_the_frame_pointer_is_refused() {
 }
 
 /// A conditional jump reads its *destination* as a value, and the opcode filter
-/// names `BPF_REG_10` as a legal destination for every one of them. Only
-/// `validate()`'s `store` rule refuses it - the pre-switch rewrite in
-/// `translate_range` materializes the guest frame pointer for a `src` operand
-/// and never for a `dst` one, so `if r10 == imm goto ...` would compare the
-/// *native* `R15` and hand the guest a host-address oracle one bit at a time.
+/// names `R10` as a legal destination for every one of them. Only `validate`'s
+/// `store` rule refuses it - the pre-switch rewrite in `translate_range`
+/// materializes the guest frame pointer for a `src` operand and never for a
+/// `dst` one, so `if r10 == imm goto ...` would compare the *native* frame
+/// pointer and leak a host address to the guest one bit at a time.
 #[tokio::test]
 async fn a_conditional_jump_cannot_name_the_frame_pointer_as_its_destination() {
   // (name, opcode) over the JMP and JMP32 encodings, immediate and register.

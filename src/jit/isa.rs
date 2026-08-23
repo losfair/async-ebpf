@@ -1,14 +1,17 @@
 //! eBPF instruction encoding, decoded exactly once.
 //!
-//! The C runtime decodes the opcode byte independently in `validate()`, in the
-//! interpreter, and in each JIT backend's `switch`, and every one of those ends
-//! in a `default:` label. Adding an opcode there means remembering three places.
-//! Here there is one [`Op`] enum and one [`Insn::op`], and every consumer
-//! `match`es it without a catch-all arm, so an opcode added to the ISA is a
-//! compile error everywhere it must be handled.
+//! The obvious shape for this is a raw opcode byte that [`validate`], the
+//! interpreter and each backend switch on independently, each ending in a
+//! catch-all arm. Then adding an opcode means remembering every one of those
+//! places, and forgetting one is silent. Here there is a single [`Op`] enum and
+//! a single [`Insn::op`] that produces it, and every consumer `match`es it
+//! without a catch-all, so an opcode added to the enum is a compile error
+//! everywhere it must be handled.
 //!
-//! The numeric constants are the wire format and are reproduced from
-//! `vendor/ubpf/vm/ebpf.h`.
+//! [`validate`]: crate::jit::validate
+//!
+//! The numeric constants below are the eBPF wire format; the census in the tests
+//! pins the exact set of opcode bytes the decoder accepts.
 
 /// Number of eBPF general-purpose registers, `R0` through `R10`.
 pub const NUM_REGS: usize = 11;
@@ -203,9 +206,13 @@ impl Insn {
     self.opcode == opcode::CALL && self.src == 1
   }
 
-  /// Whether control can fall through to the next instruction. Only `exit`
-  /// cannot; an unconditional jump still "falls through" for the purposes uBPF
-  /// uses this for, matching `ubpf_instruction_has_fallthrough()`.
+  /// Whether control can fall through to the next instruction.
+  ///
+  /// Only `exit` cannot. An unconditional jump counts as falling through, which
+  /// is deliberately conservative rather than exact: the one caller asks this to
+  /// decide whether a local function entry needs a branch emitted around its
+  /// prologue, so a spurious yes costs one unreachable jump and a spurious no
+  /// would let control run into the prologue of the function that follows.
   pub const fn has_fallthrough(self) -> bool {
     self.opcode != opcode::EXIT
   }
@@ -530,13 +537,15 @@ impl Insn {
         //
         // That matters more than it looks. Clearing only the fetch bit — the
         // obvious reading — decodes every canonical selector correctly and then
-        // diverges on the non-canonical ones the C accepts. The validator's
-        // filter for 32-bit atomics bounds the immediate at `0..=255` rather
-        // than enumerating legal values, so any immediate whose dead middle
-        // bits are set still loads: `imm = 0x02` and `0x0f` mask to
-        // `ALU_OP_ADD`, `0x4e` to `OR`, `0xff` to `CMPXCHG`. A stricter decode
-        // here turns those into `UnknownInstruction` where the C emits code — a
-        // byte-level divergence, on inputs a fuzzer reaches quickly.
+        // rejects the non-canonical ones. Those reach here: `validate`'s filter
+        // for 32-bit atomics bounds the immediate at `0..=255` rather than
+        // enumerating legal values, so any immediate whose dead middle bits are
+        // set still loads. `imm = 0x02` and `0x0f` mask to `ALU_OP_ADD`, `0x4e`
+        // to `OR`, `0xff` to `CMPXCHG`. Reading only the high nibble is what
+        // keeps the decoder and the validator agreeing about which programs
+        // exist; a stricter decode here turns loadable programs into
+        // `UnknownInstruction` at translation time, on inputs a fuzzer reaches
+        // quickly.
         //
         // `imm = 0xe0` and `0xf0` are decoded the same way for consistency but
         // do not in fact reach a backend: `validate` refuses exchange and
@@ -668,11 +677,11 @@ mod tests {
 
   #[test]
   fn the_atomic_selector_is_the_high_nibble_and_ignores_the_middle_bits() {
-    // Regression. The C computes `fetch = imm & 1` and switches on
-    // `imm & 0xf0`, so bits 1-3 are dead. Decoding by clearing only the fetch
-    // bit gets every canonical selector right and then diverges on exactly the
-    // non-canonical ones the validator lets through for 32-bit atomics, where
-    // its filter bounds the immediate at 0..=255 instead of enumerating.
+    // Regression. The selector is `imm & 0xf0` and the fetch flag is `imm & 1`,
+    // so bits 1-3 are dead. Decoding by clearing only the fetch bit gets every
+    // canonical selector right and then rejects exactly the non-canonical ones
+    // the validator lets through for 32-bit atomics, where its filter bounds
+    // the immediate at 0..=255 instead of enumerating.
     let mk = |imm| Insn {
       opcode: opcode::ATOMIC32_STORE,
       dst: 1,
@@ -754,16 +763,16 @@ mod tests {
     assert!(local.is_local_call());
   }
 
-  /// The exact set of opcode bytes `vendor/ubpf/vm/ebpf.h` names, evaluated
-  /// from its `EBPF_OP_*` defines. All 119 are distinct — the header has no
-  /// aliases.
+  /// Every opcode byte the eBPF ISA defines, as 119 distinct values. Written
+  /// out rather than derived, so a change to the decoder has to be argued
+  /// against an independent list instead of against itself.
   ///
   /// Comparing against the set rather than against its cardinality is what
   /// makes a decode bug legible: a count-only check reports "112, expected 119"
   /// and leaves you guessing, where this names the twelve `ldx`/`stx`
   /// encodings that went missing and the five byte values that were accepted
-  /// but name nothing.
-  const C_NAMED_OPCODES: [u8; 119] = [
+  /// but define nothing.
+  const DEFINED_OPCODES: [u8; 119] = [
     0x04, 0x05, 0x06, 0x07, 0x0c, 0x0f, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1c, 0x1d, 0x1e, 0x1f, 0x24,
     0x25, 0x26, 0x27, 0x2c, 0x2d, 0x2e, 0x2f, 0x34, 0x35, 0x36, 0x37, 0x3c, 0x3d, 0x3e, 0x3f, 0x44,
     0x45, 0x46, 0x47, 0x4c, 0x4d, 0x4e, 0x4f, 0x54, 0x55, 0x56, 0x57, 0x5c, 0x5d, 0x5e, 0x5f, 0x61,
@@ -775,9 +784,9 @@ mod tests {
   ];
 
   #[test]
-  fn the_decoder_accepts_exactly_the_opcodes_the_c_header_names() {
+  fn the_decoder_accepts_exactly_the_defined_opcodes() {
     use std::collections::BTreeSet;
-    let named: BTreeSet<u8> = C_NAMED_OPCODES.into_iter().collect();
+    let named: BTreeSet<u8> = DEFINED_OPCODES.into_iter().collect();
     assert_eq!(named.len(), 119, "the reference set has a duplicate");
     let decoded: BTreeSet<u8> = (0u8..=255)
       .filter(|&b| Op::from_opcode(b).is_some())
@@ -793,7 +802,7 @@ mod tests {
       .collect();
     assert!(
       missing.is_empty() && extra.is_empty(),
-      "decoder disagrees with ebpf.h\n  named but rejected: {missing:?}\n  accepted but unnamed: {extra:?}"
+      "decoder disagrees with the ISA\n  defined but rejected: {missing:?}\n  accepted but undefined: {extra:?}"
     );
   }
 
@@ -801,11 +810,11 @@ mod tests {
   fn the_mode_field_is_three_bits_wide() {
     // Regression: masking the mode with 0xc0 instead of 0xe0 still recognises
     // MEMSX and ATOMIC, because their values happen to fit, but silently
-    // rejects every plain ldx/stx and accepts five byte values that name
+    // rejects every plain ldx/stx and accepts five byte values that define
     // nothing. The census above catches it; this pins the cause.
     assert_eq!(mode::MEM & mode::MASK, mode::MEM);
     assert_eq!(0x61 & mode::MASK, mode::MEM, "ldxw must decode as MEM");
-    assert_eq!(0xa1 & mode::MASK, 0xa0, "0xa1 names no mode");
+    assert_eq!(0xa1 & mode::MASK, 0xa0, "0xa1 is not a defined mode");
     assert_eq!(Op::from_opcode(0xa1), None);
     assert_eq!(Op::from_opcode(0xe3), None);
   }
