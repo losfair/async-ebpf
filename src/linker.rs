@@ -323,6 +323,26 @@ mod tests {
   }
 
   #[test]
+  fn a_long_call_chain_is_rejected_without_overflowing_the_host_stack() {
+    // The depth cap has to bound the *descent*, not just the height reported on
+    // the way back up. A chain this long is still under `MAX_INSTS`, so it is a
+    // program the loader is willing to consider, and validation runs on
+    // whatever thread called `load` - a 2 MiB Tokio worker, typically. Run it on
+    // a deliberately small stack so a regression aborts here rather than
+    // depending on the test harness's default.
+    let code = local_call_chain(32767);
+    let handle = std::thread::Builder::new()
+      .stack_size(256 * 1024)
+      .spawn(move || validate_local_call_graph(&code).unwrap_err())
+      .unwrap();
+    let err = handle.join().unwrap();
+    assert!(
+      err.contains("exceeds max"),
+      "unexpected validation error: {err}"
+    );
+  }
+
+  #[test]
   fn local_call_graph_rejects_recursion() {
     let mut code = Vec::new();
     code.extend_from_slice(&local_call(0, 2));

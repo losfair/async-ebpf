@@ -205,13 +205,33 @@ fn insn_src(code: &[u8], pc: usize) -> u8 {
   code[pc * 8 + 1] >> 4
 }
 
+/// Depth-first walk of the local call graph, returning the height of the
+/// subtree rooted at `func_index` in frames.
+///
+/// `depth` is how many frames are already on the chain above this call,
+/// counting this one - i.e. the root is visited at `depth == 1`. It is checked
+/// *before* descending any further, which is what bounds this function's own
+/// native recursion. Checking only the height on the way back up would leave
+/// the descent bounded by the graph, not by [`MAX_LOCAL_CALL_DEPTH`], and a
+/// program is free to chain `MAX_INSTS / 2` functions together - enough to
+/// overflow the host stack of the thread that happens to be loading it before
+/// the depth is ever reported. The height check below stays as well: it is what
+/// produces the diagnostic, and it catches a chain that the memo table let us
+/// skip descending through.
 fn visit_local_call_graph(
   edges: &[Vec<usize>],
   starts: &[usize],
   states: &mut [u8],
   depths: &mut [usize],
   func_index: usize,
+  depth: usize,
 ) -> Result<usize, String> {
+  if depth > MAX_LOCAL_CALL_DEPTH {
+    return Err(format!(
+      "local function call graph depth ({depth}) exceeds max ({MAX_LOCAL_CALL_DEPTH})"
+    ));
+  }
+
   match states[func_index] {
     1 => {
       return Err(format!(
@@ -227,7 +247,8 @@ fn visit_local_call_graph(
   let mut max_depth = 1;
 
   for &callee_index in &edges[func_index] {
-    let callee_depth = visit_local_call_graph(edges, starts, states, depths, callee_index)?;
+    let callee_depth =
+      visit_local_call_graph(edges, starts, states, depths, callee_index, depth + 1)?;
     let candidate_depth = callee_depth + 1;
     if candidate_depth > MAX_LOCAL_CALL_DEPTH {
       return Err(format!(
@@ -296,7 +317,7 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
   let mut states = vec![0u8; starts.len()];
   let mut depths = vec![0usize; starts.len()];
   for func_index in 0..starts.len() {
-    visit_local_call_graph(&edges, &starts, &mut states, &mut depths, func_index)?;
+    visit_local_call_graph(&edges, &starts, &mut states, &mut depths, func_index, 1)?;
   }
 
   // Live-in masks, bottom-up: a caller's mask depends on its callees'.
