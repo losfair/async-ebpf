@@ -294,9 +294,17 @@ impl Translator {
     let mut local_func_entries = vec![false; insns.len()].into_boxed_slice();
     for (i, insn) in insns.iter().enumerate() {
       if insn.is_local_call() {
-        // `validate` has already established the target is in range.
-        let target = (i as i64 + insn.imm as i64 + 1) as usize;
-        local_func_entries[target] = true;
+        // `validate` establishes that the target is in range, but this must not
+        // depend on that: a permissive validator, or a future one that reports
+        // the problem differently, would otherwise turn a bad program into an
+        // out-of-bounds index here rather than a rejection.
+        let target = i as i64 + insn.imm as i64 + 1;
+        if target < 0 || target as usize >= local_func_entries.len() {
+          return Err(LoadError(format!(
+            "local call at pc {i} targets {target}, outside the program"
+          )));
+        }
+        local_func_entries[target as usize] = true;
       }
     }
 
