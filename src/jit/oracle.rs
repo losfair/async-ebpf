@@ -57,20 +57,15 @@ impl COracle {
       ubpf_sys::ubpf_set_frame_constants(vm, config.frame_constants);
 
       if let (Some(dispatcher), Some(validate)) = (config.dispatcher, config.dispatcher_validate) {
+        // No transmute for the dispatcher: `super::Dispatcher` is declared to
+        // match `external_function_dispatcher_t` exactly, so passing it
+        // directly is what type-checks that claim on every build. It was
+        // originally written as a transmute, which is precisely why an
+        // argument-order error in the declaration survived to be caught by a
+        // compiler diagnostic elsewhere rather than here.
         let rc = ubpf_sys::ubpf_register_external_dispatcher(
           vm,
-          Some(std::mem::transmute::<
-            super::Dispatcher,
-            unsafe extern "C" fn(
-              u64,
-              u64,
-              u64,
-              u64,
-              u64,
-              ::std::os::raw::c_uint,
-              *mut std::ffi::c_void,
-            ) -> u64,
-          >(dispatcher)),
+          Some(dispatcher),
           Some(std::mem::transmute::<
             super::DispatcherValidate,
             unsafe extern "C" fn(u32, *const ubpf_sys::ubpf_vm) -> bool,

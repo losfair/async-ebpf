@@ -3458,4 +3458,38 @@ mod tests {
     insns.push(exit());
     check_prog(&insns);
   }
+
+  // -----------------------------------------------------------------------
+  // Adversarial audit additions
+  // -----------------------------------------------------------------------
+
+  /// A two-function range, translated into every capacity from nothing up to
+  /// well past the second function's prologue.
+  ///
+  /// `out_of_space_is_reported_identically` only ever translates a *single*
+  /// function, so the second per-function prologue — and the
+  /// `debug_assert_eq!(self.st.prolog_size, size)` that guards it — is never
+  /// reached with a buffer that runs out inside it.
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn audit_out_of_space_inside_a_later_function_prologue() {
+    let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
+    let code = Insn::encode_all(&insns);
+    let ids = [1u32, 2, 3, 4];
+    let inputs = TranslationInputs {
+      resolver_ids: &ids,
+      start_pc: 0,
+      end_pc: insns.len(),
+      ..Default::default()
+    };
+    for capacity in 0..420usize {
+      for (name, config) in config_sweep(Target::X86_64) {
+        let d = diff(&config, &code, &inputs, capacity);
+        assert!(
+          d.is_same(),
+          "capacity {capacity} under {name:?} disagrees\n{d}"
+        );
+      }
+    }
+  }
 }
