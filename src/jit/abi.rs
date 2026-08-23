@@ -139,17 +139,11 @@ pub const LOCAL_FUNCTION_STACK_SIZE: u16 = 4096;
 /// Maximum eBPF call depth permitted.
 pub const MAX_CALL_DEPTH: u32 = 8;
 
-/// Total guest stack `UBPF_EBPF_STACK_SIZE` describes.
+/// Total guest stack across a maximally deep call chain.
 pub const EBPF_STACK_SIZE: u32 = MAX_CALL_DEPTH * LOCAL_FUNCTION_STACK_SIZE as u32;
 
 /// Maximum instructions in a single loaded program.
 pub const MAX_INSTS: u32 = 65536;
-
-/// Maximum registered external helper functions.
-pub const MAX_EXT_FUNCS: u32 = 64;
-
-/// Callee-saved eBPF registers `R6`-`R9`, in bytes.
-pub const NONVOLATILE_SIZE: u32 = 8 * 5;
 
 #[cfg(test)]
 mod tests {
@@ -206,15 +200,9 @@ mod tests {
     // The instruction ceiling a loaded program may not reach: 65536 is refused,
     // 65535 is accepted.
     //
-    // The same number is reused as the per-patch-table ceiling, but not for the
-    // reason it looks like: a fixup is not one per instruction. A single helper
-    // call emits three jump fixups, so roughly 21,800 helper calls cross the
-    // ceiling in a program comfortably inside the instruction limit. See
+    // The same number is reused as the per-patch-table ceiling, so no program
+    // the loader accepts can need more fixups than the tables allow. See
     // `patch::MAX_JUMPS`.
     assert_eq!(MAX_INSTS, 65536);
-
-    // Helper indices run 0..64, which is what makes the helper address table a
-    // fixed-size block the emitted code can index without a bounds check.
-    assert_eq!(MAX_EXT_FUNCS, 64);
   }
 }

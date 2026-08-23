@@ -27,8 +27,6 @@ pub enum Progress {
   Ok,
   TooManyJumps,
   TooManyLoads,
-  TooManyLeas,
-  TooManyLocalCalls,
   NotEnoughSpace,
   UnexpectedInstruction,
   UnknownInstruction,
@@ -63,9 +61,6 @@ impl Progress {
       Progress::NotEnoughSpace => return Some(TranslateError::OutOfSpace),
       Progress::TooManyJumps => "Too many jump instructions",
       Progress::TooManyLoads => "Too many load instructions",
-      // "calculations", not "instructions", in both backends' wording.
-      Progress::TooManyLeas => "Too many LEA calculations",
-      Progress::TooManyLocalCalls => "Too many local calls",
       // Set at detection; see above.
       Progress::UnexpectedInstruction
       | Progress::UnknownInstruction
@@ -79,29 +74,23 @@ impl Progress {
   }
 }
 
-/// A control-flow target whose location is not yet known.
+/// A branch target whose location is not yet known.
+///
+/// uBPF also had an `enter`, an `exit` and an `unwind` stub a branch could name.
+/// None of them survives function-granular translation: each buffer holds one
+/// local function, whose prologue and epilogue are emitted inline, so every
+/// branch a backend records lands either on an eBPF instruction in the same
+/// buffer or on a native offset it has already emitted.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PatchTarget {
-  /// One of the generated stubs, whose offset the state records.
-  Special(SpecialTarget),
   /// An eBPF instruction, located through `pc_locs`.
   EbpfPc { pc: u32, near: bool },
   /// A native offset already known at emission time, bypassing `pc_locs`.
   JitOffset { offset: u32, near: bool },
 }
 
-/// The generated stubs a patchable target can name.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum SpecialTarget {
-  Exit,
-  Enter,
-  Retpoline,
-  ExternalDispatcher,
-  LoadHelperTable,
-}
-
-/// One deferred fixup: a location in the emitted stream, and how to compute what
-/// belongs there.
+/// One deferred branch fixup: a location in the emitted stream, and how to
+/// compute what belongs there.
 #[derive(Copy, Clone, Debug)]
 pub struct PatchableRelative {
   /// Where in the emitted stream the resolved target is written.
@@ -111,10 +100,10 @@ pub struct PatchableRelative {
 
 /// The scratch state for one translation.
 ///
-/// The four patch tables are `Vec`s and grow on demand, so nothing here forces
-/// a `TooMany*` failure by running out of room. The limits are still enforced
-/// explicitly — see [`MAX_JUMPS`] and friends — because which programs the JIT
-/// accepts is a property callers depend on, and dropping the ceilings just
+/// Both patch tables are `Vec`s and grow on demand, so nothing here forces a
+/// `TooMany*` failure by running out of room. The limits are still enforced
+/// explicitly — see [`MAX_JUMPS`] and [`MAX_LOADS`] — because which programs the
+/// JIT accepts is a property callers depend on, and dropping the ceilings just
 /// because the storage no longer needs them would quietly widen it.
 pub struct JitState<'a> {
   /// The output buffer. Writes past its end set [`Progress::NotEnoughSpace`]
@@ -127,25 +116,17 @@ pub struct JitState<'a> {
   /// Native offset of each eBPF instruction, indexed by absolute pc.
   pub pc_locs: Vec<u32>,
 
-  pub exit_loc: u32,
-  pub entry_loc: u32,
-  pub unwind_loc: u32,
-  pub retpoline_loc: u32,
   /// Offset of the slot holding the external dispatcher's address.
   pub dispatcher_loc: u32,
-  /// Offset of the consecutive helper address table.
-  pub helper_table_loc: u32,
 
   pub status: Progress,
 
   pub jumps: Vec<PatchableRelative>,
-  pub loads: Vec<PatchableRelative>,
-  pub leas: Vec<PatchableRelative>,
-  pub local_calls: Vec<PatchableRelative>,
-
-  pub stack_size: u32,
-  /// Bytes emitted at the start of the function, before the first instruction.
-  pub prolog_size: usize,
+  /// Sites reading the dispatcher slot PC-relatively, as emitted offsets. The
+  /// slot is the only thing either backend loads this way, so unlike a jump a
+  /// load fixup has no target to record — uBPF's second load target, the
+  /// per-index helper table, went with the table itself.
+  pub loads: Vec<u32>,
 
   /// State of the open access group, if any.
   ///
@@ -190,20 +171,22 @@ pub struct OpenGroup {
 /// `TooMany*` error.
 ///
 /// [`MAX_INSTS`](super::abi::MAX_INSTS) — 65,536 — rather than a round number of
-/// the tables' own. It is a real limit and not a formality: a fixup is not one
-/// per instruction, because each helper call emits three jump fixups on its own,
-/// so around 21,800 helper calls cross the ceiling, and a program that size is
-/// comfortably inside the instruction limit.
+/// the tables' own, so no program the loader accepts can need more fixups than
+/// the ceiling allows.
 ///
-/// That is also why the exact value matters. An earlier version used `1 << 20`,
-/// sixteen times higher, which changed nothing about the bytes emitted for any
-/// program that compiled and everything about which programs compiled at all —
-/// the kind of difference a test that compares generated code cannot see, and
-/// only a test that loads an oversized program will.
+/// This used to bind. A helper call emitted three jump fixups of its own — the
+/// branch past the default dispatcher, the branch past the external one, and
+/// the retpoline call — so around 21,800 helper calls crossed the ceiling in a
+/// program comfortably inside the instruction limit. With the per-index helper
+/// table gone a helper call emits none, and what is left is roughly one fixup
+/// per branch instruction.
+///
+/// The exact value still matters. An earlier version used `1 << 20`, sixteen
+/// times higher, which changed nothing about the bytes emitted for any program
+/// that compiled and everything about which programs compiled at all — the kind
+/// of difference a test that compares generated code cannot see.
 pub const MAX_JUMPS: usize = super::abi::MAX_INSTS as usize;
 pub const MAX_LOADS: usize = super::abi::MAX_INSTS as usize;
-pub const MAX_LEAS: usize = super::abi::MAX_INSTS as usize;
-pub const MAX_LOCAL_CALLS: usize = super::abi::MAX_INSTS as usize;
 
 impl<'a> JitState<'a> {
   /// Prepares the scratch state for one translation.
@@ -214,23 +197,14 @@ impl<'a> JitState<'a> {
     Self {
       buf,
       offset: 0,
-      // One slot longer than the program: a jump to the instruction one past
-      // the end - which `exit` fixups use - has to have somewhere to record
-      // its native offset.
+      // One slot longer than the program, matching `group_barrier` below: the
+      // instruction one past the end is named by anything that reasons about
+      // what follows the last one.
       pc_locs: vec![0; num_insts + 1],
-      exit_loc: 0,
-      entry_loc: 0,
-      unwind_loc: 0,
-      retpoline_loc: 0,
       dispatcher_loc: 0,
-      helper_table_loc: 0,
       status: Progress::Ok,
       jumps: Vec::new(),
       loads: Vec::new(),
-      leas: Vec::new(),
-      local_calls: Vec::new(),
-      stack_size: 0,
-      prolog_size: 0,
       group: None,
       group_barrier: vec![false; num_insts + 1],
     }
@@ -300,10 +274,8 @@ impl<'a> JitState<'a> {
       // theory that the final size report should say how much room would have
       // been needed. That is wrong:
       // `offset` is what the emitters measure spans with, so a failed emit that
-      // moves it corrupts every later measurement taken from it. Concretely, a
-      // buffer that runs out inside a *second* function's prologue then
-      // produced a partial `prolog_size`, tripping a debug assertion instead of
-      // reporting `OutOfSpace`.
+      // moves it corrupts every later measurement taken from it, and the
+      // reported byte count stops describing the bytes actually written.
       self.fail(Progress::NotEnoughSpace);
       return;
     }
@@ -346,39 +318,20 @@ impl<'a> JitState<'a> {
     self.jumps.push(PatchableRelative { offset_loc, target });
   }
 
-  /// Records a deferred load fixup.
-  pub fn note_load(&mut self, offset_loc: u32, target: PatchTarget) {
+  /// Records a deferred fixup for a PC-relative read of the dispatcher slot.
+  pub fn note_load(&mut self, offset_loc: u32) {
     if self.loads.len() >= MAX_LOADS {
       self.fail(Progress::TooManyLoads);
       return;
     }
-    self.loads.push(PatchableRelative { offset_loc, target });
-  }
-
-  /// Records a deferred lea fixup.
-  pub fn note_lea(&mut self, offset_loc: u32, target: PatchTarget) {
-    if self.leas.len() >= MAX_LEAS {
-      self.fail(Progress::TooManyLeas);
-      return;
-    }
-    self.leas.push(PatchableRelative { offset_loc, target });
-  }
-
-  /// Records a deferred local-call fixup.
-  pub fn note_local_call(&mut self, offset_loc: u32, target: PatchTarget) {
-    if self.local_calls.len() >= MAX_LOCAL_CALLS {
-      self.fail(Progress::TooManyLocalCalls);
-      return;
-    }
-    self
-      .local_calls
-      .push(PatchableRelative { offset_loc, target });
+    self.loads.push(offset_loc);
   }
 
   /// Retargets every jump fixup that was emitted at `src` to `target`.
   ///
   /// Used where a jump is emitted before its real destination is known — the
-  /// `exit` path retargets to the unwind stub once it has been placed.
+  /// jump around a following function's prologue is placed before the prologue
+  /// it has to clear.
   pub fn retarget_jumps(&mut self, src: u32, target: PatchTarget) {
     for entry in &mut self.jumps {
       if entry.offset_loc == src {
@@ -510,14 +463,23 @@ mod tests {
     let mut state = JitState::new(&mut buf, 2);
     state.note_jump(4, PatchTarget::EbpfPc { pc: 1, near: false });
     state.note_jump(8, PatchTarget::EbpfPc { pc: 2, near: false });
-    state.retarget_jumps(8, PatchTarget::Special(SpecialTarget::Exit));
+    state.retarget_jumps(
+      8,
+      PatchTarget::JitOffset {
+        offset: 16,
+        near: false,
+      },
+    );
     assert_eq!(
       state.jumps[0].target,
       PatchTarget::EbpfPc { pc: 1, near: false }
     );
     assert_eq!(
       state.jumps[1].target,
-      PatchTarget::Special(SpecialTarget::Exit)
+      PatchTarget::JitOffset {
+        offset: 16,
+        near: false
+      }
     );
   }
 }
@@ -528,11 +490,9 @@ mod out_of_space_tests {
 
   /// Regression: a failed emit must not move `offset`.
   ///
-  /// The emitters measure spans - notably each function's prologue size - by
-  /// differencing `offset`. If a failed emit advances it, every later
-  /// measurement taken from it is wrong, and the symptom is a debug assertion
-  /// firing somewhere unrelated rather than a clean `OutOfSpace`.
-  ///
+  /// The emitters measure spans by differencing `offset`, and the final
+  /// `offset` is the byte count handed to the caller. If a failed emit advances
+  /// it, every later measurement taken from it is wrong.
   #[test]
   fn a_failed_emit_leaves_the_offset_where_it_was() {
     let mut buf = [0u8; 4];

@@ -25,6 +25,17 @@
 //! and on aarch64 that includes
 //! [`clear_instruction_cache`](crate::jit::clear_instruction_cache).
 //!
+//! # What was left behind
+//!
+//! The backends started as a port of uBPF's, which compiled a whole program at
+//! once into a buffer of its own. Nothing here does: the runtime compiles one
+//! local function at a time, calls every local callee through the lazy resolver
+//! and every helper through the registered dispatcher. So uBPF's whole-program
+//! entry and exit stubs, its unwind helper, its eagerly relocated local call,
+//! its per-index helper table and its constant blinding are all absent rather
+//! than merely unreachable — none of them had a caller, and carrying dead
+//! branches through a code generator is how the two backends drift apart.
+//!
 //! # Layout
 //!
 //! * [`isa`](crate::jit::isa) — the wire format and the one opcode decode.
@@ -126,12 +137,11 @@ pub struct Config {
   /// constants below the frame pointer. Enables access plans.
   pub frame_constants: bool,
 
-  /// Helper dispatch. Both must be set together or neither.
+  /// Helper dispatch. Both must be set together or neither. With neither,
+  /// [`validate`] refuses every helper call, so a translation that emits one has
+  /// a dispatcher by construction.
   pub dispatcher: Option<Dispatcher>,
   pub dispatcher_validate: Option<DispatcherValidate>,
-
-  /// Helper index whose zero return unwinds the whole program, or `None`.
-  pub unwind_helper_index: Option<u32>,
 
   /// Called to resolve a lazily-compiled local call target.
   pub local_call_resolver: Option<LocalCallResolver>,
@@ -149,7 +159,6 @@ impl Default for Config {
       // to say explicitly that it wants unchecked guest accesses.
       dispatcher: None,
       dispatcher_validate: None,
-      unwind_helper_index: None,
       local_call_resolver: None,
     }
   }
@@ -375,9 +384,12 @@ impl Translator {
     emit::translate(self, inputs, buffer)
   }
 
-  /// Translates the whole program, with no analysis inputs. Only used by tests;
-  /// the runtime always translates one function at a time, with hints and a
-  /// plan.
+  /// Translates the whole program, with no analysis inputs.
+  ///
+  /// A test convenience, and compiled only for tests: the runtime always
+  /// translates one function at a time, with hints and a plan, so shipping this
+  /// would be offering embedders a mode nothing here exercises.
+  #[cfg(test)]
   pub fn translate_all(&self, buffer: &mut [u8]) -> Result<usize, TranslateError> {
     let inputs = TranslationInputs {
       start_pc: 0,

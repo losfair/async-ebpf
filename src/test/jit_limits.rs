@@ -1,8 +1,10 @@
 //! aarch64 JIT relocation-range tests.
 //!
-//! Conditional branches on arm64 carry a signed 19-bit immediate (±1 MiB
-//! reach). A program large enough to push the exit stub past that must be
-//! refused rather than mis-encoded.
+//! `LDR` (literal) on arm64 carries a signed 19-bit word displacement (±1 MiB
+//! reach), the same reach a conditional branch has. The dispatcher slot every
+//! helper call reads sits in the trailer, past the whole instruction stream, so
+//! a program large enough pushes that load out of range — and must be refused
+//! rather than mis-encoded.
 //!
 //! These go through [`crate::jit::Translator`] directly rather than
 //! `ProgramLoader`, because the loader's own 1 MiB code buffer rejects
@@ -12,8 +14,8 @@
 //! translated, refused or not. The *bytes* either side of the same boundary are
 //! pinned separately, by the straddle tests in [`crate::jit::emit::aarch64`],
 //! which walk the last few sizes that fit and the first few that do not and
-//! record each one. Between them, a branch that stops encoding and a branch
-//! that encodes the wrong displacement are both caught.
+//! record each one. Between them, a fixup that stops encoding and a fixup that
+//! encodes the wrong displacement are both caught.
 
 use std::sync::Arc;
 
@@ -22,7 +24,7 @@ use crate::jit::{
   Config, Target, TranslateError, TranslationInputs, Translator,
 };
 
-const UNWIND_HELPER_INDEX: u32 = 1;
+const HELPER_INDEX: u32 = 1;
 
 const EBPF_OP_MOV64_IMM: u8 = 0xb7;
 const EBPF_OP_ATOMIC_STORE: u8 = 0xdb;
@@ -68,18 +70,17 @@ fn config(target: Target) -> Config {
     target,
     dispatcher: Some(stub_dispatcher),
     dispatcher_validate: Some(stub_validator),
-    unwind_helper_index: Some(UNWIND_HELPER_INDEX),
     ..Default::default()
   }
 }
 
-/// A call to the unwind helper makes the JIT emit a conditional branch to the
-/// exit stub, which is placed after the program body — so the branch has to
-/// span all of the filler. Each atomic add expands to several arm64
-/// instructions, putting the exit stub well past the ±1 MiB reach.
+/// A helper call makes the JIT emit a PC-relative load of the dispatcher slot,
+/// which is placed after the program body — so the load has to span all of the
+/// filler. Each atomic add expands to several arm64 instructions, putting the
+/// slot well past the ±1 MiB reach.
 fn oversized_program(filler: usize) -> Vec<Insn> {
   let mut prog = vec![
-    insn(opcode::CALL, 0, 0, 0, UNWIND_HELPER_INDEX as i32),
+    insn(opcode::CALL, 0, 0, 0, HELPER_INDEX as i32),
     insn(EBPF_OP_MOV64_IMM, 1, 0, 0, 0),
     insn(EBPF_OP_MOV64_IMM, 2, 0, 0, 0),
   ];
@@ -103,10 +104,10 @@ fn translate(target: Target, prog: &[Insn]) -> Result<usize, TranslateError> {
 }
 
 #[test]
-fn an_out_of_range_conditional_branch_is_refused() {
+fn an_out_of_range_pc_relative_load_is_refused() {
   let prog = oversized_program(65000);
   let err = translate(Target::Aarch64, &prog)
-    .expect_err("expected translation to fail for an out-of-range conditional branch");
+    .expect_err("expected translation to fail for an out-of-range PC-relative load");
   // The exact wording, not merely that something failed: it is what an
   // embedder sees, and it names which reach was exceeded.
   assert_eq!(
@@ -120,27 +121,27 @@ fn an_out_of_range_conditional_branch_is_refused() {
   );
 }
 
-/// The complement, so the test above is known to be measuring the branch range
+/// The complement, so the test above is known to be measuring the ±1 MiB reach
 /// and not merely that very large programs fail for some reason.
 #[test]
-fn a_program_just_inside_the_branch_range_still_translates() {
+fn a_program_just_inside_the_range_still_translates() {
   let prog = oversized_program(1000);
   let len =
     translate(Target::Aarch64, &prog).expect("a program well inside the range must translate");
   // ...and the two sizes really do sit either side of the reach rather than
   // both being far from it: this one fills a healthy fraction of the 1 MiB a
-  // conditional branch spans, so the refusal above is the boundary being
+  // PC-relative fixup spans, so the refusal above is the boundary being
   // crossed and not some unrelated cap.
   assert!(
     (1 << 14..1 << 20).contains(&len),
     "the in-range program emitted {len} bytes, which is no longer a useful \
-     distance below the 1 MiB conditional-branch reach"
+     distance below the 1 MiB PC-relative reach"
   );
 }
 
-/// x86_64 has a 32-bit displacement on conditional branches, so the same
-/// program that overflows arm64's 19-bit immediate translates fine there.
-/// Pins that the refusal is architecture-specific rather than a size cap.
+/// x86_64 reaches ±2 GiB with a rip-relative displacement, so the same program
+/// that overflows arm64's 19-bit immediate translates fine there. Pins that the
+/// refusal is architecture-specific rather than a size cap.
 #[test]
 fn the_same_program_translates_for_x86_64() {
   let prog = oversized_program(65000);

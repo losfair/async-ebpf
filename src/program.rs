@@ -2125,7 +2125,6 @@ fn jit_config(cage: &PointerCage) -> crate::jit::Config {
     frame_constants: true,
     dispatcher: Some(tls_dispatcher),
     dispatcher_validate: Some(std_validator),
-    unwind_helper_index: None,
     local_call_resolver: Some(tls_local_call_resolver),
   }
 }

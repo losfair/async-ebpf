@@ -30,13 +30,15 @@
 //!
 //! # What is not here
 //!
-//! Whole-program translation, the eager local call, and constant blinding.
-//! `translate_range` always translates one function at a time and always
-//! resolves local calls lazily, so none of them is reachable.
+//! uBPF's whole-program translation, its eagerly relocated local call, its
+//! constant blinding, its per-index helper table and its unwind helper.
+//! `translate_range` always translates one function at a time, always resolves
+//! local calls lazily, and always dispatches helpers through the registered
+//! dispatcher, so none of them has a live caller.
 
 use crate::jit::abi;
 use crate::jit::isa::{AluOp, AtomicOp, EndKind, Insn, JmpOp, Op, Source, Width};
-use crate::jit::patch::{JitState, OpenGroup, PatchTarget, Progress, SpecialTarget};
+use crate::jit::patch::{JitState, OpenGroup, PatchTarget, Progress};
 use crate::jit::{Config, PlanEntry, TranslateError, TranslationInputs, Translator};
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,6 @@ const R0: u32 = 0;
 const R2: u32 = 2;
 const R3: u32 = 3;
 const R5: u32 = 5;
-const R6: u32 = 6;
 const R8: u32 = 8;
 const R9: u32 = 9;
 const R16: u32 = 16;
@@ -75,9 +76,6 @@ const TEMP_STORE_VALUE_REGISTER: u32 = R9;
 const TEMP_DIV_REGISTER: u32 = R25;
 /// Temp register for load/store offsets.
 const OFFSET_REGISTER: u32 = R26;
-/// Special register for external dispatcher context. Aliases [`OFFSET_REGISTER`]
-/// here too.
-const VOLATILE_CTXT: u32 = R26;
 
 /// eBPF register to aarch64 register. `R0` is held in `R5` for the
 /// duration of the function and moved into the ABI return register only at the
@@ -107,10 +105,6 @@ fn unmap_register(native: u32) -> Option<u8> {
 /// `AddSubOpcode`, used as the two-bit `op` field at bit 29.
 mod addsub {
   pub const ADD: u32 = 0;
-  /// Present for completeness; nothing this entry point
-  /// reaches emits a flag-setting add.
-  #[allow(dead_code)]
-  pub const ADDS: u32 = 1;
   pub const SUB: u32 = 2;
   pub const SUBS: u32 = 3;
 }
@@ -160,9 +154,12 @@ mod br {
 }
 
 /// `UnconditionalBranchImmediateOpcode`.
+///
+/// `BL` is absent: the only PC-relative call uBPF emitted was the eager local
+/// call, and this backend reaches every callee through the lazy resolver's
+/// `BLR`.
 mod ubr {
   pub const B: u32 = 0x1400_0000;
-  pub const BL: u32 = 0x9400_0000;
 }
 
 const BR_BCOND: u32 = 0x5400_0000;
@@ -281,16 +278,12 @@ fn emit_loadstore_exclusive(st: &mut JitState, op: u32, rt: u32, rn: u32, rs: u3
   emit_instruction(st, op | (rs << 16) | (rn << 5) | rt);
 }
 
-/// PC-relative literal load; the displacement is patched later.
-fn emit_loadstore_literal(st: &mut JitState, op: u32, rt: u32, target: PatchTarget) {
-  note_load(st, target);
+/// PC-relative literal load of the dispatcher slot; the displacement is patched
+/// later.
+fn emit_dispatcher_slot_load(st: &mut JitState, op: u32, rt: u32) {
+  let at = st.offset;
+  st.note_load(at);
   emit_instruction(st, op | 0x0800_0000 | rt);
-}
-
-/// PC-relative address; the displacement is patched later.
-fn emit_adr(st: &mut JitState, target: PatchTarget, rd: u32) {
-  note_lea(st, target);
-  emit_instruction(st, 0x1000_0000 | rd);
 }
 
 /// C4.1.66 load/store register pair, offset form.
@@ -414,29 +407,12 @@ fn emit_movewide_immediate(st: &mut JitState, sixty_four: bool, rd: u32, imm: u6
 // Patch-table plumbing
 // ---------------------------------------------------------------------------
 
-fn note_load(st: &mut JitState, target: PatchTarget) {
-  let at = st.offset;
-  st.note_load(at, target);
-}
-
-fn note_lea(st: &mut JitState, target: PatchTarget) {
-  let at = st.offset;
-  st.note_lea(at, target);
-}
-
 /// C4.1.65 unconditional branch (immediate).
-/// A `BL` to a non-special target is a local call and goes in its own table, so
-/// that `resolve_local_calls` can subtract the per-function prologue from it.
 /// Returns the offset the instruction was emitted at, which is the handle
 /// [`emit_jump_target`] later retargets.
 fn emit_unconditionalbranch_immediate(st: &mut JitState, op: u32, target: PatchTarget) -> u32 {
   let source_offset = st.offset;
-  let is_local_call = op == ubr::BL && !matches!(target, PatchTarget::Special(_));
-  if is_local_call {
-    st.note_local_call(source_offset, target);
-  } else {
-    st.note_jump(source_offset, target);
-  }
+  st.note_jump(source_offset, target);
   emit_instruction(st, op);
   source_offset
 }
@@ -465,23 +441,6 @@ fn emit_jump_target(st: &mut JitState, jump_src: u32) {
 // ---------------------------------------------------------------------------
 // The pointer cage
 // ---------------------------------------------------------------------------
-
-/// Mask-and-offset the address in `src` into `dst`.
-/// Unreachable from this entry point — every caller of
-/// [`emit_masked_address_with_offset`] is already inside a `jit_pointer_mask`
-/// guard, so the fall-through that reaches this is dead. Kept for shape.
-fn emit_masked_address(cfg: &Config, st: &mut JitState, src: u32, dst: u32, scratch: u32) {
-  debug_assert_ne!(dst, scratch);
-  if src != dst {
-    emit_logical_register(st, true, log::ORR, dst, RZ, src);
-  }
-  if cfg.pointer_mask != 0 {
-    emit_movewide_immediate(st, true, scratch, cfg.pointer_mask as u32 as u64);
-    emit_logical_register(st, true, log::AND, dst, dst, scratch);
-    emit_movewide_immediate(st, true, scratch, cfg.pointer_offset as u64);
-    emit_addsub_register(st, true, addsub::ADD, dst, dst, scratch);
-  }
-}
 
 /// Bounds-check `[dst, dst+size)` against one guest region described by the
 /// memory descriptor, then translate `dst` to the native address.
@@ -762,10 +721,8 @@ fn emit_masked_address_with_offset(
     emit_logical_register(st, true, log::ORR, dst, RZ, saved_addr);
     emit_region_address(cfg, st, dst, scratch, size, &GUEST_DATA_REGION);
     emit_logical_register(st, true, log::ORR, dst, dst, stack_candidate);
-    return;
   }
-
-  emit_masked_address(cfg, st, dst, dst, scratch);
+  // With the cage off the guest address is used as-is, exactly as on x86_64.
 }
 
 /// Folds a group displacement into the address, since the load/store immediate
@@ -945,51 +902,22 @@ fn emit_masked_loadstore(
 // Calls
 // ---------------------------------------------------------------------------
 
-/// Call an external helper, through the registered dispatcher if there is one
-/// and through the per-index helper table otherwise.
+/// Call an external helper through the registered dispatcher, whose sixth and
+/// final argument is the helper index.
+///
+/// uBPF chose at *run* time between the dispatcher and a lookup in an embedded
+/// per-index helper table. This crate never registers individual helpers, and
+/// [`crate::jit::validate`] refuses a helper call when no dispatcher is
+/// configured — so a `call` only ever reaches here with a non-null slot, and the
+/// table, the runtime test and the branch around it are gone.
 fn emit_dispatched_external_helper_call(st: &mut JitState, idx: u32) {
   let stack_movement = align_to(8, 16);
   emit_addsub_immediate(st, true, addsub::SUB, SP, SP, stack_movement);
   emit_loadstore_immediate(st, ls::STRX, R30, SP, 0);
 
-  emit_loadstore_literal(
-    st,
-    ls::LDRL,
-    TEMP_REGISTER,
-    PatchTarget::Special(SpecialTarget::ExternalDispatcher),
-  );
+  emit_dispatcher_slot_load(st, ls::LDRL, TEMP_REGISTER);
 
-  // Is the dispatcher slot empty?
-  emit_addsub_immediate(st, true, addsub::SUBS, TEMP_REGISTER, TEMP_REGISTER, 0);
-
-  let default_tgt = PatchTarget::EbpfPc { pc: 0, near: false };
-  let external_dispatcher_jump_source = emit_conditionalbranch_immediate(st, cond::NE, default_tgt);
-
-  // No dispatcher: load the helper address by index out of the table.
   emit_movewide_immediate(st, true, R5, idx as u64);
-  emit_movewide_immediate(st, true, R6, 3);
-  emit_dataprocessing_twosource(st, true, dp2::LSLV, R5, R5, R6);
-
-  emit_movewide_immediate(st, true, TEMP_REGISTER, 0);
-  emit_adr(
-    st,
-    PatchTarget::Special(SpecialTarget::LoadHelperTable),
-    TEMP_REGISTER,
-  );
-  emit_addsub_register(st, true, addsub::ADD, TEMP_REGISTER, TEMP_REGISTER, R5);
-  emit_loadstore_immediate(st, ls::LDRX, TEMP_REGISTER, TEMP_REGISTER, 0);
-
-  // Add the implicit 6th parameter (the context).
-  emit_logical_register(st, true, log::ORR, R5, RZ, VOLATILE_CTXT);
-
-  let no_dispatcher_jump_source = emit_unconditionalbranch_immediate(st, ubr::B, default_tgt);
-
-  emit_jump_target(st, external_dispatcher_jump_source);
-
-  // Dispatcher path: the helper index is its sixth and final argument.
-  emit_movewide_immediate(st, true, R5, idx as u64);
-
-  emit_jump_target(st, no_dispatcher_jump_source);
 
   emit_unconditionalbranch_register(st, br::BLR, TEMP_REGISTER);
 
@@ -1227,7 +1155,7 @@ fn emit_atomic_operation(
 }
 
 // ---------------------------------------------------------------------------
-// Trailers
+// Trailer
 // ---------------------------------------------------------------------------
 
 /// Park the dispatcher's address, 4-byte aligned so the PC-relative load that
@@ -1240,16 +1168,6 @@ fn emit_dispatched_external_helper_address(st: &mut JitState, dispatcher_addr: u
   let helper_address = st.offset;
   st.emit_bytes(dispatcher_addr, 8);
   helper_address
-}
-
-/// The consecutive helper-address table. `async-ebpf` never
-/// registers individual helpers, so every entry is null.
-fn emit_helper_table(st: &mut JitState) -> u32 {
-  let helper_table_address_target = st.offset;
-  for _ in 0..abi::MAX_EXT_FUNCS {
-    st.emit_bytes(0, 8);
-  }
-  helper_table_address_target
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,45 +1359,22 @@ fn resolve_load_literal(st: &mut JitState, instr_offset: u32, target_offset: i32
   true
 }
 
-/// Patch an `ADR`.
-/// Only the `immhi` field is written; the two `immlo` bits at 30:29 are left
-/// clear, because the caller already divided the displacement by four. That is
-/// what callers depend on.
-fn resolve_adr(st: &mut JitState, instr_offset: u32, immediate: i32) -> bool {
-  if (immediate >> 18) != -1 && (immediate >> 18) != 0 {
-    st.fail(Progress::RelocationOutOfRange);
-    return false;
-  }
-  let immhi = ((immediate & 0x7ffff) as u32) << 5;
-  let instr = st.read_bytes(instr_offset, 4) as u32 | immhi;
-  st.patch_bytes(instr_offset, instr as u64, 4);
-  true
-}
-
-/// Resolve one patch target to a native offset, dispatching
-///.
-/// Decides between the two regular flavours with
+/// Resolve one branch target to a native offset.
+///
+/// uBPF decided between an eBPF pc and an already-known native offset with
 /// `jit_target_pc != 0` — a sentinel that would collide with a real offset of
 /// zero. It cannot here: offset 0 always holds the `bti c`, so nothing is ever
 /// patched to point at it. [`PatchTarget`] keeps the two apart by construction.
-fn jump_target_loc(st: &JitState, target: PatchTarget) -> Option<i32> {
+fn jump_target_loc(st: &JitState, target: PatchTarget) -> i32 {
   match target {
-    PatchTarget::Special(SpecialTarget::Exit) => Some(st.exit_loc as i32),
-    PatchTarget::Special(SpecialTarget::Enter) => Some(st.entry_loc as i32),
-    PatchTarget::Special(_) => None,
-    PatchTarget::JitOffset { offset, .. } => Some(offset as i32),
-    PatchTarget::EbpfPc { pc, .. } => {
-      Some(st.pc_locs.get(pc as usize).copied().unwrap_or(0) as i32)
-    }
+    PatchTarget::JitOffset { offset, .. } => offset as i32,
+    PatchTarget::EbpfPc { pc, .. } => st.pc_locs.get(pc as usize).copied().unwrap_or(0) as i32,
   }
 }
 
 fn resolve_jumps(st: &mut JitState) -> bool {
   for jump in std::mem::take(&mut st.jumps) {
-    let target_loc = match jump_target_loc(st, jump.target) {
-      Some(loc) => loc,
-      None => return false,
-    };
+    let target_loc = jump_target_loc(st, jump.target);
     let rel = target_loc.wrapping_sub(jump.offset_loc as i32);
     if !resolve_branch_immediate(st, jump.offset_loc, rel) {
       return false;
@@ -1488,55 +1383,15 @@ fn resolve_jumps(st: &mut JitState) -> bool {
   true
 }
 
+/// Dispatcher-slot loads. The slot is the only literal either backend reads;
+/// uBPF's second one, the per-index helper table, went with the table.
 fn resolve_loads(st: &mut JitState) -> bool {
-  for load in std::mem::take(&mut st.loads) {
-    // Right now it is only possible to load from the external dispatcher.
-    let target_loc = match load.target {
-      PatchTarget::Special(SpecialTarget::ExternalDispatcher) => st.dispatcher_loc as i32,
-      _ => return false,
-    };
-    let rel = target_loc.wrapping_sub(load.offset_loc as i32);
+  for at in std::mem::take(&mut st.loads) {
+    let rel = (st.dispatcher_loc as i32).wrapping_sub(at as i32);
     if rel % 4 != 0 {
       return false;
     }
-    if !resolve_load_literal(st, load.offset_loc, rel >> 2) {
-      return false;
-    }
-  }
-  true
-}
-
-fn resolve_leas(st: &mut JitState) -> bool {
-  for lea in std::mem::take(&mut st.leas) {
-    // Right now it is only possible to have leas to the helper table.
-    let target_loc = match lea.target {
-      PatchTarget::Special(SpecialTarget::LoadHelperTable) => st.helper_table_loc as i32,
-      _ => return false,
-    };
-    let rel = target_loc.wrapping_sub(lea.offset_loc as i32);
-    if rel % 4 != 0 {
-      return false;
-    }
-    if !resolve_adr(st, lea.offset_loc, rel >> 2) {
-      return false;
-    }
-  }
-  true
-}
-
-/// Local-call fixups. Always empty here: this entry point uses
-/// the lazy resolver, which calls through a register rather than a `BL`.
-fn resolve_local_calls(st: &mut JitState) -> bool {
-  for call in std::mem::take(&mut st.local_calls) {
-    let target_loc = match call.target {
-      PatchTarget::EbpfPc { pc, .. } => st.pc_locs.get(pc as usize).copied().unwrap_or(0) as i32,
-      // A local call must be eBPF PC-relative and cannot be special.
-      _ => return false,
-    };
-    let rel = target_loc
-      .wrapping_sub(call.offset_loc as i32)
-      .wrapping_sub(st.prolog_size as i32);
-    if !resolve_branch_immediate(st, call.offset_loc, rel) {
+    if !resolve_load_literal(st, at, rel >> 2) {
       return false;
     }
   }
@@ -1552,10 +1407,8 @@ fn failed(msg: impl Into<String>) -> TranslateError {
 }
 
 /// Translates `inputs.start_pc .. inputs.end_pc` into `buffer`, returning the
-/// number of bytes written.
-/// Port of `translate_range` with `whole_program = false, lazy_local_calls =
-/// true`, followed by the relocation passes
-/// translation runs.
+/// number of bytes written: the instruction stream, then the trailer, then the
+/// relocation passes over the fixups the two recorded.
 pub fn translate_range(
   t: &Translator,
   inputs: &TranslationInputs<'_>,
@@ -1619,17 +1472,9 @@ pub fn translate_range(
     }
 
     if i == 0 || t.is_local_func_entry(i) {
-      let prolog_start = st.offset;
       emit_movewide_immediate(&mut st, true, TEMP_REGISTER, t.stack_usage_for(i) as u64);
       emit_addsub_immediate(&mut st, true, addsub::SUB, SP, SP, 16);
       emit_loadstorepair_immediate(&mut st, lsp::STPX, TEMP_REGISTER, TEMP_REGISTER, SP, 0);
-      // Recorded so a local call can skip it. Every function's prologue is the
-      // same length, which the assertion below pins.
-      if st.prolog_size == 0 {
-        st.prolog_size = (st.offset - prolog_start) as usize;
-      } else {
-        debug_assert_eq!(st.prolog_size, (st.offset - prolog_start) as usize);
-      }
     }
 
     if fallthrough_jump_present {
@@ -1799,20 +1644,15 @@ pub fn translate_range(
       },
 
       Some(Op::Call) => {
-        let exit_tgt = PatchTarget::Special(SpecialTarget::Exit);
         if insn.src == 0 {
           emit_dispatched_external_helper_call(&mut st, insn.imm as u32);
-          let unwind = cfg.unwind_helper_index.map_or(-1i64, |x| x as i32 as i64);
-          if insn.imm as i64 == unwind {
-            emit_addsub_immediate(&mut st, true, addsub::SUBS, RZ, map_register(0), 0);
-            emit_conditionalbranch_immediate(&mut st, cond::EQ, exit_tgt);
-          }
         } else if insn.src == 1 {
-          // Always lazy from this entry point.
+          // Local calls are always resolved lazily; uBPF's eager, PC-relative
+          // one is not ported.
           emit_lazy_local_call(cfg, inputs, &mut st, i);
-        } else {
-          emit_unconditionalbranch_immediate(&mut st, ubr::B, exit_tgt);
         }
+        // A source field other than 0 or 1 emits nothing at all, as on x86_64.
+        // Unreachable: the validator bounds `call`'s source to 0..=1.
       }
 
       Some(Op::Exit) => {
@@ -1921,13 +1761,10 @@ pub fn translate_range(
     return Err(loop_error(st.status, errmsg));
   }
 
-  st.exit_loc = st.offset;
-  emit_addsub_immediate(&mut st, true, addsub::ADD, SP, SP, 16);
-  emit_unconditionalbranch_register(&mut st, br::RET, R30);
-
+  // No shared exit stub: every `EXIT` emits its own epilogue inline, and with
+  // uBPF's unwind helper gone nothing else branches to one.
   let dispatcher_addr = cfg.dispatcher.map_or(0u64, |d| d as usize as u64);
   st.dispatcher_loc = emit_dispatched_external_helper_address(&mut st, dispatcher_addr);
-  st.helper_table_loc = emit_helper_table(&mut st);
 
   // Everything above is emitted after the per-instruction error check, so an
   // overflow here would otherwise be reported as success — and a patch site
@@ -1940,11 +1777,7 @@ pub fn translate_range(
     });
   }
 
-  if !resolve_jumps(&mut st)
-    || !resolve_loads(&mut st)
-    || !resolve_leas(&mut st)
-    || !resolve_local_calls(&mut st)
-  {
+  if !resolve_jumps(&mut st) || !resolve_loads(&mut st) {
     return Err(if st.status == Progress::RelocationOutOfRange {
       failed(
         "Branch or load target out of range in the JIT'd code (the program is too large for \
@@ -1973,8 +1806,6 @@ fn loop_error(status: Progress, errmsg: Option<String>) -> TranslateError {
   match status {
     Progress::TooManyJumps => failed("Too many jump instructions."),
     Progress::TooManyLoads => failed("Too many load instructions."),
-    Progress::TooManyLeas => failed("Too many LEA calculations."),
-    Progress::TooManyLocalCalls => failed("Too many local calls."),
     Progress::UnexpectedInstruction => failed(errmsg.unwrap_or_else(|| {
       // The lazy local-call guard sets the status without a message.
       "Unexpected instruction or missing local-call resolver during JIT compilation".to_string()
@@ -2259,17 +2090,6 @@ mod tests {
           pointer_offset: 0x1_0000_0000,
           native_frame_base: true,
           frame_constants: true,
-          ..base.clone()
-        },
-      ),
-      (
-        "production + unwind helper",
-        Config {
-          pointer_mask: 0x0fff_ffff,
-          pointer_offset: 0x1_0000_0000,
-          native_frame_base: true,
-          frame_constants: true,
-          unwind_helper_index: Some(3),
           ..base
         },
       ),
@@ -2767,7 +2587,7 @@ mod tests {
   // -------------------------------------------------------------------------
 
   #[test]
-  fn helper_calls_including_the_unwind_index() {
+  fn helper_calls_at_several_indices() {
     let mut program = Vec::new();
     for idx in [0i32, 1, 3, 63] {
       program.push(insn(opcode::CALL, 0, 0, 0, idx));
@@ -3295,17 +3115,16 @@ mod tests {
 
   #[test]
   fn a_literal_load_straddling_one_mebibyte_is_pinned_either_side() {
-    // The dispatcher address and the helper table are parked after all the
-    // code, and a helper call reaches them with an LDR (literal) and an ADR -
-    // both signed 19-bit, so both stop reaching at 1 MiB.
+    // The dispatcher address is parked after all the code, and a helper call
+    // reaches it with an LDR (literal) — signed 19-bit, so it stops reaching at
+    // 1 MiB. It is the one fixup whose span grows with the whole function
+    // rather than with the distance between two instructions.
     let (_, config) = config_sweep(Target::Aarch64)
       .into_iter()
       .find(|(name, _)| *name == "cage only")
       .unwrap();
 
     let build = |n: usize| {
-      // `call 0` is not the unwind index in any sweep configuration, so no
-      // long branch to the epilogue competes with the literal load.
       let mut p = vec![insn(opcode::CALL, 0, 0, 0, 0)];
       p.extend(std::iter::repeat(filler()).take(n));
       p.push(exit());
@@ -3800,7 +3619,7 @@ mod tests {
         sweep_case(&mut digest, &config, &code, &inputs, capacity);
       }
     }
-    assert_eq!(digest.cases(), 64 * 6);
+    assert_eq!(digest.cases(), 64 * config_sweep(Target::Aarch64).len());
     finish_sweep(digest, "audit-escaping-jump-capacity");
   }
 
@@ -3836,7 +3655,7 @@ mod tests {
         sweep_case(&mut digest, &config, &code, &inputs, capacity);
       }
     }
-    assert_eq!(digest.cases(), 65 * 6);
+    assert_eq!(digest.cases(), 65 * config_sweep(Target::Aarch64).len());
     finish_sweep(digest, "audit-full-buffer-masks-a-later-error");
   }
 
@@ -4555,16 +4374,17 @@ mod tests {
     );
   }
 
-  /// AUDIT: the unwind helper emits a conditional branch to the epilogue, which
-  /// sits after all the code - a +-1 MiB reach the existing tests deliberately
-  /// avoid exercising ("call 0 is not the unwind index in any configuration").
+  /// AUDIT: the dispatcher-slot load again, under the configuration the runtime
+  /// actually uses. The pinned straddle above runs under "cage only", where the
+  /// filler expands to far fewer bytes per instruction — so it crosses 1 MiB at
+  /// a different program length, and a reach bug that only shows up at one of
+  /// the two would otherwise go unseen.
   #[test]
-  fn audit_the_unwind_branch_to_the_epilogue_straddles_one_mebibyte() {
+  fn audit_the_dispatcher_slot_load_straddles_one_mebibyte_in_production() {
     let (_, config) = config_sweep(Target::Aarch64)
       .into_iter()
-      .find(|(name, _)| *name == "production + unwind helper")
+      .find(|(name, _)| *name == "production")
       .unwrap();
-    assert_eq!(config.unwind_helper_index, Some(3));
 
     let build = |n: usize| {
       let mut p = vec![insn(opcode::CALL, 0, 0, 0, 3)];
@@ -4578,7 +4398,7 @@ mod tests {
     let boundary = (1 << 20) / per;
 
     straddle(
-      "unwind branch to the epilogue at 1 MiB",
+      "dispatcher slot load at 1 MiB, production",
       &config,
       boundary - 3..=boundary + 3,
       build,
@@ -4870,10 +4690,10 @@ mod tests {
   }
 
   /// AUDIT: every capacity from zero to just past the full output, for a
-  /// program that fills all four patch tables. The existing capacity test uses
-  /// six sizes and a two-instruction program, so it never lands inside the
-  /// epilogue, the dispatcher slot or the helper table - the places where a
-  /// truncated buffer is most likely to be handled badly.
+  /// program that fills both patch tables. The existing capacity test uses six
+  /// sizes and a two-instruction program, so it never lands inside the
+  /// dispatcher slot - where a truncated buffer is most likely to be handled
+  /// badly.
   #[test]
   fn audit_every_capacity_for_a_program_that_fills_the_patch_tables() {
     let insns = vec![

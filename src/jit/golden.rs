@@ -245,7 +245,6 @@ pub fn key(label: &str, config: &Config, code: &[u8], inputs: &TranslationInputs
     config.dispatcher.is_some() as u8,
     config.local_call_resolver.is_some() as u8,
   ]);
-  h.update(&config.unwind_helper_index.unwrap_or(u32::MAX).to_le_bytes());
   format!("{label}.{}", &h.finish()[..24])
 }
 

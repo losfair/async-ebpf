@@ -1,10 +1,11 @@
 //! The x86_64 backend.
 //!
-//! Translates one function at a time, which always reaches
-//! `translate_range(..., whole_program = false, lazy_local_calls = true)`. The
-//! whole-program entry point, the interpreter and constant blinding are not
-//! reachable and are not implemented; where the code branches on those they are
-//! folded away with a comment saying so.
+//! Translates one function at a time. uBPF's whole-program entry point, its
+//! interpreter, its constant blinding, its eagerly relocated local call, its
+//! per-index helper table and its unwind helper are all absent: the runtime
+//! compiles one local function on first call, dispatches every helper through
+//! the registered dispatcher, and calls every local callee through the lazy
+//! resolver, so none of them has a live caller.
 //!
 //! # Changing what this emits
 //!
@@ -17,21 +18,16 @@
 //!
 //! ```text
 //!   [per-function prologue]  push the callee's guest stack usage
-//!   [instruction stream]
-//!   exit_loc:  add rsp, 8 ; ret
+//!   [instruction stream]     each EXIT emits its own `add rsp, 8 ; ret`
 //!   retpoline
 //!   external dispatcher address     (8 bytes)
-//!   helper table                    (64 * 8 bytes)
 //! ```
-//!
-//! Everything after the instruction stream is emitted unconditionally, which is
-//! why even a two-instruction program is around 600 bytes.
 
 use crate::jit::abi;
 use crate::jit::isa::{
   cls, opcode, AluOp, AluWidth, AtomicOp, EndKind, Insn, JmpOp, Op, Source, Width,
 };
-use crate::jit::patch::{JitState, OpenGroup, PatchTarget, Progress, SpecialTarget};
+use crate::jit::patch::{JitState, OpenGroup, PatchTarget, Progress};
 use crate::jit::{Config, PlanEntry, TranslateError, TranslationInputs, Translator};
 
 // ---------------------------------------------------------------------------
@@ -157,9 +153,8 @@ const X64_ALU_OR: u8 = 0x09;
 const X64_ALU_AND: u8 = 0x21;
 const X64_ALU_XOR: u8 = 0x31;
 
-/// Entry point, which is
-/// `translate_range(..., whole_program = false, lazy_local_calls = true)`
-/// followed by `resolve_patchable_relatives`.
+/// Entry point: emit the instruction stream, then the trailer, then resolve
+/// every fixup the two recorded.
 pub fn translate_range(
   t: &Translator,
   inputs: &TranslationInputs<'_>,
@@ -171,6 +166,8 @@ pub fn translate_range(
     cfg: t.config(),
     inputs,
     errmsg: None,
+    retpoline_loc: 0,
+    retpoline_calls: Vec::new(),
   };
   e.run()
 }
@@ -183,6 +180,11 @@ struct Emit<'buf, 'ctx, 'in_> {
   /// Set alongside a [`Progress`] where the message needs information only
   /// the detecting site has.
   errmsg: Option<String>,
+  /// Offset of the retpoline thunk, which the trailer places after the body.
+  retpoline_loc: u32,
+  /// `call rel32` displacement fields awaiting [`Self::retpoline_loc`]. Kept
+  /// here rather than in the shared state because the thunk is x86_64's alone.
+  retpoline_calls: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -396,19 +398,6 @@ impl Emit<'_, '_, '_> {
     self.emit1(0x90);
   }
 
-  /// Retargets every jump recorded at `jump_src` to the current offset.
-  /// Resolves one jump target.
-  fn emit_jump_target(&mut self, jump_src: u32) {
-    let here = self.offset();
-    self.st.retarget_jumps(
-      jump_src,
-      PatchTarget::JitOffset {
-        offset: here,
-        near: false,
-      },
-    );
-  }
-
   /// `load [src + offset] -> dst`, zero-extending for the narrow widths.
   fn emit_load(&mut self, size: S, src: u8, dst: u8, offset: i32) {
     self.emit_basic_rex(u8::from(size == S::S64), dst, src);
@@ -506,28 +495,14 @@ impl Emit<'_, '_, '_> {
     }
   }
 
-  /// `mov dst, [rip + target]`, with the displacement deferred.
-  fn emit_rip_relative_load(&mut self, dst: u8, target: PatchTarget) -> u32 {
+  /// `mov dst, [rip + dispatcher_slot]`, with the displacement deferred.
+  fn emit_dispatcher_slot_load(&mut self, dst: u8) {
     self.emit_rex(1, 0, 0, 0);
     self.emit1(0x8b);
     self.emit_modrm(0, dst, 0x05);
 
     let at = self.offset();
-    self.st.note_load(at, target);
-    self.emit4(0);
-    at
-  }
-
-  /// `lea dst, [rip + target]`, with the displacement deferred.
-  /// `R` comes from `dst` rather than being hardcoded. The only call site
-  /// passes `R10`, for which the bit is set either way, so this emits the same
-  /// bytes — but a hardcoded `R` is wrong for any register in the low eight.
-  fn emit_rip_relative_lea(&mut self, dst: u8, target: PatchTarget) {
-    self.emit_rex(1, u8::from(dst & 8 != 0), 0, 0);
-    self.emit1(0x8d);
-    self.emit_modrm(0, dst, 0x05);
-    let at = self.offset();
-    self.st.note_lea(at, target);
+    self.st.note_load(at);
     self.emit4(0);
   }
 
@@ -914,44 +889,18 @@ fn width_span_slot(size: i32) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
-  /// The helper-call sequence
-  ///, SysV half only.
-  /// The generated code decides at *run* time which of two paths to take: if
-  /// the dispatcher slot holds an address, control goes there with the helper
-  /// index as a sixth argument; otherwise the helper is looked up in the
-  /// embedded table by index.
+  /// The helper-call sequence, SysV only.
+  ///
+  /// uBPF decided at *run* time between the registered dispatcher and a lookup
+  /// in an embedded per-index helper table. This crate never registers
+  /// individual helpers, and [`crate::jit::validate`] refuses a helper call when
+  /// no dispatcher is configured — so a `call` only ever reaches here with a
+  /// non-null slot, and the table, the runtime test and the branch around it are
+  /// gone. The dispatcher takes six arguments, the last being the helper index.
   fn emit_dispatched_external_helper_call(&mut self, idx: u32) {
-    self.emit_rip_relative_load(RAX, PatchTarget::Special(SpecialTarget::ExternalDispatcher));
-
-    self.emit_cmp_imm32(RAX, 0);
-    // The target here is a placeholder; `emit_jump_target` rewrites it below.
-    let default_tgt = PatchTarget::EbpfPc { pc: 0, near: false };
-    let skip_default_dispatcher = self.emit_jcc(0x85, default_tgt);
-
-    // Default dispatcher: index into the embedded helper table.
-    self.emit_alu32(0xc7, 0, RAX);
-    self.emit4(idx);
-    self.emit_alu64_imm8(0xc1, 4, RAX, 3);
-
-    self.emit_rip_relative_lea(R10, PatchTarget::Special(SpecialTarget::LoadHelperTable));
-
-    self.emit_alu64(0x01, R10, RAX);
-    self.emit_load(S::S64, RAX, RAX, 0);
-
-    // A registered helper takes five arguments and a context, which is the
-    // sixth argument and goes in R9 on SysV.
-    self.emit_mov(VOLATILE_CTXT, R9);
-
-    let skip_external_dispatcher = self.emit_jmp(default_tgt);
-
-    // External dispatcher: six arguments, the last being the helper index.
-    self.emit_jump_target(skip_default_dispatcher);
+    self.emit_dispatcher_slot_load(RAX);
     self.emit_load_imm(R9, idx as u64 as i64);
-
-    // Control flow converges for the call.
-    self.emit_jump_target(skip_external_dispatcher);
-
-    self.emit_call(PatchTarget::Special(SpecialTarget::Retpoline));
+    self.emit_retpoline_call();
 
     // The result is in RAX.
   }
@@ -1304,10 +1253,18 @@ impl Emit<'_, '_, '_> {
 }
 
 // ---------------------------------------------------------------------------
-// Trailer: epilogue, retpoline, dispatcher slot, helper table
+// Trailer: retpoline, dispatcher slot
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
+  /// `call retpoline`, whose displacement the trailer fills in.
+  fn emit_retpoline_call(&mut self) {
+    self.emit1(0xe8);
+    let at = self.offset();
+    self.retpoline_calls.push(at);
+    self.emit4(0);
+  }
+
   /// The retpoline `call *%rax` stand-in, adapted from Intel's guidance.
   fn emit_retpoline(&mut self) -> u32 {
     let retpoline_target = self.offset();
@@ -1346,19 +1303,6 @@ impl Emit<'_, '_, '_> {
     self.emit8(addr);
     at
   }
-
-  /// The table of registered helper addresses, indexed by helper number.
-  /// `async-ebpf` never registers individual helpers — it uses the dispatcher —
-  /// so every entry is null. The table is emitted anyway because the default
-  /// dispatch path indexes into it and the trailer's layout is part of the ABI
-  /// the runtime patches through.
-  fn emit_helper_table(&mut self) -> u32 {
-    let at = self.offset();
-    for _ in 0..abi::MAX_EXT_FUNCS {
-      self.emit8(0);
-    }
-    at
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,16 +1310,12 @@ impl Emit<'_, '_, '_> {
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
-  /// Returns false
-  /// returns false, which the caller turns into a failure.
+  /// Writes every deferred displacement. Returns false where one does not
+  /// encode, which the caller turns into a failure.
   fn resolve(&mut self) -> bool {
     let jumps = std::mem::take(&mut self.st.jumps);
     for jump in &jumps {
       let (target_loc, is_near) = match jump.target {
-        // Only Exit and Retpoline are reachable as special jump targets.
-        PatchTarget::Special(SpecialTarget::Exit) => (self.st.exit_loc, false),
-        PatchTarget::Special(SpecialTarget::Retpoline) => (self.st.retpoline_loc, false),
-        PatchTarget::Special(_) => return false,
         PatchTarget::EbpfPc { pc, near } => (self.pc_loc(pc), near),
         // Both fields were once held in one struct, preferring the JIT offset only
         // when it is non-zero, falling back to `pc_locs[ebpf_target_pc]`. Every
@@ -1405,45 +1345,17 @@ impl Emit<'_, '_, '_> {
     }
     self.st.jumps = jumps;
 
-    let local_calls = std::mem::take(&mut self.st.local_calls);
-    for call in &local_calls {
-      // Lazy local calls emit an indirect call instead, so this table is always
-      // empty on the path this backend is reached through. The loop is kept
-      // and so does this.
-      let target_loc = match call.target {
-        PatchTarget::EbpfPc { pc, .. } => self.pc_loc(pc),
-        _ => return false,
-      };
-      let rel = target_loc
-        .wrapping_sub(call.offset_loc.wrapping_add(4))
-        .wrapping_sub(self.st.prolog_size as u32);
-      self.st.patch_bytes(call.offset_loc, rel as u64, 4);
+    for at in std::mem::take(&mut self.retpoline_calls) {
+      let rel = self.retpoline_loc.wrapping_sub(at.wrapping_add(4));
+      self.st.patch_bytes(at, rel as u64, 4);
     }
-    self.st.local_calls = local_calls;
 
     let loads = std::mem::take(&mut self.st.loads);
-    for load in &loads {
-      // It is only possible to load from the external dispatcher's position.
-      let target_loc = match load.target {
-        PatchTarget::Special(SpecialTarget::ExternalDispatcher) => self.st.dispatcher_loc,
-        _ => return false,
-      };
-      let rel = target_loc.wrapping_sub(load.offset_loc.wrapping_add(4));
-      self.st.patch_bytes(load.offset_loc, rel as u64, 4);
+    for at in &loads {
+      let rel = self.st.dispatcher_loc.wrapping_sub(at.wrapping_add(4));
+      self.st.patch_bytes(*at, rel as u64, 4);
     }
     self.st.loads = loads;
-
-    let leas = std::mem::take(&mut self.st.leas);
-    for lea in &leas {
-      // It is only possible to LEA from the helper table.
-      let target_loc = match lea.target {
-        PatchTarget::Special(SpecialTarget::LoadHelperTable) => self.st.helper_table_loc,
-        _ => return false,
-      };
-      let rel = target_loc.wrapping_sub(lea.offset_loc.wrapping_add(4));
-      self.st.patch_bytes(lea.offset_loc, rel as u64, 4);
-    }
-    self.st.leas = leas;
 
     true
   }
@@ -1537,9 +1449,9 @@ impl Emit<'_, '_, '_> {
       )));
     }
 
-    // The whole-program prologue is not emitted here: this entry point is
-    // always reached with `whole_program = false`, and the embedder's own entry
-    // code establishes the frame instead.
+    // There is no whole-program prologue: the embedder's own entry code
+    // establishes the frame, and each function's prologue is emitted at its
+    // entry below.
 
     self.mark_barriers(start_pc, end_pc, num_insts);
 
@@ -1551,14 +1463,10 @@ impl Emit<'_, '_, '_> {
       return Err(self.status_error());
     }
 
-    // Epilogue: pop the guest stack usage this function pushed, and return.
-    self.st.exit_loc = self.offset();
-    self.emit_alu64_imm32(0x81, 0, RSP, 8);
-    self.emit_ret();
-
-    self.st.retpoline_loc = self.emit_retpoline();
+    // No shared exit stub: every `EXIT` emits its own epilogue inline, and with
+    // uBPF's unwind helper gone nothing else branches to one.
+    self.retpoline_loc = self.emit_retpoline();
     self.st.dispatcher_loc = self.emit_dispatched_external_helper_address();
-    self.st.helper_table_loc = self.emit_helper_table();
 
     // Everything above is emitted after the per-instruction error check, so an
     // overflow here would otherwise be reported as success. That is not merely
@@ -1708,7 +1616,6 @@ impl Emit<'_, '_, '_> {
       // Adjusting by 8 keeps the 16-byte alignment, because the `call` that got
       // here already pushed a return address.
       if i == 0 || self.t.is_local_func_entry(i) {
-        let prolog_start = self.offset();
         let stack_usage = self.t.stack_usage_for(i);
         self.emit_alu64_imm32(0x81, 5, RSP, 8);
         // `mov qword [rsp], stack_usage`, whose ModRM+SIB pair for an `[rsp]`
@@ -1718,22 +1625,6 @@ impl Emit<'_, '_, '_> {
         self.emit1(0x04);
         self.emit1(0x24);
         self.emit4(stack_usage as u32);
-
-        // Only measure a prologue that was actually emitted. Once the buffer
-        // has run out, the emits above are no-ops and `size` is a partial
-        // count, so recording or checking it here turns an ordinary
-        // out-of-space into a debug-assertion panic. That is reachable from any
-        // multi-function range - `Translator::translate_all`, and the test and
-        // fuzz surface - though not from the production loader, which always
-        // translates exactly one function.
-        let size = (self.offset() - prolog_start) as usize;
-        if !self.st.ok() {
-          // Nothing to record; the caller will report the failure.
-        } else if self.st.prolog_size == 0 {
-          self.st.prolog_size = size;
-        } else {
-          debug_assert_eq!(self.st.prolog_size, size);
-        }
       }
 
       if let Some(source) = fallthrough_jump_source {
@@ -2031,16 +1922,9 @@ impl Emit<'_, '_, '_> {
         if inst.src == 0 {
           self.emit_mov(RCX_ALT, RCX);
           self.emit_dispatched_external_helper_call(inst.imm as u32);
-          // The unwind index defaults to -1, so `None` here means a
-          // `call -1` really does take the unwind path.
-          let unwind = self.cfg.unwind_helper_index.map_or(-1i32, |i| i as i32);
-          if inst.imm == unwind {
-            self.emit_cmp_imm32(map_register(0), 0);
-            self.emit_jcc(0x84, PatchTarget::Special(SpecialTarget::Exit));
-          }
         } else if inst.src == 1 {
-          // This entry point always compiles local calls lazily; the eager
-          // `emit_local_call` is unreachable and is not ported.
+          // Local calls are always compiled lazily; uBPF's eager
+          // `emit_local_call` is not ported.
           self.emit_lazy_local_call(pc);
         }
         // A source field other than 0 or 1 emits nothing at all. Unreachable:
@@ -2312,17 +2196,6 @@ mod tests {
           pointer_offset: 0x1_0000_0000,
           native_frame_base: true,
           frame_constants: true,
-          ..base.clone()
-        },
-      ),
-      (
-        "production + unwind helper",
-        Config {
-          pointer_mask: 0x0fff_ffff,
-          pointer_offset: 0x1_0000_0000,
-          native_frame_base: true,
-          frame_constants: true,
-          unwind_helper_index: Some(3),
           ..base
         },
       ),
@@ -2340,7 +2213,7 @@ mod tests {
 
   /// A sweep entry's name, as the label a golden is filed under.
   /// The label is part of the golden key, so renaming a sweep entry rewrites
-  /// every golden it owns. The six names are fixed for that reason.
+  /// every golden it owns. The names are fixed for that reason.
   fn slug(name: &str) -> String {
     let mut out = String::new();
     let mut pending = false;
@@ -3807,20 +3680,20 @@ mod tests {
   // Adversarial audit additions
   // -----------------------------------------------------------------------
 
-  /// FAILING — left in place, ignored, as a record of a real defect.
   /// A two-function range translated into a buffer that runs out *inside the
-  /// second function's per-function prologue* trips
-  /// `debug_assert_eq!(self.st.prolog_size, size)` in `emit_instructions`
-  /// instead of returning `TranslateError::OutOfSpace`. Capacities 91..=101
-  /// panic under every configuration in the sweep.
-  /// The cause is that once the buffer is full, `self.offset()` stops tracking
-  /// what the prologue *would* have measured, so `self.offset() - prolog_start`
-  /// is a partial size. The assertion needs a `self.st.ok()` guard; nothing
-  /// about how `emit_bytes` treats `offset` on failure removes it (the
-  /// range of failing capacities merely shifts).
-  /// `out_of_space_is_reported_identically` only ever translates a *single*
-  /// function, so the second per-function prologue is never reached with a
-  /// buffer that runs out inside it.
+  /// second function's per-function prologue* must return
+  /// `TranslateError::OutOfSpace` rather than panic.
+  ///
+  /// This was a real defect, and worth keeping a test for even though what
+  /// tripped it is gone. The emitter used to measure each prologue by
+  /// differencing `offset` and assert that every one came out the same length;
+  /// once the buffer was full, `offset` stopped moving and the second
+  /// measurement was partial, so capacities 91..=101 tripped a debug assertion
+  /// under every configuration in the sweep. The measurement existed only to
+  /// let uBPF's eagerly relocated local call skip a callee's prologue, and went
+  /// with it. `out_of_space_is_reported_identically` only ever translates a
+  /// *single* function, so this shape is not covered there.
+  ///
   /// Nothing is recorded here: the property under test is that the emitter
   /// returns rather than panics, which no output can express.
   #[test]
@@ -4127,9 +4000,8 @@ mod tests {
     s.finish("audit_lddw_at_the_end_of_a_range");
   }
 
-  /// Helper indices the census never reaches: negative, past the table, and the
-  /// two integer extremes — plus the interaction with the unwind index, whose
-  /// unset state is `-1`.
+  /// Helper indices the census never reaches: negative, past the highest index
+  /// the runtime registers, and the two integer extremes.
   #[test]
   fn audit_helper_call_indices_at_the_extremes() {
     let mut s = Sweep::new();
@@ -4591,11 +4463,10 @@ mod tests {
   /// never panic — not on a `debug_assert`, not on an arithmetic overflow.
   /// Nothing is recorded here either: what is under test is that the emitter
   /// answers at all.
-  /// FAILING — ignored, same root cause as
-  /// `audit_out_of_space_inside_a_later_function_prologue`: every panic this
-  /// finds is the `debug_assert_eq!(self.st.prolog_size, size)` in
-  /// `emit_instructions`, and every program that trips it has more than one
-  /// local function. The single-function programs in the list are clean.
+  ///
+  /// The multi-function programs in the list are here because they used to be
+  /// the ones that panicked — see
+  /// `audit_out_of_space_inside_a_later_function_prologue` for what they hit.
   #[test]
   fn audit_no_capacity_makes_the_emitter_panic() {
     let programs: Vec<Vec<Insn>> = vec![
@@ -4618,7 +4489,7 @@ mod tests {
         movi(0, 7),
         exit(),
       ],
-      // A helper call, with its RIP-relative load and LEA fixups.
+      // A helper call, with its RIP-relative load of the dispatcher slot.
       vec![movi(1, 0), insn(opcode::CALL, 0, 0, 0, 3), exit()],
       // A forward and a backward branch.
       vec![
@@ -4726,19 +4597,20 @@ mod tests {
   }
 
   /// Configurations the sweep never builds.
-  /// [`sweep`] fixes six points in a space with rather more dimensions
-  /// than that: it never turns the external dispatcher off, never sets
-  /// `native_frame_base` or `frame_constants` while the cage is *disabled*,
-  /// and only ever tries one unwind index. Each of those changes what is
-  /// emitted, or what is emitted around it.
+  /// [`sweep`] fixes five points in a space with rather more dimensions than
+  /// that: it never turns the external dispatcher off, and never sets
+  /// `native_frame_base` or `frame_constants` while the cage is *disabled*.
+  /// Each of those changes what is emitted, or what is emitted around it.
   #[test]
   fn audit_configurations_outside_the_sweep() {
     let base = base_config(Target::X86_64);
 
     let mut configs: Vec<(String, Config)> = Vec::new();
 
-    // No external dispatcher at all: the trailer's dispatcher slot holds 0 and
-    // the run-time branch in the helper-call sequence takes the table path.
+    // No external dispatcher at all: the trailer's dispatcher slot holds 0, and
+    // the validator refuses every helper call, so no program that reads the
+    // slot can load. What the sweep is pinning here is the rest of the emitted
+    // code under that configuration.
     configs.push((
       "no dispatcher".into(),
       Config {
@@ -4762,22 +4634,6 @@ mod tests {
           pointer_offset: 0,
           native_frame_base: nfb,
           frame_constants: fc,
-          ..base.clone()
-        },
-      ));
-    }
-
-    // Unwind indices other than 3, including the two that collide with the
-    // "unset" sentinel once it has been narrowed to an `int`.
-    for idx in [0u32, 1, 63, 64, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff] {
-      configs.push((
-        format!("unwind index {idx:#x}"),
-        Config {
-          pointer_mask: 0x0fff_ffff,
-          pointer_offset: 0x1_0000_0000,
-          native_frame_base: true,
-          frame_constants: true,
-          unwind_helper_index: Some(idx),
           ..base.clone()
         },
       ));

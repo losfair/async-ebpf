@@ -205,7 +205,6 @@ fn hostile_config(target: Target) -> Arc<Config> {
     frame_constants: true,
     dispatcher: Some(never_called_dispatcher),
     dispatcher_validate: Some(accept_every_helper),
-    unwind_helper_index: None,
     local_call_resolver: Some(never_called_resolver),
   })
 }
@@ -420,8 +419,8 @@ fn valid_program(rng: &mut Rng, target_len: usize) -> Vec<Insn> {
 
 /// A program with local functions: a main body that calls each sub-program,
 /// then the sub-programs laid out after it, each ending in `exit`. This is the
-/// shape that fills `local_calls`, `pc_locs` and the lazy-resolver table, none
-/// of which `valid_program` reaches.
+/// shape that fills `pc_locs` and the lazy-resolver table, neither of which
+/// `valid_program` reaches.
 fn program_with_local_calls(rng: &mut Rng, target_len: usize) -> Vec<Insn> {
   let subs = 1 + rng.below(3);
   let mut main: Vec<Insn> = Vec::new();
@@ -845,43 +844,45 @@ fn malformed_code_lengths_are_refused() {
 // The patch-table ceilings
 // ---------------------------------------------------------------------------
 
-/// Every patch table stops growing at the instruction ceiling.
+/// Both patch tables stop growing at the instruction ceiling.
 ///
 /// A program can hold at most [`abi::MAX_INSTS`] instructions, so no correct
 /// program needs more fixups than that, and a table allowed to grow further is
 /// a table that accepts a program the loader should have refused. These were
 /// once `1 << 20` — sixteen times too high — which let a program with between
 /// 65536 and 1048575 jump fixups translate into a megabyte of code instead of
-/// being refused. Three jump fixups are emitted per helper call, so 21846
-/// helper calls was enough to reach it, well inside the instruction ceiling.
+/// being refused. Reaching that took only 21846 helper calls back when each
+/// emitted three jump fixups: the branch past the default dispatcher, the
+/// branch past the external one, and the retpoline call. None of the three is
+/// emitted any more.
 #[test]
 fn the_patch_table_ceilings_are_the_instruction_ceiling() {
-  use super::patch::{MAX_JUMPS, MAX_LEAS, MAX_LOADS, MAX_LOCAL_CALLS};
+  use super::patch::{MAX_JUMPS, MAX_LOADS};
   let ceiling = abi::MAX_INSTS as usize;
   assert_eq!(MAX_JUMPS, ceiling, "jump table ceiling");
   assert_eq!(MAX_LOADS, ceiling, "load table ceiling");
-  assert_eq!(MAX_LEAS, ceiling, "lea table ceiling");
-  assert_eq!(MAX_LOCAL_CALLS, ceiling, "local call table ceiling");
 }
 
-/// A program of nothing but helper calls, sized so that the jump-fixup table
-/// crosses the ceiling above.
+/// A program of nothing but helper calls, the shape that used to overrun the
+/// jump-fixup table.
 fn helper_call_storm(calls: usize) -> Vec<u8> {
   let mut insns: Vec<Insn> = (0..calls).map(|_| ins(0x85, 0, 0, 0, 1)).collect();
   insns.push(ins(0x95, 0, 0, 0, 0));
   Insn::encode_all(&insns)
 }
 
-/// The executed form of the test above: a program that really does overrun the
-/// jump-fixup table has to be refused, by name, rather than translated.
+/// The executed form of the ceiling: with the per-index helper table gone, a
+/// helper call emits no jump fixups at all, so the storm that used to overrun
+/// the table translates.
 ///
-/// The ceiling is a number in one file and the refusal is a code path in
-/// another; this is what ties them together.
+/// The number is the point. Under the two-path helper sequence each `call`
+/// emitted three jump fixups, and 21846 of them — comfortably inside the
+/// instruction ceiling — crossed a table sized for a whole program's worth. A
+/// single unconditional `call` to the retpoline emits none, so the only fixups
+/// a program can now produce are one per branch instruction it actually
+/// contains. This translating is what says that is still true.
 #[test]
-fn a_jump_fixup_storm_is_refused() {
-  // Three jump fixups per helper call: the jcc past the default dispatcher,
-  // the jmp past the external one, and the retpoline call. Two calls past the
-  // ceiling divided by three is the smallest program that overruns it.
+fn a_helper_call_storm_no_longer_floods_the_jump_table() {
   let calls = abi::MAX_INSTS as usize / 3 + 2;
   let code = helper_call_storm(calls);
   let config = hostile_config(Target::X86_64);
@@ -895,34 +896,12 @@ fn a_jump_fixup_storm_is_refused() {
     end_pc: translator.insns().len(),
   };
   let mut buf = vec![0u8; 1 << 24];
-  let outcome = translator.translate_range(&inputs, &mut buf);
-
-  // The wording embedders see, and the reason it is this one: the table that
-  // overflowed is the jump table.
-  assert_eq!(
-    outcome,
-    Err(super::TranslateError::Failed(
-      "Too many jump instructions".to_string()
-    )),
-    "a {calls}-helper-call program emits {} jump fixups against a ceiling of {}",
-    calls * 3,
-    abi::MAX_INSTS
-  );
-
-  // ...and the same program one call shorter still fits, so the refusal is the
-  // ceiling and not merely "large programs fail".
-  let code = helper_call_storm(abi::MAX_INSTS as usize / 3 - 1);
-  let translator = Translator::load(hostile_config(Target::X86_64), &code).expect("must load");
-  let inputs = TranslationInputs {
-    hints: &[],
-    plan: &[],
-    resolver_ids: &[],
-    start_pc: 0,
-    end_pc: translator.insns().len(),
-  };
   assert!(
     translator.translate_range(&inputs, &mut buf).is_ok(),
-    "a program just inside the ceiling must still translate"
+    "a {calls}-helper-call program used to emit {} jump fixups against a ceiling of {}; \
+     it should now emit none",
+    calls * 3,
+    abi::MAX_INSTS
   );
 }
 
@@ -952,16 +931,6 @@ fn into_error_reports_the_documented_strings() {
   assert_eq!(
     Progress::TooManyLoads.into_error(crate::jit::Target::X86_64),
     Some(Failed("Too many load instructions".into()))
-  );
-  assert_eq!(
-    Progress::TooManyLocalCalls.into_error(crate::jit::Target::X86_64),
-    Some(Failed("Too many local calls".into()))
-  );
-  // "Too many LEA calculations", not "Too many lea instructions": the wording
-  // is deliberately not parallel with the three above.
-  assert_eq!(
-    Progress::TooManyLeas.into_error(crate::jit::Target::X86_64),
-    Some(Failed("Too many LEA calculations".into()))
   );
   // Empty on purpose. An out-of-range relocation is only ever reported by the
   // aarch64 resolver, which writes its own message where the error is detected
