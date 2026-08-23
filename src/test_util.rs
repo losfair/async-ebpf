@@ -243,7 +243,7 @@ pub mod region_analysis {
     CurrentStackUnknown,
     /// Pointer into a caller/ancestor eBPF stack frame.
     ForeignStack,
-    /// Pointer into the relocated read-only data region.
+    /// Pointer into the relocated data region.
     Data,
     /// Non-pointer scalar value.
     Scalar,

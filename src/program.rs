@@ -22,7 +22,7 @@ use std::{
 
 use futures::{task::noop_waker_ref, Future, FutureExt};
 use memmap2::{MmapOptions, MmapRaw};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rand::prelude::SliceRandom;
 
 use crate::{
@@ -31,33 +31,34 @@ use crate::{
     Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
   },
   error::{Error, RuntimeError},
-  function_analysis::{analyze_functions, FunctionLayout, MAX_LOCAL_CALL_DEPTH},
+  function_analysis::{analyze_functions, FunctionLayout},
   helpers::Helper,
-  linker::{link_elf, validate_local_call_graph},
+  linker::{link_elf, plan_writable_data},
   pointer_cage::PointerCage,
   region_analysis::PointerSignature,
   util::nonnull_bytes_overlap,
 };
 
-const NATIVE_STACK_SIZE: usize = 16384;
+/// Native stack left below the deepest admitted JIT frame for the entry
+/// trampoline, resolver/dispatcher callbacks, and the stack-exhaustion path.
+const NATIVE_STACK_RESERVE: usize = 16 * 1024;
 pub(crate) const MAX_CALLDATA_SIZE: usize = 512;
 
-/// Guest stack the deepest accepted local call chain can consume below the entry
-/// frame: every local function is charged one fixed-size frame
-/// ([`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`]), and the loader caps the
-/// call graph at [`MAX_LOCAL_CALL_DEPTH`] frames.
-const LOCAL_CALL_FRAME_BUDGET: usize =
-  MAX_LOCAL_CALL_DEPTH * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
+/// Guest stack carried by the historical eight-frame default. Call graphs are
+/// no longer capped statically: a run may recurse until its configured stack
+/// window cannot hold the next complete frame.
+const DEFAULT_LOCAL_CALL_FRAME_BUDGET: usize = crate::jit::abi::EBPF_STACK_SIZE as usize;
 
 /// The guest stack window.
 ///
 /// Calldata is copied into the top of this window and `R10` starts at the first
 /// 8-aligned address below it, so the window has to cover the frame budget *and*
 /// the largest calldata a caller can pass. Sizing it to the frame budget alone
-/// leaves no slack: the deepest call chain the loader accepts would then run off
-/// the bottom of the stack by as much calldata as was passed, and a program that
-/// works with none would fault with any.
-const SHADOW_STACK_SIZE: usize = LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8);
+/// leaves no slack: the eighth default frame would then run off the bottom of
+/// the stack by as much calldata as was passed, and a program that works with
+/// none would fault with any.
+pub const DEFAULT_GUEST_STACK_SIZE: usize =
+  DEFAULT_LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8);
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 
@@ -67,15 +68,15 @@ const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 /// This is the one place the runtime trades a per-access check for a static
 /// argument, so the argument is worth spelling out. `R10` starts at
 /// `stack_top - calldata`, rounded down to 8, and drops one
-/// [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`] frame per local call. The loader accepts
-/// at most [`MAX_LOCAL_CALL_DEPTH`] frames, so the deepest reachable frame
-/// pointer sits `(MAX_LOCAL_CALL_DEPTH - 1)` frames below entry, and what is
-/// left of the window below *that* is the displacement any frame is allowed to
-/// reach. `[r10 + k]` with `-FRAME_WINDOW <= k` and `k + width <= 0` is therefore
-/// inside `[stack_bottom, stack_top)` at every call depth, for every accepted
-/// program - which is what lets the backend emit it as a plain native access.
+/// [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`] frame per local call. Before
+/// every local call the backend checks that the callee's R10 will leave this
+/// complete window above the invocation's stack bottom. The entry trampoline
+/// establishes the same invariant for the root. `[r10 + k]` with
+/// `-FRAME_WINDOW <= k` and `k + width <= 0` is therefore inside the guarded
+/// guest-stack backing at every admitted dynamic depth, which is what lets the
+/// backend emit it as a plain native access.
 ///
-/// `src/test/lazy_local_call.rs::the_deepest_accepted_call_chain_fits_alongside_calldata`
+/// `src/test/lazy_local_call.rs::the_default_call_capacity_fits_alongside_calldata`
 /// exercises exactly this corner at run time.
 pub(crate) const FRAME_WINDOW: usize = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
 
@@ -104,12 +105,12 @@ const _: () = {
   );
 };
 
-// What Tier F needs from the guest stack window, stated as the three facts that
+// What Tier F needs from the guest stack window, stated as the facts that
 // can each drift on their own.
 //
-// The obvious phrasing - "SHADOW_STACK_SIZE, less the calldata, less the frames
+// The obvious phrasing - "DEFAULT_GUEST_STACK_SIZE, less the calldata, less the frames
 // below the entry one, still leaves FRAME_WINDOW" - cannot fail. Substituting
-// the definition of SHADOW_STACK_SIZE cancels the calldata term against itself
+// the definition of DEFAULT_GUEST_STACK_SIZE cancels the calldata term against itself
 // and the budget against the frames, leaving `FRAME_WINDOW >= FRAME_WINDOW`:
 // true for every value of every constant it names, including all the ones it is
 // supposed to be watching. Each assertion below is instead written against
@@ -122,18 +123,18 @@ const _: () = {
   assert!(
     FRAME_WINDOW <= crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize,
     "the Tier F frame window is wider than the frame a local call is charged, \
-     so the deepest accepted chain can address below the guest stack"
+     so an admitted dynamic frame can address below the guest stack"
   );
-  // 2. The budget really does cover a frame per accepted call depth.
+  // 2. The historical default really does retain eight complete frames.
   assert!(
-    LOCAL_CALL_FRAME_BUDGET
-      >= MAX_LOCAL_CALL_DEPTH * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize,
-    "the local call frame budget no longer covers MAX_LOCAL_CALL_DEPTH frames"
+    DEFAULT_LOCAL_CALL_FRAME_BUDGET >= crate::jit::abi::EBPF_STACK_SIZE as usize,
+    "the default local-call frame budget no longer covers the ABI default"
   );
   // 3. The window covers that budget *and* the largest calldata a caller can
   //    pass, rounded the way R10's 8-alignment rounds it.
   assert!(
-    SHADOW_STACK_SIZE >= LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8),
+    DEFAULT_GUEST_STACK_SIZE
+      >= DEFAULT_LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8),
     "the guest stack window no longer covers FRAME_WINDOW below the deepest \
      accepted frame pointer; Tier F frame addressing would be unsound"
   );
@@ -145,7 +146,7 @@ const _: () = {
   //    nothing else says so, so say it here - `_run` re-checks the address the
   //    cage actually hands back.
   assert!(
-    SHADOW_STACK_SIZE.is_multiple_of(8),
+    DEFAULT_GUEST_STACK_SIZE.is_multiple_of(8),
     "the guest stack window is not a multiple of 8, so R10's alignment rounding \
      eats into the headroom Tier F frame addressing depends on"
   );
@@ -386,6 +387,7 @@ pub struct HelperScope<'a, 'b> {
   mutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_MUTABLE_DEREF_REGIONS],
   immutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_IMMUTABLE_DEREF_REGIONS],
   can_post_task: bool,
+  writable_data: bool,
 }
 
 /// A validated mutable view into user memory.
@@ -492,10 +494,13 @@ impl<'a, 'b> HelperScope<'a, 'b> {
     ptr: u64,
     size: u64,
   ) -> Result<MutableUserMemory<'a, 'b, 'c>, ()> {
-    let Some(region) = self
-      .memory
-      .safe_deref_for_write(ptr as usize, size as usize)
-    else {
+    let Some(region) = self.memory.safe_deref_for_write(
+      ptr as usize,
+      size as usize,
+      self
+        .writable_data
+        .then_some(self.program.unbound.cage.writable_data_bottom()),
+    ) else {
       tracing::warn!(ptr, size, "invalid write");
       return Err(());
     };
@@ -532,8 +537,8 @@ impl<'a, 'b> HelperScope<'a, 'b> {
   }
 }
 
-/// Native backing for one invocation's guest stack, in its own mapping with a
-/// `PROT_NONE` page on each side.
+/// Native backing for one invocation-local guest region, in its own mapping
+/// with a `PROT_NONE` page on each side.
 ///
 /// The guest stack used to be a plain heap allocation, which was fine while
 /// every guest access carried a runtime bounds check: an out-of-range address
@@ -543,29 +548,32 @@ impl<'a, 'b> HelperScope<'a, 'b> {
 /// in the backend test that enforces it - into a fault instead of a silent read
 /// or write of whatever the allocator happened to place next to the stack.
 ///
-/// The window is laid out flush against the *low* guard, because that is the
-/// direction frame addressing runs: `R10` descends with call depth and every
-/// frame displacement is negative.
-struct GuardedStack {
+/// This backs the guest stack. The usable
+/// window is laid out flush against the low guard, which is load-bearing for
+/// the stack because `R10` descends with call depth and every frame displacement
+/// is negative. For data, both guards are defense in depth around the JIT's
+/// explicit region checks.
+struct GuardedRegion {
   region: MmapRaw,
   offset: usize,
+  len: usize,
 }
 
-impl GuardedStack {
-  fn new() -> Result<Self, RuntimeError> {
+impl GuardedRegion {
+  fn new(size: usize) -> Result<Self, RuntimeError> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 {
       return Err(RuntimeError::PlatformError("failed to query page size"));
     }
     let page_size = page_size as usize;
-    let len = SHADOW_STACK_SIZE.next_multiple_of(page_size);
+    let len = size.next_multiple_of(page_size);
     let total = len + 2 * page_size;
 
     let region = MmapRaw::from(
       MmapOptions::new()
         .len(total)
         .map_anon()
-        .map_err(|_| RuntimeError::PlatformError("failed to allocate guest stack"))?,
+        .map_err(|_| RuntimeError::PlatformError("failed to allocate guarded guest memory"))?,
     );
     unsafe {
       if libc::mprotect(region.as_ptr() as *mut _, total, libc::PROT_NONE) != 0
@@ -576,7 +584,7 @@ impl GuardedStack {
         ) != 0
       {
         return Err(RuntimeError::PlatformError(
-          "failed to protect guest stack guard pages",
+          "failed to protect guarded guest memory",
         ));
       }
     }
@@ -584,34 +592,66 @@ impl GuardedStack {
     Ok(Self {
       region,
       offset: page_size,
+      len: size,
     })
   }
 
   fn as_mut_slice(&mut self) -> &mut [u8] {
     unsafe {
-      std::slice::from_raw_parts_mut(
-        self.region.as_ptr().add(self.offset) as *mut u8,
-        SHADOW_STACK_SIZE,
-      )
+      std::slice::from_raw_parts_mut(self.region.as_ptr().add(self.offset) as *mut u8, self.len)
     }
   }
 
   fn as_mut_ptr(&mut self) -> *mut u8 {
     unsafe { self.region.as_ptr().add(self.offset) as *mut u8 }
   }
+
+  fn len(&self) -> usize {
+    self.len
+  }
 }
 
 struct ExecContext {
   native_stack: DefaultStack,
-  guest_stack: GuardedStack,
+  guest_stack: GuardedRegion,
+}
+
+fn native_stack_size(guest_stack_size: usize) -> usize {
+  let guest_frame = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
+  let frame_capacity = guest_stack_size.div_ceil(guest_frame);
+  NATIVE_STACK_RESERVE
+    .checked_add(
+      frame_capacity
+        .checked_mul(crate::jit::abi::NATIVE_LOCAL_CALL_BUDGET)
+        .expect("native local-call stack budget overflow"),
+    )
+    .expect("native coroutine stack size overflow")
+}
+
+#[cfg(test)]
+#[test]
+fn native_coroutine_stack_is_derived_but_smaller_than_the_guest_stack() {
+  let guest_stack_size = 8 * 1024 * 1024;
+  assert_eq!(
+    native_stack_size(guest_stack_size),
+    NATIVE_STACK_RESERVE
+      + guest_stack_size / crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize
+        * crate::jit::abi::NATIVE_LOCAL_CALL_BUDGET
+  );
+  assert!(native_stack_size(guest_stack_size) < guest_stack_size);
+  assert!(native_stack_size(DEFAULT_GUEST_STACK_SIZE) < DEFAULT_GUEST_STACK_SIZE);
 }
 
 impl ExecContext {
-  fn new() -> Self {
+  fn new(guest_stack_size: usize) -> Self {
     Self {
-      native_stack: DefaultStack::new(NATIVE_STACK_SIZE)
+      // A guest frame is 4 KiB but its persistent native call frame is under
+      // 128 bytes on both backends. Charge a deliberately conservative 256
+      // bytes per possible guest frame, plus a fixed reserve for transient Rust
+      // resolver/dispatcher frames and the stack-exhaustion callback.
+      native_stack: DefaultStack::new(native_stack_size(guest_stack_size))
         .expect("failed to initialize native stack"),
-      guest_stack: GuardedStack::new().expect("failed to initialize guest stack"),
+      guest_stack: GuardedRegion::new(guest_stack_size).expect("failed to initialize guest stack"),
     }
   }
 }
@@ -635,6 +675,12 @@ struct JitMemory {
   /// it off `RBP` directly. See [`crate::jit::abi::derived_slot`] for the
   /// layout.
   derived: [usize; 12],
+  /// Lowest native R10 from which a local call can leave a complete frame for
+  /// its callee below the resulting frame pointer.
+  local_call_guest_floor: usize,
+  /// Lowest native SP from which a local call can consume its conservative
+  /// native frame budget without entering the emergency reserve.
+  local_call_native_floor: usize,
 }
 
 /// The entry trampoline reaches into this layout with literal displacements,
@@ -648,7 +694,9 @@ const _: () = {
   assert!(std::mem::offset_of!(JitMemory, data_guest_top) == 32);
   assert!(std::mem::offset_of!(JitMemory, data_native_base) == 40);
   assert!(std::mem::offset_of!(JitMemory, derived) == 48);
-  assert!(std::mem::size_of::<JitMemory>() == 144);
+  assert!(std::mem::offset_of!(JitMemory, local_call_guest_floor) == 144);
+  assert!(std::mem::offset_of!(JitMemory, local_call_native_floor) == 152);
+  assert!(std::mem::size_of::<JitMemory>() == 160);
 };
 
 impl JitMemory {
@@ -725,14 +773,32 @@ impl JitMemory {
     }
   }
 
-  fn safe_deref_for_write(&self, guest: usize, size: usize) -> Option<NonNull<[u8]>> {
-    Self::checked_region(
+  fn safe_deref_for_write(
+    &self,
+    guest: usize,
+    size: usize,
+    writable_data_bottom: Option<usize>,
+  ) -> Option<NonNull<[u8]>> {
+    let stack = Self::checked_region(
       guest,
       size,
       self.stack_guest_bottom,
       self.stack_guest_top,
       self.stack_native_base,
-    )
+    );
+    if let Some(writable_data_bottom) = writable_data_bottom {
+      stack.or_else(|| {
+        Self::checked_region(
+          guest,
+          size,
+          writable_data_bottom,
+          self.data_guest_top,
+          self.data_native_base + (writable_data_bottom - self.data_guest_bottom),
+        )
+      })
+    } else {
+      stack
+    }
   }
 
   fn safe_deref_for_read(&self, guest: usize, size: usize) -> Option<NonNull<[u8]>> {
@@ -806,11 +872,16 @@ struct BorrowedExecContext {
 }
 
 impl BorrowedExecContext {
-  fn new() -> Self {
+  fn new(guest_stack_size: usize) -> Self {
     let mut me = Self {
-      ctx: ManuallyDrop::new(
-        EXEC_CONTEXT_POOL.with(|x| x.borrow_mut().pop().unwrap_or_else(ExecContext::new)),
-      ),
+      ctx: ManuallyDrop::new(EXEC_CONTEXT_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let ctx = pool
+          .iter()
+          .position(|ctx| ctx.guest_stack.len() == guest_stack_size)
+          .map(|index| pool.swap_remove(index));
+        ctx.unwrap_or_else(|| ExecContext::new(guest_stack_size))
+      })),
     };
     me.ctx.guest_stack.as_mut_slice().fill(0x8e);
     me
@@ -829,6 +900,7 @@ struct ActiveJitCodeZone {
   valid: AtomicBool,
   code_range: Cell<(usize, usize)>,
   pointer_cage_protected_range: Cell<(usize, usize)>,
+  data_range: Cell<(usize, usize)>,
   yielder: Cell<Option<NonNull<Yielder<u64, Dispatch>>>>,
 }
 
@@ -866,6 +938,8 @@ pub struct ProgramLoader {
   helper_id_xor: u16,
   helpers: Arc<Vec<(u16, &'static str, Helper)>>,
   code_size_limit: usize,
+  instruction_limit: usize,
+  guest_stack_size: usize,
   require_static_regions: bool,
 }
 
@@ -876,6 +950,9 @@ pub struct UnboundProgram {
   code_base: usize,
   code_size: usize,
   page_size: usize,
+  guest_stack_size: usize,
+  run_lock: RwLock<()>,
+  data_protection_failed: Cell<bool>,
   code_arena: RefCell<CodeArena>,
   cage: PointerCage,
   helper_id_xor: u16,
@@ -1312,6 +1389,60 @@ impl Drop for PreemptionEnabled {
   }
 }
 
+/// Exclusive lease for an invocation that may mutate packed ELF data.
+///
+/// The permission transition is tied to the lease so cancellation restores
+/// read-only protection before the write lock can be released.
+struct WritableRunGuard<'a> {
+  program: &'a Program,
+  _lease: parking_lot::RwLockWriteGuard<'a, ()>,
+  writable: bool,
+}
+
+impl<'a> WritableRunGuard<'a> {
+  fn try_new(program: &'a Program) -> Result<Self, RuntimeError> {
+    let Some(lease) = program.unbound.run_lock.try_write() else {
+      return Err(RuntimeError::ProgramBusy);
+    };
+    if program.unbound.data_protection_failed.get() {
+      return Err(RuntimeError::PlatformError(
+        "writable data protection is unavailable",
+      ));
+    }
+    program.unbound.cage.protect_writable_data(true)?;
+    Ok(Self {
+      program,
+      _lease: lease,
+      writable: true,
+    })
+  }
+
+  fn restore(&mut self) -> Result<(), RuntimeError> {
+    if !self.writable {
+      return Ok(());
+    }
+    self.writable = false;
+    if let Err(err) = self.program.unbound.cage.protect_writable_data(false) {
+      self.program.unbound.data_protection_failed.set(true);
+      if !self.program.unbound.cage.quarantine_writable_data() {
+        std::process::abort();
+      }
+      return Err(err);
+    }
+    Ok(())
+  }
+
+  fn finish(mut self) -> Result<(), RuntimeError> {
+    self.restore()
+  }
+}
+
+impl Drop for WritableRunGuard<'_> {
+  fn drop(&mut self) {
+    let _ = self.restore();
+  }
+}
+
 impl Program {
   /// Returns the unique program identifier.
   pub fn id(&self) -> u64 {
@@ -1735,7 +1866,11 @@ impl Program {
     Ok(entrypoint)
   }
 
-  /// Runs the program entrypoint with the provided resources and calldata.
+  /// Runs the program entrypoint with immutable access to shared ELF data.
+  ///
+  /// Multiple immutable runs may interleave. A live [`Program::run_mut`]
+  /// conflicts and produces an error immediately rather than waiting.
+  #[allow(clippy::await_holding_lock)] // the read lease intentionally spans the full async run
   pub async fn run(
     &self,
     timeslice: &TimesliceConfig,
@@ -1743,14 +1878,44 @@ impl Program {
     entrypoint: &str,
     resources: &mut [&mut dyn Any],
     calldata: &[u8],
-    preemption: &PreemptionEnabled,
+    _preemption: &PreemptionEnabled,
   ) -> Result<i64, Error> {
+    let Some(_lease) = self.unbound.run_lock.try_read() else {
+      return Err(Error(RuntimeError::ProgramBusy));
+    };
+    if self.unbound.data_protection_failed.get() {
+      return Err(Error(RuntimeError::PlatformError(
+        "writable data protection is unavailable",
+      )));
+    }
     self
       ._run(
-        timeslice, timeslicer, entrypoint, resources, calldata, preemption,
+        timeslice, timeslicer, entrypoint, resources, calldata, false,
       )
       .await
       .map_err(Error)
+  }
+
+  /// Runs an entrypoint with exclusive, persistent access to mutable ELF data.
+  ///
+  /// The lease is non-blocking: a conflicting invocation returns an error
+  /// immediately. Only the packed writable-data suffix is made read-write, and
+  /// it is restored to read-only before the exclusive lease is released.
+  pub async fn run_mut(
+    &self,
+    timeslice: &TimesliceConfig,
+    timeslicer: &impl Timeslicer,
+    entrypoint: &str,
+    resources: &mut [&mut dyn Any],
+    calldata: &[u8],
+    _preemption: &PreemptionEnabled,
+  ) -> Result<i64, Error> {
+    let guard = WritableRunGuard::try_new(self).map_err(Error)?;
+    let result = self
+      ._run(timeslice, timeslicer, entrypoint, resources, calldata, true)
+      .await;
+    guard.finish().map_err(Error)?;
+    result.map_err(Error)
   }
 
   async fn _run(
@@ -1760,7 +1925,7 @@ impl Program {
     entrypoint: &str,
     resources: &mut [&mut dyn Any],
     calldata: &[u8],
-    _: &PreemptionEnabled,
+    writable_data: bool,
   ) -> Result<i64, RuntimeError> {
     // Once the code budget is gone nothing can ever be compiled again, so fail
     // before running anything rather than replaying the program up to the call
@@ -1805,43 +1970,61 @@ impl Program {
       }
     }
 
-    let mut ectx = BorrowedExecContext::new();
-
     if calldata.len() > MAX_CALLDATA_SIZE {
       return Err(RuntimeError::InvalidArgument("calldata too large"));
     }
-    ectx.ctx.guest_stack.as_mut_slice()[SHADOW_STACK_SIZE - calldata.len()..]
+
+    let guest_stack_size = self.unbound.guest_stack_size;
+    let mut ectx = BorrowedExecContext::new(guest_stack_size);
+
+    ectx.ctx.guest_stack.as_mut_slice()[guest_stack_size - calldata.len()..]
       .copy_from_slice(calldata);
     let calldata_len = calldata.len();
 
     let program_ret: u64 = {
       let guest_stack_top = self.unbound.cage.stack_top();
       let guest_stack_bottom = self.unbound.cage.stack_bottom();
-      // Tier F addresses `[R10 - FRAME_WINDOW, R10)` with no bounds check, so
-      // the deepest frame pointer the loader will accept has to leave that much
-      // above the bottom of the window. The constants are asserted at compile
-      // time; this is the same fact against the addresses the cage actually
-      // handed back, including the `& !0x7` rounding below and the real calldata
-      // length, neither of which a const assertion can see.
+      // Tier F addresses `[R10 - FRAME_WINDOW, R10)` with no bounds check. The
+      // root must leave that window above the stack bottom; every later local
+      // call establishes the same invariant dynamically before entering its
+      // callee.
       debug_assert!(
         ((guest_stack_top - calldata_len) & !0x7)
-          .checked_sub(
-            (MAX_LOCAL_CALL_DEPTH - 1) * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize
-          )
-          .and_then(|deepest_r10| deepest_r10.checked_sub(FRAME_WINDOW))
+          .checked_sub(FRAME_WINDOW)
           .is_some_and(|floor| floor >= guest_stack_bottom),
-        "the deepest accepted frame pointer no longer leaves FRAME_WINDOW above \
-         the guest stack bottom"
+        "the entry frame pointer does not leave FRAME_WINDOW above the guest stack bottom"
       );
       let ctx = &mut *ectx.ctx;
+      let stack_native_base = ctx.guest_stack.as_mut_ptr() as usize;
+      let guest_frame = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
+      let local_call_guest_floor = stack_native_base
+        .checked_add(FRAME_WINDOW)
+        .and_then(|floor| floor.checked_add(guest_frame))
+        .expect("local-call guest stack floor overflow");
+      let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+      if page_size <= 0 {
+        return Err(RuntimeError::PlatformError("failed to query page size"));
+      }
+      let native_usable_bottom = ctx
+        .native_stack
+        .limit()
+        .get()
+        .checked_add(page_size as usize)
+        .expect("native stack usable bottom overflow");
+      let local_call_native_floor = native_usable_bottom
+        .checked_add(NATIVE_STACK_RESERVE)
+        .and_then(|floor| floor.checked_add(crate::jit::abi::NATIVE_LOCAL_CALL_BUDGET))
+        .expect("local-call native stack floor overflow");
       let mut memory = JitMemory {
         stack_guest_bottom: guest_stack_bottom,
         stack_guest_top: guest_stack_top,
-        stack_native_base: ctx.guest_stack.as_mut_ptr() as usize,
+        stack_native_base,
         data_guest_bottom: self.unbound.cage.data_bottom(),
         data_guest_top: self.unbound.cage.data_top(),
         data_native_base: self.unbound.cage.data_native_base(),
         derived: [0; 12],
+        local_call_guest_floor,
+        local_call_native_floor,
       };
       memory.fill_derived();
       let memory = memory;
@@ -1888,6 +2071,10 @@ impl Program {
           x.yielder.set(yielder);
           x.pointer_cage_protected_range
             .set((0, POINTER_CAGE_PROTECTED_WINDOW));
+          x.data_range.set((
+            memory.data_native_base,
+            memory.data_native_base + (memory.data_guest_top - memory.data_guest_bottom),
+          ));
           compiler_fence(Ordering::Release);
           x.valid.store(true, Ordering::Relaxed);
         });
@@ -1900,6 +2087,7 @@ impl Program {
             x.yielder.set(None);
             x.code_range.set((0, 0));
             x.pointer_cage_protected_range.set((0, 0));
+            x.data_range.set((0, 0));
           });
         });
 
@@ -1913,6 +2101,7 @@ impl Program {
             mutable_dereferenced_regions: unsafe { std::mem::zeroed() },
             immutable_dereferenced_regions: unsafe { std::mem::zeroed() },
             can_post_task: false,
+            writable_data,
           })
           .map_err(|_| RuntimeError::AsyncHelperError(helper_name))?;
         }
@@ -1921,9 +2110,10 @@ impl Program {
         // The coroutine is suspended here, which is exactly the state a
         // cancellation abandons without running destructors. Checked on the
         // host stack rather than at the suspension sites themselves: those run
-        // on the 16 KiB coroutine stack, where a failing assertion overruns
-        // into the guard page and reports as a bare SIGSEGV instead of saying
-        // what went wrong. This also covers every suspension point at once -
+        // within the coroutine stack's fixed emergency reserve, where a failing
+        // assertion can overrun into the guard page and report as a bare
+        // SIGSEGV instead of saying what went wrong. This also covers every
+        // suspension point at once -
         // helper dispatch, the lazy local-call resolver, and preemption.
         self.debug_assert_nothing_to_drop_across_suspend();
         ACTIVE_PROGRAM.with(|x| x.set(std::ptr::null()));
@@ -1934,6 +2124,7 @@ impl Program {
           x.yielder.set(None);
           x.code_range.set((0, 0));
           x.pointer_cage_protected_range.set((0, 0));
+          x.data_range.set((0, 0));
           yielder
         });
         yielder = next_yielder;
@@ -1943,6 +2134,10 @@ impl Program {
           CoroutineResult::Return(x) => break x,
           CoroutineResult::Yield(x) => x,
         };
+
+        if dispatch.local_call_stack_exhausted {
+          return Err(RuntimeError::StackExhausted);
+        }
 
         // restore signal mask of current thread
         if dispatch.memory_access_error.is_some() || dispatch.async_preemption {
@@ -1954,7 +2149,7 @@ impl Program {
 
         if let Some(si_addr) = dispatch.memory_access_error {
           let vaddr = if si_addr >= memory.stack_native_base
-            && si_addr < memory.stack_native_base + SHADOW_STACK_SIZE
+            && si_addr < memory.stack_native_base + guest_stack_size
           {
             memory.stack_guest_bottom + (si_addr - memory.stack_native_base)
           } else if si_addr >= memory.data_native_base
@@ -1980,6 +2175,7 @@ impl Program {
           mutable_dereferenced_regions: unsafe { std::mem::zeroed() },
           immutable_dereferenced_regions: unsafe { std::mem::zeroed() },
           can_post_task: false,
+          writable_data,
         };
 
         // A lazy local call JIT-compiles a function on this thread before the
@@ -2115,7 +2311,7 @@ impl Program {
 /// apart: `native_frame_base` and `frame_constants` are on because both entry
 /// trampolines above establish exactly the frame the backend expects, and
 /// neither means anything without the pointer cage.
-fn jit_config(cage: &PointerCage) -> crate::jit::Config {
+fn jit_config(cage: &PointerCage, instruction_limit: usize) -> crate::jit::Config {
   crate::jit::Config {
     target: crate::jit::Target::host(),
     pointer_mask: cage.mask(),
@@ -2123,10 +2319,12 @@ fn jit_config(cage: &PointerCage) -> crate::jit::Config {
     // Both entry trampolines establish the frame these describe.
     native_frame_base: true,
     frame_constants: true,
+    instruction_limit,
     dispatcher: Some(tls_dispatcher),
     dispatcher_validate: Some(std_validator),
     unwind_helper_index: None,
     local_call_resolver: Some(tls_local_call_resolver),
+    local_call_stack_exhausted: Some(tls_local_call_stack_exhausted),
   }
 }
 
@@ -2236,12 +2434,14 @@ impl ProgramLoader {
       helpers_inverse,
       event_listener,
       code_size_limit: DEFAULT_CODE_SIZE_LIMIT,
+      instruction_limit: crate::jit::abi::MAX_INSTS as usize,
+      guest_stack_size: DEFAULT_GUEST_STACK_SIZE,
       require_static_regions: false,
     }
   }
 
   /// Requires every guest memory access to be statically routable to a single
-  /// region (stack or read-only data). When enabled, compilation fails if the
+  /// region (stack or data). When enabled, compilation fails if the
   /// region analysis cannot classify any load, store, or atomic — i.e. no
   /// access falls back to the dual-region runtime probe. Memory accesses
   /// reached only through unmodeled control flow (e.g. an argument pointer in a
@@ -2291,6 +2491,33 @@ impl ProgramLoader {
     self
   }
 
+  /// Sets the exclusive upper bound on decoded eBPF instruction slots.
+  pub fn with_instruction_limit(mut self, limit: usize) -> Self {
+    assert!(limit > 0, "instruction limit must be non-zero");
+    assert!(
+      limit <= i32::MAX as usize,
+      "instruction limit must fit in a signed 32-bit PC"
+    );
+    self.instruction_limit = limit;
+    self
+  }
+
+  /// Sets the writable guest stack window size used by each invocation.
+  ///
+  /// Each dynamic local call consumes one fixed 4 KiB guest frame. Recursive
+  /// and statically deep call graphs are admitted, then stopped with a runtime
+  /// error before the next complete frame would cross this window's bottom.
+  /// Space not consumed by call frames can be used as a caller-managed arena.
+  /// The default remains [`DEFAULT_GUEST_STACK_SIZE`].
+  pub fn with_guest_stack_size(mut self, size: usize) -> Self {
+    assert!(
+      size >= DEFAULT_GUEST_STACK_SIZE,
+      "guest stack size must be at least {DEFAULT_GUEST_STACK_SIZE} bytes"
+    );
+    self.guest_stack_size = size;
+    self
+  }
+
   /// Loads an ELF image into a new `UnboundProgram`.
   pub fn load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, Error> {
     self._load(rng, elf).map_err(Error)
@@ -2298,15 +2525,38 @@ impl ProgramLoader {
 
   fn _load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, RuntimeError> {
     let start_time = Instant::now();
-    let cage = PointerCage::new(rng, SHADOW_STACK_SIZE, elf.len())?;
+    let writable_plan = plan_writable_data(elf).map_err(RuntimeError::Linker)?;
+    let cage = PointerCage::new(rng, self.guest_stack_size, elf.len(), writable_plan.size)?;
 
     let code_sections = {
       let mut data = cage.data_slice(cage.data_bottom(), elf.len()).unwrap();
       let data = unsafe { data.as_mut() };
       data.copy_from_slice(elf);
 
-      link_elf(data, cage.data_bottom(), &self.helpers_inverse).map_err(RuntimeError::Linker)?
+      link_elf(
+        data,
+        cage.data_bottom(),
+        cage.writable_data_bottom(),
+        &writable_plan,
+        &self.helpers_inverse,
+      )
+      .map_err(RuntimeError::Linker)?
     };
+
+    // Relocations above were applied to the immutable ELF image. Copy only the
+    // allocated writable sections into their packed, page-aligned suffix;
+    // code, rodata, and ELF metadata remain single-copy in the frozen prefix.
+    for section in &writable_plan.sections {
+      unsafe {
+        std::ptr::copy_nonoverlapping(
+          (cage.data_native_base() + section.file_offset) as *const u8,
+          (cage.data_native_base()
+            + (cage.writable_data_bottom() - cage.data_bottom())
+            + section.backing_offset) as *mut u8,
+          section.size,
+        );
+      }
+    }
     cage.freeze_data();
 
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -2355,7 +2605,7 @@ impl ProgramLoader {
     let resolvers = HashMap::new();
     let next_resolver_id = 1u32;
 
-    let config = std::sync::Arc::new(jit_config(&cage));
+    let config = std::sync::Arc::new(jit_config(&cage, self.instruction_limit));
 
     for (section_name, code_vaddr_size) in code_sections {
       let code = cage
@@ -2367,17 +2617,12 @@ impl ProgramLoader {
       // here an oversized section is walked twice and given per-instruction
       // tables by the two analyses below, only to be refused afterwards for a
       // reason that was knowable from its length.
-      if code_bytes.len() / 8 > crate::jit::abi::MAX_INSTS as usize {
+      if code_bytes.len() / 8 > self.instruction_limit as usize {
         return Err(RuntimeError::InvalidArgumentOwned(format!(
           "too many instructions in {section_name} (max {})",
-          crate::jit::abi::MAX_INSTS
+          self.instruction_limit
         )));
       }
-      validate_local_call_graph(code_bytes).map_err(|err| {
-        RuntimeError::InvalidArgumentOwned(format!(
-          "local call graph validation failed in {section_name}: {err}"
-        ))
-      })?;
       let layout = analyze_functions(code_bytes).map_err(|err| {
         RuntimeError::InvalidArgumentOwned(format!(
           "local function analysis failed in {section_name}: {err}"
@@ -2432,6 +2677,9 @@ impl ProgramLoader {
       code_base,
       code_size: code_len_allocated,
       page_size,
+      guest_stack_size: self.guest_stack_size,
+      run_lock: RwLock::new(()),
+      data_protection_failed: Cell::new(false),
       code_arena: RefCell::new(CodeArena { used: 0 }),
       cage,
       helper_id_xor: self.helper_id_xor,
@@ -2452,6 +2700,7 @@ struct Dispatch {
   async_preemption: bool,
   memory_access_error: Option<usize>,
   lazy_local_call: Option<u32>,
+  local_call_stack_exhausted: bool,
 
   index: u32,
   arg1: u64,
@@ -2477,6 +2726,7 @@ unsafe extern "C" fn tls_dispatcher(
     async_preemption: false,
     memory_access_error: None,
     lazy_local_call: None,
+    local_call_stack_exhausted: false,
     index,
     arg1,
     arg2,
@@ -2503,6 +2753,21 @@ unsafe extern "C" fn tls_local_call_resolver(resolver_id: std::os::raw::c_uint) 
     lazy_local_call: Some(resolver_id),
     ..Default::default()
   })
+}
+
+unsafe extern "C" fn tls_local_call_stack_exhausted() -> ! {
+  let yielder = ACTIVE_JIT_CODE_ZONE
+    .with(|x| x.yielder.get())
+    .expect("no yielder");
+  yielder.as_ref().suspend(Dispatch {
+    local_call_stack_exhausted: true,
+    ..Default::default()
+  });
+
+  // The parent terminates and drops the coroutine instead of resuming this
+  // dispatch. If that contract is ever broken, abort rather than returning to
+  // JIT code that deliberately did not establish a callee frame.
+  libc::abort()
 }
 
 unsafe extern "C" fn std_validator(
@@ -2546,12 +2811,13 @@ unsafe extern "C" fn sigsegv_handler(
 ) {
   let fail = || chain_to_previous_sigsegv_handler();
 
-  let Some((jit_code_zone, pointer_cage, yielder)) = ACTIVE_JIT_CODE_ZONE.with(|x| {
+  let Some((jit_code_zone, pointer_cage, data_range, yielder)) = ACTIVE_JIT_CODE_ZONE.with(|x| {
     if x.valid.load(Ordering::Relaxed) {
       compiler_fence(Ordering::Acquire);
       Some((
         x.code_range.get(),
         x.pointer_cage_protected_range.get(),
+        x.data_range.get(),
         x.yielder.get(),
       ))
     } else {
@@ -2573,7 +2839,9 @@ unsafe extern "C" fn sigsegv_handler(
   }
 
   let si_addr = (*siginfo).si_addr() as usize;
-  if si_addr < pointer_cage.0 || si_addr >= pointer_cage.1 {
+  let in_fault_window = si_addr >= pointer_cage.0 && si_addr < pointer_cage.1;
+  let in_data = si_addr >= data_range.0 && si_addr < data_range.1;
+  if !in_fault_window && !in_data {
     return fail();
   }
 

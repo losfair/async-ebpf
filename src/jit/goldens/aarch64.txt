@@ -16,12 +16,12 @@ a call sits between leader and member/cage only.04f54f7903b6ea2560b9eb9c|904:h02
 a call sits between leader and member/no cage.057c4120028e86f4097307c2|636:hd542d33d354b7bfc6a24b69e1eaeb92a
 a call sits between leader and member/production + unwind helper.d57c555ff2920d6c1cd17ffa|756:ha435d3d147496694d841a85e78c1b967
 a call sits between leader and member/production.8080f121f291f1bd2b4297fa|756:ha435d3d147496694d841a85e78c1b967
-a store member against the data region/cage + frame constants.3e1735d284531d3c15cfe31c|636:h32a71c20846ffe3686d00a54e56fbf39
-a store member against the data region/cage + native frame base.59210b99fc9a021e6f77e069|756:h662a68e1354bd4082f1aea1504f981a4
-a store member against the data region/cage only.0831c13f09f962c9ad083c80|756:h662a68e1354bd4082f1aea1504f981a4
+a store member against the data region/cage + frame constants.3e1735d284531d3c15cfe31c|604:h2f254f3edd8661838e515a3ec0d5c304
+a store member against the data region/cage + native frame base.59210b99fc9a021e6f77e069|828:hc80834a55bceb3566b3493e81b0f8106
+a store member against the data region/cage only.0831c13f09f962c9ad083c80|828:hc80834a55bceb3566b3493e81b0f8106
 a store member against the data region/no cage.94cac5f2d0c239cce486ee47|560:h30bd82c00ad4340105b9efcd82e082e7
-a store member against the data region/production + unwind helper.28092d5ca25e5f418c3568e4|636:h32a71c20846ffe3686d00a54e56fbf39
-a store member against the data region/production.564eb73b5f4ab82463807a42|636:h32a71c20846ffe3686d00a54e56fbf39
+a store member against the data region/production + unwind helper.28092d5ca25e5f418c3568e4|604:h2f254f3edd8661838e515a3ec0d5c304
+a store member against the data region/production.564eb73b5f4ab82463807a42|604:h2f254f3edd8661838e515a3ec0d5c304
 all register pairs/cage + frame constants.8c11da632cfd2b2ae133d9e9|1432:h95beea18b2be1fe617db79fc6c5f56c2
 all register pairs/cage + native frame base.b4385e3e0bb3019f3f1d7ff9|1592:h0b6df48acb9c2f0fc54aa29ea7f7cd16
 all register pairs/cage only.8cf8d1665a973344f812a680|1432:h95beea18b2be1fe617db79fc6c5f56c2
@@ -34,12 +34,12 @@ alu/cage only.4b1c25a261dd51ba513dce8e|2152:hcf75361325430361abd865414140847c
 alu/no cage.0aa4671617d415727c0c3189|2152:hcf75361325430361abd865414140847c
 alu/production + unwind helper.d8f4611c39e008bdc735dd39|2152:hcf75361325430361abd865414140847c
 alu/production.a69cce9774d222b52f96e5cb|2152:hcf75361325430361abd865414140847c
-atomic between leader and member/cage + frame constants.a09616c92a8cb65563a263a3|736:hf23cbad33eabcf97edeac22d0021d374
-atomic between leader and member/cage + native frame base.ac29dc52c3db859a922f5ac3|912:h284b0e0abb052787cb59324fa3586ffe
-atomic between leader and member/cage only.f38f3be1cae12b7a0de363c6|912:h284b0e0abb052787cb59324fa3586ffe
+atomic between leader and member/cage + frame constants.a09616c92a8cb65563a263a3|780:h4fe68b778d92f3062e8231db4ffeac95
+atomic between leader and member/cage + native frame base.ac29dc52c3db859a922f5ac3|984:ha8aaf057b81a270d17c8286af2397b47
+atomic between leader and member/cage only.f38f3be1cae12b7a0de363c6|984:ha8aaf057b81a270d17c8286af2397b47
 atomic between leader and member/no cage.b6c1751ff05a9e7b4a717ef5|588:he3d8219af6a6a2979860fa9ffb03a0ef
-atomic between leader and member/production + unwind helper.89dd0918973f6ea9431a990a|736:hf23cbad33eabcf97edeac22d0021d374
-atomic between leader and member/production.948474bf557f04267d57b58f|736:hf23cbad33eabcf97edeac22d0021d374
+atomic between leader and member/production + unwind helper.89dd0918973f6ea9431a990a|780:h4fe68b778d92f3062e8231db4ffeac95
+atomic between leader and member/production.948474bf557f04267d57b58f|780:h4fe68b778d92f3062e8231db4ffeac95
 atomic selector 0x10/cage + frame constants.48a185e07f126786833e5070|load-err:invalid atomic operation 0x10 at PC 0
 atomic selector 0x10/cage + native frame base.2724db52fff60c35f6aea95a|load-err:invalid atomic operation 0x10 at PC 0
 atomic selector 0x10/cage only.12c3e29d5be15dfd0c1c69a8|load-err:invalid atomic operation 0x10 at PC 0
@@ -124,12 +124,12 @@ atomic selector 0xf2/cage only.250c13759076be3a8bd0ca5e|load-err:atomic operatio
 atomic selector 0xf2/no cage.b6416c7e3b064e1ba3de5446|load-err:atomic operation 0xf2 at PC 0 requires the fetch flag
 atomic selector 0xf2/production + unwind helper.aa3386533980a5b233223999|load-err:atomic operation 0xf2 at PC 0 requires the fetch flag
 atomic selector 0xf2/production.fa7bfe43a348ea46addb07d0|load-err:atomic operation 0xf2 at PC 0 requires the fetch flag
-atomics/cage + frame constants.56eec9d7c8b5f7909b5de678|6312:h72274648ed3220639b8624b1df9ec1a6
-atomics/cage + native frame base.60092cf98c66c49edeb69b41|9112:h83fe82721051460052caa8ca4c38420a
-atomics/cage only.6a181c0b7f46e7f7c7573df6|9112:h83fe82721051460052caa8ca4c38420a
+atomics/cage + frame constants.56eec9d7c8b5f7909b5de678|10712:h736bcd4043792bc9ba56362df40b2363
+atomics/cage + native frame base.60092cf98c66c49edeb69b41|16312:he427d002afcb1cf09bc6f0c66eaba682
+atomics/cage only.6a181c0b7f46e7f7c7573df6|16312:he427d002afcb1cf09bc6f0c66eaba682
 atomics/no cage.2ea41c59406524132bc6da38|3272:h1c5c91b5d9d6f6e2db7886f467af09b4
-atomics/production + unwind helper.5524d2c0e6ceda80c329cb41|6312:h72274648ed3220639b8624b1df9ec1a6
-atomics/production.1641fb6f8e865d27be2ee948|6312:h72274648ed3220639b8624b1df9ec1a6
+atomics/production + unwind helper.5524d2c0e6ceda80c329cb41|10712:h736bcd4043792bc9ba56362df40b2363
+atomics/production.1641fb6f8e865d27be2ee948|10712:h736bcd4043792bc9ba56362df40b2363
 backward conditional branch at 1 MiB n=7708.ce7e3309faf4e6bb8ebeece3|1048852:h9642ee6ce2360d1e0e22d1d1e9941558
 backward conditional branch at 1 MiB n=7709.40949315cbc9d7731212fd2d|1048988:h030a11dc7fd917b20ab3d9c60346c8e1
 backward conditional branch at 1 MiB n=7710.cf6aa47a69d3876b5b651d0e|1049124:h380c02c61711c925e646fc0704ada071
@@ -190,12 +190,12 @@ escaping jump/cage only.e356583568a5e39b504129f0|load-err:jump out of bounds at 
 escaping jump/no cage.14b576bea29e8688f59e5521|load-err:jump out of bounds at PC 2
 escaping jump/production + unwind helper.19e9c71c792ee43bc5355ee4|load-err:jump out of bounds at PC 2
 escaping jump/production.f7aad552026626c73c7ada41|load-err:jump out of bounds at PC 2
-group across the function boundary 0..2/cage + frame constants.6f92768b3c1f21d025699157|660:h6e7c9b6c3c49477cb198e77f2cb26aa8
-group across the function boundary 0..2/cage + native frame base.0a3f381163344009ecb020f7|660:h6e7c9b6c3c49477cb198e77f2cb26aa8
-group across the function boundary 0..2/cage only.3b85f0697e65a95999137023|660:h6e7c9b6c3c49477cb198e77f2cb26aa8
-group across the function boundary 0..2/no cage.9cbd1441daf56264435efb70|660:h6e7c9b6c3c49477cb198e77f2cb26aa8
-group across the function boundary 0..2/production + unwind helper.545847689cf95b0babfa87bd|660:h6e7c9b6c3c49477cb198e77f2cb26aa8
-group across the function boundary 0..2/production.4bf31b4f5ba70fa2dbee799a|660:h6e7c9b6c3c49477cb198e77f2cb26aa8
+group across the function boundary 0..2/cage + frame constants.6f92768b3c1f21d025699157|712:hed95b6e730ab2277fb796b48d4fdf696
+group across the function boundary 0..2/cage + native frame base.0a3f381163344009ecb020f7|712:hed95b6e730ab2277fb796b48d4fdf696
+group across the function boundary 0..2/cage only.3b85f0697e65a95999137023|712:hed95b6e730ab2277fb796b48d4fdf696
+group across the function boundary 0..2/no cage.9cbd1441daf56264435efb70|712:hed95b6e730ab2277fb796b48d4fdf696
+group across the function boundary 0..2/production + unwind helper.545847689cf95b0babfa87bd|712:hed95b6e730ab2277fb796b48d4fdf696
+group across the function boundary 0..2/production.4bf31b4f5ba70fa2dbee799a|712:hed95b6e730ab2277fb796b48d4fdf696
 group across the function boundary 2..5/cage + frame constants.bafd47972d1fbae712b14d14|604:hd114cb250373a6aad190442ff862f4d8
 group across the function boundary 2..5/cage + native frame base.27622cdabbb8b85169c97aee|828:h7b37291d5bec90e3aecdef45efb77432
 group across the function boundary 2..5/cage only.c544fde0f54f8546f380e564|828:h7b37291d5bec90e3aecdef45efb77432
@@ -267,24 +267,24 @@ literal load at 1 MiB n=7709.1f7bdd9fbb52da6a9ccd4401|1049052:hbf06dad9333abb9f4
 literal load at 1 MiB n=7710.9fbc7bcfe9c658f2c03441db|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
 literal load at 1 MiB n=7711.60de6ce0d7a61431bfec7040|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
 literal load at 1 MiB n=7712.b7b0941ae4d3114f8ffe3a59|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
-load/store/cage + frame constants.dce6d10fcaeeb5eba9bf24d5|7992:hfaf846cc992b7bca23e987004809d6d4
-load/store/cage + native frame base.5a49b38b23171d746a22772e|12920:he6d300e1278e252027c86a87c7f4117d
-load/store/cage only.e3d9a7d090d97ce1dabb35e4|12920:he6d300e1278e252027c86a87c7f4117d
+load/store/cage + frame constants.dce6d10fcaeeb5eba9bf24d5|11864:h8becb1a95fc67b93c03a155edb80b7a6
+load/store/cage + native frame base.5a49b38b23171d746a22772e|19256:hc2f0e2bfea99b678ad0814542fed5a2b
+load/store/cage only.e3d9a7d090d97ce1dabb35e4|19256:hc2f0e2bfea99b678ad0814542fed5a2b
 load/store/no cage.e095f09981d95445faeb890d|1592:h9f3d4147cfc73f4452f7c35a1dd4b857
-load/store/production + unwind helper.99f75e811b696278144f4079|7992:hfaf846cc992b7bca23e987004809d6d4
-load/store/production.cfa1315d7cf842fa14450cac|7992:hfaf846cc992b7bca23e987004809d6d4
-local call, no ids/cage + frame constants.5c5868e7c0f46e9b92e8cbbc|err:Unexpected instruction or missing local-call resolver during JIT compilation
-local call, no ids/cage + native frame base.e0fccf9b1c5efbc11bd85969|err:Unexpected instruction or missing local-call resolver during JIT compilation
-local call, no ids/cage only.6514e7d541bfa309a63db4f2|err:Unexpected instruction or missing local-call resolver during JIT compilation
-local call, no ids/no cage.d1f9d8cabe5362e41aec5719|err:Unexpected instruction or missing local-call resolver during JIT compilation
-local call, no ids/production + unwind helper.7771db13dd0ff6f7f944fc1e|err:Unexpected instruction or missing local-call resolver during JIT compilation
-local call, no ids/production.1070077a3bc9ef55265a2d84|err:Unexpected instruction or missing local-call resolver during JIT compilation
-local call/cage + frame constants.dfbee73ffd8a529eb9e3c3c8|660:ha25a31288c27f5257148410ff1db469b
-local call/cage + native frame base.4aa64f57ec8e1bae35ae8892|660:ha25a31288c27f5257148410ff1db469b
-local call/cage only.b70c1ff7703bd398d2b72186|660:ha25a31288c27f5257148410ff1db469b
-local call/no cage.f1d262f8b64c0223e99682a7|660:ha25a31288c27f5257148410ff1db469b
-local call/production + unwind helper.d34f5e98e68c75a4bcd87ceb|660:ha25a31288c27f5257148410ff1db469b
-local call/production.2dfffd9a5cb963127c1e47e3|660:ha25a31288c27f5257148410ff1db469b
+load/store/production + unwind helper.99f75e811b696278144f4079|11864:h8becb1a95fc67b93c03a155edb80b7a6
+load/store/production.cfa1315d7cf842fa14450cac|11864:h8becb1a95fc67b93c03a155edb80b7a6
+local call, no ids/cage + frame constants.5c5868e7c0f46e9b92e8cbbc|err:Unexpected instruction or missing local-call runtime callbacks during JIT compilation
+local call, no ids/cage + native frame base.e0fccf9b1c5efbc11bd85969|err:Unexpected instruction or missing local-call runtime callbacks during JIT compilation
+local call, no ids/cage only.6514e7d541bfa309a63db4f2|err:Unexpected instruction or missing local-call runtime callbacks during JIT compilation
+local call, no ids/no cage.d1f9d8cabe5362e41aec5719|err:Unexpected instruction or missing local-call runtime callbacks during JIT compilation
+local call, no ids/production + unwind helper.7771db13dd0ff6f7f944fc1e|err:Unexpected instruction or missing local-call runtime callbacks during JIT compilation
+local call, no ids/production.1070077a3bc9ef55265a2d84|err:Unexpected instruction or missing local-call runtime callbacks during JIT compilation
+local call/cage + frame constants.dfbee73ffd8a529eb9e3c3c8|712:h8e0549997450d1c52c52ffd874cb671d
+local call/cage + native frame base.4aa64f57ec8e1bae35ae8892|712:h8e0549997450d1c52c52ffd874cb671d
+local call/cage only.b70c1ff7703bd398d2b72186|712:h8e0549997450d1c52c52ffd874cb671d
+local call/no cage.f1d262f8b64c0223e99682a7|712:h8e0549997450d1c52c52ffd874cb671d
+local call/production + unwind helper.d34f5e98e68c75a4bcd87ceb|712:h8e0549997450d1c52c52ffd874cb671d
+local call/production.2dfffd9a5cb963127c1e47e3|712:h8e0549997450d1c52c52ffd874cb671d
 member addresses a base the leader overwrote/cage + frame constants.9d2dde8d6f08c7c73bbfe796|680:h081bc41d3da4734947d1bfdaaa4da050
 member addresses a base the leader overwrote/cage + native frame base.d393dbc0cbea0e00b628db8f|828:hb70c9f02f4b104d6f22d91b358d86557
 member addresses a base the leader overwrote/cage only.cbeee8f2294c2557325dbcfd|828:hb70c9f02f4b104d6f22d91b358d86557
@@ -333,12 +333,12 @@ movsx/cage only.10d114a3ffdc08eb914f3b09|580:hf236134ef034b4b65773e1d3e522d0a3
 movsx/no cage.ea32e60cb39a8319c29321e9|580:hf236134ef034b4b65773e1d3e522d0a3
 movsx/production + unwind helper.5ddb8247a17baa4f574b5045|580:hf236134ef034b4b65773e1d3e522d0a3
 movsx/production.19b1203b2026722e764d24c2|580:hf236134ef034b4b65773e1d3e522d0a3
-non-canonical atomic selectors/cage + frame constants.5d20f30b28ac07f6dcd8a317|2236:hfb7bc24f64061139213b458b62ab332b
-non-canonical atomic selectors/cage + native frame base.3190a3e2d244f268b1cbfa82|3076:ha4c3b6f22c2a145f9864aacf437c4edf
-non-canonical atomic selectors/cage only.d6a85eaf4cd76b690e0c295e|3076:ha4c3b6f22c2a145f9864aacf437c4edf
+non-canonical atomic selectors/cage + frame constants.5d20f30b28ac07f6dcd8a317|3556:ha2c1bf27728acdb5bfd63aee7386b437
+non-canonical atomic selectors/cage + native frame base.3190a3e2d244f268b1cbfa82|5236:he9a80b4bb9308741a777d25e47b6744a
+non-canonical atomic selectors/cage only.d6a85eaf4cd76b690e0c295e|5236:he9a80b4bb9308741a777d25e47b6744a
 non-canonical atomic selectors/no cage.e6ac91df463bad40dbc0bd65|1356:hfd46725ff859005ecf612390746ebf2a
-non-canonical atomic selectors/production + unwind helper.ab764e56b361d06782d1bd62|2236:hfb7bc24f64061139213b458b62ab332b
-non-canonical atomic selectors/production.86ec4214273c7ca0dd7c077f|2236:hfb7bc24f64061139213b458b62ab332b
+non-canonical atomic selectors/production + unwind helper.ab764e56b361d06782d1bd62|3556:ha2c1bf27728acdb5bfd63aee7386b437
+non-canonical atomic selectors/production.86ec4214273c7ca0dd7c077f|3556:ha2c1bf27728acdb5bfd63aee7386b437
 out of space/cage + frame constants/cap 0.48a46c2781ede433d2c5dd15|err:OutOfSpace
 out of space/cage + frame constants/cap 128.48a46c2781ede433d2c5dd15|err:OutOfSpace
 out of space/cage + frame constants/cap 4.48a46c2781ede433d2c5dd15|err:OutOfSpace
@@ -375,18 +375,18 @@ out of space/production/cap 4.1b1405fc7715d5724500e8f8|err:OutOfSpace
 out of space/production/cap 512.1b1405fc7715d5724500e8f8|err:OutOfSpace
 out of space/production/cap 64.1b1405fc7715d5724500e8f8|err:OutOfSpace
 out of space/production/cap 8.1b1405fc7715d5724500e8f8|err:OutOfSpace
-r10/cage + frame constants.641f76e440bc40ec1258339c|728:h89683339ed9cb327e54053fb333f7265
-r10/cage + native frame base.735ac3a7c938cfdfbdaa1054|880:ha144ae1fac4e5c6a5f877e57ffe74a38
-r10/cage only.bbc79efb885a1a08faa9c3ea|840:h87c246950c0c04951ed6481c658695d0
+r10/cage + frame constants.641f76e440bc40ec1258339c|816:ha8ce94ddaf562b2c5b380956168615a5
+r10/cage + native frame base.735ac3a7c938cfdfbdaa1054|1024:h7a03e0166a4454b18f910f4f49734ce2
+r10/cage only.bbc79efb885a1a08faa9c3ea|984:h884cb7e4c8c29d52896e5fbbc4015493
 r10/no cage.213c86f5adc71701c7046f6d|580:h7be6929aa975d41ef59dbbcc90a29220
-r10/production + unwind helper.5d160e9ab5b93857d78c63ec|768:haf497e4d1a4f8f04bfc5c70c10bb2523
-r10/production.a1ab6aca68679f2a98f4464c|768:haf497e4d1a4f8f04bfc5c70c10bb2523
-range 0..2/cage + frame constants.3f54bbba6063e0fb6f96d1d0|660:hc14847dd05b191e5a9d68b97fac2a7cb
-range 0..2/cage + native frame base.57c46c02e1e4654249fb8d50|660:hc14847dd05b191e5a9d68b97fac2a7cb
-range 0..2/cage only.a8c96e725ccf0b99a44f388b|660:hc14847dd05b191e5a9d68b97fac2a7cb
-range 0..2/no cage.55e482b6ead7320f16032327|660:hc14847dd05b191e5a9d68b97fac2a7cb
-range 0..2/production + unwind helper.0c546b407cc74969c207d21c|660:hc14847dd05b191e5a9d68b97fac2a7cb
-range 0..2/production.27d48b5f455a9fe4445d63ee|660:hc14847dd05b191e5a9d68b97fac2a7cb
+r10/production + unwind helper.5d160e9ab5b93857d78c63ec|856:h811646604589a324c84e0a8f6d073b62
+r10/production.a1ab6aca68679f2a98f4464c|856:h811646604589a324c84e0a8f6d073b62
+range 0..2/cage + frame constants.3f54bbba6063e0fb6f96d1d0|712:h56806448796bef0a37a552ffba5ec120
+range 0..2/cage + native frame base.57c46c02e1e4654249fb8d50|712:h56806448796bef0a37a552ffba5ec120
+range 0..2/cage only.a8c96e725ccf0b99a44f388b|712:h56806448796bef0a37a552ffba5ec120
+range 0..2/no cage.55e482b6ead7320f16032327|712:h56806448796bef0a37a552ffba5ec120
+range 0..2/production + unwind helper.0c546b407cc74969c207d21c|712:h56806448796bef0a37a552ffba5ec120
+range 0..2/production.27d48b5f455a9fe4445d63ee|712:h56806448796bef0a37a552ffba5ec120
 range 2..5/cage + frame constants.60337074828b734540c91ba4|564:h114e5d11e18aa051af8e3d425e25ffec
 range 2..5/cage + native frame base.c4b3ec310da932f72511314b|564:h114e5d11e18aa051af8e3d425e25ffec
 range 2..5/cage only.4cd1f45efdf3024e2707295a|564:h114e5d11e18aa051af8e3d425e25ffec
@@ -423,45 +423,45 @@ st src=10 width 8/cage only.8aab558e4e6ab32f943113bd|load-err:Invalid source reg
 st src=10 width 8/no cage.e4e5c88e82089d3fb402b9e4|load-err:Invalid source register 10 for opcode 6A.
 st src=10 width 8/production + unwind helper.4c385073a7e988ba23d672c4|load-err:Invalid source register 10 for opcode 6A.
 st src=10 width 8/production.ce5ccc325fcc31aff9de4594|load-err:Invalid source register 10 for opcode 6A.
-store group region 0/cage + frame constants.18cfa7f419effeacb1df7e46|628:h4259a4316cab88589441fd1d3bf8063d
-store group region 0/cage + native frame base.fee6504c482402a0614b2528|684:h6d2f826a7dcb434af716d01b9a3280d7
-store group region 0/cage only.0ce333cf4259ec2021e68adc|684:h6d2f826a7dcb434af716d01b9a3280d7
+store group region 0/cage + frame constants.18cfa7f419effeacb1df7e46|652:h868b5d8732cb34907524fd4871136b23
+store group region 0/cage + native frame base.fee6504c482402a0614b2528|828:h9e2ff0eee7d29f6d07f9d4b04c922832
+store group region 0/cage only.0ce333cf4259ec2021e68adc|828:h9e2ff0eee7d29f6d07f9d4b04c922832
 store group region 0/no cage.d36be690ede528318825982f|560:h6b16fb931e23f595751a4559ba378389
-store group region 0/production + unwind helper.f0fe8925ab7504c5828ed0d2|628:h4259a4316cab88589441fd1d3bf8063d
-store group region 0/production.2ffc532fc4efc08978473c98|628:h4259a4316cab88589441fd1d3bf8063d
+store group region 0/production + unwind helper.f0fe8925ab7504c5828ed0d2|652:h868b5d8732cb34907524fd4871136b23
+store group region 0/production.2ffc532fc4efc08978473c98|652:h868b5d8732cb34907524fd4871136b23
 store group region 1/cage + frame constants.6d4251f53629c7c714f35629|604:h1f36d697188e757398a8581aec89da22
-store group region 1/cage + native frame base.ca3dc525f4741cabdffe9b6a|684:h6d2f826a7dcb434af716d01b9a3280d7
-store group region 1/cage only.1d2327885016d342610cc7b6|684:h6d2f826a7dcb434af716d01b9a3280d7
+store group region 1/cage + native frame base.ca3dc525f4741cabdffe9b6a|828:h9e2ff0eee7d29f6d07f9d4b04c922832
+store group region 1/cage only.1d2327885016d342610cc7b6|828:h9e2ff0eee7d29f6d07f9d4b04c922832
 store group region 1/no cage.eea08c13e25375e42612fad3|560:h6b16fb931e23f595751a4559ba378389
 store group region 1/production + unwind helper.b381d4ed836c7d19d034950e|604:h1f36d697188e757398a8581aec89da22
 store group region 1/production.6a08cf6e3d97ff1f25e0c4d9|604:h1f36d697188e757398a8581aec89da22
-store group region 2/cage + frame constants.4c05a7a4a7326c2a073ca619|628:h4259a4316cab88589441fd1d3bf8063d
-store group region 2/cage + native frame base.461c00a8bc8b46d9de9d7f0a|684:h6d2f826a7dcb434af716d01b9a3280d7
-store group region 2/cage only.b28a0dae3860410bc6337eae|684:h6d2f826a7dcb434af716d01b9a3280d7
+store group region 2/cage + frame constants.4c05a7a4a7326c2a073ca619|604:hf7969f7e9d08c5eab026d6a626a20fd3
+store group region 2/cage + native frame base.461c00a8bc8b46d9de9d7f0a|828:h9e2ff0eee7d29f6d07f9d4b04c922832
+store group region 2/cage only.b28a0dae3860410bc6337eae|828:h9e2ff0eee7d29f6d07f9d4b04c922832
 store group region 2/no cage.8473b24b00e61bd50917a4b1|560:h6b16fb931e23f595751a4559ba378389
-store group region 2/production + unwind helper.dadb3042433da0070e451514|628:h4259a4316cab88589441fd1d3bf8063d
-store group region 2/production.acbe5bca0aff2ee159bedbdc|628:h4259a4316cab88589441fd1d3bf8063d
-store immediates/cage + frame constants.80b72413462080b57e69f9b1|2968:hff5ffed9f06286f19dec14aaf5ad5bd8
-store immediates/cage + native frame base.005fb81879fc7880d0cc7302|4648:h7ed0a8d6d7a45d14705c5aa8719fc083
-store immediates/cage only.9feba65509b3555daed4fa83|4536:heb8bf1c64da2d77ce8f1ad1f1fb33971
+store group region 2/production + unwind helper.dadb3042433da0070e451514|604:hf7969f7e9d08c5eab026d6a626a20fd3
+store group region 2/production.acbe5bca0aff2ee159bedbdc|604:hf7969f7e9d08c5eab026d6a626a20fd3
+store immediates/cage + frame constants.80b72413462080b57e69f9b1|5432:hbc0bf4aba2efc21096db8fa0e660da92
+store immediates/cage + native frame base.005fb81879fc7880d0cc7302|8680:h8ab386bb201e087d300909222e58062e
+store immediates/cage only.9feba65509b3555daed4fa83|8568:h4ad5d50491a1519fbb204466f3378dd1
 store immediates/no cage.ed61d13f96ef4e0e4b451e42|1064:h149ac91650ef1b49fdd0035f7c537891
-store immediates/production + unwind helper.1bb3898661582e7790306a77|3080:hd61d2b6d412d1b4c09376322e9b5f16a
-store immediates/production.ccfdecc75385f899f9f364ff|3080:hd61d2b6d412d1b4c09376322e9b5f16a
-sweep.audit-barrier-sources|48:48:4210e807ce5d3bce8e796e0640eb889ddef344f7121b2beada160589f662d2d5
+store immediates/production + unwind helper.1bb3898661582e7790306a77|5544:h110a21b0a25e65e6eee45b2886b9a0ca
+store immediates/production.ccfdecc75385f899f9f364ff|5544:h110a21b0a25e65e6eee45b2886b9a0ca
+sweep.audit-barrier-sources|48:48:0b4b1c7ca6187ef8339f043b6bba32040ca46790c8925385dd68a58c582237b4
 sweep.audit-escaping-jump-capacity|384:0:f428581ff49e176ed5e8cff07db1b66e25aa99815feff7f41aa0f4f966acfe98
-sweep.audit-every-capacity|5408:720:92b3c09616db9bd464e7d2009c5a7d2dd71661eee3b85b9166fc841b6f84b994
-sweep.audit-fallthrough-entry|24:24:25ea8a3960fdefbb8c1dbad44d84cedd81309b2f8018d3c3ecc6ca55a616f539
-sweep.audit-full-buffer-masks-a-later-error|390:0:7eb6d09c1af6615298274f77d4a26790f74e19c574637845cfbba6cec4aa9386
+sweep.audit-every-capacity|5684:720:c378dad4ca32433847e6519d02bea9e3eb400df2aa6c6599918d96bf2cfc7ae2
+sweep.audit-fallthrough-entry|24:24:e5f26c4424712de15ef89c4bd4f359097510b3dee8ae2c8cb7160e457b634179
+sweep.audit-full-buffer-masks-a-later-error|390:0:ac8e9b68af9eabde09e594188b75764f15a9ae774a09d54e17d3ddef7beda9c8
 sweep.audit-group-boundaries|2970:2970:d0a8454203e44c62e06f1ed33802dd543142b9191f527bd6906d564818ce8062
 sweep.audit-group-interactions|48:48:01702790ba053d00aa25ec735dfd994dd9d2d4a81dcd903f85157d87f4be362f
 sweep.audit-more-hostile-plans|408:408:875c20683e826d16974b7b517b0396d736dce2f0921403af6b812504bd888fa7
-sweep.audit-probe-batch|570:558:4a5e626785a358514493124732ff5b5154d0f42d2de4d31ed9afb7f460271287
-sweep.audit-short-hint-array|120:120:ee1f790efefc69d68ba53ad87f00ce9aa1753fb6fc026a6cb3ac0486420e2b4c
-sweep.audit-wide-multi-function-ranges|20904:20904:7d0ef5c742de4021ec4e7c0c3fcc27474b6077e4df198812cbdc9b2ae579a866
-sweep.audit-wide-randomised-plans|3000:3000:c9cbcf6e27178593584b6c0336f5c6677acdf78c8ddef9651dabc94fc1c59b22
-sweep.randomised-multi-function-programs|2730:2730:508262d96392880265895e902e3e7c2511bcd9bd870e83613d72d1e957a52cbb
-sweep.randomised-programs|2400:2400:83f7dbdeba04809e98fd3a06f74ee2988f53286d31d8753099830872c657070b
-sweep.region-hints|96:96:f2fd4be5f98dc320501090459f3d7087413703a13974cd88cec84dedaa2a7fc7
+sweep.audit-probe-batch|570:558:b694c29203f4f908f872a490e83c296816a1eddf98c6625ea8e65796c105779b
+sweep.audit-short-hint-array|120:120:b52db95fc43a1d2991f13cf3140aa9d077dfb5815293dcb6d09027f6c9e5a23b
+sweep.audit-wide-multi-function-ranges|20904:20904:0a5ad7ddc4a9f65faadda9a9d2b533c76560b96bc0f3db6c1d6fb986a72dfd93
+sweep.audit-wide-randomised-plans|3000:3000:8fde9da655e2aa27a8f596c123c10094f557e8a6f39f5daf5dc5ec739af034ab
+sweep.randomised-multi-function-programs|2730:2730:d8df79345e75b20328a0920272ebe26d6a3ff77fd330926667b73367b37087af
+sweep.randomised-programs|2400:2400:0ec58233d2f09065955970434cc925cc302f1b8fc6c0e0909b107c1bccb92dfd
+sweep.region-hints|96:96:911af86c557c53c242b4fe5d9cec96901a0f4a2265cf6341f8546b61958e7c9e
 unwind branch to the epilogue at 1 MiB n=13104.765e4514aa8c588a8a7dd406|1048956:h55fdfdfa1958d34790c7c112a2eaabd1
 unwind branch to the epilogue at 1 MiB n=13105.5ccc35da77ed62916ae02c61|1049036:hba8acbe6ea480c2e0dfd07646d5dbf24
 unwind branch to the epilogue at 1 MiB n=13106.d290564fe1099600cb666e84|1049116:h5f441842b2a1100f9b2d2c7ed7f2d401

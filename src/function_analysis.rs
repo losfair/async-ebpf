@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::region_analysis::{function_live_in, RegMask};
 
@@ -10,12 +10,6 @@ const EBPF_CLS_JMP: u8 = 0x05;
 const EBPF_CLS_JMP32: u8 = 0x06;
 const EBPF_OP_JA: u8 = 0x05;
 const EBPF_OP_JA32: u8 = 0x06;
-/// Maximum depth of the local call graph, in frames. Every local function is
-/// charged one [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`] frame, so this
-/// also bounds how far below its entry `R10` a program can push the guest
-/// stack.
-pub(crate) const MAX_LOCAL_CALL_DEPTH: usize = 8;
-
 #[derive(Clone, Debug)]
 pub(crate) struct FunctionLayout {
   pub(crate) functions: Vec<FunctionInfo>,
@@ -205,82 +199,54 @@ fn insn_src(code: &[u8], pc: usize) -> u8 {
   code[pc * 8 + 1] >> 4
 }
 
-/// Depth-first walk of the local call graph, returning the height of the
-/// subtree rooted at `func_index` in frames.
+/// Computes the least fixed point of the per-function live-in equations.
 ///
-/// `depth` is how many frames are already on the chain above this call,
-/// counting this one - i.e. the root is visited at `depth == 1`. It is checked
-/// *before* descending any further, which is what bounds this function's own
-/// native recursion. Checking only the height on the way back up would leave
-/// the descent bounded by the graph, not by [`MAX_LOCAL_CALL_DEPTH`], and a
-/// program is free to chain `MAX_INSTS / 2` functions together - enough to
-/// overflow the host stack of the thread that happens to be loading it before
-/// the depth is ever reported. The height check below stays as well: it is what
-/// produces the diagnostic, and it catches a chain that the memo table let us
-/// skip descending through.
-fn visit_local_call_graph(
-  edges: &[Vec<usize>],
+/// Starting at the empty masks is important: these masks control lazy JIT
+/// specialization, so an all-register over-approximation can multiply native
+/// variants at every call around a recursive component. `function_live_in` is
+/// monotone in its callee summaries. Each successful update therefore only
+/// adds bits, and a changed callee needs to wake only its direct callers. With
+/// a finite `RegMask`, every function can change at most once per register bit.
+fn live_in_fixed_point(
+  code: &[u8],
   starts: &[usize],
-  states: &mut [u8],
-  depths: &mut [usize],
-  func_index: usize,
-  depth: usize,
-) -> Result<usize, String> {
-  if depth > MAX_LOCAL_CALL_DEPTH {
-    return Err(format!(
-      "local function call graph depth ({depth}) exceeds max ({MAX_LOCAL_CALL_DEPTH})"
-    ));
-  }
+  pc_to_func: &[usize],
+  callers: &[Vec<usize>],
+) -> Vec<RegMask> {
+  let num_insns = code.len() / 8;
+  let mut arg_masks = vec![0 as RegMask; starts.len()];
+  let mut pending = (0..starts.len()).collect::<VecDeque<_>>();
+  let mut queued = vec![true; starts.len()];
 
-  match states[func_index] {
-    1 => {
-      return Err(format!(
-        "recursive local function call graph involving PC {}",
-        starts[func_index]
-      ));
+  while let Some(func_index) = pending.pop_front() {
+    queued[func_index] = false;
+    let start = starts[func_index];
+    let end = starts.get(func_index + 1).copied().unwrap_or(num_insns);
+    let computed = function_live_in(code, start, end, &|target| {
+      pc_to_func
+        .get(target)
+        .and_then(|&callee| arg_masks.get(callee).copied())
+        .unwrap_or(crate::region_analysis::ALL_SIGNATURE_REGS)
+    });
+
+    // The transfer function is monotone, so a recomputation after callee masks
+    // grow cannot lose bits. Keep the union in release builds as a safe
+    // backstop if that invariant is accidentally broken by a future change.
+    debug_assert_eq!(arg_masks[func_index] & !computed, 0);
+    let next = arg_masks[func_index] | computed;
+    if next == arg_masks[func_index] {
+      continue;
     }
-    2 => return Ok(depths[func_index]),
-    _ => {}
-  }
-
-  states[func_index] = 1;
-  let mut max_depth = 1;
-
-  for &callee_index in &edges[func_index] {
-    let callee_depth =
-      visit_local_call_graph(edges, starts, states, depths, callee_index, depth + 1)?;
-    let candidate_depth = callee_depth + 1;
-    if candidate_depth > MAX_LOCAL_CALL_DEPTH {
-      return Err(format!(
-        "local function call graph depth ({candidate_depth}) exceeds max ({MAX_LOCAL_CALL_DEPTH})"
-      ));
+    arg_masks[func_index] = next;
+    for &caller in &callers[func_index] {
+      if !queued[caller] {
+        queued[caller] = true;
+        pending.push_back(caller);
+      }
     }
-    max_depth = max_depth.max(candidate_depth);
   }
 
-  states[func_index] = 2;
-  depths[func_index] = max_depth;
-  Ok(max_depth)
-}
-
-/// Depth-first post-order over the call DAG, so a function is emitted after
-/// every function it calls. Cycles are impossible here: `visit_local_call_graph`
-/// has already rejected recursion, and it caps the depth at
-/// `MAX_LOCAL_CALL_DEPTH`, so this recursion is bounded too.
-fn call_graph_post_order(
-  edges: &[Vec<usize>],
-  func_index: usize,
-  seen: &mut [bool],
-  out: &mut Vec<usize>,
-) {
-  if seen[func_index] {
-    return;
-  }
-  seen[func_index] = true;
-  for &callee in &edges[func_index] {
-    call_graph_post_order(edges, callee, seen, out);
-  }
-  out.push(func_index);
+  arg_masks
 }
 
 pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
@@ -314,41 +280,14 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
 
   let edges = scan_local_function_ranges(code, &starts, &pc_to_func)?;
 
-  let mut states = vec![0u8; starts.len()];
-  let mut depths = vec![0usize; starts.len()];
-  for func_index in 0..starts.len() {
-    visit_local_call_graph(&edges, &starts, &mut states, &mut depths, func_index, 1)?;
-  }
-
-  // Live-in masks, bottom-up: a caller's mask depends on its callees'.
-  let mut order = Vec::with_capacity(starts.len());
-  let mut seen = vec![false; starts.len()];
-  for func_index in 0..starts.len() {
-    call_graph_post_order(&edges, func_index, &mut seen, &mut order);
-  }
-  let mut arg_masks = vec![0 as RegMask; starts.len()];
-  for &func_index in &order {
-    let start = starts[func_index];
-    let end = starts.get(func_index + 1).copied().unwrap_or(num_insns);
-    let mask = {
-      let arg_masks = &arg_masks;
-      let pc_to_func = &pc_to_func;
-      function_live_in(code, start, end, &|target| {
-        pc_to_func
-          .get(target)
-          .and_then(|&callee| arg_masks.get(callee).copied())
-          .unwrap_or(crate::region_analysis::ALL_SIGNATURE_REGS)
-      })
-    };
-    arg_masks[func_index] = mask;
-  }
-
   let mut callers = vec![Vec::new(); starts.len()];
   for (caller, callees) in edges.iter().enumerate() {
     for &callee in callees {
       callers[callee].push(caller);
     }
   }
+
+  let arg_masks = live_in_fixed_point(code, &starts, &pc_to_func, &callers);
 
   let functions = starts
     .iter()
@@ -368,6 +307,52 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
   })
 }
 
-pub(crate) fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
-  analyze_functions(code).map(|_| ())
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    bytes[0] = opcode;
+    bytes[1] = dst | (src << 4);
+    bytes[2..4].copy_from_slice(&offset.to_le_bytes());
+    bytes[4..8].copy_from_slice(&imm.to_le_bytes());
+    bytes
+  }
+
+  fn local_call(pc: usize, target: usize) -> [u8; 8] {
+    insn(EBPF_OP_CALL, 0, 1, 0, target as i32 - pc as i32 - 1)
+  }
+
+  fn exit() -> [u8; 8] {
+    insn(EBPF_OP_EXIT, 0, 0, 0, 0)
+  }
+
+  #[test]
+  fn an_unused_recursive_component_has_empty_live_in_masks() {
+    let code = [local_call(0, 2), exit(), local_call(2, 0), exit()].concat();
+    let layout = analyze_functions(&code).unwrap();
+
+    assert_eq!(layout.arg_masks, vec![0, 0]);
+  }
+
+  #[test]
+  fn live_in_bits_propagate_all_the_way_around_a_recursive_component() {
+    // The queue initially visits A then B then C. Only C directly reads R8,
+    // so reaching A requires two caller wakeups after C is first analyzed:
+    // C -> B -> A. A one-pass treatment of the cycle misses both callers.
+    let code = [
+      local_call(0, 2),
+      exit(),
+      local_call(2, 4),
+      exit(),
+      local_call(4, 0),
+      insn(0x71, 0, 8, 0, 0), // r0 = *(u8 *)r8
+      exit(),
+    ]
+    .concat();
+    let layout = analyze_functions(&code).unwrap();
+
+    assert_eq!(layout.arg_masks, vec![1 << 8; 3]);
+  }
 }

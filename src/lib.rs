@@ -10,7 +10,12 @@ pub mod error;
 mod function_analysis;
 /// Helper definitions and utilities for eBPF programs.
 pub mod helpers;
-pub mod jit;
+// The JIT and its entry-frame contract are runtime implementation details. A
+// number of its utilities exist only for the in-crate differential and golden
+// tests, so keeping the module private would otherwise make normal builds warn
+// about those deliberately test-only paths.
+#[allow(dead_code)]
+pub(crate) mod jit;
 mod linker;
 mod pointer_cage;
 /// Program loading and execution APIs.

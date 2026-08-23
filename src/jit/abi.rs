@@ -35,6 +35,11 @@ pub mod memory {
   pub const DATA_GUEST_BOTTOM: i32 = 24;
   pub const DATA_GUEST_TOP: i32 = 32;
   pub const DATA_NATIVE_BASE: i32 = 40;
+  /// Lowest native R10 from which another complete guest frame may be entered.
+  pub const LOCAL_CALL_GUEST_FLOOR: i32 = 144;
+  /// Lowest native SP from which another local-call frame may be entered while
+  /// preserving the runtime's emergency reserve.
+  pub const LOCAL_CALL_NATIVE_FLOOR: i32 = 152;
 }
 
 /// Where the descriptor pointer itself is parked, relative to the established
@@ -136,7 +141,18 @@ pub const MAX_GROUP_SPAN: u32 = 4096;
 /// Guest stack charged to each local function.
 pub const LOCAL_FUNCTION_STACK_SIZE: u16 = 4096;
 
-/// Maximum eBPF call depth permitted.
+/// Conservative persistent native-stack charge per local eBPF call.
+///
+/// Both backends use far less today (under 128 bytes including the call stub,
+/// native return state, and callee prologue). Keeping this well below the guest
+/// frame charge lets the runtime derive a compact native coroutine stack from
+/// the guest recursion capacity while retaining a large margin for backend
+/// growth.
+pub const NATIVE_LOCAL_CALL_BUDGET: usize = 256;
+
+/// Historical eight-frame depth used by the interpreter and by the JIT's
+/// default guest-stack sizing. The JIT admits deeper and recursive call graphs
+/// when the configured guest stack can carry them.
 pub const MAX_CALL_DEPTH: u32 = 8;
 
 /// Total guest stack `UBPF_EBPF_STACK_SIZE` describes.
@@ -193,9 +209,10 @@ mod tests {
   /// deliberate act rather than a typo nobody notices.
   #[test]
   fn the_constants_are_the_ones_the_contract_names() {
-    // One local eBPF function's stack frame, and the eight-deep call chain
-    // built out of it: together they are the whole guest stack.
+    // One local eBPF function's stack frame and the historical eight-frame
+    // default retained by the interpreter and JIT stack default.
     assert_eq!(LOCAL_FUNCTION_STACK_SIZE, 4096);
+    assert_eq!(NATIVE_LOCAL_CALL_BUDGET, 256);
     assert_eq!(MAX_CALL_DEPTH, 8);
     assert_eq!(EBPF_STACK_SIZE, 32768);
 

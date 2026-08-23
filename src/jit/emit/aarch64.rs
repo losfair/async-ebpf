@@ -709,7 +709,7 @@ fn emit_masked_address_with_offset(
   scratch: u32,
   offset: i16,
   size: i32,
-  store: bool,
+  _store: bool,
   region_hint: u8,
 ) {
   debug_assert_ne!(dst, scratch);
@@ -738,9 +738,7 @@ fn emit_masked_address_with_offset(
   }
 
   if cfg.pointer_mask != 0 {
-    // Stores are always confined to the active stack regardless of the hint,
-    // preserving the read-only guarantee for the data region.
-    if store || region_hint == abi::region::STACK || region_hint == abi::region::FRAME {
+    if region_hint == abi::region::STACK || region_hint == abi::region::FRAME {
       emit_region_address(cfg, st, dst, scratch, size, &GUEST_STACK_REGION);
       return;
     }
@@ -813,7 +811,6 @@ fn emit_checked_address(
             && group.written & (1u16 << base_ebpf) == 0
             && plan.delta as u64 + width as u64 <= group.span as u64
             && group.lo as i64 + plan.delta as i64 == offset as i64
-            && (!store || group.region == abi::region::STACK)
         }
         _ => false,
       };
@@ -831,7 +828,6 @@ fn emit_checked_address(
         && plan.delta as u64 + width as u64 <= plan.span as u64
         && plan.lo as i64 + plan.delta as i64 == offset as i64
         && plan.region != abi::region::FRAME
-        && (!store || plan.region == abi::region::STACK)
         && plan.lo >= i16::MIN as i32
         && plan.lo <= i16::MAX as i32;
       if usable {
@@ -1014,15 +1010,60 @@ fn emit_lazy_local_call(
   st: &mut JitState,
   call_pc: usize,
 ) {
-  let (resolver, id) = match (cfg.local_call_resolver, inputs.resolver_ids.get(call_pc)) {
-    (Some(resolver), Some(&id)) => (resolver, id),
+  // From one guard site to the next: the caller's 48-byte persistent save area
+  // and the callee's 16-byte prologue slot. BLR keeps its return address in LR.
+  const NATIVE_STACK_DELTA: usize = 48 + 16;
+  const _: () = assert!(NATIVE_STACK_DELTA <= abi::NATIVE_LOCAL_CALL_BUDGET);
+
+  let (resolver, stack_exhausted, id) = match (
+    cfg.local_call_resolver,
+    cfg.local_call_stack_exhausted,
+    inputs.resolver_ids.get(call_pc),
+  ) {
+    (Some(resolver), Some(stack_exhausted), Some(&id)) => (resolver, stack_exhausted, id),
     _ => {
       st.fail(Progress::UnexpectedInstruction);
       return;
     }
   };
 
-  emit_loadstore_immediate(st, ls::LDRX, TEMP_REGISTER, SP, 0);
+  // R10 is already translated to the invocation's native guest-stack backing.
+  // Check both independent stack budgets before changing architectural state.
+  emit_loadstore_immediate(st, ls::LDRX, TEMP_REGISTER, R29, abi::FRAME_OFFSET as i16);
+  emit_loadstore_immediate(
+    st,
+    ls::LDRX,
+    R17,
+    TEMP_REGISTER,
+    abi::memory::LOCAL_CALL_GUEST_FLOOR as i16,
+  );
+  emit_addsub_register(st, true, addsub::SUBS, RZ, map_register(10), R17);
+  let guest_exhausted =
+    emit_conditionalbranch_immediate(st, cond::LO, PatchTarget::EbpfPc { pc: 0, near: false });
+
+  emit_loadstore_immediate(st, ls::LDRX, TEMP_REGISTER, R29, abi::FRAME_OFFSET as i16);
+  emit_loadstore_immediate(
+    st,
+    ls::LDRX,
+    R17,
+    TEMP_REGISTER,
+    abi::memory::LOCAL_CALL_NATIVE_FLOOR as i16,
+  );
+  emit_addsub_immediate(st, true, addsub::ADD, TEMP_REGISTER, SP, 0);
+  emit_addsub_register(st, true, addsub::SUBS, RZ, TEMP_REGISTER, R17);
+  let native_exhausted =
+    emit_conditionalbranch_immediate(st, cond::LO, PatchTarget::EbpfPc { pc: 0, near: false });
+
+  // Stack usage is fixed for every local function. Materialise the constant
+  // directly instead of reloading the prologue's bookkeeping slot: a coroutine
+  // suspension may use host stack storage below the current frame, while R10
+  // is guest state and must not depend on that storage surviving a yield.
+  emit_movewide_immediate(
+    st,
+    true,
+    TEMP_REGISTER,
+    abi::LOCAL_FUNCTION_STACK_SIZE as u64,
+  );
   emit_addsub_register(
     st,
     true,
@@ -1036,7 +1077,6 @@ fn emit_lazy_local_call(
   emit_addsub_immediate(st, true, addsub::SUB, SP, SP, stack_movement);
 
   emit_loadstore_immediate(st, ls::STRX, R30, SP, 0);
-  emit_loadstore_immediate(st, ls::STRX, TEMP_REGISTER, SP, 8);
   emit_loadstorepair_immediate(st, lsp::STPX, map_register(6), map_register(7), SP, 16);
   emit_loadstorepair_immediate(st, lsp::STPX, map_register(8), map_register(9), SP, 32);
 
@@ -1059,14 +1099,18 @@ fn emit_lazy_local_call(
   emit_addsub_immediate(st, true, addsub::ADD, SP, SP, arg_stack_movement);
 
   emit_unconditionalbranch_register(st, br::BLR, R17);
-
   emit_loadstore_immediate(st, ls::LDRX, R30, SP, 0);
-  emit_loadstore_immediate(st, ls::LDRX, TEMP_REGISTER, SP, 8);
   emit_loadstorepair_immediate(st, lsp::LDPX, map_register(6), map_register(7), SP, 16);
   emit_loadstorepair_immediate(st, lsp::LDPX, map_register(8), map_register(9), SP, 32);
 
   emit_addsub_immediate(st, true, addsub::ADD, SP, SP, stack_movement);
 
+  emit_movewide_immediate(
+    st,
+    true,
+    TEMP_REGISTER,
+    abi::LOCAL_FUNCTION_STACK_SIZE as u64,
+  );
   emit_addsub_register(
     st,
     true,
@@ -1075,6 +1119,16 @@ fn emit_lazy_local_call(
     map_register(10),
     TEMP_REGISTER,
   );
+
+  let skip_exhausted =
+    emit_unconditionalbranch_immediate(st, ubr::B, PatchTarget::EbpfPc { pc: 0, near: false });
+  emit_jump_target(st, guest_exhausted);
+  emit_jump_target(st, native_exhausted);
+  emit_movewide_immediate(st, true, TEMP_REGISTER, stack_exhausted as usize as u64);
+  emit_unconditionalbranch_register(st, br::BLR, TEMP_REGISTER);
+  // The callback is declared divergent. Trap if an invalid embedder returns.
+  emit_instruction(st, 0xd420_0000); // BRK #0
+  emit_jump_target(st, skip_exhausted);
 }
 
 // ---------------------------------------------------------------------------
@@ -1977,7 +2031,8 @@ fn loop_error(status: Progress, errmsg: Option<String>) -> TranslateError {
     Progress::TooManyLocalCalls => failed("Too many local calls."),
     Progress::UnexpectedInstruction => failed(errmsg.unwrap_or_else(|| {
       // The lazy local-call guard sets the status without a message.
-      "Unexpected instruction or missing local-call resolver during JIT compilation".to_string()
+      "Unexpected instruction or missing local-call runtime callbacks during JIT compilation"
+        .to_string()
     })),
     Progress::UnknownInstruction => failed(errmsg.unwrap_or_default()),
     Progress::NotEnoughSpace => TranslateError::OutOfSpace,
@@ -2140,7 +2195,7 @@ mod tests {
   use super::*;
   use crate::jit::golden::{self, SweepDigest};
   use crate::jit::isa::{alu, atomic, cls, jmp, mode, opcode, size, src as srcbit};
-  use crate::jit::{Dispatcher, LocalCallResolver, Target};
+  use crate::jit::{Dispatcher, LocalCallResolver, LocalCallStackExhausted, Target};
 
   fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Insn {
     Insn {
@@ -2171,6 +2226,7 @@ mod tests {
   /// buffer, and this module never executes what it emits.
   const STAND_IN_DISPATCHER: usize = 0x0000_5eed_1111_0000;
   const STAND_IN_RESOLVER: usize = 0x0000_5eed_2222_0000;
+  const STAND_IN_STACK_EXHAUSTED: usize = 0x0000_5eed_3333_0000;
 
   fn stand_in_dispatcher() -> Dispatcher {
     // SAFETY: the address is only ever materialised as an immediate. Producing
@@ -2182,6 +2238,11 @@ mod tests {
   fn stand_in_resolver() -> LocalCallResolver {
     // SAFETY: as for the dispatcher above.
     unsafe { std::mem::transmute::<usize, LocalCallResolver>(STAND_IN_RESOLVER) }
+  }
+
+  fn stand_in_stack_exhausted() -> LocalCallStackExhausted {
+    // SAFETY: as for the dispatcher above.
+    unsafe { std::mem::transmute::<usize, LocalCallStackExhausted>(STAND_IN_STACK_EXHAUSTED) }
   }
 
   /// Admits every helper index, so that helper-call emission is exercised
@@ -2214,6 +2275,7 @@ mod tests {
       dispatcher: Some(stand_in_dispatcher()),
       dispatcher_validate: Some(accept_every_helper),
       local_call_resolver: Some(stand_in_resolver()),
+      local_call_stack_exhausted: Some(stand_in_stack_exhausted()),
       ..Default::default()
     };
     vec![
@@ -2375,6 +2437,7 @@ mod tests {
       dispatcher: Some(stand_in_dispatcher()),
       dispatcher_validate: Some(accept_every_helper),
       local_call_resolver: Some(stand_in_resolver()),
+      local_call_stack_exhausted: Some(stand_in_stack_exhausted()),
       ..Default::default()
     };
     let translator = Translator::load(std::sync::Arc::new(config), &code).unwrap();
@@ -2954,7 +3017,7 @@ mod tests {
   }
 
   #[test]
-  fn a_store_group_is_honoured_only_against_the_stack() {
+  fn a_store_group_is_honoured_in_every_region() {
     for region in [abi::region::STACK, abi::region::DATA, abi::region::UNKNOWN] {
       let insns = vec![
         insn(cls::STX | mode::MEM | size::DW, 2, 1, 0, 0),

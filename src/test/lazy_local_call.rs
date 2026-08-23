@@ -40,6 +40,19 @@ fn load_raw(code: &[Insn], rodata: &[u8]) -> Program {
   .pin_to_current_thread(t_env)
 }
 
+fn load_raw_with_large_stack(code: &[Insn], rodata: &[u8]) -> Program {
+  let (_, t_env) = gt_env();
+  ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_guest_stack_size(8 * 1024 * 1024)
+  .load(&mut rand::thread_rng(), &build_elf(code, rodata))
+  .unwrap()
+  .pin_to_current_thread(t_env)
+}
+
 async fn run(program: &Program, calldata: &[u8]) -> Result<i64, Error> {
   let (_, t_env) = gt_env();
   let mut resources: [&mut dyn Any; 0] = [];
@@ -55,15 +68,13 @@ async fn run(program: &Program, calldata: &[u8]) -> Result<i64, Error> {
     .await
 }
 
-/// The loader caps the local call graph at `MAX_LOCAL_CALL_DEPTH` frames, and
+/// The historical default carries eight complete local-function frames, while
 /// calldata is copied into the top of the same guest stack window with `R10`
-/// starting below it. The window has to cover both, or the deepest chain the
-/// loader accepts runs off the bottom of the stack as soon as any calldata is
-/// passed.
+/// starting below it. The runtime guard has to account for both.
 #[tokio::test]
-async fn the_deepest_accepted_call_chain_fits_alongside_calldata() {
+async fn the_default_call_capacity_fits_alongside_calldata() {
   // Seven callers plus a leaf that touches the very bottom of its own frame -
-  // the deepest chain `validate_local_call_graph` accepts.
+  // the complete eight-frame capacity retained by the default.
   let mut code = Vec::new();
   for _ in 0..7 {
     code.push(Insn::call_local(1)); // target is pc + imm + 1, the next function
@@ -80,6 +91,116 @@ async fn the_deepest_accepted_call_chain_fits_alongside_calldata() {
       "{calldata_len} bytes of calldata pushed the deepest frame off the stack: {ret:?}"
     );
   }
+}
+
+fn local_call_chain(function_count: usize) -> Vec<Insn> {
+  let mut code = Vec::new();
+  for index in 0..function_count {
+    if index + 1 == function_count {
+      code.push(Insn::exit());
+    } else {
+      code.push(Insn::call_local(1));
+      code.push(Insn::exit());
+    }
+  }
+  code
+}
+
+#[tokio::test]
+async fn a_call_beyond_the_default_guest_stack_returns_stack_exhausted() {
+  let program = load_raw(&local_call_chain(9), &[]);
+  assert!(matches!(
+    run(&program, &[]).await,
+    Err(Error(RuntimeError::StackExhausted))
+  ));
+}
+
+/// Entry keeps the calldata pointer in callee-saved R6. The recursive function
+/// decrements the word it points at until zero, so the same cyclic call graph
+/// can be exercised both below and beyond a configured dynamic stack bound.
+fn counted_recursion() -> Vec<Insn> {
+  vec![
+    Insn::mov64_reg(6, 1),
+    Insn::call_local(2), // pc 1 -> recursive function at pc 4
+    Insn::ldx_dw(0, 6, 0),
+    Insn::exit(),
+    Insn::ldx_dw(0, 6, 0),
+    Insn::raw(0x15, 0, 0, 3, 0), // if r0 == 0, exit
+    Insn::add64_imm(0, -1),
+    Insn::stx_dw(6, 0, 0),
+    Insn::call_local(-5), // pc 8 -> itself at pc 4
+    Insn::exit(),
+  ]
+}
+
+#[tokio::test]
+async fn terminating_recursion_runs_without_an_escape_hatch() {
+  let program = load_raw(&counted_recursion(), &[]);
+  assert_eq!(run(&program, &6u64.to_le_bytes()).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn recursion_past_the_guest_stack_returns_stack_exhausted() {
+  let program = load_raw(&counted_recursion(), &[]);
+  assert!(matches!(
+    run(&program, &7u64.to_le_bytes()).await,
+    Err(Error(RuntimeError::StackExhausted))
+  ));
+  assert_eq!(
+    run(&program, &6u64.to_le_bytes()).await.unwrap(),
+    0,
+    "abandoning the exhausted coroutine must leave later invocations usable"
+  );
+}
+
+#[tokio::test]
+async fn ninth_local_call_preserves_r6_with_an_enlarged_guest_stack() {
+  let mut code = Vec::new();
+  for _ in 0..7 {
+    code.push(Insn::call_local(1));
+    code.push(Insn::exit());
+  }
+  code.extend_from_slice(&Insn::lddw_data(6, 0));
+  code.push(Insn::call_local(2));
+  code.push(Insn::ldx_b(0, 6, 0));
+  code.push(Insn::exit());
+  code.push(Insn::mov64_imm(6, 0));
+  code.push(Insn::exit());
+
+  let program = load_raw_with_large_stack(&code, &[0x5a]);
+  assert_eq!(run(&program, &[]).await.unwrap(), 0x5a);
+}
+
+#[tokio::test]
+async fn cold_local_callee_observes_callers_r6() {
+  let mut code = Vec::new();
+  code.extend_from_slice(&Insn::lddw_data(6, 0));
+  code.push(Insn::call_local(1)); // pc 2 -> pc 4
+  code.push(Insn::exit());
+  code.push(Insn::ldx_b(0, 6, 0));
+  code.push(Insn::exit());
+
+  let program = load_raw(&code, &[0x5a]);
+  assert_eq!(run(&program, &[]).await.unwrap(), 0x5a);
+}
+
+#[tokio::test]
+async fn deep_local_calls_preserve_r6_with_an_enlarged_guest_stack() {
+  const DEPTH: usize = 64;
+  let mut code = Vec::new();
+  for _ in 0..DEPTH - 2 {
+    code.push(Insn::call_local(1));
+    code.push(Insn::exit());
+  }
+  code.extend_from_slice(&Insn::lddw_data(6, 0));
+  code.push(Insn::call_local(2));
+  code.push(Insn::ldx_b(0, 6, 0));
+  code.push(Insn::exit());
+  code.push(Insn::mov64_imm(6, 0));
+  code.push(Insn::exit());
+
+  let program = load_raw_with_large_stack(&code, &[0x5a]);
+  assert_eq!(run(&program, &[]).await.unwrap(), 0x5a);
 }
 
 /// The resolver is a full host call — it suspends the guest, runs the region
@@ -380,6 +501,38 @@ fn h_bump(_: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64
 }
 
 static BUDGET_HELPERS: &[(&str, Helper)] = &[("bump", h_bump)];
+
+/// A cold local call suspends to compile its target, and every helper call also
+/// suspends to the host. Nest the two paths to ensure the native lazy-call save
+/// areas survive repeated coroutine switches at every supported call depth.
+#[tokio::test]
+async fn nested_cold_calls_and_helpers_preserve_native_call_frames() {
+  let source = br#"
+    extern int bump(void);
+    #define F __attribute__((noinline, section("test")))
+    static int F f6(void) { bump(); return 1; }
+    static int F f5(void) { bump(); return f6() + 1; }
+    static int F f4(void) { bump(); return f5() + 1; }
+    static int F f3(void) { bump(); return f4() + 1; }
+    static int F f2(void) { bump(); return f3() + 1; }
+    static int F f1(void) { bump(); return f2() + 1; }
+    static int F f0(void) { bump(); return f1() + 1; }
+    int F entry(void) { bump(); return f0() + 1; }
+  "#;
+  let binary = compile_ebpf(source.to_vec()).await.unwrap();
+  let (_, t_env) = gt_env();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[BUDGET_HELPERS],
+  )
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(t_env);
+
+  assert_eq!(run(&program, &[]).await.unwrap(), 8);
+  assert_eq!(program.compiled_function_count_for_tests(), 8);
+}
 
 /// Exhausting the budget is terminal for the whole program - the arena never
 /// shrinks, so nothing can be compiled from there on. Later runs must fail

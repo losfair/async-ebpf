@@ -8,6 +8,14 @@ use thiserror::Error as ThisError;
 /// Public error wrapper for runtime failures.
 pub struct Error(pub(crate) RuntimeError);
 
+impl Error {
+  /// Returns whether an invocation failed because it conflicted with a live
+  /// data-access lease.
+  pub fn is_program_busy(&self) -> bool {
+    matches!(self.0, RuntimeError::ProgramBusy)
+  }
+}
+
 #[derive(ThisError, Debug, Clone)]
 pub(crate) enum RuntimeError {
   #[error("invalid argument: {0}")]
@@ -30,6 +38,12 @@ pub(crate) enum RuntimeError {
 
   #[error("memory fault at virtual address {0:#x}")]
   MemoryFault(usize),
+
+  #[error("local call stack exhausted")]
+  StackExhausted,
+
+  #[error("program data is already in use by a conflicting invocation")]
+  ProgramBusy,
 }
 
 #[derive(ThisError, Debug, Clone)]

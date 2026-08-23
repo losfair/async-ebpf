@@ -100,6 +100,11 @@ pub type DispatcherValidate = unsafe extern "C" fn(u32, *const std::ffi::c_void)
 /// code address.
 pub type LocalCallResolver = unsafe extern "C" fn(u32) -> u64;
 
+/// Reports that a local call cannot enter another guest or native stack frame.
+/// The handler must not return; the runtime uses it to suspend the coroutine
+/// and terminate the invocation with a controlled error.
+pub type LocalCallStackExhausted = unsafe extern "C" fn() -> !;
+
 /// Everything about a translation that is fixed for the life of a program.
 ///
 /// Built once and immutable afterwards, so the fields that only mean something
@@ -126,6 +131,9 @@ pub struct Config {
   /// constants below the frame pointer. Enables access plans.
   pub frame_constants: bool,
 
+  /// Exclusive upper bound on decoded eBPF instruction slots.
+  pub instruction_limit: usize,
+
   /// Helper dispatch. Both must be set together or neither.
   pub dispatcher: Option<Dispatcher>,
   pub dispatcher_validate: Option<DispatcherValidate>,
@@ -133,8 +141,12 @@ pub struct Config {
   /// Helper index whose zero return unwinds the whole program, or `None`.
   pub unwind_helper_index: Option<u32>,
 
-  /// Called to resolve a lazily-compiled local call target.
+  /// Called to resolve a lazily-compiled local call target. This and
+  /// `local_call_stack_exhausted` must be set together for local calls.
   pub local_call_resolver: Option<LocalCallResolver>,
+
+  /// Called when a local call would exhaust its guest or native stack budget.
+  pub local_call_stack_exhausted: Option<LocalCallStackExhausted>,
 }
 
 impl Default for Config {
@@ -145,12 +157,14 @@ impl Default for Config {
       pointer_offset: 0,
       native_frame_base: false,
       frame_constants: false,
+      instruction_limit: abi::MAX_INSTS as usize,
       // Safe default: a caller that has not set up a pointer cage should have
       // to say explicitly that it wants unchecked guest accesses.
       dispatcher: None,
       dispatcher_validate: None,
       unwind_helper_index: None,
       local_call_resolver: None,
+      local_call_stack_exhausted: None,
     }
   }
 }
@@ -300,10 +314,10 @@ impl Translator {
       return Err(LoadError("program is empty".to_string()));
     }
     let insns = Insn::decode_all(code).expect("length checked above");
-    if insns.len() > abi::MAX_INSTS as usize {
+    if insns.len() > config.instruction_limit {
       return Err(LoadError(format!(
         "too many instructions (max {})",
-        abi::MAX_INSTS
+        config.instruction_limit
       )));
     }
 

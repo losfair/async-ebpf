@@ -10,13 +10,112 @@ const EM_BPF: u16 = 247;
 const SHT_PROGBITS: u32 = 1;
 const SHT_REL: u32 = 9;
 const SHF_ALLOC: u64 = 1 << 1;
+const SHF_WRITE: u64 = 1;
 const SHF_EXECINSTR: u64 = 1 << 2;
 
 const R_BPF_64_64: u32 = 1;
+const R_BPF_64_ABS64: u32 = 2;
 const R_BPF_64_32: u32 = 10;
 
 const EBPF_OP_CALL: u8 = 0x05u8 | 0x80u8;
 const EBPF_OP_LDDW: u8 = 0x18;
+
+#[derive(Clone, Debug)]
+pub(crate) struct WritableSection {
+  pub(crate) index: usize,
+  pub(crate) file_offset: usize,
+  pub(crate) size: usize,
+  pub(crate) backing_offset: usize,
+}
+
+/// Packed runtime layout for allocated writable ELF sections.
+///
+/// The immutable ELF image keeps its file layout. Writable sections get new
+/// guest addresses in a dense suffix of the same DATA region; this plan is the
+/// bridge used both by relocation and by the loader's one-time copy. The
+/// protection boundary is invisible to region analysis and the JIT.
+#[derive(Clone, Debug)]
+pub(crate) struct WritableDataPlan {
+  pub(crate) sections: Vec<WritableSection>,
+  pub(crate) size: usize,
+}
+
+impl WritableDataPlan {
+  fn backing_offset(&self, section_index: usize) -> Option<usize> {
+    self
+      .sections
+      .iter()
+      .find(|section| section.index == section_index)
+      .map(|section| section.backing_offset)
+  }
+}
+
+pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, LinkerError> {
+  let elf = ElfBytes::<LittleEndian>::minimal_parse(input)?;
+  let Some(sht) = elf.section_headers() else {
+    return Err(LinkerError::InvalidElf("missing section headers"));
+  };
+
+  let mut sections = Vec::new();
+  let mut claimed_ranges = Vec::new();
+  let mut size = 0usize;
+  for (index, section) in sht.iter().enumerate() {
+    if section.sh_type != SHT_PROGBITS
+      || section.sh_flags & (SHF_ALLOC | SHF_WRITE) != SHF_ALLOC | SHF_WRITE
+      || section.sh_size == 0
+    {
+      continue;
+    }
+
+    // This validates the file range before converting it to usize below.
+    elf.section_data(&section)?;
+    let file_offset = usize::try_from(section.sh_offset)
+      .map_err(|_| LinkerError::InvalidElf("writable section offset does not fit usize"))?;
+    let section_size = usize::try_from(section.sh_size)
+      .map_err(|_| LinkerError::InvalidElf("writable section size does not fit usize"))?;
+    let file_end = file_offset
+      .checked_add(section_size)
+      .ok_or(LinkerError::InvalidElf("writable section range overflow"))?;
+    if claimed_ranges
+      .iter()
+      .any(|&(lo, hi)| file_offset < hi && lo < file_end)
+    {
+      return Err(LinkerError::InvalidElf(
+        "writable section overlaps another writable section",
+      ));
+    }
+    claimed_ranges.push((file_offset, file_end));
+
+    let alignment = usize::try_from(section.sh_addralign.max(1))
+      .map_err(|_| LinkerError::InvalidElf("writable section alignment does not fit usize"))?;
+    if !alignment.is_power_of_two() {
+      return Err(LinkerError::InvalidElf(
+        "writable section alignment is not a power of two",
+      ));
+    }
+    size = size
+      .checked_add(alignment - 1)
+      .map(|value| value & !(alignment - 1))
+      .ok_or(LinkerError::InvalidElf("writable data layout overflow"))?;
+    let backing_offset = size;
+    size = size
+      .checked_add(section_size)
+      .ok_or(LinkerError::InvalidElf("writable data layout overflow"))?;
+    if size > input.len() {
+      return Err(LinkerError::InvalidElf(
+        "writable sections exceed the ELF image size",
+      ));
+    }
+    sections.push(WritableSection {
+      index,
+      file_offset,
+      size: section_size,
+      backing_offset,
+    });
+  }
+
+  Ok(WritableDataPlan { sections, size })
+}
 
 /// Ceilings on how much work one object may ask the loader to do.
 ///
@@ -39,8 +138,6 @@ const MAX_RELOCATIONS: usize = 1024 * 1024;
 const EBPF_OP_EXIT: u8 = 0x95;
 #[cfg(test)]
 const EBPF_OP_JA: u8 = 0x05;
-#[cfg(test)]
-use crate::function_analysis::MAX_LOCAL_CALL_DEPTH;
 
 #[derive(Copy, Clone, Debug)]
 struct EbpfInsn {
@@ -71,18 +168,14 @@ impl EbpfInsn {
   }
 }
 
-/// Validates that local eBPF calls cannot recurse or exceed the statically
-/// supported call depth, before the bytecode is handed to the JIT.
-pub(crate) fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
-  crate::function_analysis::validate_local_call_graph(code)
-}
-
 /// Relocates an eBPF ELF image in place and returns entrypoint ranges.
 ///
 /// Returns: section_name -> (code_vaddr, code_size).
 pub fn link_elf(
   input: &mut [u8],
-  vbase: usize,
+  immutable_vbase: usize,
+  writable_vbase: usize,
+  writable_plan: &WritableDataPlan,
   ext_func_table: &HashMap<&str, i32>,
 ) -> Result<HashMap<String, (usize, usize)>, LinkerError> {
   let elf = ElfBytes::<LittleEndian>::minimal_parse(input)?;
@@ -145,7 +238,7 @@ pub fn link_elf(
 
     code_sections.insert(
       cs_name.to_string(),
-      (vbase + cs.sh_offset as usize, cs.sh_size as usize),
+      (immutable_vbase + cs.sh_offset as usize, cs.sh_size as usize),
     );
     code_section_indexes.insert(cs_index);
     if code_sections.len() > MAX_CODE_SECTIONS {
@@ -156,6 +249,8 @@ pub fn link_elf(
   }
 
   let mut insn_rewrites: Vec<(usize, u64)> = vec![];
+  let mut data_rewrites: Vec<(usize, u64)> = vec![];
+  let mut relocation_count = 0usize;
   // Relocation sections are not required to describe distinct bytes either, so
   // one valid relocation blob can be replayed against the same target by any
   // number of SHT_REL headers.
@@ -166,16 +261,19 @@ pub fn link_elf(
       continue;
     }
     let target_section_index = sec.sh_info as usize;
-    if !code_section_indexes.contains(&target_section_index) {
+    let target_section = sht.get(target_section_index)?;
+    let target_is_code = code_section_indexes.contains(&target_section_index);
+    let target_is_data =
+      target_section.sh_type == SHT_PROGBITS && (target_section.sh_flags & SHF_ALLOC) != 0;
+    if !target_is_code && !target_is_data {
       continue;
     }
     if !relocated_sections.insert(target_section_index) {
       return Err(LinkerError::InvalidElf(
-        "more than one relocation section targets the same code section",
+        "more than one relocation section targets the same section",
       ));
     }
 
-    let target_section = sht.get(target_section_index)?;
     let target_section_name = sht_strtab
       .get(target_section.sh_name as usize)
       .unwrap_or_default();
@@ -186,14 +284,46 @@ pub fn link_elf(
       // Checked per relocation rather than once against the section length,
       // because the rewrites are buffered and applied afterwards: without this
       // the whole buffer is built before anything rejects it.
-      if insn_rewrites.len() >= MAX_RELOCATIONS {
+      if relocation_count >= MAX_RELOCATIONS {
         return Err(LinkerError::InvalidElf(
           "too many relocations in one object",
         ));
       }
+      relocation_count += 1;
       let end = (reloc.r_offset as usize).saturating_add(8);
       if reloc.r_offset % 8 != 0 || end > target_section_data.len() {
         return Err(LinkerError::InvalidElf("relocation: invalid offset"));
+      }
+
+      let sym = symtab.0.get(reloc.r_sym as usize)?;
+      let sym_name = symtab.1.get(sym.st_name as usize)?;
+
+      if !target_is_code {
+        if reloc.r_type != R_BPF_64_ABS64 {
+          continue;
+        }
+        let data_section = sht.get(sym.st_shndx as usize)?;
+        if data_section.sh_type != SHT_PROGBITS || (data_section.sh_flags & SHF_ALLOC) == 0 {
+          return Err(LinkerError::Reloc(
+            "R_BPF_64_ABS64: symbol is not in allocated data".to_string(),
+            reloc,
+          ));
+        }
+        let addend = u64::from_le_bytes(
+          target_section_data[reloc.r_offset as usize..end]
+            .try_into()
+            .unwrap(),
+        );
+        let section_base = writable_plan
+          .backing_offset(sym.st_shndx as usize)
+          .map(|offset| writable_vbase as u64 + offset as u64)
+          .unwrap_or_else(|| immutable_vbase as u64 + data_section.sh_offset);
+        let value = section_base.wrapping_add(sym.st_value).wrapping_add(addend);
+        data_rewrites.push((
+          target_section.sh_offset as usize + reloc.r_offset as usize,
+          value,
+        ));
+        continue;
       }
 
       let insn = u64::from_le_bytes(
@@ -202,9 +332,6 @@ pub fn link_elf(
           .unwrap(),
       );
       let mut insn = EbpfInsn::from_u64(insn);
-      let sym = symtab.0.get(reloc.r_sym as usize)?;
-      let sym_name = symtab.1.get(sym.st_name as usize)?;
-
       if reloc.r_type == R_BPF_64_32 {
         if insn.opcode != EBPF_OP_CALL {
           return Err(LinkerError::Reloc(
@@ -282,10 +409,11 @@ pub fn link_elf(
           ) as u64)
             << 32);
 
-        let imm = (vbase as u64)
-          .wrapping_add(data_section.sh_offset)
-          .wrapping_add(sym.st_value)
-          .wrapping_add(oldimm);
+        let section_base = writable_plan
+          .backing_offset(sym.st_shndx as usize)
+          .map(|offset| writable_vbase as u64 + offset as u64)
+          .unwrap_or_else(|| immutable_vbase as u64 + data_section.sh_offset);
+        let imm = section_base.wrapping_add(sym.st_value).wrapping_add(oldimm);
 
         insn.imm = imm as u32 as i32;
         insn_rewrites.push((
@@ -308,6 +436,9 @@ pub fn link_elf(
   for (offset, value) in insn_rewrites {
     input[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
   }
+  for (offset, value) in data_rewrites {
+    input[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+  }
 
   // Each code section must be a whole number of 8-byte instruction slots.
   // Per-instruction validation (control flow, local-call graph, region routing)
@@ -327,6 +458,10 @@ pub fn link_elf(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
+    crate::function_analysis::analyze_functions(code).map(|_| ())
+  }
 
   const EBPF_OP_MOV64_IMM: u8 = 0xb7;
 
@@ -370,54 +505,30 @@ mod tests {
   }
 
   #[test]
-  fn local_call_graph_allows_max_depth() {
-    let code = local_call_chain(MAX_LOCAL_CALL_DEPTH);
+  fn local_call_graph_allows_deep_acyclic_graphs() {
+    let code = local_call_chain(64);
     validate_local_call_graph(&code).unwrap();
   }
 
   #[test]
-  fn local_call_graph_rejects_excessive_depth() {
-    let code = local_call_chain(MAX_LOCAL_CALL_DEPTH + 1);
-    let err = validate_local_call_graph(&code).unwrap_err();
-    assert!(
-      err.contains("exceeds max"),
-      "unexpected validation error: {err}"
-    );
-  }
-
-  #[test]
-  fn a_long_call_chain_is_rejected_without_overflowing_the_host_stack() {
-    // The depth cap has to bound the *descent*, not just the height reported on
-    // the way back up. A chain this long is still under `MAX_INSTS`, so it is a
-    // program the loader is willing to consider, and validation runs on
-    // whatever thread called `load` - a 2 MiB Tokio worker, typically. Run it on
-    // a deliberately small stack so a regression aborts here rather than
-    // depending on the test harness's default.
+  fn a_long_call_chain_is_analyzed_without_using_the_host_call_stack() {
     let code = local_call_chain(32767);
     let handle = std::thread::Builder::new()
       .stack_size(256 * 1024)
-      .spawn(move || validate_local_call_graph(&code).unwrap_err())
+      .spawn(move || validate_local_call_graph(&code))
       .unwrap();
-    let err = handle.join().unwrap();
-    assert!(
-      err.contains("exceeds max"),
-      "unexpected validation error: {err}"
-    );
+    handle.join().unwrap().unwrap();
   }
 
   #[test]
-  fn local_call_graph_rejects_recursion() {
+  fn local_call_graph_allows_recursion() {
     let mut code = Vec::new();
     code.extend_from_slice(&local_call(0, 2));
     code.extend_from_slice(&exit());
     code.extend_from_slice(&local_call(2, 2));
     code.extend_from_slice(&exit());
 
-    let err = validate_local_call_graph(&code).unwrap_err();
-    assert!(
-      err.contains("recursive"),
-      "unexpected validation error: {err}"
-    );
+    validate_local_call_graph(&code).unwrap();
   }
 
   #[test]
@@ -439,8 +550,8 @@ mod tests {
   }
 
   #[test]
-  fn local_call_graph_rejects_disguised_excessive_depth() {
-    let function_count = MAX_LOCAL_CALL_DEPTH + 1;
+  fn local_call_graph_rejects_disguised_cross_function_control_flow() {
+    let function_count = 9;
     let factory_start = 1;
     let factory_len = function_count - 1;
     let chain_start = factory_start + factory_len + 1;

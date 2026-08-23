@@ -4,7 +4,9 @@ use memmap2::{MmapOptions, MmapRaw};
 
 use crate::error::RuntimeError;
 
-/// Memory-mapped pointer cage backing the guest's read-only data region.
+/// Memory-mapped pointer cage backing one contiguous guest data region. The
+/// immutable ELF image occupies its page-aligned prefix and a packed copy of
+/// allocated writable sections occupies its suffix.
 ///
 /// The cage additionally *reserves* — but never maps — a guest address window
 /// for the per-invocation stack. The stack's backing memory lives outside the
@@ -19,6 +21,7 @@ pub struct PointerCage {
   stack_top: usize,
   data_bottom: usize,
   data_top: usize,
+  writable_data_bottom: usize,
   margin: usize,
 }
 
@@ -27,10 +30,8 @@ pub struct PointerCage {
 ///
 /// The randomization is what makes guest addresses unpredictable, but the
 /// *minimum* carries a load-bearing property of its own: an access group is
-/// checked as one window around a base, so soundness of confining a group with
-/// a store in it to the stack rests on no window being able to straddle from
-/// one region into the next. A guard wider than the widest group is what
-/// guarantees that.
+/// checked as one window around a base, so no window may straddle from the
+/// stack into data. A guard wider than the widest group guarantees that.
 const MIN_GUARD_PAGES: usize = 16;
 
 /// Widest span the cage can address, set by [`PointerCage::mask`] handing the
@@ -43,19 +44,20 @@ const MIN_PAGE_SIZE: usize = 4096;
 
 const _: () = assert!(
   MIN_GUARD_PAGES * MIN_PAGE_SIZE > crate::region_analysis::MAX_GROUP_SPAN as usize,
-  "an access group could span from one guest region into another, which is what \
-   lets a group containing a store be checked against the stack alone"
+  "an access group could span from one guest region into another"
 );
 
 impl PointerCage {
   /// Creates a new pointer cage with randomized guard regions.
   ///
   /// `stack_size` sizes the reserved guest stack window; `data_size` sizes the
-  /// mapped read-only data region. Neither has to be page-aligned.
+  /// immutable ELF image and `writable_data_size` sizes the packed writable
+  /// suffix. Neither has to be page-aligned.
   pub fn new(
     rng: &mut impl rand::Rng,
     stack_size: usize,
     data_size: usize,
+    writable_data_size: usize,
   ) -> Result<Self, RuntimeError> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size < 0 {
@@ -72,6 +74,10 @@ impl PointerCage {
     // that follows stays page-aligned for `mprotect`.
     let stack_slot = round_up(stack_size);
     let data_size = round_up(data_size);
+    let writable_data_size = round_up(writable_data_size);
+    let total_data_size = data_size
+      .checked_add(writable_data_size)
+      .ok_or(RuntimeError::PlatformError("guest data size overflow"))?;
 
     // A bounds check folds both bounds into one unsigned comparison against
     // `(top - width) - bottom`, and a group leader asks for a `width` as wide as
@@ -81,7 +87,7 @@ impl PointerCage {
     // page-rounded and the guest stack is tens of kilobytes - so this refuses a
     // configuration that cannot arise today rather than one that does.
     let widest_window = crate::region_analysis::MAX_GROUP_SPAN as usize;
-    if stack_size < widest_window || data_size < widest_window {
+    if stack_size < widest_window || total_data_size < widest_window {
       return Err(RuntimeError::PlatformError(
         "a guest region is narrower than the widest window a bounds check can cover",
       ));
@@ -98,14 +104,18 @@ impl PointerCage {
     let margin: usize = page_size;
 
     let data_bottom = guard_size_1 + stack_slot + guard_size_2;
+    // Keeping the two page-aligned pieces adjacent is load-bearing: the JIT
+    // deliberately sees them as one affine DATA region. Page protection, not
+    // region analysis, distinguishes the immutable prefix from the suffix.
+    let writable_data_bottom = data_bottom + data_size;
     // The addressable span has to stay inside what `mask()` can express: it is
     // handed to the JIT as an `i32` mask, so anything above 2 GiB has no valid
     // encoding. Refused here rather than asserted in `mask()`, which the loader
     // reaches three frames later - by which point a 4 GiB mapping and a copy of
     // the whole input have already been committed for an input that was never
     // going to load.
-    let addressable_len = data_bottom
-      .checked_add(data_size)
+    let addressable_len = writable_data_bottom
+      .checked_add(writable_data_size)
       .and_then(|x| x.checked_add(guard_size_3))
       .filter(|&x| x <= MAX_ADDRESSABLE_LEN)
       .map(|x| x.next_power_of_two())
@@ -126,7 +136,7 @@ impl PointerCage {
       if libc::mprotect(region.as_ptr() as *mut _, map_size, libc::PROT_NONE) != 0
         || libc::mprotect(
           region.as_ptr().add(margin + data_bottom) as *mut _,
-          data_size,
+          total_data_size,
           libc::PROT_READ | libc::PROT_WRITE,
         ) != 0
       {
@@ -141,7 +151,8 @@ impl PointerCage {
       stack_bottom: guard_size_1,
       stack_top: guard_size_1 + stack_size,
       data_bottom,
-      data_top: data_bottom + data_size,
+      data_top: writable_data_bottom + writable_data_size,
+      writable_data_bottom,
       margin,
     })
   }
@@ -175,6 +186,11 @@ impl PointerCage {
     unsafe { self.region.as_ptr().add(self.margin + self.data_bottom) as usize }
   }
 
+  /// Returns the start of the page-aligned writable-data suffix.
+  pub fn writable_data_bottom(&self) -> usize {
+    self.writable_data_bottom
+  }
+
   /// Returns the pointer mask used for JIT pointer masking.
   pub fn mask(&self) -> i32 {
     let addressable_len = self.region.len() - 2 * self.margin;
@@ -190,7 +206,7 @@ impl PointerCage {
     self.region.as_ptr() as usize + self.margin
   }
 
-  /// Makes the data region read-only after initialization.
+  /// Makes both parts of the data region read-only after initialization.
   pub fn freeze_data(&self) {
     unsafe {
       if libc::mprotect(
@@ -203,6 +219,52 @@ impl PointerCage {
       }
     }
     tracing::info!(len = self.data_top - self.data_bottom, "frozen data region");
+  }
+
+  /// Changes only the packed writable-data suffix's page protection.
+  pub fn protect_writable_data(&self, writable: bool) -> Result<(), RuntimeError> {
+    let len = self.data_top - self.writable_data_bottom;
+    if len == 0 {
+      return Ok(());
+    }
+    let protection = if writable {
+      libc::PROT_READ | libc::PROT_WRITE
+    } else {
+      libc::PROT_READ
+    };
+    if unsafe {
+      libc::mprotect(
+        self
+          .region
+          .as_ptr()
+          .add(self.margin + self.writable_data_bottom) as *mut _,
+        len,
+        protection,
+      )
+    } != 0
+    {
+      return Err(RuntimeError::PlatformError(
+        "failed to protect writable data region",
+      ));
+    }
+    Ok(())
+  }
+
+  /// Removes access to the mutable suffix after a failed permission restore.
+  /// Returning false means the process can no longer safely continue.
+  pub fn quarantine_writable_data(&self) -> bool {
+    let len = self.data_top - self.writable_data_bottom;
+    len == 0
+      || unsafe {
+        libc::mprotect(
+          self
+            .region
+            .as_ptr()
+            .add(self.margin + self.writable_data_bottom) as *mut _,
+          len,
+          libc::PROT_NONE,
+        ) == 0
+      }
   }
 
   /// Validates a read against the mapped data region and returns a slice on
@@ -243,7 +305,7 @@ mod tests {
 
   #[test]
   fn stack_window_is_reserved_but_never_dereferenceable() {
-    let cage = PointerCage::new(&mut rand::thread_rng(), 32768, 4096).unwrap();
+    let cage = PointerCage::new(&mut rand::thread_rng(), 32768, 4096, 4096).unwrap();
 
     // The guest stack window sits below the data region with a guard between
     // them, so the two guest address ranges can never overlap.
@@ -263,6 +325,23 @@ mod tests {
   }
 
   #[test]
+  fn immutable_and_writable_backing_are_one_affine_data_region() {
+    let page = page_size();
+    let cage = PointerCage::new(&mut rand::thread_rng(), 32768, page + 1, page + 1).unwrap();
+
+    // There is no guard or second translation base at the protection boundary:
+    // the JIT translates either side with `native = data_native_base +
+    // (guest - data_bottom)`.
+    assert_eq!(cage.writable_data_bottom(), cage.data_bottom() + 2 * page);
+    let before = cage.data_slice(cage.writable_data_bottom() - 1, 1).unwrap();
+    let after = cage.data_slice(cage.writable_data_bottom(), 1).unwrap();
+    assert_eq!(
+      after.as_ptr() as *mut u8 as usize,
+      before.as_ptr() as *mut u8 as usize + 1
+    );
+  }
+
+  #[test]
   fn a_region_narrower_than_the_widest_window_is_refused() {
     // `(top - width) - bottom` would wrap, and the single unsigned comparison
     // the bounds check folds down to would then accept every address for that
@@ -271,13 +350,13 @@ mod tests {
 
     // The stack window is used unrounded, so it is the one that can be too
     // small.
-    assert!(PointerCage::new(&mut rand::thread_rng(), widest - 1, 4096).is_err());
-    assert!(PointerCage::new(&mut rand::thread_rng(), widest, 4096).is_ok());
+    assert!(PointerCage::new(&mut rand::thread_rng(), widest - 1, 4096, 0).is_err());
+    assert!(PointerCage::new(&mut rand::thread_rng(), widest, 4096, 0).is_ok());
 
     // The data region is rounded up to a page first, so on any page size at
     // least as large as the window it can only be too small when it is empty.
-    assert!(PointerCage::new(&mut rand::thread_rng(), 32768, 0).is_err());
-    assert!(PointerCage::new(&mut rand::thread_rng(), 32768, 1).is_ok());
+    assert!(PointerCage::new(&mut rand::thread_rng(), 32768, 0, 0).is_err());
+    assert!(PointerCage::new(&mut rand::thread_rng(), 32768, 1, 0).is_ok());
   }
 
   #[test]
@@ -286,7 +365,7 @@ mod tests {
     // 32 KiB guest stack work on a 64 KiB-page kernel. The size is deliberately
     // not a multiple of any page size, but it does have to clear the widest
     // window a bounds check can be asked to cover.
-    let cage = PointerCage::new(&mut rand::thread_rng(), 5000, 4096).unwrap();
+    let cage = PointerCage::new(&mut rand::thread_rng(), 5000, 4096, 4096).unwrap();
     assert_eq!(cage.stack_top() - cage.stack_bottom(), 5000);
     assert_eq!(cage.data_bottom() % page_size(), 0);
 

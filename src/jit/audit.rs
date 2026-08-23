@@ -194,6 +194,10 @@ unsafe extern "C" fn never_called_resolver(_: u32) -> u64 {
   unreachable!("translation never executes what it emits")
 }
 
+unsafe extern "C" fn never_called_stack_exhausted() -> ! {
+  unreachable!("translation never executes what it emits")
+}
+
 /// The nastiest configuration the runtime actually uses: cage on, native frame
 /// base on, frame constants on, every helper index accepted.
 fn hostile_config(target: Target) -> Arc<Config> {
@@ -203,10 +207,12 @@ fn hostile_config(target: Target) -> Arc<Config> {
     pointer_offset: 0x1_0000_0000,
     native_frame_base: true,
     frame_constants: true,
+    instruction_limit: crate::jit::abi::MAX_INSTS as usize,
     dispatcher: Some(never_called_dispatcher),
     dispatcher_validate: Some(accept_every_helper),
     unwind_helper_index: None,
     local_call_resolver: Some(never_called_resolver),
+    local_call_stack_exhausted: Some(never_called_stack_exhausted),
   })
 }
 
@@ -1007,6 +1013,8 @@ fn the_memory_descriptor_offsets_are_the_ones_abi_names() {
   // The derived block begins immediately after the six descriptor fields and
   // is exactly `DERIVED_SLOTS` words long; the trampolines copy it wholesale.
   assert_eq!(abi::DERIVED_SLOTS * 8 + 48, 144);
+  assert_eq!(abi::memory::LOCAL_CALL_GUEST_FLOOR, 144);
+  assert_eq!(abi::memory::LOCAL_CALL_NATIVE_FLOOR, 152);
 }
 
 // ---------------------------------------------------------------------------

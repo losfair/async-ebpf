@@ -55,8 +55,10 @@
 //! assemble an empty program. See
 //! `tests::decisions::the_empty_program_is_refused_by_the_loader_not_the_validator`.
 
+#[cfg(test)]
+use super::abi;
 use super::isa::{cls, opcode, AluOp, AluWidth, Insn, Op};
-use super::{abi, Config};
+use super::Config;
 
 // ---------------------------------------------------------------------------
 // Layer 1: the per-opcode operand filter
@@ -316,8 +318,11 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
   // instructions is refused. `Translator::load` checks `>` before calling here,
   // so the two together reproduce `>=` — but this must not depend on that, and
   // stating it here is what makes the boundary testable in one place.
-  if insns.len() >= abi::MAX_INSTS as usize {
-    return Err(format!("too many instructions (max {})", abi::MAX_INSTS));
+  if insns.len() >= config.instruction_limit {
+    return Err(format!(
+      "too many instructions (max {})",
+      config.instruction_limit
+    ));
   }
 
   // Stack usage is checked next,
@@ -553,8 +558,9 @@ fn check_call(config: &Config, insn: &Insn, pc: usize, num_insns: usize) -> Resu
 /// Ports `check_for_self_contained_sub_programs`. A local call target is taken
 /// to start a sub-program, and a sub-program runs to the next start or to the
 /// end of the program. Within one sub-program every jump must land inside it,
-/// and the sub-program must end in `exit` or with an unconditional jump as its
-/// second-to-last instruction.
+/// and the sub-program must end in `exit` or have an unconditional jump in one
+/// of its last two slots. The second-to-last form leaves unreachable padding;
+/// the final-slot form is the canonical layout compiler-generated BPF uses.
 ///
 /// Two details that are easy to miss:
 ///
@@ -613,8 +619,10 @@ fn check_self_contained_sub_programs(insns: &[Insn]) -> Result<(), String> {
     // `end > start` always: the starts are distinct and sorted, every local
     // call target is inside the program, and 0 is always present.
     let ends_with_exit = insns[end - 1].opcode == opcode::EXIT;
-    let ends_with_jump = end >= start + 2
-      && (insns[end - 2].opcode == opcode::JA || insns[end - 2].opcode == opcode::JA32);
+    let is_unconditional_jump =
+      |insn: Insn| insn.opcode == opcode::JA || insn.opcode == opcode::JA32;
+    let ends_with_jump = is_unconditional_jump(insns[end - 1])
+      || (end >= start + 2 && is_unconditional_jump(insns[end - 2]));
     if !ends_with_exit && !ends_with_jump {
       return Err(format!(
         "sub-program does not end with EXIT or unconditional jump at PC {}",
@@ -684,6 +692,18 @@ mod tests {
     assert_eq!(validate(&config, &[insn(0xb7, 0, 0, 0, 1)]), Ok(()));
     // And an empty program is accepted too.
     assert_eq!(validate(&config, &[]), Ok(()));
+  }
+
+  #[test]
+  fn a_sub_program_may_end_with_an_unconditional_jump_in_its_final_slot() {
+    let config = Config::default();
+    let program = [
+      insn(opcode::CALL, 0, 1, 0, 1), // pc 0 -> pc 2
+      exit(),
+      insn(0xb7, 0, 0, 0, 0),
+      insn(opcode::JA, 0, 0, -2, 0), // closed loop in the callee
+    ];
+    assert_eq!(validate(&config, &program), Ok(()));
   }
 
   #[test]

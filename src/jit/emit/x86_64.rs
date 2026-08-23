@@ -693,7 +693,7 @@ impl Emit<'_, '_, '_> {
     scratch: u8,
     offset: i32,
     size: i32,
-    store: bool,
+    _store: bool,
     region_hint: u8,
   ) {
     debug_assert_ne!(dst, scratch);
@@ -711,9 +711,7 @@ impl Emit<'_, '_, '_> {
     }
 
     if self.cfg.pointer_mask != 0 {
-      // Stores are confined to the active stack regardless of the hint, which
-      // is what preserves the read-only guarantee for the data region.
-      if store || region_hint == abi::region::STACK {
+      if region_hint == abi::region::STACK {
         self.emit_single_region_address(dst, scratch, size, &STACK_REGION);
         return;
       }
@@ -784,9 +782,6 @@ impl Emit<'_, '_, '_> {
             && g.written & (1u16 << base_ebpf) == 0
             && plan.delta as u64 + width as u64 <= g.span as u64
             && g.lo as i64 + plan.delta as i64 == offset as i64
-            // A store cannot ride a window checked against the read-only data
-            // region.
-            && (!store || g.region == abi::region::STACK)
         }
         _ => false,
       };
@@ -805,8 +800,7 @@ impl Emit<'_, '_, '_> {
         && plan.span <= abi::MAX_GROUP_SPAN
         && plan.delta as u64 + width as u64 <= plan.span as u64
         && plan.lo as i64 + plan.delta as i64 == offset as i64
-        && plan.region != abi::region::FRAME
-        && (!store || plan.region == abi::region::STACK);
+        && plan.region != abi::region::FRAME;
       if usable {
         self.emit_masked_address_with_offset(
           base,
@@ -959,8 +953,18 @@ impl Emit<'_, '_, '_> {
   /// A local call whose target has not been compiled yet: ask the resolver at
   /// run time, then call what it returns.
   fn emit_lazy_local_call(&mut self, call_pc: usize) {
-    let resolver = match self.cfg.local_call_resolver {
-      Some(r) if call_pc < self.inputs.resolver_ids.len() => r,
+    // From one guard site to the next: four saved callee registers, the CALL
+    // return address, and the callee's 8-byte prologue slot.
+    const NATIVE_STACK_DELTA: usize = 4 * 8 + 8 + 8;
+    const _: () = assert!(NATIVE_STACK_DELTA <= abi::NATIVE_LOCAL_CALL_BUDGET);
+
+    let (resolver, stack_exhausted) = match (
+      self.cfg.local_call_resolver,
+      self.cfg.local_call_stack_exhausted,
+    ) {
+      (Some(resolver), Some(stack_exhausted)) if call_pc < self.inputs.resolver_ids.len() => {
+        (resolver, stack_exhausted)
+      }
       _ => {
         self.st.fail(Progress::UnexpectedInstruction);
         return;
@@ -968,14 +972,35 @@ impl Emit<'_, '_, '_> {
     };
     let id = self.inputs.resolver_ids[call_pc];
 
-    // Match the normal local-call frame setup: `sub r15, [rsp]` moves R10 down
-    // by the current function's stack usage. Emitted literally because the
-    // ModRM+SIB pair for an `[rsp]` base is not what
-    // `emit_modrm_and_displacement` produces.
-    self.emit1(0x4c);
-    self.emit1(0x2B);
-    self.emit1(0x3C);
-    self.emit1(0x24);
+    // R10 is already a native pointer into the per-invocation guest stack.
+    // Refuse the call unless subtracting one frame still leaves a complete
+    // FRAME_WINDOW below the callee's R10. Independently reserve enough native
+    // coroutine stack for the persistent call frame and the non-returning
+    // exhaustion callback.
+    self.emit_load(S::S64, RBP, RCX, abi::FRAME_OFFSET);
+    self.emit_load(S::S64, RCX, RCX, abi::memory::LOCAL_CALL_GUEST_FLOOR);
+    self.emit_cmp(RCX, map_register(10));
+    let guest_exhausted = self.emit_jcc(
+      0x82, // JB: unsigned R10 < guest floor
+      PatchTarget::EbpfPc { pc: 0, near: false },
+    );
+
+    self.emit_load(S::S64, RBP, RCX, abi::FRAME_OFFSET);
+    self.emit_load(S::S64, RCX, RCX, abi::memory::LOCAL_CALL_NATIVE_FLOOR);
+    self.emit_cmp(RCX, RSP);
+    let native_exhausted = self.emit_jcc(
+      0x82, // JB: unsigned RSP < native floor
+      PatchTarget::EbpfPc { pc: 0, near: false },
+    );
+
+    // Every local function has the same fixed guest-frame charge. Keep R10
+    // independent of host stack bookkeeping across coroutine suspension.
+    self.emit_alu64_imm32(
+      0x81,
+      5,
+      map_register(10),
+      abi::LOCAL_FUNCTION_STACK_SIZE as i32,
+    );
 
     self.emit_push(map_register(6));
     self.emit_push(map_register(7));
@@ -1024,11 +1049,22 @@ impl Emit<'_, '_, '_> {
     self.emit_pop(map_register(7));
     self.emit_pop(map_register(6));
 
-    // `add r15, [rsp]`
-    self.emit1(0x4c);
-    self.emit1(0x03);
-    self.emit1(0x3C);
-    self.emit1(0x24);
+    self.emit_alu64_imm32(
+      0x81,
+      0,
+      map_register(10),
+      abi::LOCAL_FUNCTION_STACK_SIZE as i32,
+    );
+
+    let skip_exhausted = self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: false });
+    self.emit_jump_target(guest_exhausted);
+    self.emit_jump_target(native_exhausted);
+    self.emit_load_imm(RAX, stack_exhausted as usize as u64 as i64);
+    self.emit_indirect_call_rax();
+    // The callback is declared divergent. Trap if an invalid embedder returns.
+    self.emit1(0x0f);
+    self.emit1(0x0b); // UD2
+    self.emit_jump_target(skip_exhausted);
   }
 }
 
@@ -1590,7 +1626,8 @@ impl Emit<'_, '_, '_> {
       // provides a fallback for it.
       Progress::UnexpectedInstruction => {
         TranslateError::Failed(self.errmsg.clone().unwrap_or_else(|| {
-          "Unexpected instruction or missing local-call resolver during JIT compilation".to_string()
+          "Unexpected instruction or missing local-call runtime callbacks during JIT compilation"
+            .to_string()
         }))
       }
       Progress::UnknownInstruction => {
@@ -2117,8 +2154,8 @@ impl Emit<'_, '_, '_> {
         let mut atomic_dst = dst;
         let mut atomic_offset = inst.offset as i32;
         if self.cfg.pointer_mask != 0 {
-          // The hint is forced to UNKNOWN, but `store` is true, so this is a
-          // stack-region check regardless: an atomic is a write.
+          // Atomics use the ordinary all-region runtime probe. Page protection
+          // decides whether the selected data backing is writable for this invocation.
           self.emit_masked_address_with_offset(
             dst,
             R11,
@@ -2187,7 +2224,7 @@ mod tests {
 
   use crate::jit::golden;
   use crate::jit::isa::{alu, jmp, mode, opcode, size, src as srcbit, Insn};
-  use crate::jit::{Dispatcher, LocalCallResolver, Target};
+  use crate::jit::{Dispatcher, LocalCallResolver, LocalCallStackExhausted, Target};
 
   // -----------------------------------------------------------------------
   // Instructions
@@ -2230,6 +2267,7 @@ mod tests {
   /// every run.
   const DISPATCHER_ADDRESS: usize = 0x0000_7f00_d15b_a000;
   const RESOLVER_ADDRESS: usize = 0x0000_7f00_0e50_1000;
+  const STACK_EXHAUSTED_ADDRESS: usize = 0x0000_7f00_57ac_0000;
 
   fn dispatcher() -> Dispatcher {
     // SAFETY: never called. The value is materialised as an immediate and
@@ -2240,6 +2278,11 @@ mod tests {
   fn local_call_resolver() -> LocalCallResolver {
     // SAFETY: as above.
     unsafe { std::mem::transmute::<usize, LocalCallResolver>(RESOLVER_ADDRESS) }
+  }
+
+  fn local_call_stack_exhausted() -> LocalCallStackExhausted {
+    // SAFETY: as above.
+    unsafe { std::mem::transmute::<usize, LocalCallStackExhausted>(STACK_EXHAUSTED_ADDRESS) }
   }
 
   /// Accepts every helper index, so that helper-call emission is exercised
@@ -2258,6 +2301,7 @@ mod tests {
       dispatcher: Some(dispatcher()),
       dispatcher_validate: Some(accept_every_helper),
       local_call_resolver: Some(local_call_resolver()),
+      local_call_stack_exhausted: Some(local_call_stack_exhausted()),
       ..Default::default()
     }
   }
@@ -2643,6 +2687,7 @@ mod tests {
       dispatcher: Some(dispatcher()),
       dispatcher_validate: Some(accept_every_helper),
       local_call_resolver: Some(local_call_resolver()),
+      local_call_stack_exhausted: Some(local_call_stack_exhausted()),
       ..Default::default()
     };
     let translator = Translator::load(Arc::new(config), &code).unwrap();
@@ -3303,9 +3348,8 @@ mod tests {
   #[test]
   fn stores_match_under_every_region_hint() {
     let mut s = Sweep::new();
-    // The store paths are not the load paths: a store is pinned to the stack
-    // region whatever the hint says, and the immediate form swaps the address
-    // and scratch registers around.
+    // Stores use the same region hints as loads; the immediate form still swaps
+    // the address and scratch registers around.
     for hint in [
       abi::region::UNKNOWN,
       abi::region::STACK,
@@ -3366,7 +3410,7 @@ mod tests {
 
     // Every one of these must make the backend fall back to a checked access,
     // at exactly the places the plan stops being self-consistent.
-    let hostile: [[PlanEntry; 4]; 8] = [
+    let hostile: [[PlanEntry; 4]; 7] = [
       // A span of zero.
       plan3(abi::plan_role::LEADER, abi::region::STACK, 0, 0, 0, 0),
       // A span wider than a page.
@@ -3381,8 +3425,6 @@ mod tests {
       plan3(abi::plan_role::MEMBER, abi::region::STACK, 8, 64, 0, 99),
       // A member whose delta lands outside the leader's window.
       plan3(abi::plan_role::MEMBER, abi::region::STACK, 4096, 64, 0, 0),
-      // A store riding a window checked against the read-only data region.
-      plan3(abi::plan_role::LEADER, abi::region::DATA, 0, 64, 0, 0),
     ];
     for plan in hostile {
       let inputs = TranslationInputs {
