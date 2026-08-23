@@ -84,6 +84,20 @@ pub fn updating() -> bool {
   std::env::var_os("ASYNC_EBPF_UPDATE_GOLDENS").is_some()
 }
 
+/// Whether this run should additionally drop entries nothing looked up.
+///
+/// Separate from plain updating, and opt-in, because it is only correct for a
+/// run of the *whole* suite: a filtered run touches a fraction of the entries,
+/// and pruning against that would delete everything else. Renaming or removing
+/// a test otherwise leaves its entry behind for ever, so:
+///
+/// ```text
+/// ASYNC_EBPF_UPDATE_GOLDENS=prune cargo test --features testing
+/// ```
+pub fn pruning() -> bool {
+  std::env::var("ASYNC_EBPF_UPDATE_GOLDENS").map(|v| v == "prune").unwrap_or(false)
+}
+
 fn golden_path(target: Target) -> std::path::PathBuf {
   let arch = match target {
     Target::X86_64 => "x86_64",
@@ -96,6 +110,8 @@ fn golden_path(target: Target) -> std::path::PathBuf {
 
 struct Store {
   entries: BTreeMap<String, String>,
+  /// Keys this process looked up or recorded. Used only by the prune mode.
+  seen: std::collections::BTreeSet<String>,
   dirty: bool,
 }
 
@@ -122,6 +138,7 @@ fn store(target: Target) -> &'static Mutex<Store> {
     }
     Mutex::new(Store {
       entries,
+      seen: Default::default(),
       dirty: false,
     })
   })
@@ -134,9 +151,26 @@ fn store(target: Target) -> &'static Mutex<Store> {
 pub fn flush() {
   for target in [Target::X86_64, Target::Aarch64] {
     let mut guard = store(target).lock().unwrap();
+    if pruning() {
+      let seen = guard.seen.clone();
+      let before = guard.entries.len();
+      guard.entries.retain(|k, _| seen.contains(k));
+      if guard.entries.len() != before {
+        guard.dirty = true;
+      }
+    }
     if !guard.dirty {
       continue;
     }
+    assert!(
+      guard.entries.len() <= MAX_ENTRIES,
+      "{:?} golden file would hold {} entries, over the {MAX_ENTRIES} ceiling.\n\n\
+       `check` is for a bounded set of named cases. A test looping over a large \
+       cross-product should fold its outcomes into a `SweepDigest` instead, \
+       which records one line however many cases it covers.",
+      target,
+      guard.entries.len()
+    );
     let path = golden_path(target);
     let _ = std::fs::create_dir_all(path.parent().unwrap());
     let mut out = String::new();
@@ -198,10 +232,24 @@ pub fn key(label: &str, config: &Config, code: &[u8], inputs: &TranslationInputs
 /// Bytes above this are recorded as a length and a hash rather than in full.
 ///
 /// Below it the golden holds the actual machine code, so a codegen change shows
-/// up in review as the bytes that changed rather than as an opaque digest. The
-/// few cases above it - a four-thousand-instruction function emits ~100 KB -
-/// would otherwise dominate the file for no review value.
-const FULL_HEX_LIMIT: usize = 1024;
+/// up in review as the bytes that changed rather than as an opaque digest.
+///
+/// The limit is low on purpose. Typical emitted functions run to a few hundred
+/// bytes, so a generous limit means nearly every entry is recorded in full and
+/// the file grows with the *product* of cases and code size - at 1 KB it
+/// reached 24 MB for one architecture. Full hex is worth having for the small
+/// canonical cases a reviewer might actually read; beyond that a hash carries
+/// the same regression signal for a fortieth of the bytes.
+const FULL_HEX_LIMIT: usize = 128;
+
+/// Per-case entries permitted in one golden file.
+///
+/// A ceiling rather than a guideline, because the failure it prevents is
+/// gradual: [`check`] is for a bounded set of named cases, and it is very easy
+/// to point a loop over a large cross-product at it and grow the file by a
+/// megabyte without noticing. Cross-products belong in a [`SweepDigest`], which
+/// records one line however many cases it folds in.
+const MAX_ENTRIES: usize = 3000;
 
 pub fn outcome_digest(out: &Result<Vec<u8>, TranslateError>) -> String {
   match out {
@@ -236,6 +284,7 @@ pub fn check(
   let digest = outcome_digest(&out);
 
   let mut guard = store(config.target).lock().unwrap();
+  guard.seen.insert(k.clone());
   if updating() {
     if guard.entries.get(&k) != Some(&digest) {
       guard.entries.insert(k, digest);
@@ -307,34 +356,6 @@ impl SweepDigest {
     self.hasher.update(outcome_digest(out).as_bytes());
   }
 
-  /// Translates one case and folds its outcome in, going through the same
-  /// certification [`check`] does.
-  ///
-  /// Returns whether the case produced code, so a sweep can still assert it is
-  /// exercising the emitter rather than agreeing about a refusal. A program
-  /// that does not load contributes a distinct marker rather than nothing, so
-  /// a case that silently stops loading changes the digest.
-  pub fn add_case(
-    &mut self,
-    label: &str,
-    config: &Config,
-    code: &[u8],
-    inputs: &TranslationInputs<'_>,
-    capacity: usize,
-  ) -> bool {
-    match translate_certified(label, config, code, inputs, capacity) {
-      Some(out) => {
-        self.add(&out);
-        out.is_ok()
-      }
-      None => {
-        self.cases += 1;
-        self.hasher.update(b"did-not-load");
-        false
-      }
-    }
-  }
-
   pub fn translated(&self) -> usize {
     self.translated
   }
@@ -348,6 +369,7 @@ impl SweepDigest {
     let digest = format!("{}:{}:{}", self.cases, self.translated, self.hasher.finish());
     let k = format!("sweep.{label}");
     let mut guard = store(target).lock().unwrap();
+    guard.seen.insert(k.clone());
     if updating() {
       if guard.entries.get(&k) != Some(&digest) {
         guard.entries.insert(k, digest);
