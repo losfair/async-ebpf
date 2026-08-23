@@ -32,8 +32,8 @@ mod trampoline_contract {
 
   const PROGRAM_RS: &str = include_str!("../program.rs");
 
-  /// Everything between `async_ebpf_entry_trampoline:` and the matching
-  /// `.size` directive, for whichever trampoline `arch` names.
+  /// Everything between the architecture-specific opening instruction and the
+  /// matching `entry_trampoline_end!()` invocation.
   fn trampoline(arch: &str) -> &'static str {
     // Both trampolines are in one file; split on the architecture-specific
     // opening instruction rather than on the cfg attribute.
@@ -47,8 +47,8 @@ mod trampoline_contract {
       .unwrap_or_else(|| panic!("no {arch} trampoline found in program.rs"));
     let rest = &PROGRAM_RS[start..];
     let end = rest
-      .find(".size async_ebpf_entry_trampoline")
-      .expect("trampoline has no .size terminator");
+      .find("entry_trampoline_end!()")
+      .expect("trampoline has no end marker");
     &rest[..end]
   }
 
@@ -1021,12 +1021,11 @@ fn the_memory_descriptor_offsets_are_the_ones_abi_names() {
 // icache: the CTR_EL0 decode
 // ---------------------------------------------------------------------------
 
-/// `icache.rs`'s aarch64 module is `#[cfg(target_arch = "aarch64")]`, so on an
-/// x86_64 host nothing in it is even compiled. This pins the arithmetic the
-/// comment there documents — `DminLine` at bits 19:16, `IminLine` at bits 3:0,
-/// each `log2` of the line size in *words* — against real `CTR_EL0` values, so
-/// a transposition of the two fields is caught on every host rather than only
-/// on the one whose D and I line sizes happen to differ.
+/// The non-Darwin cache-maintenance module is not compiled on x86_64. This pins
+/// the arithmetic the comment there documents — `DminLine` at bits 19:16,
+/// `IminLine` at bits 3:0, each `log2` of the line size in *words* — against real
+/// `CTR_EL0` values, so a transposition of the two fields is caught on every
+/// host rather than only on the one whose D and I line sizes happen to differ.
 #[test]
 fn the_ctr_el0_decode_matches_real_hardware() {
   fn decode(ctr: u64) -> (usize, usize) {
@@ -1081,9 +1080,10 @@ fn the_icache_loop_rounding_covers_every_line_of_an_unaligned_range() {
   }
 }
 
-/// `icache::clear` on aarch64 is the one thing here that can only be checked on
-/// the machine it targets.
-#[cfg(target_arch = "aarch64")]
+/// The non-Darwin `icache::clear` implementation reads `CTR_EL0`, so validate
+/// the host's value wherever that implementation is active. Darwin deliberately
+/// uses `sys_icache_invalidate` instead because macOS traps this register read.
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[test]
 fn the_host_reports_a_sane_cache_geometry() {
   let ctr: u64;

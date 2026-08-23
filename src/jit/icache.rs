@@ -29,7 +29,25 @@ mod imp {
   pub unsafe fn clear(_buffer: *mut u8, _size: usize) {}
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod imp {
+  use std::ffi::c_void;
+
+  extern "C" {
+    fn sys_icache_invalidate(start: *mut c_void, len: usize);
+  }
+
+  /// Uses Darwin's cache-maintenance API, which handles the cache geometry and
+  /// required barriers for the current Apple processor.
+  #[inline]
+  pub unsafe fn clear(buffer: *mut u8, size: usize) {
+    if size != 0 {
+      sys_icache_invalidate(buffer.cast(), size);
+    }
+  }
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 mod imp {
   use std::arch::asm;
 

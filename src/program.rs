@@ -80,8 +80,8 @@ const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 /// exercises exactly this corner at run time.
 pub(crate) const FRAME_WINDOW: usize = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
 
-/// Guest addresses the SIGSEGV handler claims as a guest fault rather than a
-/// host crash: `(0, POINTER_CAGE_PROTECTED_WINDOW)`.
+/// Guest addresses the SIGSEGV/SIGBUS handlers claim as a guest fault rather
+/// than a host crash: `(0, POINTER_CAGE_PROTECTED_WINDOW)`.
 ///
 /// A bounds check that fails substitutes address 0, so this is the window every
 /// failed access has to land in. An access group makes that load-bearing at a
@@ -152,15 +152,54 @@ const _: () = {
   );
 };
 
+// `extern "C"` applies the leading underscore to this symbol on Darwin, but
+// global assembly names are passed through verbatim. Keep the object-format
+// spelling here alongside the ELF type/size directives that Mach-O rejects.
+#[cfg(target_os = "macos")]
+macro_rules! entry_trampoline_begin {
+  () => {
+    ".global _async_ebpf_entry_trampoline\n.private_extern \
+     _async_ebpf_entry_trampoline\n_async_ebpf_entry_trampoline:\n"
+  };
+}
+
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+macro_rules! entry_trampoline_begin {
+  () => {
+    ".global async_ebpf_entry_trampoline\n.type \
+     async_ebpf_entry_trampoline,@function\nasync_ebpf_entry_trampoline:\n"
+  };
+}
+
+#[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
+macro_rules! entry_trampoline_begin {
+  () => {
+    ".global async_ebpf_entry_trampoline\n.type \
+     async_ebpf_entry_trampoline,%function\nasync_ebpf_entry_trampoline:\n"
+  };
+}
+
+#[cfg(target_os = "macos")]
+macro_rules! entry_trampoline_end {
+  () => {
+    ""
+  };
+}
+
+#[cfg(not(target_os = "macos"))]
+macro_rules! entry_trampoline_end {
+  () => {
+    ".size async_ebpf_entry_trampoline, . - async_ebpf_entry_trampoline\n"
+  };
+}
+
 #[cfg(all(
   target_arch = "x86_64",
-  any(target_os = "linux", target_os = "openbsd")
+  any(target_os = "linux", target_os = "macos", target_os = "openbsd")
 ))]
 std::arch::global_asm!(
+  entry_trampoline_begin!(),
   r#"
-.global async_ebpf_entry_trampoline
-.type async_ebpf_entry_trampoline,@function
-async_ebpf_entry_trampoline:
     // rdi = target, rsi = ctx, rcx = guest stack bottom, r8 = guest stack len,
     // [rsp + 8] = JitMemory descriptor. The entry target is staged through r9
     // and then rcx, neither of which the backend maps to an eBPF register, so
@@ -251,19 +290,17 @@ async_ebpf_entry_trampoline:
     pop rbx
     pop rbp
     ret
-.size async_ebpf_entry_trampoline, . - async_ebpf_entry_trampoline
-"#
+"#,
+  entry_trampoline_end!(),
 );
 
 #[cfg(all(
   target_arch = "aarch64",
-  any(target_os = "linux", target_os = "openbsd")
+  any(target_os = "linux", target_os = "macos", target_os = "openbsd")
 ))]
 std::arch::global_asm!(
+  entry_trampoline_begin!(),
   r#"
-.global async_ebpf_entry_trampoline
-.type async_ebpf_entry_trampoline,%function
-async_ebpf_entry_trampoline:
     // x0 = target, x1 = ctx, x3 = guest stack bottom, x4 = guest stack len,
     // x6 = JitMemory descriptor. x17 is not mapped to any eBPF register, so the
     // entry target is staged through it.
@@ -342,8 +379,8 @@ async_ebpf_entry_trampoline:
     ldp x29, x30, [sp]
     add sp, sp, #16
     ret
-.size async_ebpf_entry_trampoline, . - async_ebpf_entry_trampoline
-"#
+"#,
+  entry_trampoline_end!(),
 );
 
 extern "C" {
@@ -977,10 +1014,10 @@ pub struct UnboundProgram {
 /// spawnable onto a work-stealing executor. A guest suspends inside the SIGUSR1
 /// handler, so resuming it on a second worker would run the `sigreturn` and the
 /// unblocking `sigprocmask` on a thread that never took the signal - leaving
-/// SIGUSR1 and SIGSEGV blocked forever on the thread that did, with neither
-/// preemption nor guest fault handling. The watcher would also still be
-/// signalling the original thread, and the pooled `ExecContext` would migrate
-/// with it.
+/// SIGUSR1, SIGSEGV, and SIGBUS blocked forever on the thread that did, with
+/// neither preemption nor guest fault handling. The watcher would also still
+/// be signalling the original thread, and the pooled `ExecContext` would
+/// migrate with it.
 ///
 /// `ThreadEnv`'s `PhantomData<*const ()>` and the `Rc` in `data` are what
 /// establish this today; the doctests pin it so a future change to either has
@@ -1087,7 +1124,7 @@ pub struct ThreadEnv {
 
 #[cfg(target_os = "linux")]
 type NativeThread = (libc::pid_t, libc::pid_t);
-#[cfg(target_os = "openbsd")]
+#[cfg(any(target_os = "macos", target_os = "openbsd"))]
 type NativeThread = libc::pthread_t;
 
 #[cfg(target_os = "linux")]
@@ -1095,7 +1132,7 @@ unsafe fn current_native_thread() -> NativeThread {
   (libc::getpid(), libc::gettid())
 }
 
-#[cfg(target_os = "openbsd")]
+#[cfg(any(target_os = "macos", target_os = "openbsd"))]
 unsafe fn current_native_thread() -> NativeThread {
   libc::pthread_self()
 }
@@ -1105,7 +1142,7 @@ unsafe fn signal_native_thread(thread: NativeThread, signal: i32) -> i32 {
   libc::syscall(libc::SYS_tgkill, thread.0, thread.1, signal) as i32
 }
 
-#[cfg(target_os = "openbsd")]
+#[cfg(any(target_os = "macos", target_os = "openbsd"))]
 unsafe fn signal_native_thread(thread: NativeThread, signal: i32) -> i32 {
   libc::pthread_kill(thread, signal)
 }
@@ -1115,21 +1152,22 @@ impl GlobalEnv {
   ///
   /// # Safety
   ///
-  /// Must be called in a process that can install SIGUSR1/SIGSEGV handlers.
+  /// Must be called in a process that can install SIGUSR1/SIGSEGV/SIGBUS
+  /// handlers.
   ///
   /// The effect is **process-wide**, not scoped to this crate's threads: it
-  /// replaces whatever dispositions SIGUSR1 and SIGSEGV had. Notably that
-  /// includes the SIGSEGV handler Rust's standard library installs to report
-  /// thread stack overflow, so a host stack overflow reports as a plain
-  /// segmentation fault while this is installed. The previous SIGSEGV
-  /// disposition is kept and restored for any fault this crate determines is
-  /// not its own, so another component's handler still sees those - but it does
-  /// not see them *first*, and a component that needs to run before this one
-  /// cannot be accommodated.
+  /// replaces whatever dispositions SIGUSR1, SIGSEGV, and SIGBUS had. Notably
+  /// that includes the SIGSEGV handler Rust's standard library installs to
+  /// report thread stack overflow, so a host stack overflow reports as a plain
+  /// segmentation fault while this is installed. The previous fault
+  /// dispositions are kept and restored for any fault this crate determines
+  /// is not its own, so another component's handler still sees those - but it
+  /// does not see them *first*, and a component that needs to run before this
+  /// one cannot be accommodated.
   ///
-  /// An embedder sharing the process with another SIGSEGV user - a garbage
-  /// collector, another JIT, a crash reporter, a `userfaultfd`-style mapper -
-  /// should know this before calling.
+  /// An embedder sharing the process with another SIGSEGV/SIGBUS user - a
+  /// garbage collector, another JIT, a crash reporter, a
+  /// `userfaultfd`-style mapper - should know this before calling.
   pub unsafe fn new() -> Self {
     static INIT: Once = Once::new();
 
@@ -1152,7 +1190,8 @@ impl GlobalEnv {
 
       for (sig, handler) in [
         (libc::SIGUSR1, sigusr1_handler as *const () as usize),
-        (libc::SIGSEGV, sigsegv_handler as *const () as usize),
+        (libc::SIGSEGV, fault_handler as *const () as usize),
+        (libc::SIGBUS, fault_handler as *const () as usize),
       ] {
         let mut act: libc::sigaction = std::mem::zeroed();
         act.sa_sigaction = handler;
@@ -1168,12 +1207,16 @@ impl GlobalEnv {
         if libc::sigaction(sig, &act, &mut prev) != 0 {
           panic!("failed to setup handler for signal {}", sig);
         }
-        if sig == libc::SIGSEGV {
+        if sig == libc::SIGSEGV || sig == libc::SIGBUS {
           // Kept so a fault this crate does not own can go back to whoever was
-          // handling SIGSEGV before - Rust's own stack-overflow reporter, a
+          // handling the signal before - Rust's own stack-overflow reporter, a
           // crash reporter, another runtime's guard pages - instead of being
-          // converted into an abort. See `chain_to_previous_sigsegv_handler`.
-          let _ = PREV_SIGSEGV.set(prev);
+          // converted into an abort. See `chain_to_previous_fault_handler`.
+          if sig == libc::SIGSEGV {
+            let _ = PREV_SIGSEGV.set(prev);
+          } else {
+            let _ = PREV_SIGBUS.set(prev);
+          }
         }
       }
     });
@@ -2804,12 +2847,22 @@ unsafe fn program_counter(uctx: *mut libc::ucontext_t) -> usize {
   (*uctx).sc_elr as usize
 }
 
-unsafe extern "C" fn sigsegv_handler(
-  _sig: i32,
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+unsafe fn program_counter(uctx: *mut libc::ucontext_t) -> usize {
+  (*(*uctx).uc_mcontext).__ss.__rip as usize
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+unsafe fn program_counter(uctx: *mut libc::ucontext_t) -> usize {
+  (*(*uctx).uc_mcontext).__ss.__pc as usize
+}
+
+unsafe extern "C" fn fault_handler(
+  sig: i32,
   siginfo: *mut libc::siginfo_t,
   uctx: *mut libc::ucontext_t,
 ) {
-  let fail = || chain_to_previous_sigsegv_handler();
+  let fail = || chain_to_previous_fault_handler(sig);
 
   let Some((jit_code_zone, pointer_cage, data_range, yielder)) = ACTIVE_JIT_CODE_ZONE.with(|x| {
     if x.valid.load(Ordering::Relaxed) {
@@ -2833,7 +2886,8 @@ unsafe extern "C" fn sigsegv_handler(
     return fail();
   }
 
-  // SEGV_MAPERR or SEGV_ACCERR.
+  // SEGV_MAPERR/SEGV_ACCERR and BUS_ADRALN/BUS_ADRERR are 1/2 on the
+  // supported platforms. Other causes belong to the previous handler.
   if (*siginfo).si_code != 1 && (*siginfo).si_code != 2 {
     return fail();
   }
@@ -2885,11 +2939,12 @@ unsafe extern "C" fn sigusr1_handler(
   });
 }
 
-/// The SIGSEGV disposition that was in place before [`GlobalEnv::new`] replaced
-/// it, captured once under `INIT` and only ever read afterwards.
+/// The fault dispositions that were in place before [`GlobalEnv::new`]
+/// replaced them, captured once under `INIT` and only ever read afterwards.
 static PREV_SIGSEGV: OnceLock<libc::sigaction> = OnceLock::new();
+static PREV_SIGBUS: OnceLock<libc::sigaction> = OnceLock::new();
 
-/// Hands SIGSEGV back to whoever had it before this crate took it, then returns
+/// Hands a fault back to whoever had it before this crate took it, then returns
 /// so the faulting instruction re-executes under that disposition.
 ///
 /// Installing `SIG_DFL` here instead - which is what this used to do - turns a
@@ -2897,13 +2952,20 @@ static PREV_SIGSEGV: OnceLock<libc::sigaction> = OnceLock::new();
 /// and silently discards Rust's own stack-overflow handler, so a host stack
 /// overflow reports as a bare `Segmentation fault` rather than naming itself.
 /// `sigaction` is async-signal-safe, so this is legal from a handler.
-unsafe fn chain_to_previous_sigsegv_handler() {
-  if let Some(prev) = PREV_SIGSEGV.get() {
-    if libc::sigaction(libc::SIGSEGV, prev, std::ptr::null_mut()) == 0 {
+unsafe fn chain_to_previous_fault_handler(signum: i32) {
+  let prev = if signum == libc::SIGSEGV {
+    PREV_SIGSEGV.get()
+  } else if signum == libc::SIGBUS {
+    PREV_SIGBUS.get()
+  } else {
+    None
+  };
+  if let Some(prev) = prev {
+    if libc::sigaction(signum, prev, std::ptr::null_mut()) == 0 {
       return;
     }
   }
-  restore_default_signal_handler(libc::SIGSEGV);
+  restore_default_signal_handler(signum);
 }
 
 unsafe fn restore_default_signal_handler(signum: i32) {
@@ -2920,6 +2982,7 @@ fn get_blocked_sigset() -> libc::sigset_t {
     let mut s: libc::sigset_t = std::mem::zeroed();
     libc::sigaddset(&mut s, libc::SIGUSR1);
     libc::sigaddset(&mut s, libc::SIGSEGV);
+    libc::sigaddset(&mut s, libc::SIGBUS);
     s
   }
 }
