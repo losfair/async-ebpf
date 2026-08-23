@@ -33,6 +33,10 @@ pub struct PointerCage {
 /// guarantees that.
 const MIN_GUARD_PAGES: usize = 16;
 
+/// Widest span the cage can address, set by [`PointerCage::mask`] handing the
+/// JIT an `i32` mask: 2 GiB, the largest power of two whose mask still fits.
+const MAX_ADDRESSABLE_LEN: usize = 0x8000_0000;
+
 /// The smallest page size the cage asserts against. Real pages are at least
 /// this, so a bound proved here holds on any supported platform.
 const MIN_PAGE_SIZE: usize = 4096;
@@ -94,7 +98,22 @@ impl PointerCage {
     let margin: usize = page_size;
 
     let data_bottom = guard_size_1 + stack_slot + guard_size_2;
-    let map_size = (data_bottom + data_size + guard_size_3).next_power_of_two() + margin * 2;
+    // The addressable span has to stay inside what `mask()` can express: it is
+    // handed to the JIT as an `i32` mask, so anything above 2 GiB has no valid
+    // encoding. Refused here rather than asserted in `mask()`, which the loader
+    // reaches three frames later - by which point a 4 GiB mapping and a copy of
+    // the whole input have already been committed for an input that was never
+    // going to load.
+    let addressable_len = data_bottom
+      .checked_add(data_size)
+      .and_then(|x| x.checked_add(guard_size_3))
+      .filter(|&x| x <= MAX_ADDRESSABLE_LEN)
+      .map(|x| x.next_power_of_two())
+      .filter(|&x| x <= MAX_ADDRESSABLE_LEN)
+      .ok_or(RuntimeError::PlatformError(
+        "the guest data region is too large for the pointer cage to address",
+      ))?;
+    let map_size = addressable_len + margin * 2;
     let region = MmapRaw::from(
       MmapOptions::new()
         .len(map_size)
@@ -159,8 +178,10 @@ impl PointerCage {
   /// Returns the pointer mask used for JIT pointer masking.
   pub fn mask(&self) -> i32 {
     let addressable_len = self.region.len() - 2 * self.margin;
-    assert_eq!(addressable_len.count_ones(), 1);
-    assert!(addressable_len <= 0x8000_0000usize);
+    // Both established by `new`, which refuses an oversized region before it
+    // maps anything.
+    debug_assert_eq!(addressable_len.count_ones(), 1);
+    debug_assert!(addressable_len <= MAX_ADDRESSABLE_LEN);
     (addressable_len - 1) as i32
   }
 

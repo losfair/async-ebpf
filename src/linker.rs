@@ -17,6 +17,24 @@ const R_BPF_64_32: u32 = 10;
 
 const EBPF_OP_CALL: u8 = 0x05u8 | 0x80u8;
 const EBPF_OP_LDDW: u8 = 0x18;
+
+/// Ceilings on how much work one object may ask the loader to do.
+///
+/// Every one of these is per-*object*, because nothing else bounds them.
+/// `MAX_INSTS` is enforced per code section, `DEFAULT_CODE_SIZE_LIMIT` bounds
+/// only JIT output - which lazy compilation means is never reached at load -
+/// and the pointer cage is sized from the file length rather than from the work
+/// the file implies. Without these, a small object linear in file size costs
+/// gigabytes: section headers are 64 bytes each and nothing requires two of
+/// them to describe disjoint bytes, so N headers pointing at one code blob
+/// multiply the analysis by N for ~67 bytes apiece.
+///
+/// The numbers are far above anything a compiler emits - LLVM produces one code
+/// section per function at most - and are about refusing absurd inputs, not
+/// about being tight.
+const MAX_CODE_SECTIONS: usize = 1024;
+const MAX_TOTAL_CODE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RELOCATIONS: usize = 1024 * 1024;
 #[cfg(test)]
 const EBPF_OP_EXIT: u8 = 0x95;
 #[cfg(test)]
@@ -87,6 +105,12 @@ pub fn link_elf(
 
   let mut code_sections: HashMap<String, (usize, usize)> = HashMap::new();
   let mut code_section_indexes: HashSet<usize> = HashSet::new();
+  // Byte ranges already claimed by a code section, so two headers cannot
+  // describe the same bytes and have them analyzed, translated and retained
+  // twice over. No compiler emits overlapping code sections; an object that
+  // does is asking for the work to be multiplied, not for two functions.
+  let mut claimed_code_ranges: Vec<(u64, u64)> = Vec::new();
+  let mut total_code_bytes: usize = 0;
   for (cs_index, cs) in sht.iter().enumerate() {
     if cs.sh_type != SHT_PROGBITS || cs.sh_flags != SHF_ALLOC | SHF_EXECINSTR {
       continue;
@@ -102,14 +126,40 @@ pub fn link_elf(
     // Validate that the section header points to valid data
     elf.section_data(&cs)?;
 
+    let start = cs.sh_offset;
+    let end = start.saturating_add(cs.sh_size);
+    if claimed_code_ranges
+      .iter()
+      .any(|&(lo, hi)| start < hi && lo < end)
+    {
+      return Err(LinkerError::InvalidElf(
+        "code section overlaps another code section",
+      ));
+    }
+    claimed_code_ranges.push((start, end));
+
+    total_code_bytes = total_code_bytes.saturating_add(cs.sh_size as usize);
+    if total_code_bytes > MAX_TOTAL_CODE_BYTES {
+      return Err(LinkerError::InvalidElf("too many code bytes in one object"));
+    }
+
     code_sections.insert(
       cs_name.to_string(),
       (vbase + cs.sh_offset as usize, cs.sh_size as usize),
     );
     code_section_indexes.insert(cs_index);
+    if code_sections.len() > MAX_CODE_SECTIONS {
+      return Err(LinkerError::InvalidElf(
+        "too many code sections in one object",
+      ));
+    }
   }
 
   let mut insn_rewrites: Vec<(usize, u64)> = vec![];
+  // Relocation sections are not required to describe distinct bytes either, so
+  // one valid relocation blob can be replayed against the same target by any
+  // number of SHT_REL headers.
+  let mut relocated_sections: HashSet<usize> = HashSet::new();
 
   for sec in sht.iter() {
     if sec.sh_type != SHT_REL {
@@ -118,6 +168,11 @@ pub fn link_elf(
     let target_section_index = sec.sh_info as usize;
     if !code_section_indexes.contains(&target_section_index) {
       continue;
+    }
+    if !relocated_sections.insert(target_section_index) {
+      return Err(LinkerError::InvalidElf(
+        "more than one relocation section targets the same code section",
+      ));
     }
 
     let target_section = sht.get(target_section_index)?;
@@ -128,6 +183,14 @@ pub fn link_elf(
 
     let relocs = elf.section_data_as_rels(&sec)?;
     for reloc in relocs {
+      // Checked per relocation rather than once against the section length,
+      // because the rewrites are buffered and applied afterwards: without this
+      // the whole buffer is built before anything rejects it.
+      if insn_rewrites.len() >= MAX_RELOCATIONS {
+        return Err(LinkerError::InvalidElf(
+          "too many relocations in one object",
+        ));
+      }
       let end = (reloc.r_offset as usize).saturating_add(8);
       if reloc.r_offset % 8 != 0 || end > target_section_data.len() {
         return Err(LinkerError::InvalidElf("relocation: invalid offset"));

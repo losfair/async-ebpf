@@ -13,7 +13,7 @@ use std::{
   rc::Rc,
   sync::{
     atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
-    Arc, Once,
+    Arc, Once, OnceLock,
   },
   task::{Context, Poll},
   thread::ThreadId,
@@ -1057,10 +1057,24 @@ impl GlobalEnv {
       ] {
         let mut act: libc::sigaction = std::mem::zeroed();
         act.sa_sigaction = handler;
-        act.sa_flags = libc::SA_SIGINFO;
+        // SA_RESTART: the watcher signals its thread every interval for as long
+        // as any `PreemptionEnabled` is alive, whether or not a guest is
+        // actually running, so a thread parked in a syscall takes those signals
+        // too. Without this each one surfaces as EINTR to whatever the host was
+        // doing - an embedder's blocking FFI in a helper, a third-party crate's
+        // libc call - and not every caller retries.
+        act.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
         act.sa_mask = sa_mask;
-        if libc::sigaction(sig, &act, std::ptr::null_mut()) != 0 {
+        let mut prev: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(sig, &act, &mut prev) != 0 {
           panic!("failed to setup handler for signal {}", sig);
+        }
+        if sig == libc::SIGSEGV {
+          // Kept so a fault this crate does not own can go back to whoever was
+          // handling SIGSEGV before - Rust's own stack-overflow reporter, a
+          // crash reporter, another runtime's guard pages - instead of being
+          // converted into an abort. See `chain_to_previous_sigsegv_handler`.
+          let _ = PREV_SIGSEGV.set(prev);
         }
       }
     });
@@ -2282,6 +2296,16 @@ impl ProgramLoader {
         .unwrap();
       let code_bytes =
         unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
+      // `Translator::load` enforces this, but it runs last: without the check
+      // here an oversized section is walked twice and given per-instruction
+      // tables by the two analyses below, only to be refused afterwards for a
+      // reason that was knowable from its length.
+      if code_bytes.len() / 8 > crate::jit::abi::MAX_INSTS as usize {
+        return Err(RuntimeError::InvalidArgumentOwned(format!(
+          "too many instructions in {section_name} (max {})",
+          crate::jit::abi::MAX_INSTS
+        )));
+      }
       validate_local_call_graph(code_bytes).map_err(|err| {
         RuntimeError::InvalidArgumentOwned(format!(
           "local call graph validation failed in {section_name}: {err}"
@@ -2453,7 +2477,7 @@ unsafe extern "C" fn sigsegv_handler(
   siginfo: *mut libc::siginfo_t,
   uctx: *mut libc::ucontext_t,
 ) {
-  let fail = || restore_default_signal_handler(libc::SIGSEGV);
+  let fail = || chain_to_previous_sigsegv_handler();
 
   let Some((jit_code_zone, pointer_cage, yielder)) = ACTIVE_JIT_CODE_ZONE.with(|x| {
     if x.valid.load(Ordering::Relaxed) {
@@ -2524,6 +2548,27 @@ unsafe extern "C" fn sigusr1_handler(
     async_preemption: true,
     ..Default::default()
   });
+}
+
+/// The SIGSEGV disposition that was in place before [`GlobalEnv::new`] replaced
+/// it, captured once under `INIT` and only ever read afterwards.
+static PREV_SIGSEGV: OnceLock<libc::sigaction> = OnceLock::new();
+
+/// Hands SIGSEGV back to whoever had it before this crate took it, then returns
+/// so the faulting instruction re-executes under that disposition.
+///
+/// Installing `SIG_DFL` here instead - which is what this used to do - turns a
+/// fault another component would have *recovered* from into a process death,
+/// and silently discards Rust's own stack-overflow handler, so a host stack
+/// overflow reports as a bare `Segmentation fault` rather than naming itself.
+/// `sigaction` is async-signal-safe, so this is legal from a handler.
+unsafe fn chain_to_previous_sigsegv_handler() {
+  if let Some(prev) = PREV_SIGSEGV.get() {
+    if libc::sigaction(libc::SIGSEGV, prev, std::ptr::null_mut()) == 0 {
+      return;
+    }
+  }
+  restore_default_signal_handler(libc::SIGSEGV);
 }
 
 unsafe fn restore_default_signal_handler(signum: i32) {
