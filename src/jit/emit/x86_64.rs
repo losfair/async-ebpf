@@ -367,18 +367,14 @@ impl Emit<'_, '_, '_> {
     self.emit_jump_address_reloc(target)
   }
 
-  /// A near jump emits the two-byte `0xeb rel8` form but still reserves a
-  /// *four*-byte placeholder, so three bytes are wasted after every one. They
-  /// are never executed — the jump is unconditional and lands past them — so
-  /// this costs code size and nothing else. Narrowing the reservation would
-  /// shift the offset of everything after it, so it is a self-contained change
-  /// to make on its own and measure, not a tidy-up to fold into something else.
+  /// `jmp rel32`.
+  ///
+  /// There was a `0xeb rel8` near form too, chosen by a flag on the target. Its
+  /// only user was the jump around a following function's prologue, which went
+  /// with whole-program translation — and with `rel8` gone so is the one fixup
+  /// that could fail to encode.
   fn emit_jmp(&mut self, target: PatchTarget) -> u32 {
-    let near = matches!(
-      target,
-      PatchTarget::EbpfPc { near: true, .. } | PatchTarget::JitOffset { near: true, .. }
-    );
-    self.emit1(if near { 0xeb } else { 0xe9 });
+    self.emit1(0xe9);
     self.emit_jump_address_reloc(target)
   }
 
@@ -1268,13 +1264,12 @@ impl Emit<'_, '_, '_> {
   /// The retpoline `call *%rax` stand-in, adapted from Intel's guidance.
   fn emit_retpoline(&mut self) -> u32 {
     let retpoline_target = self.offset();
-    let label1_call_offset = self.emit_call(PatchTarget::EbpfPc { pc: 0, near: false });
+    let label1_call_offset = self.emit_call(PatchTarget::EbpfPc { pc: 0 });
 
     let capture_ret_spec = self.offset();
     self.emit_pause();
     self.emit_jmp(PatchTarget::JitOffset {
       offset: capture_ret_spec,
-      near: false,
     });
 
     // label1: mov [rsp], rax ; ret
@@ -1287,10 +1282,7 @@ impl Emit<'_, '_, '_> {
 
     self.st.retarget_jumps(
       label1_call_offset,
-      PatchTarget::JitOffset {
-        offset: label1,
-        near: false,
-      },
+      PatchTarget::JitOffset { offset: label1 },
     );
 
     retpoline_target
@@ -1310,38 +1302,33 @@ impl Emit<'_, '_, '_> {
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
-  /// Writes every deferred displacement. Returns false where one does not
-  /// encode, which the caller turns into a failure.
-  fn resolve(&mut self) -> bool {
+  /// Writes every deferred displacement.
+  ///
+  /// Cannot fail. Every fixup this backend records is a 32-bit displacement
+  /// within one function's buffer, and `rel32` reaches ±2 GiB — where aarch64's
+  /// 19- and 26-bit fields do not, which is why only that backend has a
+  /// relocation-out-of-range error. The `rel8` jump that could fail to encode
+  /// went with whole-program translation.
+  fn resolve(&mut self) {
     let jumps = std::mem::take(&mut self.st.jumps);
     for jump in &jumps {
-      let (target_loc, is_near) = match jump.target {
-        PatchTarget::EbpfPc { pc, near } => (self.pc_loc(pc), near),
+      let target_loc = match jump.target {
+        PatchTarget::EbpfPc { pc } => self.pc_loc(pc),
         // Both fields were once held in one struct, preferring the JIT offset only
         // when it is non-zero, falling back to `pc_locs[ebpf_target_pc]`. Every
         // site that sets a JIT offset leaves the eBPF pc at 0, so a zero JIT
         // offset means `pc_locs[0]`.
-        PatchTarget::JitOffset { offset, near } => {
+        PatchTarget::JitOffset { offset } => {
           if offset != 0 {
-            (offset, near)
+            offset
           } else {
-            (self.pc_loc(0), near)
+            self.pc_loc(0)
           }
         }
       };
 
-      if is_near {
-        let rel = target_loc as i64 - (jump.offset_loc as i64 + 1);
-        if !(-128..128).contains(&rel) {
-          return false;
-        }
-        self
-          .st
-          .patch_bytes(jump.offset_loc, rel as i8 as u8 as u64, 1);
-      } else {
-        let rel = target_loc.wrapping_sub(jump.offset_loc.wrapping_add(4));
-        self.st.patch_bytes(jump.offset_loc, rel as u64, 4);
-      }
+      let rel = target_loc.wrapping_sub(jump.offset_loc.wrapping_add(4));
+      self.st.patch_bytes(jump.offset_loc, rel as u64, 4);
     }
     self.st.jumps = jumps;
 
@@ -1356,8 +1343,6 @@ impl Emit<'_, '_, '_> {
       self.st.patch_bytes(*at, rel as u64, 4);
     }
     self.st.loads = loads;
-
-    true
   }
 
   fn pc_loc(&self, pc: u32) -> u32 {
@@ -1428,31 +1413,10 @@ impl Emit<'_, '_, '_> {
     let start_pc = self.inputs.start_pc;
     let end_pc = self.inputs.end_pc;
 
-    if end_pc > num_insts || start_pc >= end_pc {
-      return Err(TranslateError::Failed(format!(
-        "Invalid function range [{start_pc}, {end_pc})"
-      )));
-    }
+    super::check_function_range(self.t, start_pc, end_pc)?;
 
-    // In function-granular mode the emitted prologue/epilogue assume the range
-    // is exactly one local function: the prologue is only emitted at a function
-    // entry, but the EXIT/epilogue always pops a frame. A start that is not an
-    // entry, or an end that splits a function, would unbalance the host stack.
-    if !(start_pc == 0 || self.t.is_local_func_entry(start_pc)) {
-      return Err(TranslateError::Failed(format!(
-        "Function range start {start_pc} is not a local function entry"
-      )));
-    }
-    if end_pc != num_insts && !self.t.is_local_func_entry(end_pc) {
-      return Err(TranslateError::Failed(format!(
-        "Function range end {end_pc} is not a local function boundary"
-      )));
-    }
-
-    // There is no whole-program prologue: the embedder's own entry code
-    // establishes the frame, and each function's prologue is emitted at its
-    // entry below.
-
+    // The frame itself is the embedder's entry code's job; this function's own
+    // prologue is emitted by the loop below, at its first instruction.
     self.mark_barriers(start_pc, end_pc, num_insts);
 
     if let Some(msg) = self.emit_instructions(start_pc, end_pc) {
@@ -1480,11 +1444,7 @@ impl Emit<'_, '_, '_> {
       });
     }
 
-    if !self.resolve() {
-      return Err(TranslateError::Failed(
-        "Could not patch the relative addresses in the JIT'd code".to_string(),
-      ));
-    }
+    self.resolve();
 
     Ok(self.offset() as usize)
   }
@@ -1510,17 +1470,35 @@ impl Emit<'_, '_, '_> {
     }
   }
 
+  /// The function's prologue, emitted once at its first instruction.
+  ///
+  /// The top of the host stack always holds the guest stack usage of the
+  /// currently-executing eBPF function, so entering one pushes its own.
+  /// Adjusting by 8 keeps the 16-byte alignment, because the `call` that got
+  /// here already pushed a return address.
+  ///
+  /// The driver emits this from inside its loop rather than ahead of it, so
+  /// that a buffer too small to hold the prologue does not stop the first
+  /// instruction from being *examined*: the range may be untranslatable at any
+  /// capacity, and that verdict has to reach the caller instead of
+  /// `OutOfSpace`. See `JitState::fail`.
+  fn emit_prologue(&mut self, start_pc: usize) {
+    let stack_usage = self.t.stack_usage_for(start_pc);
+    self.emit_alu64_imm32(0x81, 5, RSP, 8);
+    // `mov qword [rsp], stack_usage`, whose ModRM+SIB pair for an `[rsp]` base
+    // is emitted literally.
+    self.emit1(0x48);
+    self.emit1(0xC7);
+    self.emit1(0x04);
+    self.emit1(0x24);
+    self.emit4(stack_usage as u32);
+  }
+
   /// Marks every instruction a branch can land on, which closes any access
   /// group open across it.
   fn mark_barriers(&mut self, start_pc: usize, end_pc: usize, num_insts: usize) {
     for i in start_pc..end_pc {
       let inst = self.t.insns()[i];
-
-      // A local function entry is reached by `call`, never by falling into it,
-      // so a group must not span one.
-      if self.t.is_local_func_entry(i) {
-        self.st.mark_barrier(i);
-      }
 
       let class = inst.opcode & cls::MASK;
       if class != cls::JMP && class != cls::JMP32 {
@@ -1595,48 +1573,12 @@ impl Emit<'_, '_, '_> {
         break;
       }
 
-      let tgt = PatchTarget::EbpfPc {
-        pc: target_pc,
-        near: false,
-      };
+      let tgt = PatchTarget::EbpfPc { pc: target_pc };
 
-      // If the previous instruction could fall through to this one and this one
-      // starts a local function, there has to be a way to jump around the code
-      // that manipulates the host stack.
-      let mut fallthrough_jump_source = None;
-      if i != start_pc && self.t.is_local_func_entry(i) {
-        let prev = self.t.insns()[i - 1];
-        if prev.has_fallthrough() {
-          fallthrough_jump_source = Some(self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: true }));
-        }
+      if i == start_pc {
+        self.emit_prologue(i);
       }
 
-      // The top of the host stack always holds the guest stack usage of the
-      // currently-executing eBPF function, so a function entry pushes its own.
-      // Adjusting by 8 keeps the 16-byte alignment, because the `call` that got
-      // here already pushed a return address.
-      if i == 0 || self.t.is_local_func_entry(i) {
-        let stack_usage = self.t.stack_usage_for(i);
-        self.emit_alu64_imm32(0x81, 5, RSP, 8);
-        // `mov qword [rsp], stack_usage`, whose ModRM+SIB pair for an `[rsp]`
-        // base is emitted literally.
-        self.emit1(0x48);
-        self.emit1(0xC7);
-        self.emit1(0x04);
-        self.emit1(0x24);
-        self.emit4(stack_usage as u32);
-      }
-
-      if let Some(source) = fallthrough_jump_source {
-        let here = self.offset();
-        self.st.retarget_jumps(
-          source,
-          PatchTarget::JitOffset {
-            offset: here,
-            near: true,
-          },
-        );
-      }
       self.st.pc_locs[i] = self.offset();
 
       // Under a native frame base the register mapped to eBPF R10 holds a host
@@ -2231,7 +2173,9 @@ mod tests {
     out
   }
 
-  /// [`TranslationInputs`] covering a whole program, with no hints or plan.
+  /// [`TranslationInputs`] covering pc 0 to the end, with no hints or plan.
+  /// Only correct for a single-function program — anything with a local call
+  /// needs an `end_pc` of its own; see [`first_function_end`].
   fn plain_inputs(num_insns: usize) -> TranslationInputs<'static> {
     TranslationInputs {
       hints: &[],
@@ -2240,6 +2184,23 @@ mod tests {
       start_pc: 0,
       end_pc: num_insns,
     }
+  }
+
+  /// Where the function beginning at pc 0 ends: the earliest local callee entry
+  /// in the program, or the end of it.
+  ///
+  /// A buffer holds exactly one function, so a test program that calls a local
+  /// callee cannot be handed to the emitter whole. This is what the loader does
+  /// for real, in one line, for the test programs that need it.
+  fn first_function_end(insns: &[Insn]) -> usize {
+    insns
+      .iter()
+      .enumerate()
+      .filter(|(_, i)| i.is_local_call())
+      .map(|(pc, i)| pc as i64 + i.imm as i64 + 1)
+      .filter(|&t| t > 0 && t < insns.len() as i64)
+      .min()
+      .map_or(insns.len(), |t| t as usize)
   }
 
   /// The buffer every check translates into: comfortably more than anything
@@ -2495,44 +2456,6 @@ mod tests {
   #[test]
   fn the_minimal_program_matches() {
     check_prog(&[movi(0, 42), exit()]);
-  }
-
-  #[test]
-  fn a_function_granular_callee_does_not_skip_its_own_prologue() {
-    // The preceding, unreachable JA is conservatively considered to have
-    // fallthrough. That needs a bypass in whole-program translation, but not
-    // when this buffer begins at the local callee itself.
-    let insns = vec![
-      insn(opcode::CALL, 0, 1, 0, 3), // pc 0 -> pc 4
-      exit(),
-      insn(opcode::JA, 0, 0, 0, 0),
-      insn(opcode::CALL, 0, 0, 0, 0),
-      movi(0, 7),
-      exit(),
-    ];
-    let code = Insn::encode_all(&insns);
-    let config = Config {
-      target: Target::X86_64,
-      dispatcher: Some(dispatcher()),
-      dispatcher_validate: Some(accept_every_helper),
-      local_call_resolver: Some(local_call_resolver()),
-      ..Default::default()
-    };
-    let translator = Translator::load(Arc::new(config), &code).unwrap();
-    let resolver_ids = [1u32; 6];
-    let inputs = TranslationInputs {
-      resolver_ids: &resolver_ids,
-      start_pc: 4,
-      end_pc: 6,
-      ..Default::default()
-    };
-    let mut out = vec![0u8; CAPACITY];
-    translator.translate_range(&inputs, &mut out).unwrap();
-
-    assert_ne!(
-      out[0], 0xeb,
-      "the callee entry jumped past its own prologue"
-    );
   }
 
   // -----------------------------------------------------------------------
@@ -2909,10 +2832,17 @@ mod tests {
   fn a_local_call_without_a_resolver_id_fails_the_same_way() {
     // A lazy local call needs a resolver id for its call site; with none, there
     // is nothing to resolve the call against and it is refused.
+    //
+    // The range is the *calling* function, pc 0..2. The callee at pc 2 is a
+    // separate function and a separate buffer.
     let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
     let code = Insn::encode_all(&insns);
+    let inputs = TranslationInputs {
+      end_pc: 2,
+      ..plain_inputs(insns.len())
+    };
     assert!(
-      !check(&code, &plain_inputs(insns.len())),
+      !check(&code, &inputs),
       "with no resolver ids there is nothing to resolve the call against, so \
        the lazy local call must be refused"
     );
@@ -2926,7 +2856,7 @@ mod tests {
     let inputs = TranslationInputs {
       resolver_ids: &ids,
       start_pc: 0,
-      end_pc: insns.len(),
+      end_pc: 2,
       ..Default::default()
     };
     assert!(check(&code, &inputs));
@@ -2959,7 +2889,11 @@ mod tests {
   fn a_range_that_is_not_a_function_boundary_is_rejected_the_same_way() {
     let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
     let code = Insn::encode_all(&insns);
-    for (start, end) in [(1usize, 4usize), (0, 3), (3, 3), (0, 99)] {
+    // `(0, 4)` is the whole program, which is two functions: the prologue is
+    // emitted once, before pc 0, so the callee at pc 2 would be entered without
+    // one. There is no whole-program mode to fall back on, so it is refused
+    // like any other range that is not exactly one function.
+    for (start, end) in [(1usize, 4usize), (0, 3), (3, 3), (0, 99), (0, 4)] {
       let inputs = TranslationInputs {
         start_pc: start,
         end_pc: end,
@@ -2970,39 +2904,6 @@ mod tests {
         "the range is not a function, so it must be refused"
       );
     }
-  }
-
-  #[test]
-  fn a_fallthrough_into_a_local_function_entry_matches() {
-    // The instruction before the entry falls through, so a jump around the
-    // per-function prologue has to be emitted.
-    // Reaching a local function entry by falling into it takes some arranging.
-    // The validator requires each sub-program to end in EXIT or to carry an
-    // unconditional jump in its second-to-last slot, and refuses a jump that
-    // crosses a sub-program boundary — but only EXIT counts as not falling
-    // through, so a sub-program ending in a `ja` followed by an ordinary
-    // instruction both validates and falls through. That is the shape the
-    // backend's bypass jump exists for.
-    let insns = [
-      insn(opcode::CALL, 0, 1, 0, 2),
-      insn(opcode::JA, 0, 0, 0, 0),
-      movi(0, 1),
-      movi(0, 7),
-      exit(),
-    ];
-    let code = Insn::encode_all(&insns);
-    let ids = [1u32, 2, 3, 4, 5];
-    let inputs = TranslationInputs {
-      resolver_ids: &ids,
-      start_pc: 0,
-      end_pc: insns.len(),
-      ..Default::default()
-    };
-    assert!(
-      check(&code, &inputs),
-      "nothing was translated\n{}",
-      refusal_report(&code, &inputs)
-    );
   }
 
   // -----------------------------------------------------------------------
@@ -3680,24 +3581,25 @@ mod tests {
   // Adversarial audit additions
   // -----------------------------------------------------------------------
 
-  /// A two-function range translated into a buffer that runs out *inside the
-  /// second function's per-function prologue* must return
-  /// `TranslateError::OutOfSpace` rather than panic.
+  /// A called function translated into a buffer that runs out *inside its
+  /// prologue* must return `TranslateError::OutOfSpace` rather than panic.
   ///
   /// This was a real defect, and worth keeping a test for even though what
-  /// tripped it is gone. The emitter used to measure each prologue by
-  /// differencing `offset` and assert that every one came out the same length;
-  /// once the buffer was full, `offset` stopped moving and the second
+  /// tripped it is gone twice over. The emitter used to measure each prologue
+  /// by differencing `offset` and assert that every one came out the same
+  /// length; once the buffer was full, `offset` stopped moving and the
   /// measurement was partial, so capacities 91..=101 tripped a debug assertion
   /// under every configuration in the sweep. The measurement existed only to
   /// let uBPF's eagerly relocated local call skip a callee's prologue, and went
-  /// with it. `out_of_space_is_reported_identically` only ever translates a
-  /// *single* function, so this shape is not covered there.
+  /// with it — as did the whole-program range that reached a *second* prologue
+  /// in the first place. `out_of_space_is_reported_identically` translates the
+  /// program's first function, so the callee's own prologue is not covered
+  /// there.
   ///
   /// Nothing is recorded here: the property under test is that the emitter
   /// returns rather than panics, which no output can express.
   #[test]
-  fn audit_out_of_space_inside_a_later_function_prologue() {
+  fn audit_out_of_space_inside_the_prologue_of_a_called_function() {
     let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
     let code = Insn::encode_all(&insns);
     let ids = [1u32, 2, 3, 4];
@@ -3707,9 +3609,10 @@ mod tests {
         let code = code.clone();
         let ids = ids;
         let outcome = std::panic::catch_unwind(move || {
+          // The callee at pc 2, in its own buffer, as the runtime compiles it.
           let inputs = TranslationInputs {
             resolver_ids: &ids,
-            start_pc: 0,
+            start_pc: 2,
             end_pc: 4,
             ..Default::default()
           };
@@ -4246,14 +4149,16 @@ mod tests {
 
   /// A second randomised sweep, in the shapes the first one cannot generate.
   /// `randomised_programs_hints_and_plans_match` builds one straight-line
-  /// function, never emits a local call or an `lddw`, always translates the
-  /// whole program, and draws plan fields from small ranges (`delta < 64`,
-  /// `span < 8192`, `lo` in the `i16` range). This one does the opposite of each
-  /// of those: two local functions with a real `call src=1` between them,
-  /// `lddw` in the mix, a translation range that is sometimes a strict
-  /// sub-range, and plan fields drawn from the whole of their types.
+  /// function, never emits a local call or an `lddw`, and draws plan fields
+  /// from small ranges (`delta < 64`, `span < 8192`, `lo` in the `i16` range).
+  /// This one does the opposite of each of those: a program of two local
+  /// functions with a real `call src=1` between them, `lddw` in the mix, and
+  /// plan fields drawn from the whole of their types.
+  ///
+  /// The *program* has two functions; each translation still covers exactly
+  /// one, since that is the only range shape there is.
   #[test]
-  fn audit_randomised_multi_function_programs_and_wide_plans_match() {
+  fn audit_randomised_two_function_programs_and_wide_plans_match() {
     let sizes = [size::B, size::H, size::W, size::DW];
     let ops = [
       alu::ADD,
@@ -4410,7 +4315,7 @@ mod tests {
       let ids: Vec<u32> = (0..n).map(|_| rng.next() as u32).collect();
       let ids = &ids[..if rng.below(8) == 0 { n / 2 } else { n }];
 
-      for (start, end) in [(0usize, n), (0, entry), (entry, n)] {
+      for (start, end) in [(0usize, entry), (entry, n)] {
         let inputs = TranslationInputs {
           hints: &hints,
           plan,
@@ -4424,14 +4329,14 @@ mod tests {
 
     assert!(
       s.translated() * 4 >= s.cases(),
-      "only {} of {} random multi-function programs translated; the generator \
+      "only {} of {} random two-function programs translated; the generator \
        is producing programs the validator refuses rather than exercising the \
        emitter",
       s.translated(),
       s.cases()
     );
     if seeds == DEFAULT_SEEDS {
-      s.finish("audit_randomised_multi_function_programs_and_wide_plans_match");
+      s.finish("audit_randomised_two_function_programs_and_wide_plans_match");
     }
   }
 
@@ -4464,9 +4369,11 @@ mod tests {
   /// Nothing is recorded here either: what is under test is that the emitter
   /// answers at all.
   ///
-  /// The multi-function programs in the list are here because they used to be
-  /// the ones that panicked — see
-  /// `audit_out_of_space_inside_a_later_function_prologue` for what they hit.
+  /// The programs that call a local callee are here because they used to be the
+  /// ones that panicked — see
+  /// `audit_out_of_space_inside_the_prologue_of_a_called_function` for what
+  /// they hit. Each is translated up to the callee's entry, which is as much of
+  /// it as one buffer ever holds.
   #[test]
   fn audit_no_capacity_makes_the_emitter_panic() {
     let programs: Vec<Vec<Insn>> = vec![
@@ -4478,9 +4385,9 @@ mod tests {
       vec![insn(cls::ALU | alu::MOD, 1, 0, 1, -1), exit()],
       // A fetching atomic, whose loop branch is computed from `offset`.
       vec![insn(opcode::ATOMIC_STORE, 1, 0, 0, 0x01), exit()],
-      // Two local functions, so a later prologue is measured.
+      // A local call, whose callee begins the next function.
       vec![insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()],
-      // Three, so a third prologue is too.
+      // Two local calls, the second of which lands mid-program.
       vec![
         insn(opcode::CALL, 0, 1, 0, 1),
         exit(),
@@ -4532,6 +4439,7 @@ mod tests {
     for (pi, insns) in programs.iter().enumerate() {
       let code = Insn::encode_all(insns);
       let n = insns.len();
+      let end_pc = first_function_end(insns);
       for capacity in 0..900usize {
         for (name, config) in sweep(Target::X86_64) {
           let code = code.clone();
@@ -4544,7 +4452,7 @@ mod tests {
               plan: &plan[..n.min(plan.len())],
               resolver_ids: &ids,
               start_pc: 0,
-              end_pc: n,
+              end_pc,
             };
             let t = match crate::jit::Translator::load(std::sync::Arc::new(config), &code) {
               Ok(t) => t,
@@ -4695,6 +4603,9 @@ mod tests {
     for insns in &programs {
       let code = Insn::encode_all(insns);
       let n = insns.len();
+      // One function per buffer: a program that calls a local callee is
+      // translated up to that callee's entry, not whole.
+      let end_pc = first_function_end(insns);
       let ids = vec![9u32; n];
       let hints = vec![abi::region::FRAME; n];
       for (name, config) in &configs {
@@ -4703,7 +4614,7 @@ mod tests {
           plan: &plan[..n.min(plan.len())],
           resolver_ids: &ids,
           start_pc: 0,
-          end_pc: n,
+          end_pc,
         };
         let out = emit_outcome(config, &code, &inputs);
         if out.is_ok() {

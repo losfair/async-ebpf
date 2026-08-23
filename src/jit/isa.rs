@@ -206,17 +206,6 @@ impl Insn {
     self.opcode == opcode::CALL && self.src == 1
   }
 
-  /// Whether control can fall through to the next instruction.
-  ///
-  /// Only `exit` cannot. An unconditional jump counts as falling through, which
-  /// is deliberately conservative rather than exact: the one caller asks this to
-  /// decide whether a local function entry needs a branch emitted around its
-  /// prologue, so a spurious yes costs one unreachable jump and a spurious no
-  /// would let control run into the prologue of the function that follows.
-  pub const fn has_fallthrough(self) -> bool {
-    self.opcode != opcode::EXIT
-  }
-
   /// Decodes the opcode into the exhaustive [`Op`] enum, or `None` if the byte
   /// is not a defined encoding.
   ///

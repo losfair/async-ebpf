@@ -84,9 +84,9 @@ impl Progress {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PatchTarget {
   /// An eBPF instruction, located through `pc_locs`.
-  EbpfPc { pc: u32, near: bool },
+  EbpfPc { pc: u32 },
   /// A native offset already known at emission time, bypassing `pc_locs`.
-  JitOffset { offset: u32, near: bool },
+  JitOffset { offset: u32 },
 }
 
 /// One deferred branch fixup: a location in the emitted stream, and how to
@@ -329,9 +329,9 @@ impl<'a> JitState<'a> {
 
   /// Retargets every jump fixup that was emitted at `src` to `target`.
   ///
-  /// Used where a jump is emitted before its real destination is known — the
-  /// jump around a following function's prologue is placed before the prologue
-  /// it has to clear.
+  /// Used where a jump is emitted before its real destination is known and the
+  /// destination turns out to be a native offset rather than an eBPF pc: the
+  /// branch out of an atomic retry loop, and the retpoline's own `call`.
   pub fn retarget_jumps(&mut self, src: u32, target: PatchTarget) {
     for entry in &mut self.jumps {
       if entry.offset_loc == src {
@@ -461,26 +461,11 @@ mod tests {
   fn retargeting_only_touches_the_named_source() {
     let mut buf = [0u8; 8];
     let mut state = JitState::new(&mut buf, 2);
-    state.note_jump(4, PatchTarget::EbpfPc { pc: 1, near: false });
-    state.note_jump(8, PatchTarget::EbpfPc { pc: 2, near: false });
-    state.retarget_jumps(
-      8,
-      PatchTarget::JitOffset {
-        offset: 16,
-        near: false,
-      },
-    );
-    assert_eq!(
-      state.jumps[0].target,
-      PatchTarget::EbpfPc { pc: 1, near: false }
-    );
-    assert_eq!(
-      state.jumps[1].target,
-      PatchTarget::JitOffset {
-        offset: 16,
-        near: false
-      }
-    );
+    state.note_jump(4, PatchTarget::EbpfPc { pc: 1 });
+    state.note_jump(8, PatchTarget::EbpfPc { pc: 2 });
+    state.retarget_jumps(8, PatchTarget::JitOffset { offset: 16 });
+    assert_eq!(state.jumps[0].target, PatchTarget::EbpfPc { pc: 1 });
+    assert_eq!(state.jumps[1].target, PatchTarget::JitOffset { offset: 16 });
   }
 }
 

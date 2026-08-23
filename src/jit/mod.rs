@@ -7,9 +7,10 @@
 //! functions, and the per-function stack usage.
 //! [`Translator::translate_range`](crate::jit::Translator::translate_range) then
 //! compiles a half-open instruction range into a caller-supplied buffer and
-//! reports how many bytes it wrote. Ranges rather than whole programs, because
-//! the runtime compiles one local function at a time, on first call, into an
-//! arena it manages itself.
+//! reports how many bytes it wrote. That range is always **exactly one local
+//! function**, because the runtime compiles one at a time, on first call, into
+//! an arena it manages itself. A range spanning two functions is refused, not
+//! compiled: there is no whole-program mode to fall back on.
 //!
 //! Everything the analysis knows about a range beyond the bytecode — region
 //! hints, the access plan, the lazy-call resolver ids — arrives through
@@ -31,10 +32,17 @@
 //! once into a buffer of its own. Nothing here does: the runtime compiles one
 //! local function at a time, calls every local callee through the lazy resolver
 //! and every helper through the registered dispatcher. So uBPF's whole-program
-//! entry and exit stubs, its unwind helper, its eagerly relocated local call,
-//! its per-index helper table and its constant blinding are all absent rather
-//! than merely unreachable — none of them had a caller, and carrying dead
-//! branches through a code generator is how the two backends drift apart.
+//! translation, its entry and exit stubs, its unwind helper, its eagerly
+//! relocated local call, its per-index helper table and its constant blinding
+//! are all absent rather than merely unreachable — none of them had a caller,
+//! and carrying dead branches through a code generator is how the two backends
+//! drift apart.
+//!
+//! Losing whole-program translation is what lets each driver emit its prologue
+//! once, at the range's first instruction, and stop asking of every slot
+//! whether a function starts there and whether the slot before it could fall
+//! in. [`emit::check_function_range`](crate::jit::emit::check_function_range)
+//! is where that assumption is now enforced instead.
 //!
 //! # Layout
 //!
@@ -371,32 +379,21 @@ impl Translator {
   /// Translates `inputs.start_pc .. inputs.end_pc` into `buffer`, returning the
   /// number of bytes written.
   ///
-  /// The range must begin at pc 0 or at a local function entry and end at a
-  /// local function entry or at the end of the program, and every jump it
-  /// contains must stay inside it — the emitted code is self-contained, so a
-  /// branch to a pc translated into some other buffer has nowhere to go and is
-  /// rejected rather than emitted.
+  /// The range must be **exactly one local function**: it begins at pc 0 or at a
+  /// local function entry, ends at the next local function entry or at the end
+  /// of the program, and contains no entry in between. There is no
+  /// whole-program mode — a range holding two functions is rejected, not
+  /// compiled.
+  ///
+  /// Every jump the range contains must also stay inside it. The emitted code
+  /// is self-contained, so a branch to a pc translated into some other buffer
+  /// has nowhere to go and is rejected rather than emitted.
   pub fn translate_range(
     &self,
     inputs: &TranslationInputs<'_>,
     buffer: &mut [u8],
   ) -> Result<usize, TranslateError> {
     emit::translate(self, inputs, buffer)
-  }
-
-  /// Translates the whole program, with no analysis inputs.
-  ///
-  /// A test convenience, and compiled only for tests: the runtime always
-  /// translates one function at a time, with hints and a plan, so shipping this
-  /// would be offering embedders a mode nothing here exercises.
-  #[cfg(test)]
-  pub fn translate_all(&self, buffer: &mut [u8]) -> Result<usize, TranslateError> {
-    let inputs = TranslationInputs {
-      start_pc: 0,
-      end_pc: self.insns.len(),
-      ..Default::default()
-    };
-    self.translate_range(&inputs, buffer)
   }
 }
 

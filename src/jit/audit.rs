@@ -209,6 +209,27 @@ fn hostile_config(target: Target) -> Arc<Config> {
   })
 }
 
+/// Translates one function range with no analysis inputs.
+///
+/// The range has to be exactly one local function; a program with a local call
+/// therefore needs one call of this per function, and a caller that asks for
+/// the whole program gets the range refusal rather than a translation.
+fn translate(
+  t: &Translator,
+  start_pc: usize,
+  end_pc: usize,
+  buf: &mut [u8],
+) -> Result<usize, super::TranslateError> {
+  t.translate_range(
+    &TranslationInputs {
+      start_pc,
+      end_pc,
+      ..Default::default()
+    },
+    buf,
+  )
+}
+
 /// xorshift64*, so the corpus is reproducible without a dependency.
 struct Rng(u64);
 
@@ -681,7 +702,9 @@ fn every_opcode_byte_loads_or_is_refused_without_panicking() {
             let code = Insn::encode_all(&insns);
             if let Ok(translator) = Translator::load(config.clone(), &code) {
               let mut buf = vec![0u8; 1 << 14];
-              let _ = translator.translate_all(&mut buf);
+              // Two instructions and no local call, so the whole program is
+              // also exactly one function.
+              let _ = translate(&translator, 0, insns.len(), &mut buf);
             }
           }
         }
@@ -779,8 +802,14 @@ fn extreme_local_call_displacements_are_refused_without_overflowing() {
             "load accepted a local call at pc {pc} with imm {imm}, targeting \
              {target_pc}, which is outside the program"
           );
+          // One function at a time: the caller up to the callee's entry, then
+          // the callee. Either range can be degenerate — a call targeting pc 0
+          // makes the first empty — and a refusal is as good an answer as a
+          // translation, so long as it is an answer.
+          let entry = target_pc as usize;
           let mut buf = vec![0u8; 1 << 14];
-          let _ = t.translate_all(&mut buf);
+          let _ = translate(&t, 0, entry, &mut buf);
+          let _ = translate(&t, entry, t.insns().len(), &mut buf);
         }
       }
     }

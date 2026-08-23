@@ -293,6 +293,16 @@ non-canonical atomic selectors/cage + native frame base.a30968963b2d64e6d3e28eb6
 non-canonical atomic selectors/cage only.8737912c1f2fe12e617acc84|2556:hb88258dc0c38b628ed1f36a7824be321
 non-canonical atomic selectors/no cage.36aa5f55952f879462f1b789|836:hf7eea1b3408d134db55076aef086f64b
 non-canonical atomic selectors/production.0a78f82c69fac7d6d1b49ac4|1716:h9072691bcd67e9d3d41828d088d9730b
+one function 0..2/cage + frame constants.db248a4dae4c64a6182ea04a|140:he8053060cb0d0a4d2fd280278b7b5da5
+one function 0..2/cage + native frame base.a59c9e8d8caf354e4125d5cd|140:he8053060cb0d0a4d2fd280278b7b5da5
+one function 0..2/cage only.1f537cb0252cd8b278fd09dd|140:he8053060cb0d0a4d2fd280278b7b5da5
+one function 0..2/no cage.164a0e139d6133b01d1a46b7|140:he8053060cb0d0a4d2fd280278b7b5da5
+one function 0..2/production.1ed3a4102eb9b1a759a0c5cb|140:he8053060cb0d0a4d2fd280278b7b5da5
+one function 2..4/cage + frame constants.356792c9b47fd8519ff3ae91|36:5f2403d5180082d2ff4300d1f86300a9e50080d2ff430091c0035fd600001111ed5e0000
+one function 2..4/cage + native frame base.de66659e0eb5e1671f413371|36:5f2403d5180082d2ff4300d1f86300a9e50080d2ff430091c0035fd600001111ed5e0000
+one function 2..4/cage only.ad1a6a98e4148d28f2fc22df|36:5f2403d5180082d2ff4300d1f86300a9e50080d2ff430091c0035fd600001111ed5e0000
+one function 2..4/no cage.293f8436293d21285e81f19c|36:5f2403d5180082d2ff4300d1f86300a9e50080d2ff430091c0035fd600001111ed5e0000
+one function 2..4/production.33b254947fc45029e6d886de|36:5f2403d5180082d2ff4300d1f86300a9e50080d2ff430091c0035fd600001111ed5e0000
 out of space/cage + frame constants/cap 0.91106adce5f17739f7d0fb96|err:OutOfSpace
 out of space/cage + frame constants/cap 128.91106adce5f17739f7d0fb96|36:5f2403d5180082d2ff4300d1f86300a9450580d2ff430091c0035fd600001111ed5e0000
 out of space/cage + frame constants/cap 4.91106adce5f17739f7d0fb96|err:OutOfSpace
@@ -338,6 +348,11 @@ range 2..5/cage + native frame base.ec97c31084dee55e02f775a3|44:5f2403d5180082d2
 range 2..5/cage only.890670c322106efc6d3beb2e|44:5f2403d5180082d2ff4300d1f86300a9250180d2bf2400f120000054ff430091c0035fd600001111ed5e0000
 range 2..5/no cage.debda6a336af0bef11434b02|44:5f2403d5180082d2ff4300d1f86300a9250180d2bf2400f120000054ff430091c0035fd600001111ed5e0000
 range 2..5/production.afd9dfff1023ca8e5d297f7a|44:5f2403d5180082d2ff4300d1f86300a9250180d2bf2400f120000054ff430091c0035fd600001111ed5e0000
+range spanning two functions/cage + frame constants.46fb171c87b43fe9b34dfeaf|err:Function range [0, 4) spans more than one local function; 2 begins another
+range spanning two functions/cage + native frame base.3a00b96a0b11fc0a2ee9d176|err:Function range [0, 4) spans more than one local function; 2 begins another
+range spanning two functions/cage only.079cefd9b1c007b1e3fd9172|err:Function range [0, 4) spans more than one local function; 2 begins another
+range spanning two functions/no cage.45db157bf272e753b4426b00|err:Function range [0, 4) spans more than one local function; 2 begins another
+range spanning two functions/production.35057643216ba8d709ca487d|err:Function range [0, 4) spans more than one local function; 2 begins another
 short plan/cage + frame constants.458f832aa8653f687fb18b76|160:hbf7785f59b2cf63ab3c0a8377a0e05ff
 short plan/cage + native frame base.14a266c53b0582ed16ff50c2|308:h46a0ad4dbc37012ce745564ac5763302
 short plan/cage only.aed16b97b221f202f0f5d300|308:h46a0ad4dbc37012ce745564ac5763302
@@ -383,17 +398,15 @@ store immediates/cage + native frame base.cc91ca9a0cd1fed349af28a3|4128:h03aea22
 store immediates/cage only.febb548e9d619f4a65bdf4bb|4016:he4c291016a3115ebfd6580570fadf81f
 store immediates/no cage.3c12dd9fc7e27506ace877be|544:hb0d52eb350e69af52fc0696063a44397
 store immediates/production.c448c069ad8fbc325be2c15c|2560:he340a32d7f99b10467aded22a1024d29
-sweep.audit-barrier-sources|40:40:0b8c78039c2fb03af940e3bae44fe82a197a040afc043aa0c78e7fe10a7e23e5
+sweep.audit-barrier-sources|35:35:2d213ed5b6ea8c9785ab3d27babd7077f81ab376ce2af259fc40203fde2fa50b
 sweep.audit-escaping-jump-capacity|320:0:502413187da5f24538476dac010faba25f715666f0c265d22b0690509085e777
 sweep.audit-every-capacity|1696:592:93dce418e334e630b503ff71639fb575fe604d7ebadd54ae9dba4ffc95821f51
-sweep.audit-fallthrough-entry|20:20:4eaa1836395a27227d6864da7a488205942dad822ac6eafdc6d3e6d1fc2a9c7d
 sweep.audit-full-buffer-masks-a-later-error|325:0:fa5c7467acafe197879851631381be4ded30baa587cea3cce841715863d3557d
 sweep.audit-group-boundaries|2475:2475:f9c76ecf3ed05fffea9e2cd1766c26fdce00407ec3c3314eebbfbc90d4f729ac
 sweep.audit-group-interactions|40:40:18e58f58bc193b81e3054713133c76a744c38483ac3bf181db12c602b6d7cdde
 sweep.audit-more-hostile-plans|340:340:40d3b0f44f12c7291992a437b930dea3368e50aa71042f3a701c2c8d603f0b1b
 sweep.audit-probe-batch|475:465:dd02c300ab20f815cbd4f6517933b191526f751503e637a6b08d78680bd40e52
 sweep.audit-short-hint-array|100:100:52e3d72e679d9c9623a6bfce35aeb971f362f1360563724d1c493749631a1563
-sweep.audit-wide-multi-function-ranges|17420:17420:7e6f0eac2925f00062edbd2f25a3b9e4d9d79b2bfdc54175ab341f4a124382f3
 sweep.audit-wide-randomised-plans|2500:2500:7843e97ee6e0b395bfa9cc98c9e3c349f87f237c6adda917dc73ee48d1ee564b
 sweep.randomised-multi-function-programs|2275:2275:f902fc8d7aa7ebb06b615d3389b82a05ee115a36d14b3478dedb14fde6bbc25d
 sweep.randomised-programs|2000:2000:1bed05386762dd1c17d415cca7a7ed592b6dc1cc32c1abe98232ebf93e168347

@@ -429,13 +429,7 @@ fn emit_conditionalbranch_immediate(st: &mut JitState, c: u32, target: PatchTarg
 /// Resolves one jump target.
 fn emit_jump_target(st: &mut JitState, jump_src: u32) {
   let here = st.offset;
-  st.retarget_jumps(
-    jump_src,
-    PatchTarget::JitOffset {
-      offset: here,
-      near: false,
-    },
-  );
+  st.retarget_jumps(jump_src, PatchTarget::JitOffset { offset: here });
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,10 +1064,7 @@ fn emit_atomic_operation(
   }
 
   let retry_loc = st.offset;
-  let retry_tgt = PatchTarget::JitOffset {
-    offset: retry_loc,
-    near: false,
-  };
+  let retry_tgt = PatchTarget::JitOffset { offset: retry_loc };
 
   let load_reg = temp_reg;
   if is_64bit {
@@ -1088,7 +1079,7 @@ fn emit_atomic_operation(
     emit_addsub_register(st, is_64bit, addsub::SUBS, RZ, load_reg, expected_reg);
 
     let skip_store_src =
-      emit_conditionalbranch_immediate(st, cond::NE, PatchTarget::EbpfPc { pc: 0, near: false });
+      emit_conditionalbranch_immediate(st, cond::NE, PatchTarget::EbpfPc { pc: 0 });
 
     if is_64bit {
       emit_loadstore_exclusive(st, lse::STXRX, value_reg, addr_temp, status_reg);
@@ -1420,25 +1411,7 @@ pub fn translate_range(
   let start_pc = inputs.start_pc;
   let end_pc = inputs.end_pc;
 
-  if end_pc > num_insts || start_pc >= end_pc {
-    return Err(failed(format!(
-      "Invalid function range [{start_pc}, {end_pc})"
-    )));
-  }
-
-  // In function-granular mode the emitted prologue/epilogue assume the range is
-  // exactly one local function: the per-function prologue is only emitted at a
-  // function entry, but EXIT always pops a frame.
-  if !(start_pc == 0 || t.is_local_func_entry(start_pc)) {
-    return Err(failed(format!(
-      "Function range start {start_pc} is not a local function entry"
-    )));
-  }
-  if end_pc != num_insts && !t.is_local_func_entry(end_pc) {
-    return Err(failed(format!(
-      "Function range end {end_pc} is not a local function boundary"
-    )));
-  }
+  super::check_function_range(t, start_pc, end_pc)?;
 
   let mut st = JitState::new(buffer, num_insts);
   let mut errmsg: Option<String> = None;
@@ -1458,34 +1431,17 @@ pub fn translate_range(
 
     let insn = insns[i];
 
-    // If the previous instruction could fall through to this one and this one
-    // starts a local function, jump around the stack manipulation.
-    let mut fallthrough_jump_source = 0u32;
-    let mut fallthrough_jump_present = false;
-    if i != start_pc && t.is_local_func_entry(i) && insns[i - 1].has_fallthrough() {
-      fallthrough_jump_source = emit_unconditionalbranch_immediate(
-        &mut st,
-        ubr::B,
-        PatchTarget::EbpfPc { pc: 0, near: false },
-      );
-      fallthrough_jump_present = true;
-    }
-
-    if i == 0 || t.is_local_func_entry(i) {
+    // The function's prologue: the top of the host stack always holds the guest
+    // stack usage of the currently-executing eBPF function, and every `EXIT`
+    // below pops it again. Emitted here rather than before the loop so that a
+    // buffer too small to hold it does not stop the first instruction from
+    // being *examined* — the range may be untranslatable at any capacity, and
+    // that verdict has to reach the caller instead of `OutOfSpace`. See
+    // `JitState::fail`.
+    if i == start_pc {
       emit_movewide_immediate(&mut st, true, TEMP_REGISTER, t.stack_usage_for(i) as u64);
       emit_addsub_immediate(&mut st, true, addsub::SUB, SP, SP, 16);
       emit_loadstorepair_immediate(&mut st, lsp::STPX, TEMP_REGISTER, TEMP_REGISTER, SP, 0);
-    }
-
-    if fallthrough_jump_present {
-      let here = st.offset;
-      st.retarget_jumps(
-        fallthrough_jump_source,
-        PatchTarget::JitOffset {
-          offset: here,
-          near: false,
-        },
-      );
     }
 
     st.pc_locs[i] = st.offset;
@@ -1537,10 +1493,7 @@ pub fn translate_range(
       }
     }
 
-    let tgt = PatchTarget::EbpfPc {
-      pc: target_pc,
-      near: false,
-    };
+    let tgt = PatchTarget::EbpfPc { pc: target_pc };
 
     let sixty_four = is_alu64_op(&insn);
 
@@ -1828,11 +1781,6 @@ fn barrier_prepass(t: &Translator, st: &mut JitState, start_pc: usize, end_pc: u
   for i in start_pc..end_pc {
     let insn = insns[i];
 
-    // A local function entry is reached by `call`, never by falling into it.
-    if t.is_local_func_entry(i) {
-      st.mark_barrier(i);
-    }
-
     let barrier_cls = insn.opcode & cls::MASK;
     if barrier_cls != cls::JMP && barrier_cls != cls::JMP32 {
       continue;
@@ -2022,8 +1970,10 @@ mod tests {
     true
   }
 
-  /// Builds [`TranslationInputs`] covering a whole program with no hints or
-  /// plan.
+  /// Builds [`TranslationInputs`] covering pc 0 to the end, with no hints or
+  /// plan. Only correct for a single-function program: a range has to be
+  /// exactly one function, so anything with a local call needs its own
+  /// `end_pc`.
   fn plain_inputs(num_insns: usize) -> TranslationInputs<'static> {
     TranslationInputs {
       hints: &[],
@@ -2173,49 +2123,6 @@ mod tests {
   // -------------------------------------------------------------------------
   // Shape
   // -------------------------------------------------------------------------
-
-  #[test]
-  fn a_function_granular_callee_does_not_skip_its_own_prologue() {
-    // The preceding, unreachable JA is deliberately treated as potentially
-    // falling through by Insn::has_fallthrough. Whole-program translation
-    // needs a jump around a later function's prologue in that case, but a
-    // buffer translated for the callee starts at pc 4 and must enter its own
-    // prologue directly.
-    let insns = vec![
-      insn(opcode::CALL, 0, 1, 0, 3), // pc 0 -> pc 4
-      exit(),
-      insn(opcode::JA, 0, 0, 0, 0),
-      insn(opcode::CALL, 0, 0, 0, 0),
-      insn(cls::ALU64 | alu::MOV, 0, 0, 0, 7),
-      exit(),
-    ];
-    let code = Insn::encode_all(&insns);
-    let config = Config {
-      target: Target::Aarch64,
-      dispatcher: Some(stand_in_dispatcher()),
-      dispatcher_validate: Some(accept_every_helper),
-      local_call_resolver: Some(stand_in_resolver()),
-      ..Default::default()
-    };
-    let translator = Translator::load(std::sync::Arc::new(config), &code).unwrap();
-    let resolver_ids = [1u32; 6];
-    let inputs = TranslationInputs {
-      resolver_ids: &resolver_ids,
-      start_pc: 4,
-      end_pc: 6,
-      ..Default::default()
-    };
-    let mut out = vec![0u8; 4096];
-    let len = translator.translate_range(&inputs, &mut out).unwrap();
-
-    assert!(len >= 8);
-    assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), BTI_C);
-    assert_ne!(
-      u32::from_le_bytes(out[4..8].try_into().unwrap()) & 0xfc00_0000,
-      ubr::B,
-      "the callee entry jumped past its own prologue"
-    );
-  }
 
   #[test]
   fn prologue_epilogue_and_exit() {
@@ -2688,6 +2595,44 @@ mod tests {
         &format!("bad range {start}..{end}"),
         &insns,
         &TranslationInputs {
+          start_pc: start,
+          end_pc: end,
+          ..Default::default()
+        },
+      );
+    }
+  }
+
+  #[test]
+  fn a_range_spanning_two_functions_is_refused() {
+    // pc 2 begins the callee. `0..4` is the whole program and therefore two
+    // functions: the prologue is emitted once, at the range's first
+    // instruction, so the callee would be entered without one. There is no
+    // whole-program mode to fall back on.
+    let insns = vec![
+      insn(opcode::CALL, 0, 1, 0, 1),
+      exit(),
+      insn(0xb7, 0, 0, 0, 7),
+      exit(),
+    ];
+    let ids = [1u32; 4];
+    check_rejected(
+      "range spanning two functions",
+      &insns,
+      &TranslationInputs {
+        resolver_ids: &ids,
+        start_pc: 0,
+        end_pc: 4,
+        ..Default::default()
+      },
+    );
+    // ...while each half on its own translates.
+    for (start, end) in [(0usize, 2usize), (2, 4)] {
+      check_with(
+        &format!("one function {start}..{end}"),
+        &insns,
+        &TranslationInputs {
+          resolver_ids: &ids,
           start_pc: start,
           end_pc: end,
           ..Default::default()
@@ -4236,77 +4181,6 @@ mod tests {
     finish_sweep(digest, "audit-group-interactions");
   }
 
-  /// AUDIT: a local function entry reached by *fall-through*.
-  /// The validator requires every sub-program to end with `exit` or to carry an
-  /// unconditional jump as its second-to-last instruction - so the instruction
-  /// physically before a function entry can still fall through, and the
-  /// backend's "jump around the prologue" path is reachable after all. No
-  /// existing test reaches it.
-  #[test]
-  fn audit_fallthrough_into_a_local_function_entry() {
-    let mut digest = SweepDigest::new();
-    // pc0 calls pc3; pc1 is the unconditional jump that satisfies the
-    // validator; pc2 falls through into the function entry at pc3.
-    let insns = vec![
-      insn(opcode::CALL, 0, 1, 0, 2),
-      insn(opcode::JA, 0, 0, -2, 0),
-      insn(0xb7, 1, 0, 0, 7),
-      insn(0xb7, 2, 0, 0, 9),
-      exit(),
-    ];
-    let ids = [4u32; 5];
-    audit_case(
-      &mut digest,
-      "fallthrough entry, whole program",
-      &insns,
-      &TranslationInputs {
-        resolver_ids: &ids,
-        ..plain_inputs(5)
-      },
-    );
-    for (start, end) in [(0usize, 3usize), (3, 5)] {
-      audit_case(
-        &mut digest,
-        &format!("fallthrough entry, range {start}..{end}"),
-        &insns,
-        &TranslationInputs {
-          resolver_ids: &ids,
-          start_pc: start,
-          end_pc: end,
-          ..Default::default()
-        },
-      );
-    }
-
-    // The same shape with a group open across the boundary.
-    let plan = vec![
-      none_entry(),
-      none_entry(),
-      leader(abi::region::STACK, 0, 0, 16, 2),
-      member(abi::region::STACK, 0, 8, 2),
-      none_entry(),
-    ];
-    let insns2 = vec![
-      insn(opcode::CALL, 0, 1, 0, 2),
-      insn(opcode::JA, 0, 0, -2, 0),
-      insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
-      insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
-      exit(),
-    ];
-    audit_case(
-      &mut digest,
-      "fallthrough entry with a group across it",
-      &insns2,
-      &TranslationInputs {
-        plan: &plan,
-        resolver_ids: &ids,
-        ..plain_inputs(5)
-      },
-    );
-
-    finish_sweep(digest, "audit-fallthrough-entry");
-  }
-
   /// AUDIT: a region-hint array shorter than the program.
   #[test]
   fn audit_short_hint_array() {
@@ -4534,104 +4408,6 @@ mod tests {
     assert_eq!(n - base, 4, "bswap 64");
   }
 
-  /// AUDIT: multi-function programs translated over ranges that *span several
-  /// functions*, with random hints and plans. The existing multi-function
-  /// fuzzer always passes empty hints and an empty plan, and always translates
-  /// exactly one function per range.
-  #[test]
-  fn audit_wide_multi_function_ranges_with_plans_and_hints() {
-    const SEED: u64 = 0x1357_9bdf_2468_ace0;
-    const COUNT: usize = 400;
-    let seed = env_u64("AUDIT_SEED", SEED);
-    let count = env_u64("AUDIT_N", COUNT as u64) as usize;
-    let mut rng = Rng(seed);
-    let mut digest = SweepDigest::new();
-
-    for _ in 0..count {
-      let functions = 2 + rng.below(4);
-      let mut bounds = vec![0usize];
-      let mut program: Vec<Insn> = Vec::new();
-
-      let call_sites: Vec<usize> = (0..functions - 1).collect();
-      for _ in &call_sites {
-        program.push(insn(opcode::CALL, 0, 1, 0, 0));
-      }
-      for _ in 0..rng.below(5) {
-        let next = random_insn(&mut rng);
-        program.push(if is_conditional_jump(&next) {
-          Insn { offset: 0, ..next }
-        } else {
-          next
-        });
-      }
-      // Half the time the first function ends with a `ja` two slots from the
-      // end, so the next function entry is reached by fall-through too.
-      if rng.below(2) == 0 {
-        program.push(insn(opcode::JA, 0, 0, -1 - (program.len() as i16), 0));
-        program.push(insn(0xb7, 1, 0, 0, 3));
-      } else {
-        program.push(exit());
-      }
-
-      for _ in 1..functions {
-        bounds.push(program.len());
-        for _ in 0..rng.below(5) {
-          let next = random_insn(&mut rng);
-          program.push(if is_conditional_jump(&next) {
-            Insn { offset: 0, ..next }
-          } else {
-            next
-          });
-        }
-        program.push(exit());
-      }
-      bounds.push(program.len());
-
-      for (k, &site) in call_sites.iter().enumerate() {
-        program[site].imm = (bounds[k + 1] as i64 - site as i64 - 1) as i32;
-      }
-
-      let n = program.len();
-      let ids: Vec<u32> = (0..n).map(|_| rng.next() as u32).collect();
-      let hints: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
-      let plan: Vec<PlanEntry> = (0..n)
-        .map(|_| PlanEntry {
-          role: rng.below(3) as u8,
-          region: rng.below(4) as u8,
-          delta: rng.pick(&[0u16, 4, 8, 255, 256, 4088, 4095]),
-          span: rng.pick(&[0u32, 1, 2, 4, 8, 16, 4095, 4096, 4097, u32::MAX]),
-          lo: rng.pick(&[0i32, 8, -8, 255, -32768, 32767, i32::MIN]),
-          leader_pc: rng.below(n + 2) as u32,
-        })
-        .collect();
-      let code = Insn::encode_all(&program);
-
-      // Every legal range: start at a boundary, end at any later boundary.
-      for a in 0..bounds.len() - 1 {
-        for b in a + 1..bounds.len() {
-          let inputs = TranslationInputs {
-            hints: &hints,
-            plan: &plan,
-            resolver_ids: &ids,
-            start_pc: bounds[a],
-            end_pc: bounds[b],
-          };
-          for (_, config) in config_sweep(Target::Aarch64) {
-            sweep_case(&mut digest, &config, &code, &inputs, 262144);
-          }
-        }
-      }
-    }
-    let translated = digest.translated();
-    assert!(
-      translated > 200,
-      "only {translated} translations produced code"
-    );
-    if (seed, count) == (SEED, COUNT) {
-      finish_sweep(digest, "audit-wide-multi-function-ranges");
-    }
-  }
-
   /// AUDIT FINDING 2 (was: the patch tables grew sixteen times too far).
   /// The jump-fixup table stops growing at [`abi::MAX_INSTS`] entries, the same
   /// ceiling a loaded program's instruction count has, and reports "Too many
@@ -4742,8 +4518,12 @@ mod tests {
   }
 
   /// AUDIT: every way the barrier pre-pass can close a group - the slot after a
-  /// jump/call/exit, a forward branch target, a backward branch target, and a
-  /// local function entry - with a leader/member pair straddling each.
+  /// jump/call/exit, a forward branch target and a backward branch target -
+  /// with a leader/member pair straddling each.
+  ///
+  /// A local function entry used to be a fourth source. It cannot be one now: a
+  /// range is exactly one function, so the only entry inside it is its first
+  /// instruction, and the group starts closed there anyway.
   #[test]
   fn audit_every_barrier_source_closes_a_group() {
     let mut digest = SweepDigest::new();
@@ -4813,35 +4593,6 @@ mod tests {
         &TranslationInputs {
           plan: &plan,
           ..plain_inputs(4)
-        },
-      );
-    }
-
-    // A local function entry between the two, inside one translation range.
-    {
-      let insns = vec![
-        insn(opcode::CALL, 0, 1, 0, 2),
-        insn(opcode::JA, 0, 0, -2, 0),
-        ld(1, 0),
-        ld(3, 8),
-        exit(),
-      ];
-      let plan = vec![
-        none_entry(),
-        none_entry(),
-        leader(abi::region::STACK, 0, 0, 16, 2),
-        member(abi::region::STACK, 0, 8, 2),
-        none_entry(),
-      ];
-      let ids = [7u32; 5];
-      audit_case(
-        &mut digest,
-        "function entry lands on the member",
-        &insns,
-        &TranslationInputs {
-          plan: &plan,
-          resolver_ids: &ids,
-          ..plain_inputs(5)
         },
       );
     }
