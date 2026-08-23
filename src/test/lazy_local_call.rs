@@ -386,8 +386,12 @@ static BUDGET_HELPERS: &[(&str, Helper)] = &[("bump", h_bump)];
 #[tokio::test]
 async fn code_budget_exhaustion_is_terminal() {
   // A small entry that calls a helper, then a callee too big for the budget.
+  // The loop count is sized to overshoot `with_code_size_limit` below with room
+  // to spare, because how much native code an eBPF instruction costs is exactly
+  // what the frame-addressing work changes: at 1200 the callee used to be a
+  // little over the 64 KiB budget and is now a little under it.
   let mut body = String::new();
-  for i in 0..1200u64 {
+  for i in 0..3000u64 {
     body.push_str(&format!("  acc ^= acc << {}; acc += {i};\n", (i % 13) + 1));
   }
   let source = format!(

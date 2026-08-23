@@ -1864,7 +1864,11 @@ validate(const struct ubpf_vm* vm, const struct ebpf_inst* insts, uint32_t num_i
             break;
         case EBPF_OP_MOV64_IMM:
         case EBPF_OP_MOV64_REG:
-            store = true;
+            // `store` exists solely to let the check below admit R10 as a memory
+            // base. A mov is not a store, and setting the flag here let
+            // `mov64 r10, x` past this function - the opcode table happened to
+            // refuse it, so the two layers were each covering the other's gap.
+            // Nothing downstream reads `store` for any other purpose.
             break;
         case EBPF_OP_ARSH64_IMM:
         case EBPF_OP_ARSH64_REG:
@@ -2349,6 +2353,25 @@ ubpf_set_region_hints(struct ubpf_vm* vm, const uint8_t* hints, size_t len)
 {
     vm->region_hints = hints;
     vm->region_hints_len = len;
+}
+
+void
+ubpf_set_native_frame_base(struct ubpf_vm* vm, bool native)
+{
+    vm->native_frame_base = native;
+}
+
+void
+ubpf_set_frame_constants(struct ubpf_vm* vm, bool available)
+{
+    vm->frame_constants = available;
+}
+
+void
+ubpf_set_access_plan(struct ubpf_vm* vm, const struct ubpf_access_plan_entry* plan, size_t len)
+{
+    vm->access_plan = plan;
+    vm->access_plan_len = len;
 }
 
 void

@@ -61,6 +61,64 @@ const SHADOW_STACK_SIZE: usize = LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.nex
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 
+/// Displacement below `R10` that a frame access may use without a runtime bounds
+/// check.
+///
+/// This is the one place the runtime trades a per-access check for a static
+/// argument, so the argument is worth spelling out. `R10` starts at
+/// `stack_top - calldata`, rounded down to 8, and drops one
+/// `UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE` frame per local call. The loader accepts
+/// at most [`MAX_LOCAL_CALL_DEPTH`] frames, so the deepest reachable frame
+/// pointer sits `(MAX_LOCAL_CALL_DEPTH - 1)` frames below entry, and what is
+/// left of the window below *that* is the displacement any frame is allowed to
+/// reach. `[r10 + k]` with `-FRAME_WINDOW <= k` and `k + width <= 0` is therefore
+/// inside `[stack_bottom, stack_top)` at every call depth, for every accepted
+/// program - which is what lets the backend emit it as a plain native access.
+///
+/// `src/test/lazy_local_call.rs::the_deepest_accepted_call_chain_fits_alongside_calldata`
+/// exercises exactly this corner at run time.
+pub(crate) const FRAME_WINDOW: usize = crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+
+/// Guest addresses the SIGSEGV handler claims as a guest fault rather than a
+/// host crash: `(0, POINTER_CAGE_PROTECTED_WINDOW)`.
+///
+/// A bounds check that fails substitutes address 0, so this is the window every
+/// failed access has to land in. An access group makes that load-bearing at a
+/// distance: a failed leader parks base 0 and its members then dereference
+/// `[0 + delta]`, so the group span has to fit here too. Three constants in
+/// three files have to agree about that page - this one, `MAX_GROUP_SPAN` in
+/// the analysis, and `JIT_MAX_GROUP_SPAN` in the backend - and if they ever
+/// drift apart the symptom is a legitimate guest aborting the process rather
+/// than taking a fault. The assertion below ties the first two together.
+pub(crate) const POINTER_CAGE_PROTECTED_WINDOW: usize = 4096;
+
+const _: () = {
+  assert!(
+    crate::region_analysis::MAX_GROUP_SPAN as usize <= POINTER_CAGE_PROTECTED_WINDOW,
+    "an access group can span further than the guard window the fault handler \
+     claims, so a group off a bad base would abort the process instead of faulting"
+  );
+  assert!(
+    crate::region_analysis::MAX_GROUP_SPAN == crate::ubpf::UBPF_MAX_GROUP_SPAN as i32,
+    "the analysis and the backend disagree about how wide an access group may be"
+  );
+};
+
+const _: () = {
+  // What the window has left below the deepest frame pointer the loader accepts.
+  let headroom = SHADOW_STACK_SIZE
+    - MAX_CALLDATA_SIZE.next_multiple_of(8)
+    - (MAX_LOCAL_CALL_DEPTH - 1) * crate::ubpf::UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE as usize;
+  // Tight today - headroom is exactly one frame. Raising MAX_CALLDATA_SIZE,
+  // shrinking SHADOW_STACK_SIZE or charging local functions more than one frame
+  // would each silently invalidate Tier F's proof, so fail the build instead.
+  assert!(
+    headroom >= FRAME_WINDOW,
+    "the guest stack window no longer covers FRAME_WINDOW below the deepest \
+     accepted frame pointer; Tier F frame addressing would be unsound"
+  );
+};
+
 #[cfg(all(
   target_arch = "x86_64",
   any(target_os = "linux", target_os = "openbsd")
@@ -82,13 +140,55 @@ async_ebpf_entry_trampoline:
     push r13
     push r14
     push r15
+    // r15 carries eBPF r10, and it carries the *native* frame pointer rather
+    // than the guest one - see ubpf_set_native_frame_base(). Guest-to-native
+    // translation for the stack region is the affine shift
+    // `native_base - guest_bottom`, so applying it once here to the entry frame
+    // is enough: the backend only ever adds and subtracts frame sizes from r10,
+    // and that commutes with the shift. What it buys is a frame access emitted
+    // as one native instruction instead of a bounds check and a translation.
+    //
+    // rdx is free by here (the guest sees it scrubbed below), so use it to
+    // carry the delta into the frame slot the backend reads when a program
+    // needs the guest value of r10 back. [rax + 16] is
+    // JitMemory::stack_native_base and [rbp - 40] is the backend's
+    // JIT_MEMORY_FRAME_DELTA_OFFSET; both are asserted below.
+    mov rdx, [rax + 16]
+    sub rdx, rcx
     mov r15, rcx
     add r15, r8
+    add r15, rdx
     mov rdi, rsi
     sub rsp, 8
     mov rbp, rsp
-    sub rsp, 32
+    sub rsp, 160
     mov [rbp - 8], rax
+    mov [rbp - 40], rdx
+    // Copy JitMemory::derived - the twelve bounds-check constants - into the
+    // frame, where the backend reads them off rbp without a descriptor load.
+    // See ubpf_set_frame_constants(). xmm0 keeps this to twelve instructions
+    // without disturbing any of the registers still carrying guest state; the
+    // guest has no way to name an xmm register, and these are guest-space
+    // bounds rather than host addresses, but it is cleared afterwards anyway.
+    movdqu xmm0, [rax + 48]
+    movdqu [rbp - 136], xmm0
+    movdqu xmm0, [rax + 64]
+    movdqu [rbp - 120], xmm0
+    movdqu xmm0, [rax + 80]
+    movdqu [rbp - 104], xmm0
+    movdqu xmm0, [rax + 96]
+    movdqu [rbp - 88], xmm0
+    movdqu xmm0, [rax + 112]
+    movdqu [rbp - 72], xmm0
+    movdqu xmm0, [rax + 128]
+    movdqu [rbp - 56], xmm0
+    pxor xmm0, xmm0
+    // The access-group base slot. The backend only reads it after emitting the
+    // leader that writes it, so this is belt and braces - but it costs one
+    // instruction per invocation and turns any future hole in that reasoning
+    // into a fault at page 0 rather than a dereference of whatever the host
+    // stack happened to hold.
+    mov qword ptr [rbp - 144], 0
     mov rcx, r9
     mov r11, rdi
     // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
@@ -141,10 +241,43 @@ async_ebpf_entry_trampoline:
     stp x23, x24, [sp, #32]
     stp x25, x26, [sp, #48]
     mov x29, sp
+    // x23 carries eBPF r10, and it carries the *native* frame pointer rather
+    // than the guest one - see ubpf_set_native_frame_base(). Guest-to-native
+    // translation for the stack region is the affine shift
+    // `native_base - guest_bottom`, so applying it once here to the entry frame
+    // is enough: the backend only ever adds and subtracts frame sizes from r10,
+    // and that commutes with the shift.
+    ldr x7, [x6, #16]
+    sub x7, x7, x3
     add x23, x3, x4
+    add x23, x23, x7
     mov x0, x1
-    sub sp, sp, #16
+    sub sp, sp, #160
     str x6, [x29, #-8]
+    // The delta that recovers the guest value of r10 where a program reads it
+    // as a value rather than as a memory base.
+    str x7, [x29, #-40]
+    // The twelve derived bounds-check constants, copied from JitMemory::derived
+    // into [x29-136, x29-40) where the backend reads them off the frame pointer
+    // without a descriptor load. See ubpf_set_frame_constants().
+    ldp x7, x16, [x6, #48]
+    stp x7, x16, [x29, #-136]
+    ldp x7, x16, [x6, #64]
+    stp x7, x16, [x29, #-120]
+    ldp x7, x16, [x6, #80]
+    stp x7, x16, [x29, #-104]
+    ldp x7, x16, [x6, #96]
+    stp x7, x16, [x29, #-88]
+    ldp x7, x16, [x6, #112]
+    stp x7, x16, [x29, #-72]
+    ldp x7, x16, [x6, #128]
+    stp x7, x16, [x29, #-56]
+    // The access-group base slot. The backend only reads it after emitting the
+    // leader that writes it; zeroing turns any hole in that reasoning into a
+    // fault at page 0 rather than a dereference of stale host stack.
+    str xzr, [x29, #-144]
+    mov x7, xzr
+    mov x16, xzr
     mov x26, x0
     // Scrub every register the guest can name (uBPF maps eBPF r0-r10 to
     // x5/x0-x4/x19-x23) except r1 (ctx) and r10 (frame pointer), plus the
@@ -359,9 +492,78 @@ impl<'a, 'b> HelperScope<'a, 'b> {
 struct AssumeSend<T>(T);
 unsafe impl<T> Send for AssumeSend<T> {}
 
+/// Native backing for one invocation's guest stack, in its own mapping with a
+/// `PROT_NONE` page on each side.
+///
+/// The guest stack used to be a plain heap allocation, which was fine while
+/// every guest access carried a runtime bounds check: an out-of-range address
+/// was rejected before it was ever dereferenced. Tier F frame accesses are
+/// emitted without that check, on the static argument recorded at
+/// [`FRAME_WINDOW`]. Guard pages are what turns a mistake in that argument - or
+/// in the backend test that enforces it - into a fault instead of a silent read
+/// or write of whatever the allocator happened to place next to the stack.
+///
+/// The window is laid out flush against the *low* guard, because that is the
+/// direction frame addressing runs: `R10` descends with call depth and every
+/// frame displacement is negative.
+struct GuardedStack {
+  region: MmapRaw,
+  offset: usize,
+}
+
+impl GuardedStack {
+  fn new() -> Result<Self, RuntimeError> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+      return Err(RuntimeError::PlatformError("failed to query page size"));
+    }
+    let page_size = page_size as usize;
+    let len = SHADOW_STACK_SIZE.next_multiple_of(page_size);
+    let total = len + 2 * page_size;
+
+    let region = MmapRaw::from(
+      MmapOptions::new()
+        .len(total)
+        .map_anon()
+        .map_err(|_| RuntimeError::PlatformError("failed to allocate guest stack"))?,
+    );
+    unsafe {
+      if libc::mprotect(region.as_ptr() as *mut _, total, libc::PROT_NONE) != 0
+        || libc::mprotect(
+          region.as_ptr().add(page_size) as *mut _,
+          len,
+          libc::PROT_READ | libc::PROT_WRITE,
+        ) != 0
+      {
+        return Err(RuntimeError::PlatformError(
+          "failed to protect guest stack guard pages",
+        ));
+      }
+    }
+
+    Ok(Self {
+      region,
+      offset: page_size,
+    })
+  }
+
+  fn as_mut_slice(&mut self) -> &mut [u8] {
+    unsafe {
+      std::slice::from_raw_parts_mut(
+        self.region.as_ptr().add(self.offset) as *mut u8,
+        SHADOW_STACK_SIZE,
+      )
+    }
+  }
+
+  fn as_mut_ptr(&mut self) -> *mut u8 {
+    unsafe { self.region.as_ptr().add(self.offset) as *mut u8 }
+  }
+}
+
 struct ExecContext {
   native_stack: DefaultStack,
-  guest_stack: Box<[u8; SHADOW_STACK_SIZE]>,
+  guest_stack: GuardedStack,
 }
 
 impl ExecContext {
@@ -369,10 +571,14 @@ impl ExecContext {
     Self {
       native_stack: DefaultStack::new(NATIVE_STACK_SIZE)
         .expect("failed to initialize native stack"),
-      guest_stack: Box::new([0u8; SHADOW_STACK_SIZE]),
+      guest_stack: GuardedStack::new().expect("failed to initialize guest stack"),
     }
   }
 }
+
+/// Access widths a single guest memory instruction can have, in the order the
+/// backend's span slots expect (`span_slot_index` in `ubpf_jit_x86_64.c`).
+const ACCESS_WIDTHS: [usize; 4] = [1, 2, 4, 8];
 
 #[repr(C)]
 struct JitMemory {
@@ -382,9 +588,93 @@ struct JitMemory {
   data_guest_bottom: usize,
   data_guest_top: usize,
   data_native_base: usize,
+  /// Everything a single-region bounds check needs, derived once here instead
+  /// of being rebuilt from the fields above at every guest memory access. The
+  /// entry trampoline copies the block into the frame, where the backend reads
+  /// it off `RBP` directly. See `ubpf_set_frame_constants()` for the layout.
+  derived: [usize; 12],
 }
 
+/// The entry trampoline reaches into this layout with literal displacements,
+/// and so does the JIT backend (`JIT_MEMORY_*` in `ubpf_jit_x86_64.c`). Nothing
+/// else ties the three together, so tie them here.
+const _: () = {
+  assert!(std::mem::offset_of!(JitMemory, stack_guest_bottom) == 0);
+  assert!(std::mem::offset_of!(JitMemory, stack_guest_top) == 8);
+  assert!(std::mem::offset_of!(JitMemory, stack_native_base) == 16);
+  assert!(std::mem::offset_of!(JitMemory, data_guest_bottom) == 24);
+  assert!(std::mem::offset_of!(JitMemory, data_guest_top) == 32);
+  assert!(std::mem::offset_of!(JitMemory, data_native_base) == 40);
+  assert!(std::mem::offset_of!(JitMemory, derived) == 48);
+  assert!(std::mem::size_of::<JitMemory>() == 144);
+};
+
+/// The access plan crosses into C as a raw pointer, so the two declarations of
+/// its entry have to agree field for field.
+const _: () = {
+  use crate::region_analysis::PlanEntry;
+  use crate::ubpf::ubpf_access_plan_entry as CEntry;
+  assert!(std::mem::size_of::<PlanEntry>() == std::mem::size_of::<CEntry>());
+  assert!(std::mem::align_of::<PlanEntry>() == std::mem::align_of::<CEntry>());
+  assert!(std::mem::offset_of!(PlanEntry, role) == std::mem::offset_of!(CEntry, role));
+  assert!(std::mem::offset_of!(PlanEntry, region) == std::mem::offset_of!(CEntry, region));
+  assert!(std::mem::offset_of!(PlanEntry, delta) == std::mem::offset_of!(CEntry, delta));
+  assert!(std::mem::offset_of!(PlanEntry, span) == std::mem::offset_of!(CEntry, span));
+  assert!(std::mem::offset_of!(PlanEntry, lo) == std::mem::offset_of!(CEntry, lo));
+  assert!(std::mem::offset_of!(PlanEntry, leader_pc) == std::mem::offset_of!(CEntry, leader_pc));
+};
+
 impl JitMemory {
+  /// Derives the twelve bounds-check constants from the six region fields.
+  ///
+  /// The check the backend emits is a single unsigned comparison: with
+  /// `off = guest - bottom`, an access of width `w` is in range exactly when
+  /// `off <= (top - w) - bottom`. Both operands are invariant for the whole
+  /// invocation, so precomputing them here is the difference between a bounds
+  /// check that reloads and re-derives them every time and one that reads two
+  /// frame slots.
+  fn fill_derived(&mut self) {
+    // A region narrower than the width being checked makes `(top - w) - bottom`
+    // wrap, and the single unsigned comparison would then accept *every* address
+    // for that region - a complete bypass of the cage, not a near miss.
+    //
+    // The width that matters is not the widest single access. A group leader
+    // checks its whole window at once, so `w` reaches `MAX_GROUP_SPAN`. Both
+    // regions are comfortably larger than that and `PointerCage::new` refuses to
+    // build one that is not, so this is a restatement of a load-time invariant
+    // rather than a live check - which is why it is a debug assertion here and
+    // an error there.
+    debug_assert!(
+      self.stack_guest_top - self.stack_guest_bottom
+        >= crate::region_analysis::MAX_GROUP_SPAN as usize
+        && self.data_guest_top - self.data_guest_bottom
+          >= crate::region_analysis::MAX_GROUP_SPAN as usize,
+      "a guest region is narrower than the widest window a bounds check can be asked for"
+    );
+
+    let mut slot = 0;
+    for (bottom, top, native_base) in [
+      (
+        self.stack_guest_bottom,
+        self.stack_guest_top,
+        self.stack_native_base,
+      ),
+      (
+        self.data_guest_bottom,
+        self.data_guest_top,
+        self.data_native_base,
+      ),
+    ] {
+      self.derived[slot] = bottom;
+      self.derived[slot + 1] = native_base.wrapping_sub(bottom);
+      for (i, width) in ACCESS_WIDTHS.iter().enumerate() {
+        self.derived[slot + 2 + i] = (top - width) - bottom;
+      }
+      slot += 2 + ACCESS_WIDTHS.len();
+    }
+    debug_assert_eq!(slot, self.derived.len());
+  }
+
   fn checked_region(
     guest: usize,
     size: usize,
@@ -476,7 +766,7 @@ impl BorrowedExecContext {
         EXEC_CONTEXT_POOL.with(|x| x.borrow_mut().pop().unwrap_or_else(ExecContext::new)),
       ),
     };
-    me.ctx.guest_stack.fill(0x8e);
+    me.ctx.guest_stack.as_mut_slice().fill(0x8e);
     me
   }
 }
@@ -1131,10 +1421,13 @@ impl Program {
     let outcome = unsafe {
       translate_function_into(
         vm,
-        &region_analysis.hints,
-        &resolver_ids,
-        function.start_pc,
-        function.end_pc,
+        &TranslationInputs {
+          hints: &region_analysis.hints,
+          plan: &region_analysis.plan,
+          resolver_ids: &resolver_ids,
+          start_pc: function.start_pc,
+          end_pc: function.end_pc,
+        },
         code_ptr as *mut u8,
         remaining,
       )
@@ -1277,21 +1570,25 @@ impl Program {
     if calldata.len() > MAX_CALLDATA_SIZE {
       return Err(RuntimeError::InvalidArgument("calldata too large"));
     }
-    ectx.ctx.guest_stack[SHADOW_STACK_SIZE - calldata.len()..].copy_from_slice(calldata);
+    ectx.ctx.guest_stack.as_mut_slice()[SHADOW_STACK_SIZE - calldata.len()..]
+      .copy_from_slice(calldata);
     let calldata_len = calldata.len();
 
     let program_ret: u64 = {
       let guest_stack_top = self.unbound.cage.stack_top();
       let guest_stack_bottom = self.unbound.cage.stack_bottom();
       let ctx = &mut *ectx.ctx;
-      let memory = JitMemory {
+      let mut memory = JitMemory {
         stack_guest_bottom: guest_stack_bottom,
         stack_guest_top: guest_stack_top,
         stack_native_base: ctx.guest_stack.as_mut_ptr() as usize,
         data_guest_bottom: self.unbound.cage.data_bottom(),
         data_guest_top: self.unbound.cage.data_top(),
         data_native_base: self.unbound.cage.data_native_base(),
+        derived: [0; 12],
       };
+      memory.fill_derived();
+      let memory = memory;
       let memory_ptr = &memory as *const JitMemory as usize;
 
       let mut co = AssumeSend(CoDropper(Coroutine::with_stack(
@@ -1333,7 +1630,8 @@ impl Program {
             self.unbound.code_base + self.unbound.code_size,
           ));
           x.yielder.set(yielder.map(|x| x.0));
-          x.pointer_cage_protected_range.set((0, 4096));
+          x.pointer_cage_protected_range
+            .set((0, POINTER_CAGE_PROTECTED_WINDOW));
           compiler_fence(Ordering::Release);
           x.valid.store(true, Ordering::Relaxed);
         });
@@ -1540,6 +1838,12 @@ impl Vm {
     unsafe {
       crate::ubpf::ubpf_toggle_bounds_check(vm.as_ptr(), false);
       crate::ubpf::ubpf_set_jit_pointer_mask_and_offset(vm.as_ptr(), cage.mask(), cage.offset());
+      // Both entry trampolines establish the frame these describe.
+      #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+      {
+        crate::ubpf::ubpf_set_native_frame_base(vm.as_ptr(), true);
+        crate::ubpf::ubpf_set_frame_constants(vm.as_ptr(), true);
+      }
     }
     Self(vm)
   }
@@ -1582,6 +1886,17 @@ enum TranslateError {
   Failed(String),
 }
 
+/// What the analysis tells the JIT about one function, beyond the bytecode
+/// itself. All of it is borrowed for the duration of a single translation and
+/// cleared again afterwards.
+struct TranslationInputs<'a> {
+  hints: &'a [u8],
+  plan: &'a [crate::region_analysis::PlanEntry],
+  resolver_ids: &'a [u32],
+  start_pc: usize,
+  end_pc: usize,
+}
+
 /// Translates `[start_pc, end_pc)` into `buffer`, returning the number of bytes
 /// emitted.
 ///
@@ -1590,22 +1905,24 @@ enum TranslateError {
 /// must be writable for `capacity` bytes.
 unsafe fn translate_function_into(
   vm: *mut crate::ubpf::ubpf_vm,
-  hints: &[u8],
-  resolver_ids: &[u32],
-  start_pc: usize,
-  end_pc: usize,
+  inputs: &TranslationInputs<'_>,
   buffer: *mut u8,
   capacity: usize,
 ) -> Result<usize, TranslateError> {
   let mut written_len = capacity;
   let mut errmsg_ptr = std::ptr::null_mut();
 
-  crate::ubpf::ubpf_set_region_hints(vm, hints.as_ptr(), hints.len());
+  crate::ubpf::ubpf_set_region_hints(vm, inputs.hints.as_ptr(), inputs.hints.len());
+  crate::ubpf::ubpf_set_access_plan(
+    vm,
+    inputs.plan.as_ptr() as *const crate::ubpf::ubpf_access_plan_entry,
+    inputs.plan.len(),
+  );
   crate::ubpf::ubpf_set_lazy_local_call_resolver(
     vm,
     Some(tls_local_call_resolver),
-    resolver_ids.as_ptr(),
-    resolver_ids.len(),
+    inputs.resolver_ids.as_ptr(),
+    inputs.resolver_ids.len(),
   );
   let ret = crate::ubpf::ubpf_translate_function_ex(
     vm,
@@ -1613,10 +1930,11 @@ unsafe fn translate_function_into(
     &mut written_len,
     &mut errmsg_ptr,
     crate::ubpf::JitMode_ExtendedJitMode,
-    start_pc as u32,
-    end_pc as u32,
+    inputs.start_pc as u32,
+    inputs.end_pc as u32,
   );
   crate::ubpf::ubpf_set_region_hints(vm, std::ptr::null(), 0);
+  crate::ubpf::ubpf_set_access_plan(vm, std::ptr::null(), 0);
   crate::ubpf::ubpf_set_lazy_local_call_resolver(vm, None, std::ptr::null(), 0);
 
   let errmsg = if errmsg_ptr.is_null() {

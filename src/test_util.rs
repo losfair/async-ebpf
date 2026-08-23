@@ -217,8 +217,8 @@ pub async fn run_one_program(opts: RunOpts<'_, '_>, code: &str) -> Result<i64, E
 /// `test_util`; it is not part of the runtime's stable public API.
 pub mod region_analysis {
   use crate::region_analysis::{
-    self as analyzer, PointerSignature, RegKind, StackKind, REGION_DATA, REGION_STACK,
-    REGION_UNKNOWN,
+    self as analyzer, PointerSignature, RegKind, StackKind, REGION_DATA, REGION_FRAME,
+    REGION_STACK, REGION_UNKNOWN,
   };
 
   /// Number of eBPF general-purpose registers modeled by the analyzer.
@@ -229,6 +229,8 @@ pub mod region_analysis {
   pub const STACK: u8 = REGION_STACK;
   /// Read-only data memory region.
   pub const DATA: u8 = REGION_DATA;
+  /// A displacement off the frame pointer that stays inside the guest stack.
+  pub const FRAME: u8 = REGION_FRAME;
 
   /// Register provenance tag used to build fuzz-time function signatures.
   #[derive(Clone, Copy, Debug)]

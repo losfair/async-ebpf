@@ -41,7 +41,15 @@ fn main() -> anyhow::Result<()> {
     Arc::new(DummyProgramEventListener),
     &[],
   )
-  .with_code_size_limit(4 * 1024 * 1024);
+  // Overridable so the benchmark can also be used to measure how much native
+  // code the workload actually needs: shrink the budget until the run reports
+  // "code budget exhausted", which names the sizes involved.
+  .with_code_size_limit(
+    env::var("CODE_SIZE_LIMIT")
+      .ok()
+      .and_then(|x| x.parse().ok())
+      .unwrap_or(4 * 1024 * 1024),
+  );
   let prog = loader
     .load(&mut rand::thread_rng(), &binary)?
     .pin_to_current_thread(t_env);

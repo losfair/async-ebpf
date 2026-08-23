@@ -121,8 +121,12 @@ struct ubpf_vm
     void* bounds_check_user_data;
     int32_t jit_pointer_mask;
     size_t jit_pointer_offset;
-    const uint8_t* region_hints; ///< Per-instruction load region hints (0=unknown, 1=stack, 2=data); indexed by instruction slot. NULL disables.
+    const uint8_t* region_hints; ///< Per-instruction memory region hints (0=unknown, 1=stack, 2=data, 3=frame); indexed by instruction slot. NULL disables.
     size_t region_hints_len;     ///< Number of valid entries in region_hints.
+    bool native_frame_base;      ///< The embedder's entry code puts a native frame base in R10. See ubpf_set_native_frame_base().
+    bool frame_constants;        ///< The embedder's entry code fills in the derived bounds-check constants. See ubpf_set_frame_constants().
+    const struct ubpf_access_plan_entry* access_plan; ///< Per-instruction access grouping. See ubpf_set_access_plan(). NULL disables.
+    size_t access_plan_len;      ///< Number of valid entries in access_plan.
     local_call_resolver_t local_call_resolver;
     const uint32_t* local_call_resolver_ids;
     size_t local_call_resolver_ids_len;

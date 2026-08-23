@@ -22,6 +22,27 @@ pub struct PointerCage {
   margin: usize,
 }
 
+/// Smallest guard, in pages, that separates the guest regions from each other
+/// and from everything around them.
+///
+/// The randomization is what makes guest addresses unpredictable, but the
+/// *minimum* carries a load-bearing property of its own: an access group is
+/// checked as one window around a base, so soundness of confining a group with
+/// a store in it to the stack rests on no window being able to straddle from
+/// one region into the next. A guard wider than the widest group is what
+/// guarantees that.
+const MIN_GUARD_PAGES: usize = 16;
+
+/// The smallest page size the cage asserts against. Real pages are at least
+/// this, so a bound proved here holds on any supported platform.
+const MIN_PAGE_SIZE: usize = 4096;
+
+const _: () = assert!(
+  MIN_GUARD_PAGES * MIN_PAGE_SIZE > crate::region_analysis::MAX_GROUP_SPAN as usize,
+  "an access group could span from one guest region into another, which is what \
+   lets a group containing a store be checked against the stack alone"
+);
+
 impl PointerCage {
   /// Creates a new pointer cage with randomized guard regions.
   ///
@@ -48,9 +69,23 @@ impl PointerCage {
     let stack_slot = round_up(stack_size);
     let data_size = round_up(data_size);
 
-    let guard_size_1 = rng.gen_range(16..128) * page_size;
-    let guard_size_2 = rng.gen_range(16..128) * page_size;
-    let guard_size_3 = rng.gen_range(16..128) * page_size;
+    // A bounds check folds both bounds into one unsigned comparison against
+    // `(top - width) - bottom`, and a group leader asks for a `width` as wide as
+    // the whole window it covers. A region narrower than that makes the
+    // subtraction wrap, and the comparison then accepts every address for that
+    // region. Both regions are far larger in practice - the data region is
+    // page-rounded and the guest stack is tens of kilobytes - so this refuses a
+    // configuration that cannot arise today rather than one that does.
+    let widest_window = crate::region_analysis::MAX_GROUP_SPAN as usize;
+    if stack_size < widest_window || data_size < widest_window {
+      return Err(RuntimeError::PlatformError(
+        "a guest region is narrower than the widest window a bounds check can cover",
+      ));
+    }
+
+    let guard_size_1 = rng.gen_range(MIN_GUARD_PAGES..128) * page_size;
+    let guard_size_2 = rng.gen_range(MIN_GUARD_PAGES..128) * page_size;
+    let guard_size_3 = rng.gen_range(MIN_GUARD_PAGES..128) * page_size;
 
     // max range of offset in ld/st instructions
     // | margin | usable pointer cage range | margin |
@@ -207,11 +242,31 @@ mod tests {
   }
 
   #[test]
+  fn a_region_narrower_than_the_widest_window_is_refused() {
+    // `(top - width) - bottom` would wrap, and the single unsigned comparison
+    // the bounds check folds down to would then accept every address for that
+    // region. Refusing the cage is the only place this can be caught.
+    let widest = crate::region_analysis::MAX_GROUP_SPAN as usize;
+
+    // The stack window is used unrounded, so it is the one that can be too
+    // small.
+    assert!(PointerCage::new(&mut rand::thread_rng(), widest - 1, 4096).is_err());
+    assert!(PointerCage::new(&mut rand::thread_rng(), widest, 4096).is_ok());
+
+    // The data region is rounded up to a page first, so on any page size at
+    // least as large as the window it can only be too small when it is empty.
+    assert!(PointerCage::new(&mut rand::thread_rng(), 32768, 0).is_err());
+    assert!(PointerCage::new(&mut rand::thread_rng(), 32768, 1).is_ok());
+  }
+
+  #[test]
   fn stack_size_need_not_be_page_aligned() {
     // The stack window is address space, not a mapping. This is what lets a
-    // 32 KiB guest stack work on a 64 KiB-page kernel.
-    let cage = PointerCage::new(&mut rand::thread_rng(), 1000, 4096).unwrap();
-    assert_eq!(cage.stack_top() - cage.stack_bottom(), 1000);
+    // 32 KiB guest stack work on a 64 KiB-page kernel. The size is deliberately
+    // not a multiple of any page size, but it does have to clear the widest
+    // window a bounds check can be asked to cover.
+    let cage = PointerCage::new(&mut rand::thread_rng(), 5000, 4096).unwrap();
+    assert_eq!(cage.stack_top() - cage.stack_bottom(), 5000);
     assert_eq!(cage.data_bottom() % page_size(), 0);
 
     // The data region is still mapped read-write until it is frozen.

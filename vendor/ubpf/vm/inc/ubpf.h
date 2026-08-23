@@ -639,14 +639,25 @@ extern "C"
     ubpf_set_jit_pointer_mask_and_offset(struct ubpf_vm* vm, int32_t mask, size_t offset);
 
     /**
-     * @brief Supply per-instruction load region hints for JIT compilation.
+     * @brief Supply per-instruction memory region hints for JIT compilation.
      *
-     * Each entry corresponds to one eBPF instruction slot and routes a load to
-     * a single guest region (0 = unknown/probe both, 1 = stack, 2 = data). The
-     * hints are only an optimization: a single-region bounds check is always
-     * retained, so an incorrect hint can only cause a spurious fault. The
-     * pointer must remain valid until JIT translation completes; pass NULL to
-     * clear it.
+     * Each entry corresponds to one eBPF instruction slot and routes an access
+     * to a single guest region (0 = unknown/probe both, 1 = stack, 2 = data,
+     * 3 = current frame). Hints 1 and 2 are only an optimization: a
+     * single-region bounds check is always retained, so an incorrect hint can
+     * only cause a spurious fault.
+     *
+     * Hint 3 is different. It asserts that the access is a displacement off an
+     * unmodified frame pointer that provably stays inside the guest stack, and
+     * the backend emits it with *no* bounds check at all. The backend
+     * re-derives the conditions it can see for itself - the base really is R10,
+     * and the displacement lies in [-UBPF_EBPF_LOCAL_FUNCTION_STACK_SIZE, -width]
+     * - and falls back to a checked access if any of them fails, so a hint that
+     * is merely wrong about provenance still cannot escape the frame. It is
+     * only honoured when ubpf_set_native_frame_base() is in effect.
+     *
+     * The pointer must remain valid until JIT translation completes; pass NULL
+     * to clear it.
      *
      * @param[in] vm The VM.
      * @param[in] hints Pointer to the hint array (one byte per instruction slot).
@@ -654,6 +665,114 @@ extern "C"
      */
     void
     ubpf_set_region_hints(struct ubpf_vm* vm, const uint8_t* hints, size_t len);
+
+    /**
+     * @brief Declare that the embedder's entry code puts a *native* frame base
+     * in the eBPF R10 register, rather than a guest address.
+     *
+     * Off by default, and meaningful only together with
+     * ubpf_set_jit_pointer_mask_and_offset(). When enabled, the embedder
+     * promises that at entry to JIT-compiled code:
+     *
+     *  - the register mapped to eBPF R10 holds the *native* address of the
+     *    frame, not the guest address; and
+     *  - the frame slot at JIT_MEMORY_FRAME_DELTA_OFFSET below the established
+     *    frame pointer holds `native_base - guest_bottom` for the stack region,
+     *    so the guest value of R10 can be recovered where a program reads it as
+     *    a value rather than as a memory base.
+     *
+     * Guest-to-native translation for the stack is an affine shift, and the
+     * backend's own frame bookkeeping only ever adds and subtracts frame sizes,
+     * so it commutes with translation and needs no changes. What this buys is
+     * region hint 3: a frame access becomes a single native instruction instead
+     * of a bounds check and a translation.
+     *
+     * @param[in] vm The VM.
+     * @param[in] native True if R10 carries a native frame base.
+     */
+    void
+    ubpf_set_native_frame_base(struct ubpf_vm* vm, bool native);
+
+    /**
+     * @brief Declare that the embedder's entry code fills in the derived
+     * bounds-check constants below the established frame pointer.
+     *
+     * Off by default, and meaningful only together with
+     * ubpf_set_jit_pointer_mask_and_offset(). Every value a single-region bounds
+     * check needs is constant for the whole invocation - the memory descriptor
+     * is built once and never mutated - but the backend otherwise rebuilds them
+     * at every access: load the descriptor pointer, subtract the region bottom,
+     * reload the top, subtract the access width and the bottom again. Seven of
+     * the ten instructions are recomputing invariants, and one spills the offset
+     * to memory only to compare against it three instructions later.
+     *
+     * When enabled, the embedder promises that twelve 64-bit values are present
+     * at JIT_DERIVED_SLOT(0)..JIT_DERIVED_SLOT(11) below the frame pointer, in
+     * the order documented in the backend: for the stack region and then the
+     * data region, the guest bottom, the guest-to-native delta, and the four
+     * spans `(guest_top - w) - guest_bottom` for access widths 1, 2, 4 and 8.
+     *
+     * The check keeps its shape exactly - one unsigned comparison and a CMOV to
+     * address 0, no data-dependent branch - and drops to six instructions with
+     * no spill on the dependency chain.
+     *
+     * @param[in] vm The VM.
+     * @param[in] available True if the frame constants are present.
+     */
+    void
+    ubpf_set_frame_constants(struct ubpf_vm* vm, bool available);
+
+    /**
+     * @brief One access-plan entry per instruction slot.
+     *
+     * A *group* is a run of memory accesses that share a base register, so all
+     * of their addresses lie within a bounded window around that register's
+     * value. The group's **leader** bounds-checks the whole window once and
+     * parks the translated base in the frame; each later **member** reads that
+     * base back and accesses it at a constant displacement.
+     */
+/**
+ * @brief Widest window one access group may cover.
+ *
+ * A failed check leaves the parked base at 0, so a member then dereferences
+ * `[0 + delta]`. That has to land inside the embedder's guard window - the range
+ * its fault handler claims as a guest fault rather than a host crash - which
+ * bounds delta, and with it the span, at one page. An embedder whose guard
+ * window is smaller than this must not enable access plans.
+ */
+#define UBPF_MAX_GROUP_SPAN 4096
+
+    struct ubpf_access_plan_entry
+    {
+        uint8_t role;       ///< 0 = ordinary checked access, 1 = leader, 2 = member.
+        uint8_t region;     ///< Region the leader checks against, as for ubpf_set_region_hints().
+        uint16_t delta;     ///< This access's displacement from the window's low bound.
+        uint32_t span;      ///< Bytes the leader's check covers.
+        int32_t lo;         ///< The low bound, as a displacement from the base register.
+        uint32_t leader_pc; ///< The leader that established the base; leaders name themselves.
+    };
+
+    /**
+     * @brief Supply a per-instruction access plan for JIT compilation.
+     *
+     * Meaningful only together with ubpf_set_jit_pointer_mask_and_offset() and
+     * ubpf_set_frame_constants(). The pointer must remain valid until
+     * translation completes; pass NULL to clear it.
+     *
+     * The plan is advisory, and the backend does not take it on trust. Before
+     * emitting a member it re-derives, from the instruction stream it is already
+     * walking, that the named leader is the one most recently emitted, that no
+     * branch can land between the two, that nothing has redefined the base
+     * register in between, and that the access lies inside the window the leader
+     * checked. Any failure emits an ordinary checked access instead, so a plan
+     * that is wrong - or hostile - costs speed and nothing else.
+     *
+     * @param[in] vm The VM.
+     * @param[in] plan Pointer to the plan array (one entry per instruction slot).
+     * @param[in] len Number of entries in @p plan.
+     */
+    void
+    ubpf_set_access_plan(struct ubpf_vm* vm, const struct ubpf_access_plan_entry* plan, size_t len);
 
     /**
      * @brief Set a size for the buffer allocated to machine code generated during JIT compilation.

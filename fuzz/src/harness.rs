@@ -390,7 +390,7 @@ fn assert_region_result(hints: &[u8], unresolved: &[usize], slots: usize) {
     previous = Some(pc);
   }
   for &hint in hints {
-    assert!(hint == ra::UNKNOWN || hint == ra::STACK || hint == ra::DATA);
+    assert!(hint == ra::UNKNOWN || hint == ra::STACK || hint == ra::DATA || hint == ra::FRAME);
   }
 }
 
