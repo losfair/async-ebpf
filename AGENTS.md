@@ -4,11 +4,13 @@
 - `src/` holds the Rust library. Core runtime logic lives in `src/program.rs`, with helper APIs in `src/helpers.rs`, pointer-cage memory safety in `src/pointer_cage.rs`, and ELF relocation in `src/linker.rs`.
 - `src/test/` contains crate tests (Tokio-based) for execution and memory fault behavior.
 - `benches/bench.rs` hosts Criterion benchmarks (requires the `testing` feature).
-- `vendor/ubpf/` is the vendored uBPF C runtime; `build.rs` integrates CMake/bindgen.
+- `src/jit/` is the Rust JIT: `isa.rs` (one instruction decode), `abi.rs` (the frame contract shared with the entry trampolines), `validate.rs`, `patch.rs`, and `emit/{x86_64,aarch64}.rs`.
+- `oracle/ubpf-sys/` holds the vendored uBPF C runtime the JIT was ported from, kept as a differential-testing oracle behind the `oracle` feature. It is the only thing that needs CMake and bindgen, and nothing in a default build links it.
 
 ## Build, Test, and Development Commands
 - `cargo build` — build the library.
 - `cargo test --features testing` — run tests; enables optional deps used by `test_util`.
+- `cargo test --features testing,oracle` — additionally byte-diff the JIT against the vendored C. Requires CMake and libclang.
 - `cargo bench --features testing` — run benchmarks (Criterion).
 - `cargo fmt` — format with rustfmt (configured in `rustfmt.toml`).
 
@@ -28,4 +30,5 @@
 
 ## Platform & Environment Notes
 - The crate supports Linux and OpenBSD on `x86_64` and `aarch64` (enforced at compile time).
-- Changes touching `vendor/ubpf/` or `build.rs` should note external toolchain requirements (CMake, bindgen/clang).
+- Changes touching `oracle/ubpf-sys/` should note external toolchain requirements (CMake, bindgen/clang).
+- The Rust JIT must stay byte-identical to the vendored C while the oracle exists. If a change makes the two differ, that is a finding to raise, not a diff to accept.
