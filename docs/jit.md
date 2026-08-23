@@ -222,9 +222,12 @@ It does not work for general local functions:
 
 What the JIT provides instead:
 
-- translate only `[start_pc, end_pc)`, where the range must begin at pc 0 or at
-  a local function entry and end at a function boundary or the end of the
-  program;
+- translate only `[start_pc, end_pc)`, where the range must be *exactly one*
+  local function: it begins at pc 0 or at a local function entry, ends at the
+  next entry or at the end of the program, and contains no entry in between.
+  There is no whole-program mode — a range holding two functions is refused,
+  not compiled, so the prologue can be emitted once and every `EXIT` can pop
+  what it pushed;
 - consume caller-provided region hints and access plan for that range;
 - reject any branch that leaves the function range, rather than emitting a jump
   to code that is not in this buffer;
