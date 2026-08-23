@@ -85,6 +85,45 @@ impl Insn {
   }
 }
 
+/// Loads `elf` and returns whatever the loader made of it, without running.
+pub(crate) fn load_raw_elf(elf: &[u8]) -> Result<(), Error> {
+  ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .load(&mut rand::thread_rng(), elf)
+  .map(|_| ())
+}
+
+/// Appends `extra` copies of the `test` section header, each describing exactly
+/// the same bytes.
+///
+/// Nothing in ELF requires two section headers to describe disjoint ranges, so
+/// this is how one code blob is made to cost the loader N times over: 64 bytes
+/// of header buys a full analyze-and-translate pass.
+pub(crate) fn duplicate_code_section_header(elf: &[u8], extra: usize) -> Vec<u8> {
+  const SEC_TEXT: usize = 1;
+
+  let mut elf = elf.to_vec();
+  let shoff = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
+  let shnum = u16::from_le_bytes(elf[60..62].try_into().unwrap()) as usize;
+  let text_header = elf[shoff + SEC_TEXT * 64..shoff + (SEC_TEXT + 1) * 64].to_vec();
+
+  // The headers sit last, so the copies can simply be appended.
+  assert_eq!(
+    shoff + shnum * 64,
+    elf.len(),
+    "section headers are not last"
+  );
+  for _ in 0..extra {
+    elf.extend_from_slice(&text_header);
+  }
+  let shnum = u16::try_from(shnum + extra).unwrap();
+  elf[60..62].copy_from_slice(&shnum.to_le_bytes());
+  elf
+}
+
 /// Loads `code` as the program `test` and runs it to completion.
 pub(crate) async fn run_raw(
   code: &[Insn],

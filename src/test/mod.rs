@@ -9,6 +9,7 @@ mod lazy_local_call;
 // translatable (rel32 reaches ±2 GiB), so there is nothing to reject.
 #[cfg(target_arch = "aarch64")]
 mod jit_limits;
+mod loader_limits;
 mod preemption;
 mod raw_elf;
 mod runtime_state;

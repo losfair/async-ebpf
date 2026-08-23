@@ -13,7 +13,7 @@ use std::{
   rc::Rc,
   sync::{
     atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
-    Arc, Once,
+    Arc, Once, OnceLock,
   },
   task::{Context, Poll},
   thread::ThreadId,
@@ -104,18 +104,50 @@ const _: () = {
   );
 };
 
+// What Tier F needs from the guest stack window, stated as the three facts that
+// can each drift on their own.
+//
+// The obvious phrasing - "SHADOW_STACK_SIZE, less the calldata, less the frames
+// below the entry one, still leaves FRAME_WINDOW" - cannot fail. Substituting
+// the definition of SHADOW_STACK_SIZE cancels the calldata term against itself
+// and the budget against the frames, leaving `FRAME_WINDOW >= FRAME_WINDOW`:
+// true for every value of every constant it names, including all the ones it is
+// supposed to be watching. Each assertion below is instead written against
+// constants that are *not* derived from the one being checked, so raising
+// MAX_CALLDATA_SIZE, charging a local function more than one frame, or
+// redefining the window all fail the build rather than quietly eating the
+// margin Tier F addresses within.
 const _: () = {
-  // What the window has left below the deepest frame pointer the loader accepts.
-  let headroom = SHADOW_STACK_SIZE
-    - MAX_CALLDATA_SIZE.next_multiple_of(8)
-    - (MAX_LOCAL_CALL_DEPTH - 1) * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
-  // Tight today - headroom is exactly one frame. Raising MAX_CALLDATA_SIZE,
-  // shrinking SHADOW_STACK_SIZE or charging local functions more than one frame
-  // would each silently invalidate Tier F's proof, so fail the build instead.
+  // 1. The unchecked window fits in the frame every local call is charged.
   assert!(
-    headroom >= FRAME_WINDOW,
+    FRAME_WINDOW <= crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize,
+    "the Tier F frame window is wider than the frame a local call is charged, \
+     so the deepest accepted chain can address below the guest stack"
+  );
+  // 2. The budget really does cover a frame per accepted call depth.
+  assert!(
+    LOCAL_CALL_FRAME_BUDGET
+      >= MAX_LOCAL_CALL_DEPTH * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize,
+    "the local call frame budget no longer covers MAX_LOCAL_CALL_DEPTH frames"
+  );
+  // 3. The window covers that budget *and* the largest calldata a caller can
+  //    pass, rounded the way R10's 8-alignment rounds it.
+  assert!(
+    SHADOW_STACK_SIZE >= LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8),
     "the guest stack window no longer covers FRAME_WINDOW below the deepest \
      accepted frame pointer; Tier F frame addressing would be unsound"
+  );
+  // 4. R10 starts at the first 8-aligned address below the calldata, which the
+  //    runtime computes with `& !0x7`. Assertion 3 models that rounding as
+  //    `next_multiple_of(8)` of the calldata size, and the two agree only while
+  //    the top of the window is itself 8-aligned. That follows today from the
+  //    guard being page-aligned and the window being a multiple of 8, but
+  //    nothing else says so, so say it here - `_run` re-checks the address the
+  //    cage actually hands back.
+  assert!(
+    SHADOW_STACK_SIZE.is_multiple_of(8),
+    "the guest stack window is not a multiple of 8, so R10's alignment rounding \
+     eats into the headroom Tier F frame addressing depends on"
   );
 };
 
@@ -378,6 +410,13 @@ impl<'a, 'b, 'c> DerefMut for MutableUserMemory<'a, 'b, 'c> {
 
 impl<'a, 'b> HelperScope<'a, 'b> {
   /// Posts an async task to be run between timeslices.
+  ///
+  /// # Panics
+  ///
+  /// Panics if called from a context that cannot post a task - an async task's
+  /// own completion callback, most notably - or if this invocation has already
+  /// posted one. Both are helper bugs rather than anything a guest can provoke:
+  /// a guest chooses *which* helper runs, not how that helper uses its scope.
   pub fn post_task(
     &self,
     task: impl Future<Output = impl FnOnce(&HelperScope) -> Result<u64, ()> + 'static> + 'static,
@@ -492,10 +531,6 @@ impl<'a, 'b> HelperScope<'a, 'b> {
     })
   }
 }
-
-#[derive(Copy, Clone)]
-struct AssumeSend<T>(T);
-unsafe impl<T> Send for AssumeSend<T> {}
 
 /// Native backing for one invocation's guest stack, in its own mapping with a
 /// `PROT_NONE` page on each side.
@@ -734,7 +769,22 @@ enum PreemptionState {
   Shutdown,
 }
 
-type PreemptionStateSignal = (Mutex<PreemptionState>, Condvar);
+/// The per-thread handle onto that thread's preemption watcher.
+struct PreemptionStateSignal {
+  state: Mutex<PreemptionState>,
+  changed: Condvar,
+  /// Set when the watcher stops for any reason other than an orderly shutdown -
+  /// a failed `tgkill`/`pthread_kill`, or a panic in the watcher itself.
+  ///
+  /// Preemption is asynchronous and has no cooperative fallback, so a watcher
+  /// that has stopped means a guest resumed on this thread can hold the OS
+  /// thread for as long as it likes: the reactor and timer wheel stop with it,
+  /// and there is no await point at which the run could be cancelled. The
+  /// thread never gets a watcher back either, because `init_thread` sees the
+  /// `WATCHER` slot already filled and returns early. `Program::run` reads this
+  /// and refuses to start rather than wedging the runtime.
+  watcher_failed: AtomicBool,
+}
 
 thread_local! {
   static RUST_TID: ThreadId = std::thread::current().id();
@@ -742,7 +792,11 @@ thread_local! {
   static ACTIVE_JIT_CODE_ZONE: ActiveJitCodeZone = ActiveJitCodeZone::default();
   static EXEC_CONTEXT_POOL: RefCell<Vec<ExecContext>> = Default::default();
   static PENDING_ASYNC_TASK: RefCell<Option<PendingAsyncTask>> = RefCell::new(None);
-  static PREEMPTION_STATE: Arc<PreemptionStateSignal> = Arc::new((Mutex::new(PreemptionState::Inactive), Condvar::new()));
+  static PREEMPTION_STATE: Arc<PreemptionStateSignal> = Arc::new(PreemptionStateSignal {
+    state: Mutex::new(PreemptionState::Inactive),
+    changed: Condvar::new(),
+    watcher_failed: AtomicBool::new(false),
+  });
   static LOADING_PROGRAM_LOADER: Cell<*const ProgramLoader> = const { Cell::new(std::ptr::null()) };
   static ACTIVE_PROGRAM: Cell<*const Program> = const { Cell::new(std::ptr::null()) };
 }
@@ -840,6 +894,32 @@ pub struct UnboundProgram {
 }
 
 /// A program pinned to a specific thread and ready to execute.
+///
+/// Pinned in earnest: this must stay neither `Send` nor `Sync`, because the
+/// future [`Program::run`] returns borrows it, and that future must not be
+/// spawnable onto a work-stealing executor. A guest suspends inside the SIGUSR1
+/// handler, so resuming it on a second worker would run the `sigreturn` and the
+/// unblocking `sigprocmask` on a thread that never took the signal - leaving
+/// SIGUSR1 and SIGSEGV blocked forever on the thread that did, with neither
+/// preemption nor guest fault handling. The watcher would also still be
+/// signalling the original thread, and the pooled `ExecContext` would migrate
+/// with it.
+///
+/// `ThreadEnv`'s `PhantomData<*const ()>` and the `Rc` in `data` are what
+/// establish this today; the doctests pin it so a future change to either has
+/// to come with a decision about the above rather than silently making the
+/// future spawnable. A wrapper asserting `Send` over the live coroutine used to
+/// stand here instead, which hid exactly this reasoning.
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<async_ebpf::Program>();
+/// ```
+///
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<async_ebpf::Program>();
+/// ```
 pub struct Program {
   unbound: UnboundProgram,
   data: RefCell<HashMap<TypeId, Rc<dyn Any>>>,
@@ -957,7 +1037,22 @@ impl GlobalEnv {
   /// Initializes global state and installs signal handlers.
   ///
   /// # Safety
+  ///
   /// Must be called in a process that can install SIGUSR1/SIGSEGV handlers.
+  ///
+  /// The effect is **process-wide**, not scoped to this crate's threads: it
+  /// replaces whatever dispositions SIGUSR1 and SIGSEGV had. Notably that
+  /// includes the SIGSEGV handler Rust's standard library installs to report
+  /// thread stack overflow, so a host stack overflow reports as a plain
+  /// segmentation fault while this is installed. The previous SIGSEGV
+  /// disposition is kept and restored for any fault this crate determines is
+  /// not its own, so another component's handler still sees those - but it does
+  /// not see them *first*, and a component that needs to run before this one
+  /// cannot be accommodated.
+  ///
+  /// An embedder sharing the process with another SIGSEGV user - a garbage
+  /// collector, another JIT, a crash reporter, a `userfaultfd`-style mapper -
+  /// should know this before calling.
   pub unsafe fn new() -> Self {
     static INIT: Once = Once::new();
 
@@ -984,10 +1079,24 @@ impl GlobalEnv {
       ] {
         let mut act: libc::sigaction = std::mem::zeroed();
         act.sa_sigaction = handler;
-        act.sa_flags = libc::SA_SIGINFO;
+        // SA_RESTART: the watcher signals its thread every interval for as long
+        // as any `PreemptionEnabled` is alive, whether or not a guest is
+        // actually running, so a thread parked in a syscall takes those signals
+        // too. Without this each one surfaces as EINTR to whatever the host was
+        // doing - an embedder's blocking FFI in a helper, a third-party crate's
+        // libc call - and not every caller retries.
+        act.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
         act.sa_mask = sa_mask;
-        if libc::sigaction(sig, &act, std::ptr::null_mut()) != 0 {
+        let mut prev: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(sig, &act, &mut prev) != 0 {
           panic!("failed to setup handler for signal {}", sig);
+        }
+        if sig == libc::SIGSEGV {
+          // Kept so a fault this crate does not own can go back to whoever was
+          // handling SIGSEGV before - Rust's own stack-overflow reporter, a
+          // crash reporter, another runtime's guard pages - instead of being
+          // converted into an abort. See `chain_to_previous_sigsegv_handler`.
+          let _ = PREV_SIGSEGV.set(prev);
         }
       }
     });
@@ -1009,8 +1118,23 @@ impl GlobalEnv {
     impl Drop for DeferDrop {
       fn drop(&mut self) {
         let x = &self.0;
-        *x.0.lock() = PreemptionState::Shutdown;
-        x.1.notify_one();
+        *x.state.lock() = PreemptionState::Shutdown;
+        x.changed.notify_one();
+      }
+    }
+
+    /// Marks the watcher as failed unless it left through the shutdown arm.
+    /// Covers a panic in the watcher as well as the signal failure below, since
+    /// either leaves the thread just as unpreemptible.
+    struct WatcherExitGuard {
+      shared: Arc<PreemptionStateSignal>,
+      orderly: bool,
+    }
+    impl Drop for WatcherExitGuard {
+      fn drop(&mut self) {
+        if !self.orderly {
+          self.shared.watcher_failed.store(true, Ordering::SeqCst);
+        }
       }
     }
 
@@ -1033,16 +1157,23 @@ impl GlobalEnv {
       std::thread::Builder::new()
         .name("preempt-watcher".to_string())
         .spawn(move || {
-          let mut state = preemption_state.0.lock();
+          let mut exit = WatcherExitGuard {
+            shared: preemption_state.clone(),
+            orderly: false,
+          };
+          let mut state = preemption_state.state.lock();
           let _ = ready_tx.send(());
           loop {
             match *state {
-              PreemptionState::Shutdown => break,
+              PreemptionState::Shutdown => {
+                exit.orderly = true;
+                break;
+              }
               PreemptionState::Inactive => {
-                preemption_state.1.wait(&mut state);
+                preemption_state.changed.wait(&mut state);
               }
               PreemptionState::Armed(_) => {
-                let timeout = preemption_state.1.wait_while_for(
+                let timeout = preemption_state.changed.wait_while_for(
                   &mut state,
                   |x| matches!(x, PreemptionState::Armed(_)),
                   async_preemption_interval,
@@ -1053,12 +1184,19 @@ impl GlobalEnv {
                       *state = PreemptionState::Inactive;
                     }
                     PreemptionState::Armed(_) => {
+                      // The thread is now unpreemptible for the rest of its
+                      // life, and `init_thread` will not replace this watcher.
+                      // Leave the guard set to failed so `run` refuses work
+                      // here rather than letting a guest wedge the runtime.
                       if signal_native_thread(target_thread, libc::SIGUSR1) != 0 {
                         break;
                       }
                     }
                     PreemptionState::Inactive => {}
-                    PreemptionState::Shutdown => break,
+                    PreemptionState::Shutdown => {
+                      exit.orderly = true;
+                      break;
+                    }
                   }
                 }
               }
@@ -1093,44 +1231,81 @@ impl UnboundProgram {
   }
 }
 
-pub struct PreemptionEnabled(());
+/// Arms asynchronous preemption for **the current thread**, until dropped.
+///
+/// This is a thread-local arming token, not a transferable capability: the
+/// state it flips lives in a thread-local, and the watcher it wakes signals the
+/// thread that called [`GlobalEnv::init_thread`]. Sending it elsewhere and
+/// running a program there would leave that thread unarmed and unpreemptible -
+/// the guest would hold the OS thread, stopping the reactor and the timer wheel
+/// with it - so the token is deliberately neither `Send` nor `Sync` and cannot
+/// leave the thread that created it. [`ThreadEnv`] is `!Send` for the same
+/// reason; before this marker existed the token derived from it silently was
+/// not.
+pub struct PreemptionEnabled {
+  /// The thread this token armed, checked on drop.
+  armed_on: ThreadId,
+  /// `*const ()` is neither `Send` nor `Sync`, which is inherited here.
+  ///
+  /// ```compile_fail
+  /// fn send<T: Send>() {}
+  /// send::<async_ebpf::PreemptionEnabled>();
+  /// ```
+  ///
+  /// ```compile_fail
+  /// fn sync<T: Sync>() {}
+  /// sync::<async_ebpf::PreemptionEnabled>();
+  /// ```
+  _not_send_sync: PhantomData<*const ()>,
+}
 
 impl PreemptionEnabled {
   pub fn new(_: ThreadEnv) -> Self {
     PREEMPTION_STATE.with(|x| {
       let mut notify = false;
       {
-        let mut st = x.0.lock();
+        let mut st = x.state.lock();
         let next = match *st {
           PreemptionState::Inactive => {
             notify = true;
             PreemptionState::Armed(1)
           }
-          PreemptionState::Armed(n) => PreemptionState::Armed(n + 1),
-          PreemptionState::Shutdown => unreachable!(),
+          PreemptionState::Armed(n) => PreemptionState::Armed(n.saturating_add(1)),
+          // The watcher for this thread has already stopped. Arming is then a
+          // no-op rather than a process-killing panic on what is only ever an
+          // embedder sequencing mistake; `Program::run` is where an unarmed
+          // thread is reported, and it reports it as an error.
+          PreemptionState::Shutdown => PreemptionState::Shutdown,
         };
         *st = next;
       }
 
       if notify {
-        x.1.notify_one();
+        x.changed.notify_one();
       }
     });
-    Self(())
+    Self {
+      armed_on: RUST_TID.with(|x| *x),
+      _not_send_sync: PhantomData,
+    }
   }
 }
 
 impl Drop for PreemptionEnabled {
   fn drop(&mut self) {
+    debug_assert_eq!(
+      self.armed_on,
+      RUST_TID.with(|x| *x),
+      "a PreemptionEnabled was dropped on a thread other than the one it armed"
+    );
     PREEMPTION_STATE.with(|x| {
-      let mut st = x.0.lock();
+      let mut st = x.state.lock();
       let next = match *st {
         PreemptionState::Armed(1) => PreemptionState::Armed(0),
-        PreemptionState::Armed(n) => {
-          assert!(n > 1);
-          PreemptionState::Armed(n - 1)
-        }
-        PreemptionState::Inactive | PreemptionState::Shutdown => unreachable!(),
+        PreemptionState::Armed(n) => PreemptionState::Armed(n.saturating_sub(1)),
+        // Either the watcher shut down under us, or arming was a no-op above.
+        // Neither is worth killing the process over on the way out.
+        other @ (PreemptionState::Inactive | PreemptionState::Shutdown) => other,
       };
       *st = next;
     });
@@ -1273,6 +1448,38 @@ impl Program {
       .get(&info.signature)
       .and_then(|compilation| compilation.entrypoint())
       .map(|entrypoint| entrypoint.code_ptr)
+  }
+
+  /// Debug-only check that this frame holds nothing a cancellation would
+  /// strand, immediately before it suspends the guest.
+  ///
+  /// The crate declares no `unwind` feature, so `force_unwind_slow` on a
+  /// started, suspended coroutine panics from inside a `Drop` inside a
+  /// scopeguard - an abort. `CoDropper::drop` is what keeps every cancelled
+  /// `run` away from that, by force-resetting the coroutine instead of
+  /// unwinding it. The consequence is that cancelling a run abandons the
+  /// coroutine stack *without running a single destructor* on it, which is
+  /// sound only while none of the frames that can be live at a suspension owns
+  /// anything that needs dropping.
+  ///
+  /// That holds today, but narrowly: `cached_resolver_target` takes borrows of
+  /// both `resolvers` and `sections`, and stays sound only because both `Ref`s
+  /// die when it returns, one line before the suspension. Hoisting the suspend
+  /// into it - or holding either borrow across it - would leak the borrow on
+  /// the first cancelled run and panic every later `borrow_mut` on that cell,
+  /// from JIT-adjacent code, for the life of the program. This turns that from
+  /// an argument in a comment into something a debug build fails on.
+  fn debug_assert_nothing_to_drop_across_suspend(&self) {
+    debug_assert!(
+      self.unbound.resolvers.try_borrow_mut().is_ok(),
+      "a `resolvers` borrow is live across a suspension; a cancelled run would \
+       abandon it without dropping it"
+    );
+    debug_assert!(
+      self.unbound.sections.try_borrow_mut().is_ok(),
+      "a `sections` borrow is live across a suspension; a cancelled run would \
+       abandon it without dropping it"
+    );
   }
 
   fn protect_code_pages(&self, executable_len: usize) -> Result<(), RuntimeError> {
@@ -1562,6 +1769,18 @@ impl Program {
       return Err(err);
     }
 
+    // Preemption is asynchronous with no cooperative fallback, so a stopped
+    // watcher means nothing can interrupt a guest on this thread. Refuse the
+    // run: a program that never returns would otherwise hold the OS thread, and
+    // with the reactor and timer wheel stopped there is no await point left at
+    // which the caller could time it out or cancel it.
+    if PREEMPTION_STATE.with(|x| x.watcher_failed.load(Ordering::SeqCst)) {
+      return Err(RuntimeError::PlatformError(
+        "the preemption watcher for this thread has stopped, so a program run \
+         here could not be preempted",
+      ));
+    }
+
     let Some(section_index) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));
     };
@@ -1598,6 +1817,22 @@ impl Program {
     let program_ret: u64 = {
       let guest_stack_top = self.unbound.cage.stack_top();
       let guest_stack_bottom = self.unbound.cage.stack_bottom();
+      // Tier F addresses `[R10 - FRAME_WINDOW, R10)` with no bounds check, so
+      // the deepest frame pointer the loader will accept has to leave that much
+      // above the bottom of the window. The constants are asserted at compile
+      // time; this is the same fact against the addresses the cage actually
+      // handed back, including the `& !0x7` rounding below and the real calldata
+      // length, neither of which a const assertion can see.
+      debug_assert!(
+        ((guest_stack_top - calldata_len) & !0x7)
+          .checked_sub(
+            (MAX_LOCAL_CALL_DEPTH - 1) * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize
+          )
+          .and_then(|deepest_r10| deepest_r10.checked_sub(FRAME_WINDOW))
+          .is_some_and(|floor| floor >= guest_stack_bottom),
+        "the deepest accepted frame pointer no longer leaves FRAME_WINDOW above \
+         the guest stack bottom"
+      );
       let ctx = &mut *ectx.ctx;
       let mut memory = JitMemory {
         stack_guest_bottom: guest_stack_bottom,
@@ -1612,7 +1847,7 @@ impl Program {
       let memory = memory;
       let memory_ptr = &memory as *const JitMemory as usize;
 
-      let mut co = AssumeSend(CoDropper(Coroutine::with_stack(
+      let mut co = CoDropper(Coroutine::with_stack(
         &mut ctx.native_stack,
         move |yielder, _input| unsafe {
           ACTIVE_JIT_CODE_ZONE.with(|x| {
@@ -1631,11 +1866,11 @@ impl Program {
             memory_ptr,
           )
         },
-      )));
+      ));
 
       let mut last_yield_time: Option<Instant> = None;
       let mut last_throttle_time: Option<Instant> = None;
-      let mut yielder: Option<AssumeSend<NonNull<Yielder<u64, Dispatch>>>> = None;
+      let mut yielder: Option<NonNull<Yielder<u64, Dispatch>>> = None;
       let mut resume_input: u64 = 0;
       let mut did_throttle = false;
       let mut rust_tid_sigusr1_counter = (RUST_TID.with(|x| *x), SIGUSR1_COUNTER.with(|x| x.get()));
@@ -1650,7 +1885,7 @@ impl Program {
             self.unbound.code_base,
             self.unbound.code_base + self.unbound.code_size,
           ));
-          x.yielder.set(yielder.map(|x| x.0));
+          x.yielder.set(yielder);
           x.pointer_cage_protected_range
             .set((0, POINTER_CAGE_PROTECTED_WINDOW));
           compiler_fence(Ordering::Release);
@@ -1682,12 +1917,20 @@ impl Program {
           .map_err(|_| RuntimeError::AsyncHelperError(helper_name))?;
         }
 
-        let ret = co.0 .0.resume(resume_input);
+        let ret = co.0.resume(resume_input);
+        // The coroutine is suspended here, which is exactly the state a
+        // cancellation abandons without running destructors. Checked on the
+        // host stack rather than at the suspension sites themselves: those run
+        // on the 16 KiB coroutine stack, where a failing assertion overruns
+        // into the guard page and reports as a bare SIGSEGV instead of saying
+        // what went wrong. This also covers every suspension point at once -
+        // helper dispatch, the lazy local-call resolver, and preemption.
+        self.debug_assert_nothing_to_drop_across_suspend();
         ACTIVE_PROGRAM.with(|x| x.set(std::ptr::null()));
         let next_yielder = ACTIVE_JIT_CODE_ZONE.with(|x| {
           x.valid.store(false, Ordering::Relaxed);
           compiler_fence(Ordering::Release);
-          let yielder = x.yielder.get().map(AssumeSend);
+          let yielder = x.yielder.get();
           x.yielder.set(None);
           x.code_range.set((0, 0));
           x.pointer_cage_protected_range.set((0, 0));
@@ -2030,6 +2273,11 @@ impl ProgramLoader {
   /// ("jit: code translation failed") regardless of this limit; raising it
   /// past 1 MiB only adds room for more or larger sections within that
   /// per-section ceiling. x86-64 has no such per-section constraint.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `limit` is zero, is not a multiple of 64 KiB, or does not fit in
+  /// a `u32`.
   pub fn with_code_size_limit(mut self, limit: usize) -> Self {
     assert!(
       limit > 0 && limit % (64 * 1024) == 0,
@@ -2115,6 +2363,16 @@ impl ProgramLoader {
         .unwrap();
       let code_bytes =
         unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
+      // `Translator::load` enforces this, but it runs last: without the check
+      // here an oversized section is walked twice and given per-instruction
+      // tables by the two analyses below, only to be refused afterwards for a
+      // reason that was knowable from its length.
+      if code_bytes.len() / 8 > crate::jit::abi::MAX_INSTS as usize {
+        return Err(RuntimeError::InvalidArgumentOwned(format!(
+          "too many instructions in {section_name} (max {})",
+          crate::jit::abi::MAX_INSTS
+        )));
+      }
       validate_local_call_graph(code_bytes).map_err(|err| {
         RuntimeError::InvalidArgumentOwned(format!(
           "local call graph validation failed in {section_name}: {err}"
@@ -2286,7 +2544,7 @@ unsafe extern "C" fn sigsegv_handler(
   siginfo: *mut libc::siginfo_t,
   uctx: *mut libc::ucontext_t,
 ) {
-  let fail = || restore_default_signal_handler(libc::SIGSEGV);
+  let fail = || chain_to_previous_sigsegv_handler();
 
   let Some((jit_code_zone, pointer_cage, yielder)) = ACTIVE_JIT_CODE_ZONE.with(|x| {
     if x.valid.load(Ordering::Relaxed) {
@@ -2357,6 +2615,27 @@ unsafe extern "C" fn sigusr1_handler(
     async_preemption: true,
     ..Default::default()
   });
+}
+
+/// The SIGSEGV disposition that was in place before [`GlobalEnv::new`] replaced
+/// it, captured once under `INIT` and only ever read afterwards.
+static PREV_SIGSEGV: OnceLock<libc::sigaction> = OnceLock::new();
+
+/// Hands SIGSEGV back to whoever had it before this crate took it, then returns
+/// so the faulting instruction re-executes under that disposition.
+///
+/// Installing `SIG_DFL` here instead - which is what this used to do - turns a
+/// fault another component would have *recovered* from into a process death,
+/// and silently discards Rust's own stack-overflow handler, so a host stack
+/// overflow reports as a bare `Segmentation fault` rather than naming itself.
+/// `sigaction` is async-signal-safe, so this is legal from a handler.
+unsafe fn chain_to_previous_sigsegv_handler() {
+  if let Some(prev) = PREV_SIGSEGV.get() {
+    if libc::sigaction(libc::SIGSEGV, prev, std::ptr::null_mut()) == 0 {
+      return;
+    }
+  }
+  restore_default_signal_handler(libc::SIGSEGV);
 }
 
 unsafe fn restore_default_signal_handler(signum: i32) {

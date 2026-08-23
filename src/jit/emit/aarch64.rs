@@ -809,7 +809,7 @@ fn emit_checked_address(
       let usable = match (st.group, base_ebpf) {
         (Some(group), Some(base_ebpf)) => {
           group.leader_pc == plan.leader_pc
-            && base == group.base_reg as u32
+            && base_ebpf == group.base_reg
             && group.written & (1u16 << base_ebpf) == 0
             && plan.delta as u64 + width as u64 <= group.span as u64
             && group.lo as i64 + plan.delta as i64 == offset as i64
@@ -847,13 +847,11 @@ fn emit_checked_address(
           plan.region,
         );
         emit_loadstore_immediate(st, ls::STRX, addr_reg, R29, abi::GROUP_BASE_OFFSET as i16);
-        // `base_reg` holds the *native* register here, matching the
-        // `state->group_base_reg`; `written` is indexed by eBPF register.
         st.group = Some(OpenGroup {
           leader_pc: pc,
           span: plan.span,
           lo: plan.lo,
-          base_reg: base as u8,
+          base_reg: base_ebpf.expect("checked above"),
           region: plan.region,
           written: 0,
         });
@@ -1707,12 +1705,26 @@ pub fn translate_range(
     if is_imm_op(&insn) && !is_mov_imm(opcode) && !is_simple_imm(&insn) {
       // A store's value has to survive the address computation, which uses
       // TEMP_REGISTER for the translated address.
-      let imm_register = if opcode & crate::jit::isa::cls::MASK == crate::jit::isa::cls::ST {
+      let is_store = opcode & crate::jit::isa::cls::MASK == crate::jit::isa::cls::ST;
+      let imm_register = if is_store {
         TEMP_STORE_VALUE_REGISTER
       } else {
         TEMP_REGISTER
       };
-      emit_movewide_immediate(&mut st, sixty_four, imm_register, insn.imm as i64 as u64);
+      // A store's immediate is sign-extended to 64 bits and only then truncated
+      // to the access width, so a doubleword store has to materialise it wide.
+      // `ST` is not an ALU64 class, so `sixty_four` is false here, and building
+      // the value in a W register would zero-extend instead - storing
+      // 0x00000000ffffffff for `stdw [r1+0], -1` where x86_64 and the reference
+      // interpreter both store all ones. The narrower widths keep only the low
+      // bits, which are the same either way, so they stay at 32 bits.
+      let wide = sixty_four
+        || (is_store
+          && matches!(
+            Width::from_size_bits(insn.opcode & crate::jit::isa::size::DW),
+            Some(Width::DW)
+          ));
+      emit_movewide_immediate(&mut st, wide, imm_register, insn.imm as i64 as u64);
       src = imm_register;
       opcode = to_reg_op(opcode);
     }
@@ -1893,11 +1905,14 @@ pub fn translate_range(
 
     // After the instruction has used its operands, note what it overwrote: an
     // access whose destination is its own base is still valid, but nothing
-    // addressing that base afterwards is. This accumulates in a state
-    // field that a leader resets to zero; here the accumulator lives in the
-    // open group, which is created with it already zero, so the two agree.
-    if let Some(group) = &mut st.group {
-      group.written |= written_registers_mask(&insn);
+    // addressing that base afterwards is. Routed through the shared helper, as
+    // x86_64 does, so both backends invalidate a group by the same rule rather
+    // than by two mechanisms that happen to agree.
+    let mask = written_registers_mask(&insn);
+    for reg in 0..16u8 {
+      if mask & (1u16 << reg) != 0 {
+        st.note_register_written(reg);
+      }
     }
     i += 1;
   }
@@ -3269,11 +3284,68 @@ mod tests {
   // Store immediates
   // -------------------------------------------------------------------------
 
+  /// The immediate a store materialises has to be built at the access width, so
+  /// a negative one reaches memory sign-extended. Asserted on the encoding
+  /// rather than left to the goldens, which would only say that *something*
+  /// moved.
   #[test]
-  fn store_immediates_are_materialised_at_thirty_two_bits() {
-    // A `st` is lowered to a `stx` through TEMP_STORE_VALUE_REGISTER, and the
-    // width the immediate is built at comes from `is_alu64_op`, which is false
-    // for the ST class - so even `stdw` moves a 32-bit immediate. Reproduced.
+  fn a_negative_store_immediate_is_built_at_the_access_width() {
+    // Bit 31 of a move-wide is `sf`: set for an X-register destination, clear
+    // for a W one. A W destination zero-extends, which is what silently turned
+    // `stdw [r1+0], -1` into a store of 0x00000000ffffffff.
+    const SF: u32 = 1 << 31;
+    // A move-wide into TEMP_STORE_VALUE_REGISTER, which is where a lowered `st`
+    // parks its immediate. Keying on the destination keeps the prologue's own
+    // move-wides out of the assertion.
+    let move_wide_into_store_value =
+      |word: u32| word & 0x1f80_0000 == 0x1280_0000 && word & 0x1f == TEMP_STORE_VALUE_REGISTER;
+
+    for (label, sz, want_wide) in [
+      ("stdw", size::DW, true),
+      ("stw", size::W, false),
+      ("sth", size::H, false),
+      ("stb", size::B, false),
+    ] {
+      let program = vec![insn(cls::ST | mode::MEM | sz, 1, 0, 0, -1), exit()];
+      let code = Insn::encode_all(&program);
+      let (_, config) = config_sweep(Target::Aarch64)
+        .into_iter()
+        .find(|(name, _)| *name == "no cage")
+        .expect("the sweep always includes an uncaged configuration");
+      let out =
+        crate::jit::golden::translate_one(&config, &code, &plain_inputs(program.len()), 262144)
+          .expect("the program loads")
+          .expect("the program translates");
+
+      let moves: Vec<u32> = out
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .filter(|&w| move_wide_into_store_value(w))
+        .collect();
+      assert!(
+        !moves.is_empty(),
+        "{label} materialised no immediate at all"
+      );
+      for word in moves {
+        assert_eq!(
+          word & SF != 0,
+          want_wide,
+          "{label} built its immediate at the wrong width ({word:08x})"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn store_immediates_are_sign_extended_at_the_access_width() {
+    // A `st` is lowered to a `stx` through TEMP_STORE_VALUE_REGISTER. `stdw`
+    // materialises its immediate in an X register so the sign extension
+    // survives; the narrower widths stay in a W register, since they discard
+    // everything above their access width anyway.
+    //
+    // This used to build every store immediate at 32 bits, inherited from the C
+    // runtime this backend was ported from, which made `stdw [r1+0], -1` store
+    // 0x00000000ffffffff here and 0xffffffffffffffff on x86_64.
     let mut program = Vec::new();
     for sz in [size::B, size::H, size::W, size::DW] {
       for imm in [0i32, 1, -1, 0xffff, 0x1_0000, i32::MIN, 0x1234_5678] {

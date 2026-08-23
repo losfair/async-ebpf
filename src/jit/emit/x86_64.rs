@@ -772,13 +772,16 @@ impl Emit<'_, '_, '_> {
 
     if let Some(plan) = plan.filter(|p| p.role == abi::plan_role::MEMBER) {
       // `group` is `Some` only while the backend has established that the
-      // leader ran and that nothing has redefined the base since — this keeps
-      // the group open and tests a written-register mask instead, which rejects
-      // exactly the same accesses.
+      // leader ran and that nothing has redefined the base since:
+      // `note_register_written` closes the group outright when the base is
+      // overwritten, and the `written` mask below rejects the same access on its
+      // own. Both are tested here and on aarch64, so neither backend depends on
+      // which half of `OpenGroup` does the invalidating.
       let usable = match (&self.st.group, base_ebpf) {
         (Some(g), Some(base_ebpf)) => {
           g.leader_pc == plan.leader_pc
             && base_ebpf == g.base_reg
+            && g.written & (1u16 << base_ebpf) == 0
             && plan.delta as u64 + width as u64 <= g.span as u64
             && g.lo as i64 + plan.delta as i64 == offset as i64
             // A store cannot ride a window checked against the read-only data
