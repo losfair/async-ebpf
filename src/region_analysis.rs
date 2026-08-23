@@ -1,10 +1,10 @@
-//! Static region analysis for eBPF memory loads.
+//! Static region analysis for eBPF memory accesses.
 //!
-//! Classifies the pointer operand of every load (`LDX`) instruction as pointing
-//! into the per-invocation stack, the shared read-only data region, or neither
+//! Classifies the pointer operand of every load, store, and atomic as pointing
+//! into the per-invocation stack, the shared data region, or neither
 //! ("unknown"). The JIT consumes the result as
 //! [`crate::jit::TranslationInputs::hints`], and emits a single-region bounds
-//! check and address translation for confidently classified loads instead of
+//! check and address translation for confidently classified accesses instead of
 //! probing both regions.
 //!
 //! ## Provenance
@@ -21,8 +21,8 @@
 //!
 //! This pass is a *precision optimization, not a security boundary*. The stack
 //! and data guest ranges are disjoint and the JIT always retains a
-//! single-region bounds check, so a misclassified load can only fault
-//! spuriously — never read out of bounds or cross between regions. Loads that
+//! single-region bounds check, so a misclassified access can only fault
+//! spuriously — never access out of bounds or cross between regions. Accesses that
 //! cannot be classified confidently are left `UNKNOWN` and fall back to the
 //! original dual-region probe.
 //!
@@ -405,9 +405,9 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   }
 
   // Classify every memory access from the converged entry state of its slot.
-  // Loads additionally produce a JIT routing hint; stores/atomics are always
-  // confined to the stack by the backend but are still checked for strict-mode
-  // analyzability. The second slot of a `lddw` has opcode 0 and is skipped.
+  // Every access produces the same region-routing hint, independently of
+  // whether it reads or writes. Page protection enforces data permissions.
+  // The second slot of a `lddw` has opcode 0 and is skipped.
   for pc in 0..num_slots {
     if !reached[pc] {
       continue;
@@ -425,12 +425,7 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
     } else {
       region
     };
-    // Loads route by region. Stores are confined to the stack by the backend
-    // whatever the hint says, so the only hint that changes anything for them is
-    // the frame one.
-    if cls == EBPF_CLS_LDX || hint == REGION_FRAME {
-      hints[pc] = hint;
-    }
+    hints[pc] = hint;
     if region == REGION_UNKNOWN {
       unresolved.push(pc);
     }
@@ -513,12 +508,7 @@ pub(crate) fn analyze_function(
     } else {
       region
     };
-    // Loads route by region. Stores are confined to the stack by the backend
-    // whatever the hint says, so the only hint that changes anything for them is
-    // the frame one.
-    if cls == EBPF_CLS_LDX || hint == REGION_FRAME {
-      hints[pc] = hint;
-    }
+    hints[pc] = hint;
     if region == REGION_UNKNOWN {
       unresolved.push(pc);
     }
@@ -1020,10 +1010,8 @@ struct OpenGroup {
   leader_pc: usize,
   /// `(pc, displacement)` of each access so far.
   members: Vec<(usize, i32)>,
-  /// True once any member is a store, which pins the group to the stack.
-  has_store: bool,
-  /// The region the loads so far agree on, if any.
-  load_region: Option<u8>,
+  /// The region all members so far agree on, if any.
+  region: Option<u8>,
   lo: i32,
   hi: i32,
 }
@@ -1033,14 +1021,7 @@ fn close_group(open: &mut Option<OpenGroup>, plan: &mut [PlanEntry]) {
   if g.members.len() < 2 {
     return;
   }
-  let region = if g.has_store {
-    // A store is confined to the stack whatever its hint says, so the whole
-    // window is checked there. A load sharing the base is a stack access too -
-    // if it were not, the store through that base would already be faulting.
-    REGION_STACK
-  } else {
-    g.load_region.unwrap_or(REGION_UNKNOWN)
-  };
+  let region = g.region.unwrap_or(REGION_UNKNOWN);
   let span = (g.hi - g.lo) as u32;
   for (i, &(pc, disp)) in g.members.iter().enumerate() {
     plan[pc] = PlanEntry {
@@ -1125,15 +1106,15 @@ fn build_access_plan(
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
     let cls = inst.opcode & EBPF_CLS_MASK;
     let is_atomic = cls == EBPF_CLS_STX && inst.opcode & 0xe0 == 0xc0;
-    let base_and_store = match cls {
-      EBPF_CLS_LDX => Some((inst.src, false)),
-      EBPF_CLS_ST | EBPF_CLS_STX => Some((inst.dst, true)),
+    let base = match cls {
+      EBPF_CLS_LDX => Some(inst.src),
+      EBPF_CLS_ST | EBPF_CLS_STX => Some(inst.dst),
       _ => None,
     };
 
     // Atomics both read and write, and the backend routes them through the full
     // check, so they neither join nor start a group.
-    if let Some((base, is_store)) = base_and_store.filter(|_| !is_atomic) {
+    if let Some(base) = base.filter(|_| !is_atomic) {
       if base != R10 {
         let width = access_width(inst.opcode) as i32;
         let disp = inst.offset as i32;
@@ -1149,8 +1130,7 @@ fn build_access_plan(
             base,
             leader_pc: pc,
             members: Vec::new(),
-            has_store: false,
-            load_region: None,
+            region: None,
             lo: disp,
             hi: disp + width,
           });
@@ -1159,17 +1139,13 @@ fn build_access_plan(
         g.members.push((pc, disp));
         g.lo = g.lo.min(disp);
         g.hi = g.hi.max(disp + width);
-        if is_store {
-          g.has_store = true;
-        } else {
-          // Loads that disagree on a region leave the group to the dual-region
-          // probe, which covers both.
-          g.load_region = Some(match g.load_region {
-            None => hints[pc],
-            Some(prev) if prev == hints[pc] => prev,
-            Some(_) => REGION_UNKNOWN,
-          });
-        }
+        // Members that disagree on a region leave the group to the dual-region
+        // probe, which covers both.
+        g.region = Some(match g.region {
+          None => hints[pc],
+          Some(prev) if prev == hints[pc] => prev,
+          Some(_) => REGION_UNKNOWN,
+        });
       }
     }
 
@@ -1342,22 +1318,22 @@ mod tests {
     }
   }
 
-  /// Stores now get a hint too, but only the frame one: everything else is
-  /// left UNKNOWN, because the backend confines a store to the stack anyway.
+  /// Stores and atomics get the same region hint as loads. Only the narrower
+  /// frame fast path remains specific to non-atomic frame accesses.
   #[test]
-  fn only_the_frame_hint_is_emitted_for_stores() {
+  fn stores_receive_their_statically_classified_region() {
     let code = flatten(&[
       slot(STDW, 10, 0, -8, 0),      // st [r10-8], 0      -> FRAME
       slot(STXDW, 10, 1, -16, 0),    // stx [r10-16], r1   -> FRAME
-      slot(STDW, 10, 0, -8192, 0),   // outside the window -> UNKNOWN
-      slot(ATOMIC_DW, 10, 2, -8, 1), // an atomic is never a frame access
+      slot(STDW, 10, 0, -8192, 0),   // outside the window -> STACK
+      slot(ATOMIC_DW, 10, 2, -8, 1), // atomic -> STACK, never FRAME
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
     let hints = analyze_fn(&code).hints;
     assert_eq!(hints[0], REGION_FRAME);
     assert_eq!(hints[1], REGION_FRAME);
-    assert_eq!(hints[2], REGION_UNKNOWN);
-    assert_eq!(hints[3], REGION_UNKNOWN);
+    assert_eq!(hints[2], REGION_STACK);
+    assert_eq!(hints[3], REGION_STACK);
   }
 
   /// A group's window is the convex hull of its members, and every member's
@@ -1433,30 +1409,28 @@ mod tests {
     }
   }
 
-  /// A group containing a store is checked against the stack even when its
-  /// loads say data. Documented as sound because a store through that base
-  /// would already be faulting - this pins the behaviour down either way.
+  /// Stores participate in the same region agreement as loads.
   #[test]
-  fn a_store_pins_the_group_to_the_stack() {
+  fn a_store_keeps_the_groups_data_region() {
     let code = flatten(&[
       slot(EBPF_OP_LDDW, 1, 0, 0, DATA_LO as i32),
       slot(0, 0, 0, 0, 0),
       slot(LDXDW, 2, 1, 0, 0), // hint DATA
       slot(LDXDW, 3, 1, 8, 0), // hint DATA
-      slot(STDW, 1, 0, 16, 0), // a store pins the whole window
+      slot(STDW, 1, 0, 16, 0), // same DATA base
       slot(EBPF_OP_EXIT, 0, 0, 0, 0),
     ]);
     let result = analyze_fn(&code);
     assert_eq!(result.hints[2], REGION_DATA);
     assert_eq!(result.hints[3], REGION_DATA);
-    assert_eq!(result.plan[2].region, REGION_STACK);
-    assert_eq!(result.plan[3].region, REGION_STACK);
-    assert_eq!(result.plan[4].region, REGION_STACK);
+    assert_eq!(result.hints[4], REGION_DATA);
+    assert_eq!(result.plan[2].region, REGION_DATA);
+    assert_eq!(result.plan[3].region, REGION_DATA);
+    assert_eq!(result.plan[4].region, REGION_DATA);
   }
 
   /// The window a group covers never reaches from one guest region into the
-  /// other, which is what makes "a store in the group implies the whole window
-  /// is stack" sound. The cage's inter-region guard is what guarantees it.
+  /// other. The cage's inter-region guard is what guarantees it.
   #[test]
   fn a_group_window_cannot_span_two_guest_regions() {
     // The narrowest guard the cage can randomize to, on the smallest page size

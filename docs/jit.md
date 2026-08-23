@@ -29,14 +29,25 @@ the region-analysis model in `src/region_analysis.rs`.
 Loading performs only the work that is independent of the eventual
 specialization:
 
-1. Allocate the pointer cage.
-2. Copy the ELF into the data region.
-3. Relocate the ELF.
-4. Freeze the data region.
-5. Validate each executable section (`jit::Translator::load`).
-6. Run shared local-function layout validation.
-7. Allocate the native code arena as `PROT_NONE`.
-8. Store per-section metadata, but do not translate eBPF to native code.
+1. Plan a dense copy of allocated `SHF_WRITE` sections.
+2. Allocate one contiguous data window: a page-aligned ELF prefix followed by
+   the packed writable-data suffix.
+3. Copy and relocate the ELF prefix, assigning writable symbols addresses in
+   the suffix.
+4. Copy only the relocated writable sections into that suffix; code, rodata,
+   and ELF metadata remain single-copy in the prefix.
+5. Freeze the whole data window read-only.
+6. Validate each executable section (`jit::Translator::load`).
+7. Run shared local-function layout validation.
+8. Allocate the native code arena as `PROT_NONE`.
+9. Store per-section metadata, but do not translate eBPF to native code.
+
+The backend and region analysis deliberately see the prefix and suffix as one
+affine DATA region. `Program::run` holds a shared lease and leaves every page
+read-only. `Program::run_mut` takes the non-blocking exclusive lease, changes
+only the writable suffix to `PROT_READ | PROT_WRITE` for the complete async
+invocation, and restores it before unlocking. Conflicting invocations fail
+immediately; writable globals persist between successful writable runs.
 
 Loading deliberately does *not* perform strict region validation. Local functions
 are polymorphic over their incoming pointer tags, so an access that is unroutable

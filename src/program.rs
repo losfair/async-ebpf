@@ -22,7 +22,7 @@ use std::{
 
 use futures::{task::noop_waker_ref, Future, FutureExt};
 use memmap2::{MmapOptions, MmapRaw};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rand::prelude::SliceRandom;
 
 use crate::{
@@ -33,7 +33,7 @@ use crate::{
   error::{Error, RuntimeError},
   function_analysis::{analyze_functions, FunctionLayout},
   helpers::Helper,
-  linker::link_elf,
+  linker::{link_elf, plan_writable_data},
   pointer_cage::PointerCage,
   region_analysis::PointerSignature,
   util::nonnull_bytes_overlap,
@@ -387,6 +387,7 @@ pub struct HelperScope<'a, 'b> {
   mutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_MUTABLE_DEREF_REGIONS],
   immutable_dereferenced_regions: [Cell<Option<NonNull<[u8]>>>; MAX_IMMUTABLE_DEREF_REGIONS],
   can_post_task: bool,
+  writable_data: bool,
 }
 
 /// A validated mutable view into user memory.
@@ -496,7 +497,9 @@ impl<'a, 'b> HelperScope<'a, 'b> {
     let Some(region) = self.memory.safe_deref_for_write(
       ptr as usize,
       size as usize,
-      self.program.unbound.writable_data,
+      self
+        .writable_data
+        .then_some(self.program.unbound.cage.writable_data_bottom()),
     ) else {
       tracing::warn!(ptr, size, "invalid write");
       return Err(());
@@ -545,7 +548,7 @@ impl<'a, 'b> HelperScope<'a, 'b> {
 /// in the backend test that enforces it - into a fault instead of a silent read
 /// or write of whatever the allocator happened to place next to the stack.
 ///
-/// This backs both the guest stack and private writable ELF data. The usable
+/// This backs the guest stack. The usable
 /// window is laid out flush against the low guard, which is load-bearing for
 /// the stack because `R10` descends with call depth and every frame displacement
 /// is negative. For data, both guards are defense in depth around the JIT's
@@ -774,7 +777,7 @@ impl JitMemory {
     &self,
     guest: usize,
     size: usize,
-    writable_data: bool,
+    writable_data_bottom: Option<usize>,
   ) -> Option<NonNull<[u8]>> {
     let stack = Self::checked_region(
       guest,
@@ -783,14 +786,14 @@ impl JitMemory {
       self.stack_guest_top,
       self.stack_native_base,
     );
-    if writable_data {
+    if let Some(writable_data_bottom) = writable_data_bottom {
       stack.or_else(|| {
         Self::checked_region(
           guest,
           size,
-          self.data_guest_bottom,
+          writable_data_bottom,
           self.data_guest_top,
-          self.data_native_base,
+          self.data_native_base + (writable_data_bottom - self.data_guest_bottom),
         )
       })
     } else {
@@ -897,6 +900,7 @@ struct ActiveJitCodeZone {
   valid: AtomicBool,
   code_range: Cell<(usize, usize)>,
   pointer_cage_protected_range: Cell<(usize, usize)>,
+  data_range: Cell<(usize, usize)>,
   yielder: Cell<Option<NonNull<Yielder<u64, Dispatch>>>>,
 }
 
@@ -936,7 +940,6 @@ pub struct ProgramLoader {
   code_size_limit: usize,
   instruction_limit: usize,
   guest_stack_size: usize,
-  writable_data: bool,
   require_static_regions: bool,
 }
 
@@ -948,7 +951,8 @@ pub struct UnboundProgram {
   code_size: usize,
   page_size: usize,
   guest_stack_size: usize,
-  writable_data: bool,
+  run_lock: RwLock<()>,
+  data_protection_failed: Cell<bool>,
   code_arena: RefCell<CodeArena>,
   cage: PointerCage,
   helper_id_xor: u16,
@@ -1385,6 +1389,60 @@ impl Drop for PreemptionEnabled {
   }
 }
 
+/// Exclusive lease for an invocation that may mutate packed ELF data.
+///
+/// The permission transition is tied to the lease so cancellation restores
+/// read-only protection before the write lock can be released.
+struct WritableRunGuard<'a> {
+  program: &'a Program,
+  _lease: parking_lot::RwLockWriteGuard<'a, ()>,
+  writable: bool,
+}
+
+impl<'a> WritableRunGuard<'a> {
+  fn try_new(program: &'a Program) -> Result<Self, RuntimeError> {
+    let Some(lease) = program.unbound.run_lock.try_write() else {
+      return Err(RuntimeError::ProgramBusy);
+    };
+    if program.unbound.data_protection_failed.get() {
+      return Err(RuntimeError::PlatformError(
+        "writable data protection is unavailable",
+      ));
+    }
+    program.unbound.cage.protect_writable_data(true)?;
+    Ok(Self {
+      program,
+      _lease: lease,
+      writable: true,
+    })
+  }
+
+  fn restore(&mut self) -> Result<(), RuntimeError> {
+    if !self.writable {
+      return Ok(());
+    }
+    self.writable = false;
+    if let Err(err) = self.program.unbound.cage.protect_writable_data(false) {
+      self.program.unbound.data_protection_failed.set(true);
+      if !self.program.unbound.cage.quarantine_writable_data() {
+        std::process::abort();
+      }
+      return Err(err);
+    }
+    Ok(())
+  }
+
+  fn finish(mut self) -> Result<(), RuntimeError> {
+    self.restore()
+  }
+}
+
+impl Drop for WritableRunGuard<'_> {
+  fn drop(&mut self) {
+    let _ = self.restore();
+  }
+}
+
 impl Program {
   /// Returns the unique program identifier.
   pub fn id(&self) -> u64 {
@@ -1808,7 +1866,11 @@ impl Program {
     Ok(entrypoint)
   }
 
-  /// Runs the program entrypoint with the provided resources and calldata.
+  /// Runs the program entrypoint with immutable access to shared ELF data.
+  ///
+  /// Multiple immutable runs may interleave. A live [`Program::run_mut`]
+  /// conflicts and produces an error immediately rather than waiting.
+  #[allow(clippy::await_holding_lock)] // the read lease intentionally spans the full async run
   pub async fn run(
     &self,
     timeslice: &TimesliceConfig,
@@ -1816,14 +1878,44 @@ impl Program {
     entrypoint: &str,
     resources: &mut [&mut dyn Any],
     calldata: &[u8],
-    preemption: &PreemptionEnabled,
+    _preemption: &PreemptionEnabled,
   ) -> Result<i64, Error> {
+    let Some(_lease) = self.unbound.run_lock.try_read() else {
+      return Err(Error(RuntimeError::ProgramBusy));
+    };
+    if self.unbound.data_protection_failed.get() {
+      return Err(Error(RuntimeError::PlatformError(
+        "writable data protection is unavailable",
+      )));
+    }
     self
       ._run(
-        timeslice, timeslicer, entrypoint, resources, calldata, preemption,
+        timeslice, timeslicer, entrypoint, resources, calldata, false,
       )
       .await
       .map_err(Error)
+  }
+
+  /// Runs an entrypoint with exclusive, persistent access to mutable ELF data.
+  ///
+  /// The lease is non-blocking: a conflicting invocation returns an error
+  /// immediately. Only the packed writable-data suffix is made read-write, and
+  /// it is restored to read-only before the exclusive lease is released.
+  pub async fn run_mut(
+    &self,
+    timeslice: &TimesliceConfig,
+    timeslicer: &impl Timeslicer,
+    entrypoint: &str,
+    resources: &mut [&mut dyn Any],
+    calldata: &[u8],
+    _preemption: &PreemptionEnabled,
+  ) -> Result<i64, Error> {
+    let guard = WritableRunGuard::try_new(self).map_err(Error)?;
+    let result = self
+      ._run(timeslice, timeslicer, entrypoint, resources, calldata, true)
+      .await;
+    guard.finish().map_err(Error)?;
+    result.map_err(Error)
   }
 
   async fn _run(
@@ -1833,7 +1925,7 @@ impl Program {
     entrypoint: &str,
     resources: &mut [&mut dyn Any],
     calldata: &[u8],
-    _: &PreemptionEnabled,
+    writable_data: bool,
   ) -> Result<i64, RuntimeError> {
     // Once the code budget is gone nothing can ever be compiled again, so fail
     // before running anything rather than replaying the program up to the call
@@ -1885,26 +1977,6 @@ impl Program {
     let guest_stack_size = self.unbound.guest_stack_size;
     let mut ectx = BorrowedExecContext::new(guest_stack_size);
 
-    // Mutable ELF state belongs to an invocation, not to the loaded program.
-    // Runs may interleave while an async helper is pending, so sharing this
-    // backing would let one invocation observe and overwrite another's globals.
-    // The cage remains the relocated, read-only initial image; writable runs
-    // get the same guest address range backed by a guarded private copy.
-    let data_len = self.unbound.cage.data_top() - self.unbound.cage.data_bottom();
-    let mut private_data = if self.unbound.writable_data {
-      let mut region = GuardedRegion::new(data_len)?;
-      let initial = self
-        .unbound
-        .cage
-        .data_slice(self.unbound.cage.data_bottom(), data_len)
-        .expect("the cage owns its full data range");
-      let initial = unsafe { std::slice::from_raw_parts(initial.as_ptr() as *const u8, data_len) };
-      region.as_mut_slice().copy_from_slice(initial);
-      Some(region)
-    } else {
-      None
-    };
-
     ectx.ctx.guest_stack.as_mut_slice()[guest_stack_size - calldata.len()..]
       .copy_from_slice(calldata);
     let calldata_len = calldata.len();
@@ -1949,11 +2021,7 @@ impl Program {
         stack_native_base,
         data_guest_bottom: self.unbound.cage.data_bottom(),
         data_guest_top: self.unbound.cage.data_top(),
-        data_native_base: private_data
-          .as_mut()
-          .map(GuardedRegion::as_mut_ptr)
-          .map(|ptr| ptr as usize)
-          .unwrap_or_else(|| self.unbound.cage.data_native_base()),
+        data_native_base: self.unbound.cage.data_native_base(),
         derived: [0; 12],
         local_call_guest_floor,
         local_call_native_floor,
@@ -2003,6 +2071,10 @@ impl Program {
           x.yielder.set(yielder);
           x.pointer_cage_protected_range
             .set((0, POINTER_CAGE_PROTECTED_WINDOW));
+          x.data_range.set((
+            memory.data_native_base,
+            memory.data_native_base + (memory.data_guest_top - memory.data_guest_bottom),
+          ));
           compiler_fence(Ordering::Release);
           x.valid.store(true, Ordering::Relaxed);
         });
@@ -2015,6 +2087,7 @@ impl Program {
             x.yielder.set(None);
             x.code_range.set((0, 0));
             x.pointer_cage_protected_range.set((0, 0));
+            x.data_range.set((0, 0));
           });
         });
 
@@ -2028,6 +2101,7 @@ impl Program {
             mutable_dereferenced_regions: unsafe { std::mem::zeroed() },
             immutable_dereferenced_regions: unsafe { std::mem::zeroed() },
             can_post_task: false,
+            writable_data,
           })
           .map_err(|_| RuntimeError::AsyncHelperError(helper_name))?;
         }
@@ -2050,6 +2124,7 @@ impl Program {
           x.yielder.set(None);
           x.code_range.set((0, 0));
           x.pointer_cage_protected_range.set((0, 0));
+          x.data_range.set((0, 0));
           yielder
         });
         yielder = next_yielder;
@@ -2100,6 +2175,7 @@ impl Program {
           mutable_dereferenced_regions: unsafe { std::mem::zeroed() },
           immutable_dereferenced_regions: unsafe { std::mem::zeroed() },
           can_post_task: false,
+          writable_data,
         };
 
         // A lazy local call JIT-compiles a function on this thread before the
@@ -2235,11 +2311,7 @@ impl Program {
 /// apart: `native_frame_base` and `frame_constants` are on because both entry
 /// trampolines above establish exactly the frame the backend expects, and
 /// neither means anything without the pointer cage.
-fn jit_config(
-  cage: &PointerCage,
-  writable_data: bool,
-  instruction_limit: usize,
-) -> crate::jit::Config {
+fn jit_config(cage: &PointerCage, instruction_limit: usize) -> crate::jit::Config {
   crate::jit::Config {
     target: crate::jit::Target::host(),
     pointer_mask: cage.mask(),
@@ -2247,7 +2319,6 @@ fn jit_config(
     // Both entry trampolines establish the frame these describe.
     native_frame_base: true,
     frame_constants: true,
-    writable_data,
     instruction_limit,
     dispatcher: Some(tls_dispatcher),
     dispatcher_validate: Some(std_validator),
@@ -2365,13 +2436,12 @@ impl ProgramLoader {
       code_size_limit: DEFAULT_CODE_SIZE_LIMIT,
       instruction_limit: crate::jit::abi::MAX_INSTS as usize,
       guest_stack_size: DEFAULT_GUEST_STACK_SIZE,
-      writable_data: false,
       require_static_regions: false,
     }
   }
 
   /// Requires every guest memory access to be statically routable to a single
-  /// region (stack or read-only data). When enabled, compilation fails if the
+  /// region (stack or data). When enabled, compilation fails if the
   /// region analysis cannot classify any load, store, or atomic — i.e. no
   /// access falls back to the dual-region runtime probe. Memory accesses
   /// reached only through unmodeled control flow (e.g. an argument pointer in a
@@ -2448,17 +2518,6 @@ impl ProgramLoader {
     self
   }
 
-  /// Allows the guest to mutate a private copy of allocated ELF data sections.
-  ///
-  /// Each invocation starts from the relocated load-time image and receives
-  /// its own guarded backing, so globals cannot leak across interleaved async
-  /// executions. The loaded program image remains read-only. Disabled by
-  /// default.
-  pub fn with_writable_data(mut self, writable: bool) -> Self {
-    self.writable_data = writable;
-    self
-  }
-
   /// Loads an ELF image into a new `UnboundProgram`.
   pub fn load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, Error> {
     self._load(rng, elf).map_err(Error)
@@ -2466,15 +2525,38 @@ impl ProgramLoader {
 
   fn _load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, RuntimeError> {
     let start_time = Instant::now();
-    let cage = PointerCage::new(rng, self.guest_stack_size, elf.len())?;
+    let writable_plan = plan_writable_data(elf).map_err(RuntimeError::Linker)?;
+    let cage = PointerCage::new(rng, self.guest_stack_size, elf.len(), writable_plan.size)?;
 
     let code_sections = {
       let mut data = cage.data_slice(cage.data_bottom(), elf.len()).unwrap();
       let data = unsafe { data.as_mut() };
       data.copy_from_slice(elf);
 
-      link_elf(data, cage.data_bottom(), &self.helpers_inverse).map_err(RuntimeError::Linker)?
+      link_elf(
+        data,
+        cage.data_bottom(),
+        cage.writable_data_bottom(),
+        &writable_plan,
+        &self.helpers_inverse,
+      )
+      .map_err(RuntimeError::Linker)?
     };
+
+    // Relocations above were applied to the immutable ELF image. Copy only the
+    // allocated writable sections into their packed, page-aligned suffix;
+    // code, rodata, and ELF metadata remain single-copy in the frozen prefix.
+    for section in &writable_plan.sections {
+      unsafe {
+        std::ptr::copy_nonoverlapping(
+          (cage.data_native_base() + section.file_offset) as *const u8,
+          (cage.data_native_base()
+            + (cage.writable_data_bottom() - cage.data_bottom())
+            + section.backing_offset) as *mut u8,
+          section.size,
+        );
+      }
+    }
     cage.freeze_data();
 
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -2523,11 +2605,7 @@ impl ProgramLoader {
     let resolvers = HashMap::new();
     let next_resolver_id = 1u32;
 
-    let config = std::sync::Arc::new(jit_config(
-      &cage,
-      self.writable_data,
-      self.instruction_limit,
-    ));
+    let config = std::sync::Arc::new(jit_config(&cage, self.instruction_limit));
 
     for (section_name, code_vaddr_size) in code_sections {
       let code = cage
@@ -2600,7 +2678,8 @@ impl ProgramLoader {
       code_size: code_len_allocated,
       page_size,
       guest_stack_size: self.guest_stack_size,
-      writable_data: self.writable_data,
+      run_lock: RwLock::new(()),
+      data_protection_failed: Cell::new(false),
       code_arena: RefCell::new(CodeArena { used: 0 }),
       cage,
       helper_id_xor: self.helper_id_xor,
@@ -2732,12 +2811,13 @@ unsafe extern "C" fn sigsegv_handler(
 ) {
   let fail = || chain_to_previous_sigsegv_handler();
 
-  let Some((jit_code_zone, pointer_cage, yielder)) = ACTIVE_JIT_CODE_ZONE.with(|x| {
+  let Some((jit_code_zone, pointer_cage, data_range, yielder)) = ACTIVE_JIT_CODE_ZONE.with(|x| {
     if x.valid.load(Ordering::Relaxed) {
       compiler_fence(Ordering::Acquire);
       Some((
         x.code_range.get(),
         x.pointer_cage_protected_range.get(),
+        x.data_range.get(),
         x.yielder.get(),
       ))
     } else {
@@ -2759,7 +2839,9 @@ unsafe extern "C" fn sigsegv_handler(
   }
 
   let si_addr = (*siginfo).si_addr() as usize;
-  if si_addr < pointer_cage.0 || si_addr >= pointer_cage.1 {
+  let in_fault_window = si_addr >= pointer_cage.0 && si_addr < pointer_cage.1;
+  let in_data = si_addr >= data_range.0 && si_addr < data_range.1;
+  if !in_fault_window && !in_data {
     return fail();
   }
 

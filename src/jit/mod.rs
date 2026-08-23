@@ -131,9 +131,6 @@ pub struct Config {
   /// constants below the frame pointer. Enables access plans.
   pub frame_constants: bool,
 
-  /// Permit stores into the ELF data region. Disabled by default.
-  pub writable_data: bool,
-
   /// Exclusive upper bound on decoded eBPF instruction slots.
   pub instruction_limit: usize,
 
@@ -160,7 +157,6 @@ impl Default for Config {
       pointer_offset: 0,
       native_frame_base: false,
       frame_constants: false,
-      writable_data: false,
       instruction_limit: abi::MAX_INSTS as usize,
       // Safe default: a caller that has not set up a pointer cage should have
       // to say explicitly that it wants unchecked guest accesses.
@@ -186,7 +182,7 @@ impl Config {
   /// check the cage would otherwise emit, and its members read the leader's
   /// translated base out of the frame constants.
   pub const fn access_plans_active(&self) -> bool {
-    self.pointer_mask != 0 && self.frame_constants && !self.writable_data
+    self.pointer_mask != 0 && self.frame_constants
   }
 }
 

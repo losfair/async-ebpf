@@ -693,7 +693,7 @@ impl Emit<'_, '_, '_> {
     scratch: u8,
     offset: i32,
     size: i32,
-    store: bool,
+    _store: bool,
     region_hint: u8,
   ) {
     debug_assert_ne!(dst, scratch);
@@ -711,13 +711,11 @@ impl Emit<'_, '_, '_> {
     }
 
     if self.cfg.pointer_mask != 0 {
-      // Stores are confined to the active stack regardless of the hint, which
-      // is what preserves the read-only guarantee for the data region.
-      if !self.cfg.writable_data && (store || region_hint == abi::region::STACK) {
+      if region_hint == abi::region::STACK {
         self.emit_single_region_address(dst, scratch, size, &STACK_REGION);
         return;
       }
-      if !self.cfg.writable_data && region_hint == abi::region::DATA {
+      if region_hint == abi::region::DATA {
         self.emit_single_region_address(dst, scratch, size, &DATA_REGION);
         return;
       }
@@ -784,9 +782,6 @@ impl Emit<'_, '_, '_> {
             && g.written & (1u16 << base_ebpf) == 0
             && plan.delta as u64 + width as u64 <= g.span as u64
             && g.lo as i64 + plan.delta as i64 == offset as i64
-            // A store cannot ride a window checked against the read-only data
-            // region.
-            && (!store || self.cfg.writable_data || g.region == abi::region::STACK)
         }
         _ => false,
       };
@@ -805,8 +800,7 @@ impl Emit<'_, '_, '_> {
         && plan.span <= abi::MAX_GROUP_SPAN
         && plan.delta as u64 + width as u64 <= plan.span as u64
         && plan.lo as i64 + plan.delta as i64 == offset as i64
-        && plan.region != abi::region::FRAME
-        && (!store || self.cfg.writable_data || plan.region == abi::region::STACK);
+        && plan.region != abi::region::FRAME;
       if usable {
         self.emit_masked_address_with_offset(
           base,
@@ -2160,8 +2154,8 @@ impl Emit<'_, '_, '_> {
         let mut atomic_dst = dst;
         let mut atomic_offset = inst.offset as i32;
         if self.cfg.pointer_mask != 0 {
-          // The hint is forced to UNKNOWN, but `store` is true, so this is a
-          // stack-region check regardless: an atomic is a write.
+          // Atomics use the ordinary all-region runtime probe. Page protection
+          // decides whether the selected data backing is writable for this invocation.
           self.emit_masked_address_with_offset(
             dst,
             R11,
@@ -3354,9 +3348,8 @@ mod tests {
   #[test]
   fn stores_match_under_every_region_hint() {
     let mut s = Sweep::new();
-    // The store paths are not the load paths: a store is pinned to the stack
-    // region whatever the hint says, and the immediate form swaps the address
-    // and scratch registers around.
+    // Stores use the same region hints as loads; the immediate form still swaps
+    // the address and scratch registers around.
     for hint in [
       abi::region::UNKNOWN,
       abi::region::STACK,
@@ -3417,7 +3410,7 @@ mod tests {
 
     // Every one of these must make the backend fall back to a checked access,
     // at exactly the places the plan stops being self-consistent.
-    let hostile: [[PlanEntry; 4]; 8] = [
+    let hostile: [[PlanEntry; 4]; 7] = [
       // A span of zero.
       plan3(abi::plan_role::LEADER, abi::region::STACK, 0, 0, 0, 0),
       // A span wider than a page.
@@ -3432,8 +3425,6 @@ mod tests {
       plan3(abi::plan_role::MEMBER, abi::region::STACK, 8, 64, 0, 99),
       // A member whose delta lands outside the leader's window.
       plan3(abi::plan_role::MEMBER, abi::region::STACK, 4096, 64, 0, 0),
-      // A store riding a window checked against the read-only data region.
-      plan3(abi::plan_role::LEADER, abi::region::DATA, 0, 64, 0, 0),
     ];
     for plan in hostile {
       let inputs = TranslationInputs {

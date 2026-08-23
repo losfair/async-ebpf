@@ -207,7 +207,6 @@ fn hostile_config(target: Target) -> Arc<Config> {
     pointer_offset: 0x1_0000_0000,
     native_frame_base: true,
     frame_constants: true,
-    writable_data: false,
     instruction_limit: crate::jit::abi::MAX_INSTS as usize,
     dispatcher: Some(never_called_dispatcher),
     dispatcher_validate: Some(accept_every_helper),

@@ -709,7 +709,7 @@ fn emit_masked_address_with_offset(
   scratch: u32,
   offset: i16,
   size: i32,
-  store: bool,
+  _store: bool,
   region_hint: u8,
 ) {
   debug_assert_ne!(dst, scratch);
@@ -738,15 +738,11 @@ fn emit_masked_address_with_offset(
   }
 
   if cfg.pointer_mask != 0 {
-    // Stores are always confined to the active stack regardless of the hint,
-    // preserving the read-only guarantee for the data region.
-    if !cfg.writable_data
-      && (store || region_hint == abi::region::STACK || region_hint == abi::region::FRAME)
-    {
+    if region_hint == abi::region::STACK || region_hint == abi::region::FRAME {
       emit_region_address(cfg, st, dst, scratch, size, &GUEST_STACK_REGION);
       return;
     }
-    if !cfg.writable_data && region_hint == abi::region::DATA {
+    if region_hint == abi::region::DATA {
       emit_region_address(cfg, st, dst, scratch, size, &GUEST_DATA_REGION);
       return;
     }
@@ -815,7 +811,6 @@ fn emit_checked_address(
             && group.written & (1u16 << base_ebpf) == 0
             && plan.delta as u64 + width as u64 <= group.span as u64
             && group.lo as i64 + plan.delta as i64 == offset as i64
-            && (!store || cfg.writable_data || group.region == abi::region::STACK)
         }
         _ => false,
       };
@@ -833,7 +828,6 @@ fn emit_checked_address(
         && plan.delta as u64 + width as u64 <= plan.span as u64
         && plan.lo as i64 + plan.delta as i64 == offset as i64
         && plan.region != abi::region::FRAME
-        && (!store || cfg.writable_data || plan.region == abi::region::STACK)
         && plan.lo >= i16::MIN as i32
         && plan.lo <= i16::MAX as i32;
       if usable {
@@ -3023,7 +3017,7 @@ mod tests {
   }
 
   #[test]
-  fn a_store_group_is_honoured_only_against_the_stack() {
+  fn a_store_group_is_honoured_in_every_region() {
     for region in [abi::region::STACK, abi::region::DATA, abi::region::UNKNOWN] {
       let insns = vec![
         insn(cls::STX | mode::MEM | size::DW, 2, 1, 0, 0),

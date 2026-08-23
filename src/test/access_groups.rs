@@ -41,9 +41,8 @@ fn base_in_frame() -> Vec<Insn> {
 /// The displacements have to survive the round trip: what a member writes at
 /// `[base + d]` is what a member reads back from `[base + d]`.
 ///
-/// Stores and loads share one base here, so they land in a single group - which
-/// is the case worth pinning down, because a store is confined to the stack
-/// whatever its hint says and the loads inherit that window.
+/// Stores and loads share one base here, so they land in a single group and
+/// reuse the same statically selected region window.
 #[tokio::test]
 async fn a_mixed_group_round_trips_every_displacement() {
   let mut code = base_in_frame();

@@ -10,6 +10,7 @@ const EM_BPF: u16 = 247;
 const SHT_PROGBITS: u32 = 1;
 const SHT_REL: u32 = 9;
 const SHF_ALLOC: u64 = 1 << 1;
+const SHF_WRITE: u64 = 1;
 const SHF_EXECINSTR: u64 = 1 << 2;
 
 const R_BPF_64_64: u32 = 1;
@@ -18,6 +19,103 @@ const R_BPF_64_32: u32 = 10;
 
 const EBPF_OP_CALL: u8 = 0x05u8 | 0x80u8;
 const EBPF_OP_LDDW: u8 = 0x18;
+
+#[derive(Clone, Debug)]
+pub(crate) struct WritableSection {
+  pub(crate) index: usize,
+  pub(crate) file_offset: usize,
+  pub(crate) size: usize,
+  pub(crate) backing_offset: usize,
+}
+
+/// Packed runtime layout for allocated writable ELF sections.
+///
+/// The immutable ELF image keeps its file layout. Writable sections get new
+/// guest addresses in a dense suffix of the same DATA region; this plan is the
+/// bridge used both by relocation and by the loader's one-time copy. The
+/// protection boundary is invisible to region analysis and the JIT.
+#[derive(Clone, Debug)]
+pub(crate) struct WritableDataPlan {
+  pub(crate) sections: Vec<WritableSection>,
+  pub(crate) size: usize,
+}
+
+impl WritableDataPlan {
+  fn backing_offset(&self, section_index: usize) -> Option<usize> {
+    self
+      .sections
+      .iter()
+      .find(|section| section.index == section_index)
+      .map(|section| section.backing_offset)
+  }
+}
+
+pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, LinkerError> {
+  let elf = ElfBytes::<LittleEndian>::minimal_parse(input)?;
+  let Some(sht) = elf.section_headers() else {
+    return Err(LinkerError::InvalidElf("missing section headers"));
+  };
+
+  let mut sections = Vec::new();
+  let mut claimed_ranges = Vec::new();
+  let mut size = 0usize;
+  for (index, section) in sht.iter().enumerate() {
+    if section.sh_type != SHT_PROGBITS
+      || section.sh_flags & (SHF_ALLOC | SHF_WRITE) != SHF_ALLOC | SHF_WRITE
+      || section.sh_size == 0
+    {
+      continue;
+    }
+
+    // This validates the file range before converting it to usize below.
+    elf.section_data(&section)?;
+    let file_offset = usize::try_from(section.sh_offset)
+      .map_err(|_| LinkerError::InvalidElf("writable section offset does not fit usize"))?;
+    let section_size = usize::try_from(section.sh_size)
+      .map_err(|_| LinkerError::InvalidElf("writable section size does not fit usize"))?;
+    let file_end = file_offset
+      .checked_add(section_size)
+      .ok_or(LinkerError::InvalidElf("writable section range overflow"))?;
+    if claimed_ranges
+      .iter()
+      .any(|&(lo, hi)| file_offset < hi && lo < file_end)
+    {
+      return Err(LinkerError::InvalidElf(
+        "writable section overlaps another writable section",
+      ));
+    }
+    claimed_ranges.push((file_offset, file_end));
+
+    let alignment = usize::try_from(section.sh_addralign.max(1))
+      .map_err(|_| LinkerError::InvalidElf("writable section alignment does not fit usize"))?;
+    if !alignment.is_power_of_two() {
+      return Err(LinkerError::InvalidElf(
+        "writable section alignment is not a power of two",
+      ));
+    }
+    size = size
+      .checked_add(alignment - 1)
+      .map(|value| value & !(alignment - 1))
+      .ok_or(LinkerError::InvalidElf("writable data layout overflow"))?;
+    let backing_offset = size;
+    size = size
+      .checked_add(section_size)
+      .ok_or(LinkerError::InvalidElf("writable data layout overflow"))?;
+    if size > input.len() {
+      return Err(LinkerError::InvalidElf(
+        "writable sections exceed the ELF image size",
+      ));
+    }
+    sections.push(WritableSection {
+      index,
+      file_offset,
+      size: section_size,
+      backing_offset,
+    });
+  }
+
+  Ok(WritableDataPlan { sections, size })
+}
 
 /// Ceilings on how much work one object may ask the loader to do.
 ///
@@ -75,7 +173,9 @@ impl EbpfInsn {
 /// Returns: section_name -> (code_vaddr, code_size).
 pub fn link_elf(
   input: &mut [u8],
-  vbase: usize,
+  immutable_vbase: usize,
+  writable_vbase: usize,
+  writable_plan: &WritableDataPlan,
   ext_func_table: &HashMap<&str, i32>,
 ) -> Result<HashMap<String, (usize, usize)>, LinkerError> {
   let elf = ElfBytes::<LittleEndian>::minimal_parse(input)?;
@@ -138,7 +238,7 @@ pub fn link_elf(
 
     code_sections.insert(
       cs_name.to_string(),
-      (vbase + cs.sh_offset as usize, cs.sh_size as usize),
+      (immutable_vbase + cs.sh_offset as usize, cs.sh_size as usize),
     );
     code_section_indexes.insert(cs_index);
     if code_sections.len() > MAX_CODE_SECTIONS {
@@ -214,10 +314,11 @@ pub fn link_elf(
             .try_into()
             .unwrap(),
         );
-        let value = (vbase as u64)
-          .wrapping_add(data_section.sh_offset)
-          .wrapping_add(sym.st_value)
-          .wrapping_add(addend);
+        let section_base = writable_plan
+          .backing_offset(sym.st_shndx as usize)
+          .map(|offset| writable_vbase as u64 + offset as u64)
+          .unwrap_or_else(|| immutable_vbase as u64 + data_section.sh_offset);
+        let value = section_base.wrapping_add(sym.st_value).wrapping_add(addend);
         data_rewrites.push((
           target_section.sh_offset as usize + reloc.r_offset as usize,
           value,
@@ -308,10 +409,11 @@ pub fn link_elf(
           ) as u64)
             << 32);
 
-        let imm = (vbase as u64)
-          .wrapping_add(data_section.sh_offset)
-          .wrapping_add(sym.st_value)
-          .wrapping_add(oldimm);
+        let section_base = writable_plan
+          .backing_offset(sym.st_shndx as usize)
+          .map(|offset| writable_vbase as u64 + offset as u64)
+          .unwrap_or_else(|| immutable_vbase as u64 + data_section.sh_offset);
+        let imm = section_base.wrapping_add(sym.st_value).wrapping_add(oldimm);
 
         insn.imm = imm as u32 as i32;
         insn_rewrites.push((

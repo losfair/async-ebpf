@@ -1,6 +1,6 @@
 use std::{any::Any, sync::Arc, time::Duration};
 
-use tokio::sync::Barrier;
+use tokio::sync::Notify;
 
 use crate::{
   error::{Error, RuntimeError},
@@ -57,13 +57,18 @@ static HELPERS: &'static [(&'static str, Helper)] = &[
 ];
 static FAILING_ASYNC_HELPERS: &[(&str, Helper)] = &[("fail_async", h_fail_async)];
 
-struct InterleavingGate(Arc<Barrier>);
+struct InterleavingGate {
+  entered: Arc<Notify>,
+  release: Arc<Notify>,
+}
 
 fn h_wait_for_peer(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-  let barrier =
-    scope.with_resource_mut::<InterleavingGate, _>(|gate| gate.map(|gate| Arc::clone(&gate.0)))?;
+  let (entered, release) = scope.with_resource_mut::<InterleavingGate, _>(|gate| {
+    gate.map(|gate| (Arc::clone(&gate.entered), Arc::clone(&gate.release)))
+  })?;
   scope.post_task(async move {
-    barrier.wait().await;
+    entered.notify_one();
+    release.notified().await;
     |_: &HelperScope| Ok(0)
   });
   Ok(0)
@@ -86,7 +91,7 @@ fn h_fill_user_memory(
 static WRITABLE_DATA_HELPERS: &[(&str, Helper)] = &[("fill_user_memory", h_fill_user_memory)];
 
 #[tokio::test]
-async fn writable_globals_are_private_to_interleaved_invocations() {
+async fn writable_globals_are_exclusive_and_persist() {
   let binary = compile_ebpf(
     br#"
       extern void wait_for_peer(void);
@@ -114,18 +119,19 @@ async fn writable_globals_are_private_to_interleaved_invocations() {
     &mut rand::thread_rng(),
     Arc::new(DummyProgramEventListener),
     &[INTERLEAVING_HELPERS],
-  )
-  .with_writable_data(true);
+  );
   let prog = loader
     .load(&mut rand::thread_rng(), &binary)
     .unwrap()
     .pin_to_current_thread(t_env);
 
-  let barrier = Arc::new(Barrier::new(2));
-  let mut gate_a = InterleavingGate(Arc::clone(&barrier));
-  let mut gate_b = InterleavingGate(barrier);
+  let entered = Arc::new(Notify::new());
+  let release = Arc::new(Notify::new());
+  let mut gate_a = InterleavingGate {
+    entered: Arc::clone(&entered),
+    release: Arc::clone(&release),
+  };
   let mut resources_a: [&mut dyn Any; 1] = [&mut gate_a];
-  let mut resources_b: [&mut dyn Any; 1] = [&mut gate_b];
   let input_a = 0xaaaa_u64.to_ne_bytes();
   let input_b = 0xbbbb_u64.to_ne_bytes();
   let preemption_a = PreemptionEnabled::new(prog.thread_env());
@@ -133,8 +139,8 @@ async fn writable_globals_are_private_to_interleaved_invocations() {
   let timeslice = timeslice_config();
   let timeslicer = TokioTimeslicer;
 
-  let (result_a, result_b) = tokio::join!(
-    prog.run(
+  let (result_a, ()) = tokio::join!(
+    prog.run_mut(
       &timeslice,
       &timeslicer,
       "test",
@@ -142,18 +148,39 @@ async fn writable_globals_are_private_to_interleaved_invocations() {
       &input_a,
       &preemption_a,
     ),
-    prog.run(
-      &timeslice,
-      &timeslicer,
-      "test",
-      &mut resources_b,
-      &input_b,
-      &preemption_b,
-    ),
+    async {
+      entered.notified().await;
+      assert!(matches!(
+        prog
+          .run_mut(
+            &timeslice,
+            &timeslicer,
+            "test",
+            &mut [],
+            &input_b,
+            &preemption_b,
+          )
+          .await,
+        Err(Error(RuntimeError::ProgramBusy))
+      ));
+      assert!(matches!(
+        prog
+          .run(
+            &timeslice,
+            &timeslicer,
+            "initial",
+            &mut [],
+            &[],
+            &preemption_b,
+          )
+          .await,
+        Err(Error(RuntimeError::ProgramBusy))
+      ));
+      release.notify_one();
+    },
   );
 
   assert_eq!(result_a.unwrap(), 0xaaaa);
-  assert_eq!(result_b.unwrap(), 0xbbbb);
 
   let initial = prog
     .run(
@@ -166,11 +193,93 @@ async fn writable_globals_are_private_to_interleaved_invocations() {
     )
     .await
     .unwrap();
-  assert_eq!(initial, 7);
+  assert_eq!(initial, 0xaaaa);
 }
 
 #[tokio::test]
-async fn helpers_can_mutate_only_invocation_private_writable_data() {
+async fn cancelling_a_writable_run_restores_protection_before_unlocking() {
+  let binary = compile_ebpf(
+    br#"
+      extern void wait_for_peer(void);
+      volatile unsigned long long state = 7;
+
+      unsigned long long __attribute__((section("hold"))) entry_hold(void) {
+        wait_for_peer();
+        state = 9;
+        return state;
+      }
+      unsigned long long __attribute__((section("write"))) write_state(void) {
+        state = 10;
+        return state;
+      }
+    "#
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let (_, t_env) = gt_env();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[INTERLEAVING_HELPERS],
+  )
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(t_env);
+  let entered = Arc::new(Notify::new());
+  let release = Arc::new(Notify::new());
+  let mut gate = InterleavingGate {
+    entered: Arc::clone(&entered),
+    release,
+  };
+  let mut resources: [&mut dyn Any; 1] = [&mut gate];
+  let timeslice = timeslice_config();
+  let preemption = PreemptionEnabled::new(t_env);
+  let mut run = Box::pin(program.run_mut(
+    &timeslice,
+    &TokioTimeslicer,
+    "hold",
+    &mut resources,
+    &[],
+    &preemption,
+  ));
+  tokio::select! {
+    _ = entered.notified() => {}
+    result = &mut run => panic!("writable run returned before suspension: {result:?}"),
+  }
+  drop(run);
+
+  assert!(matches!(
+    program
+      .run(
+        &timeslice,
+        &TokioTimeslicer,
+        "write",
+        &mut [],
+        &[],
+        &preemption,
+      )
+      .await,
+    Err(Error(RuntimeError::MemoryFault(_)))
+  ));
+  assert_eq!(
+    program
+      .run_mut(
+        &timeslice,
+        &TokioTimeslicer,
+        "write",
+        &mut [],
+        &[],
+        &preemption,
+      )
+      .await
+      .unwrap(),
+    10
+  );
+}
+
+#[tokio::test]
+async fn helpers_mutate_data_only_through_the_writable_entry() {
   let binary = compile_ebpf(
     br#"
       extern unsigned long long fill_user_memory(
@@ -196,12 +305,11 @@ async fn helpers_can_mutate_only_invocation_private_writable_data() {
     Arc::new(DummyProgramEventListener),
     &[WRITABLE_DATA_HELPERS],
   )
-  .with_writable_data(true)
   .load(&mut rand::thread_rng(), &binary)
   .unwrap()
   .pin_to_current_thread(t_env);
   let result = writable
-    .run(
+    .run_mut(
       &timeslice_config(),
       &TokioTimeslicer,
       "test",
@@ -213,16 +321,8 @@ async fn helpers_can_mutate_only_invocation_private_writable_data() {
     .unwrap();
   assert_eq!(result, 0x5a5a);
 
-  let read_only = ProgramLoader::new(
-    &mut rand::thread_rng(),
-    Arc::new(DummyProgramEventListener),
-    &[WRITABLE_DATA_HELPERS],
-  )
-  .load(&mut rand::thread_rng(), &binary)
-  .unwrap()
-  .pin_to_current_thread(t_env);
   assert!(matches!(
-    read_only
+    writable
       .run(
         &timeslice_config(),
         &TokioTimeslicer,
@@ -233,6 +333,96 @@ async fn helpers_can_mutate_only_invocation_private_writable_data() {
       )
       .await,
     Err(Error(RuntimeError::HelperError("fill_user_memory")))
+  ));
+}
+
+#[tokio::test]
+async fn mutable_data_and_rodata_keep_distinct_page_permissions() {
+  let binary = compile_ebpf(
+    br#"
+      volatile unsigned long long state = 7;
+      static const volatile unsigned long long frozen = 9;
+
+      unsigned long long __attribute__((section("write_state"))) entry_write_state(void) {
+        return ++state;
+      }
+      unsigned long long __attribute__((section("read"))) read_both(void) {
+        return state + frozen;
+      }
+      unsigned long long __attribute__((section("write_frozen"))) entry_write_frozen(void) {
+        *(volatile unsigned long long *)&frozen = 10;
+        return frozen;
+      }
+    "#
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let (_, t_env) = gt_env();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(t_env);
+  let timeslice = timeslice_config();
+  let preemption = PreemptionEnabled::new(t_env);
+
+  assert!(matches!(
+    program
+      .run(
+        &timeslice,
+        &TokioTimeslicer,
+        "write_state",
+        &mut [],
+        &[],
+        &preemption,
+      )
+      .await,
+    Err(Error(RuntimeError::MemoryFault(_)))
+  ));
+  assert_eq!(
+    program
+      .run_mut(
+        &timeslice,
+        &TokioTimeslicer,
+        "write_state",
+        &mut [],
+        &[],
+        &preemption,
+      )
+      .await
+      .unwrap(),
+    8
+  );
+  assert_eq!(
+    program
+      .run(
+        &timeslice,
+        &TokioTimeslicer,
+        "read",
+        &mut [],
+        &[],
+        &preemption,
+      )
+      .await
+      .unwrap(),
+    17
+  );
+  assert!(matches!(
+    program
+      .run_mut(
+        &timeslice,
+        &TokioTimeslicer,
+        "write_frozen",
+        &mut [],
+        &[],
+        &preemption,
+      )
+      .await,
+    Err(Error(RuntimeError::MemoryFault(_)))
   ));
 }
 

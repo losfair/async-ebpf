@@ -28,10 +28,10 @@ use crate::program::{HelperScope, MutableUserMemory};
 ///
 /// * [`user_memory`](HelperScope::user_memory) accepts a guest stack *or* data
 ///   address. [`user_memory_mut`](HelperScope::user_memory_mut) always accepts
-///   stack addresses and also accepts data addresses when the program was loaded
-///   with writable data enabled. Such writes target the invocation's private
-///   copy; the relocated load-time image remains frozen. A data write attempted
-///   without that option returns `Err(())` rather than faulting.
+///   stack addresses and accepts allocated writable-data addresses only during
+///   [`Program::run_mut`](crate::program::Program::run_mut). Those writes target
+///   the program's persistent packed data copy. Immutable invocations and ELF
+///   image/rodata addresses return `Err(())` rather than faulting in host code.
 /// * A read refuses a region overlapping one already handed out for writing,
 ///   and a write refuses one overlapping any region already handed out at all,
 ///   so a mutable view can never alias another live view. Two reads may

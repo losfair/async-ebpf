@@ -87,7 +87,6 @@ fn main() -> anyhow::Result<()> {
     &[TINYCC_HELPERS],
   )
   .with_guest_stack_size(guest_stack_size)
-  .with_writable_data(true)
   .with_instruction_limit(1_000_000)
   .with_code_size_limit(64 * 1024 * 1024);
   let program = loader
@@ -100,7 +99,7 @@ fn main() -> anyhow::Result<()> {
   let mut input = GuestInput(source);
   let mut emitted = EmittedElf::default();
   let mut resources: [&mut dyn Any; 2] = [&mut input, &mut emitted];
-  let result = runtime.block_on(program.run(
+  let result = runtime.block_on(program.run_mut(
     &TimesliceConfig {
       max_run_time_before_throttle: Duration::from_secs(120),
       max_run_time_before_yield: Duration::from_secs(120),
