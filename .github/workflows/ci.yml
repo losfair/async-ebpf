@@ -39,6 +39,49 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+  tinycc-bootstrap:
+    name: TinyCC self-bootstrap (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout async-ebpf
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            llvm \
+            perl
+
+      - name: Checkout pinned TinyCC
+        uses: actions/checkout@v4
+        with:
+          repository: losfair/tinycc
+          ref: ac2dd4a1011674ed3f55eb99bc8fa22bdf635daa
+          path: tinycc
+
+      - name: Configure TinyCC
+        working-directory: tinycc
+        run: ./configure --cc=clang
+
+      - name: Compare native and async-ebpf bootstrap artifacts
+        working-directory: tinycc
+        env:
+          ASYNC_EBPF_WORKTREE: ${{ github.workspace }}
+          TCC_EBPF_STACK_SIZE: 67108864
+        run: ./async-ebpf-host/bootstrap.sh
+
   openbsd-tests:
     name: OpenBSD unit tests (${{ matrix.arch }})
     runs-on: ubuntu-24.04
