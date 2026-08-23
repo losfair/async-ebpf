@@ -1,5 +1,8 @@
 [workspace]
 members = ["oracle/ubpf-sys"]
+# cargo-fuzz crates carry their own lockfile and nightly-only dependencies, and
+# were standalone before this repo became a workspace. Excluding keeps them so.
+exclude = ["fuzz"]
 
 [package]
 name = "async-ebpf"

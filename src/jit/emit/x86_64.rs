@@ -3482,14 +3482,37 @@ mod tests {
       end_pc: insns.len(),
       ..Default::default()
     };
+    // The Rust side alone: it must return an error, never panic. The C oracle
+    // `assert()`s (and so aborts the whole test process) on exactly these
+    // inputs, so it cannot be consulted here at all.
+    let mut panicked = Vec::new();
     for capacity in 0..420usize {
       for (name, config) in config_sweep(Target::X86_64) {
-        let d = diff(&config, &code, &inputs, capacity);
-        assert!(
-          d.is_same(),
-          "capacity {capacity} under {name:?} disagrees\n{d}"
-        );
+        let code = code.clone();
+        let ids = ids;
+        let outcome = std::panic::catch_unwind(move || {
+          let inputs = TranslationInputs {
+            resolver_ids: &ids,
+            start_pc: 0,
+            end_pc: 4,
+            ..Default::default()
+          };
+          let t = crate::jit::Translator::load(std::sync::Arc::new(config), &code)
+            .expect("program must load");
+          let mut buf = vec![0u8; capacity];
+          let _ = t.translate_range(&inputs, &mut buf);
+        });
+        if outcome.is_err() {
+          panicked.push((capacity, name));
+        }
       }
     }
+    assert!(
+      panicked.is_empty(),
+      "the emitter panicked instead of reporting out-of-space at {} capacities, \
+       first {:?}",
+      panicked.len(),
+      &panicked[..panicked.len().min(8)]
+    );
   }
 }
