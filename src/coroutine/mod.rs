@@ -3,7 +3,8 @@
 //! This is intentionally private and only supports the Unix architectures
 //! supported by async-ebpf. The low-level switching design is adapted from
 //! corosensei 0.1.4 (Apache-2.0/MIT), with a reduced platform surface and
-//! OpenBSD stack/BTI support maintained here.
+//! OpenBSD stack/BTI support maintained here. The inherited Darwin support is
+//! also used by the macOS runtime target.
 
 #![allow(dead_code, unexpected_cfgs)]
 

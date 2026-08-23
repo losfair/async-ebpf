@@ -1,8 +1,8 @@
 #[cfg(not(all(
-  any(target_os = "linux", target_os = "openbsd"),
+  any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
   any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
-compile_error!("only x86_64/aarch64 Linux and OpenBSD are supported");
+compile_error!("only x86_64/aarch64 Linux, macOS, and OpenBSD are supported");
 
 mod coroutine;
 /// Error types returned by the runtime.

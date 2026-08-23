@@ -122,6 +122,33 @@ jobs:
             clang --version
             cargo test --locked --features testing -- --test-threads=1
 
+  macos-tests:
+    name: macOS unit tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+          - arch: aarch64
+            runner: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Run unit tests
+        run: cargo test --locked --features testing -- --test-threads=1
+
+      - name: Build
+        run: cargo build --locked
+
   coremark:
     name: CoreMark (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

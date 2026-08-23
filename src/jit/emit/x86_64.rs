@@ -63,7 +63,8 @@ const VOLATILE_CTXT: u8 = R11;
 const RCX_ALT: u8 = R10;
 
 /// eBPF register to x86 register, SysV flavour.
-/// The Windows map differs and is not ported: this crate is Linux/OpenBSD only.
+/// The Windows map differs and is not ported: this crate supports Unix targets
+/// only.
 /// The *structure* is kept — eBPF `R0`-`R5` land on caller-saved registers and
 /// `R6`-`R10` on callee-saved ones — because the helper-call sequence relies on
 /// it to know what it does not have to preserve.
