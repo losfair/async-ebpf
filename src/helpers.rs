@@ -27,10 +27,11 @@ use crate::program::{HelperScope, MutableUserMemory};
 /// # What the scope will and will not do
 ///
 /// * [`user_memory`](HelperScope::user_memory) accepts a guest stack *or* data
-///   address; [`user_memory_mut`](HelperScope::user_memory_mut) accepts only a
-///   stack address, because the data region is frozen read-only after load. The
-///   asymmetry is deliberate, and a write to a data address returns `Err(())`
-///   rather than faulting.
+///   address. [`user_memory_mut`](HelperScope::user_memory_mut) always accepts
+///   stack addresses and also accepts data addresses when the program was loaded
+///   with writable data enabled. Such writes target the invocation's private
+///   copy; the relocated load-time image remains frozen. A data write attempted
+///   without that option returns `Err(())` rather than faulting.
 /// * A read refuses a region overlapping one already handed out for writing,
 ///   and a write refuses one overlapping any region already handed out at all,
 ///   so a mutable view can never alias another live view. Two reads may

@@ -71,6 +71,20 @@ fn h_wait_for_peer(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) 
 
 static INTERLEAVING_HELPERS: &[(&str, Helper)] = &[("wait_for_peer", h_wait_for_peer)];
 
+fn h_fill_user_memory(
+  scope: &HelperScope,
+  ptr: u64,
+  len: u64,
+  value: u64,
+  _: u64,
+  _: u64,
+) -> Result<u64, ()> {
+  scope.user_memory_mut(ptr, len)?.fill(value as u8);
+  Ok(0)
+}
+
+static WRITABLE_DATA_HELPERS: &[(&str, Helper)] = &[("fill_user_memory", h_fill_user_memory)];
+
 #[tokio::test]
 async fn writable_globals_are_private_to_interleaved_invocations() {
   let binary = compile_ebpf(
@@ -153,6 +167,73 @@ async fn writable_globals_are_private_to_interleaved_invocations() {
     .await
     .unwrap();
   assert_eq!(initial, 7);
+}
+
+#[tokio::test]
+async fn helpers_can_mutate_only_invocation_private_writable_data() {
+  let binary = compile_ebpf(
+    br#"
+      extern unsigned long long fill_user_memory(
+        unsigned char *, unsigned long long, unsigned long long
+      );
+      volatile unsigned char global_buffer[2] = { 1, 2 };
+
+      unsigned long long __attribute__((section("test"))) entry(void) {
+        if (fill_user_memory((unsigned char *)global_buffer, 2, 0x5a) != 0) {
+          return 0;
+        }
+        return global_buffer[0] | ((unsigned long long)global_buffer[1] << 8);
+      }
+    "#
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let (_, t_env) = gt_env();
+
+  let writable = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[WRITABLE_DATA_HELPERS],
+  )
+  .with_writable_data(true)
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(t_env);
+  let result = writable
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(result, 0x5a5a);
+
+  let read_only = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[WRITABLE_DATA_HELPERS],
+  )
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(t_env);
+  assert!(matches!(
+    read_only
+      .run(
+        &timeslice_config(),
+        &TokioTimeslicer,
+        "test",
+        &mut [],
+        &[],
+        &PreemptionEnabled::new(t_env),
+      )
+      .await,
+    Err(Error(RuntimeError::HelperError("fill_user_memory")))
+  ));
 }
 
 #[tokio::test]

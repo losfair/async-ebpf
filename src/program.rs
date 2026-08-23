@@ -493,10 +493,11 @@ impl<'a, 'b> HelperScope<'a, 'b> {
     ptr: u64,
     size: u64,
   ) -> Result<MutableUserMemory<'a, 'b, 'c>, ()> {
-    let Some(region) = self
-      .memory
-      .safe_deref_for_write(ptr as usize, size as usize)
-    else {
+    let Some(region) = self.memory.safe_deref_for_write(
+      ptr as usize,
+      size as usize,
+      self.program.unbound.writable_data,
+    ) else {
       tracing::warn!(ptr, size, "invalid write");
       return Err(());
     };
@@ -769,14 +770,32 @@ impl JitMemory {
     }
   }
 
-  fn safe_deref_for_write(&self, guest: usize, size: usize) -> Option<NonNull<[u8]>> {
-    Self::checked_region(
+  fn safe_deref_for_write(
+    &self,
+    guest: usize,
+    size: usize,
+    writable_data: bool,
+  ) -> Option<NonNull<[u8]>> {
+    let stack = Self::checked_region(
       guest,
       size,
       self.stack_guest_bottom,
       self.stack_guest_top,
       self.stack_native_base,
-    )
+    );
+    if writable_data {
+      stack.or_else(|| {
+        Self::checked_region(
+          guest,
+          size,
+          self.data_guest_bottom,
+          self.data_guest_top,
+          self.data_native_base,
+        )
+      })
+    } else {
+      stack
+    }
   }
 
   fn safe_deref_for_read(&self, guest: usize, size: usize) -> Option<NonNull<[u8]>> {
