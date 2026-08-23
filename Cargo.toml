@@ -18,6 +18,8 @@ required-features = ["testing"]
 [features]
 default = []
 testing = ["anyhow", "tokio", "rand/default"]
+# Differential-test the Rust JIT against the vendored C. Test-only.
+oracle = []
 
 [dependencies]
 anyhow = { version = "1", optional = true }

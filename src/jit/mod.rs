@@ -42,6 +42,9 @@ pub mod validate;
 #[cfg(any(test, feature = "testing"))]
 pub mod interp;
 
+#[cfg(any(test, feature = "oracle"))]
+pub mod oracle;
+
 use std::sync::Arc;
 
 use isa::Insn;
@@ -74,12 +77,15 @@ impl Target {
 
 /// The external helper dispatcher the JIT emits calls to.
 ///
-/// Signature matches `external_function_dispatcher_t`: five guest arguments, an
-/// opaque cookie, and the helper index.
-pub type Dispatcher = unsafe extern "C" fn(u64, u64, u64, u64, u64, *mut std::ffi::c_void, u32) -> u64;
+/// Signature matches `external_function_dispatcher_t`: five guest arguments,
+/// then the helper index, then an opaque cookie. The index precedes the cookie —
+/// the emitted call sequence loads them into that argument order, so getting it
+/// backwards would compile and then pass a pointer where an index belongs.
+pub type Dispatcher =
+  unsafe extern "C" fn(u64, u64, u64, u64, u64, u32, *mut std::ffi::c_void) -> u64;
 
 /// Validates that a helper index is one the embedder registered. Matches
-/// `external_function_validate_t`.
+/// `external_function_validate_t`, whose second argument is the VM itself.
 pub type DispatcherValidate = unsafe extern "C" fn(u32, *const std::ffi::c_void) -> bool;
 
 /// Resolves a lazily-compiled local call target. Matches `local_call_resolver_t`.
