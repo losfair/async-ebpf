@@ -42,9 +42,8 @@ fn two_code_sections_describing_the_same_bytes_are_refused() {
 #[test]
 fn a_storm_of_duplicate_code_section_headers_is_refused_cheaply() {
   // The shape of the original denial of service: one code blob, many headers.
-  // Each copy used to buy a `validate_local_call_graph`, an `analyze_functions`
-  // and a retained `Translator`; the load now fails on the first duplicate,
-  // before any of that runs even once more.
+  // Each copy used to buy another function analysis and retained `Translator`;
+  // the load now fails on the first duplicate, before either is repeated.
   let elf = build_elf(&minimal_program(), &[0u8; 16]);
   let elf = duplicate_code_section_header(&elf, 4096);
 

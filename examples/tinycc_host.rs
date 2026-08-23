@@ -87,7 +87,6 @@ fn main() -> anyhow::Result<()> {
     &[TINYCC_HELPERS],
   )
   .with_guest_stack_size(guest_stack_size)
-  .with_unbounded_local_calls(true)
   .with_writable_data(true)
   .with_instruction_limit(1_000_000)
   .with_code_size_limit(64 * 1024 * 1024);

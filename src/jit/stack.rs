@@ -6,12 +6,11 @@
 //! almost entirely a constant behind a lookup.
 //!
 //! That the answer is uniform is what makes the runtime's stack budget a matter
-//! of arithmetic rather than analysis: the deepest accepted call chain consumes
-//! exactly `MAX_LOCAL_CALL_DEPTH` frames, which is how `program.rs` sizes the
-//! guest stack window and how it justifies the unchecked frame-access window
-//! below `R10`. A per-function calculation would make the
-//! frame budget depend on which functions are on the stack, and both of those
-//! arguments would have to be redone.
+//! of arithmetic rather than call-graph analysis. Before every local call the
+//! backend can prove that subtracting this charge still leaves one complete
+//! unchecked frame-access window below the callee's `R10`; cycles need no
+//! special case. A per-function calculation would make that runtime check
+//! depend on which functions are on the dynamic stack.
 //!
 //! The 16-byte alignment check below is load-bearing: the generated prologue
 //! subtracts this size from the native stack pointer, so an unaligned value

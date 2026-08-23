@@ -959,14 +959,45 @@ impl Emit<'_, '_, '_> {
   /// A local call whose target has not been compiled yet: ask the resolver at
   /// run time, then call what it returns.
   fn emit_lazy_local_call(&mut self, call_pc: usize) {
-    let resolver = match self.cfg.local_call_resolver {
-      Some(r) if call_pc < self.inputs.resolver_ids.len() => r,
+    // From one guard site to the next: four saved callee registers, the CALL
+    // return address, and the callee's 8-byte prologue slot.
+    const NATIVE_STACK_DELTA: usize = 4 * 8 + 8 + 8;
+    const _: () = assert!(NATIVE_STACK_DELTA <= abi::NATIVE_LOCAL_CALL_BUDGET);
+
+    let (resolver, stack_exhausted) = match (
+      self.cfg.local_call_resolver,
+      self.cfg.local_call_stack_exhausted,
+    ) {
+      (Some(resolver), Some(stack_exhausted)) if call_pc < self.inputs.resolver_ids.len() => {
+        (resolver, stack_exhausted)
+      }
       _ => {
         self.st.fail(Progress::UnexpectedInstruction);
         return;
       }
     };
     let id = self.inputs.resolver_ids[call_pc];
+
+    // R10 is already a native pointer into the per-invocation guest stack.
+    // Refuse the call unless subtracting one frame still leaves a complete
+    // FRAME_WINDOW below the callee's R10. Independently reserve enough native
+    // coroutine stack for the persistent call frame and the non-returning
+    // exhaustion callback.
+    self.emit_load(S::S64, RBP, RCX, abi::FRAME_OFFSET);
+    self.emit_load(S::S64, RCX, RCX, abi::memory::LOCAL_CALL_GUEST_FLOOR);
+    self.emit_cmp(RCX, map_register(10));
+    let guest_exhausted = self.emit_jcc(
+      0x82, // JB: unsigned R10 < guest floor
+      PatchTarget::EbpfPc { pc: 0, near: false },
+    );
+
+    self.emit_load(S::S64, RBP, RCX, abi::FRAME_OFFSET);
+    self.emit_load(S::S64, RCX, RCX, abi::memory::LOCAL_CALL_NATIVE_FLOOR);
+    self.emit_cmp(RCX, RSP);
+    let native_exhausted = self.emit_jcc(
+      0x82, // JB: unsigned RSP < native floor
+      PatchTarget::EbpfPc { pc: 0, near: false },
+    );
 
     // Every local function has the same fixed guest-frame charge. Keep R10
     // independent of host stack bookkeeping across coroutine suspension.
@@ -1030,6 +1061,16 @@ impl Emit<'_, '_, '_> {
       map_register(10),
       abi::LOCAL_FUNCTION_STACK_SIZE as i32,
     );
+
+    let skip_exhausted = self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: false });
+    self.emit_jump_target(guest_exhausted);
+    self.emit_jump_target(native_exhausted);
+    self.emit_load_imm(RAX, stack_exhausted as usize as u64 as i64);
+    self.emit_indirect_call_rax();
+    // The callback is declared divergent. Trap if an invalid embedder returns.
+    self.emit1(0x0f);
+    self.emit1(0x0b); // UD2
+    self.emit_jump_target(skip_exhausted);
   }
 }
 
@@ -1591,7 +1632,8 @@ impl Emit<'_, '_, '_> {
       // provides a fallback for it.
       Progress::UnexpectedInstruction => {
         TranslateError::Failed(self.errmsg.clone().unwrap_or_else(|| {
-          "Unexpected instruction or missing local-call resolver during JIT compilation".to_string()
+          "Unexpected instruction or missing local-call runtime callbacks during JIT compilation"
+            .to_string()
         }))
       }
       Progress::UnknownInstruction => {
@@ -2188,7 +2230,7 @@ mod tests {
 
   use crate::jit::golden;
   use crate::jit::isa::{alu, jmp, mode, opcode, size, src as srcbit, Insn};
-  use crate::jit::{Dispatcher, LocalCallResolver, Target};
+  use crate::jit::{Dispatcher, LocalCallResolver, LocalCallStackExhausted, Target};
 
   // -----------------------------------------------------------------------
   // Instructions
@@ -2231,6 +2273,7 @@ mod tests {
   /// every run.
   const DISPATCHER_ADDRESS: usize = 0x0000_7f00_d15b_a000;
   const RESOLVER_ADDRESS: usize = 0x0000_7f00_0e50_1000;
+  const STACK_EXHAUSTED_ADDRESS: usize = 0x0000_7f00_57ac_0000;
 
   fn dispatcher() -> Dispatcher {
     // SAFETY: never called. The value is materialised as an immediate and
@@ -2241,6 +2284,11 @@ mod tests {
   fn local_call_resolver() -> LocalCallResolver {
     // SAFETY: as above.
     unsafe { std::mem::transmute::<usize, LocalCallResolver>(RESOLVER_ADDRESS) }
+  }
+
+  fn local_call_stack_exhausted() -> LocalCallStackExhausted {
+    // SAFETY: as above.
+    unsafe { std::mem::transmute::<usize, LocalCallStackExhausted>(STACK_EXHAUSTED_ADDRESS) }
   }
 
   /// Accepts every helper index, so that helper-call emission is exercised
@@ -2259,6 +2307,7 @@ mod tests {
       dispatcher: Some(dispatcher()),
       dispatcher_validate: Some(accept_every_helper),
       local_call_resolver: Some(local_call_resolver()),
+      local_call_stack_exhausted: Some(local_call_stack_exhausted()),
       ..Default::default()
     }
   }
@@ -2644,6 +2693,7 @@ mod tests {
       dispatcher: Some(dispatcher()),
       dispatcher_validate: Some(accept_every_helper),
       local_call_resolver: Some(local_call_resolver()),
+      local_call_stack_exhausted: Some(local_call_stack_exhausted()),
       ..Default::default()
     };
     let translator = Translator::load(Arc::new(config), &code).unwrap();

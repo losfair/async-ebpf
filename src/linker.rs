@@ -40,8 +40,6 @@ const MAX_RELOCATIONS: usize = 1024 * 1024;
 const EBPF_OP_EXIT: u8 = 0x95;
 #[cfg(test)]
 const EBPF_OP_JA: u8 = 0x05;
-#[cfg(test)]
-use crate::function_analysis::MAX_LOCAL_CALL_DEPTH;
 
 #[derive(Copy, Clone, Debug)]
 struct EbpfInsn {
@@ -70,12 +68,6 @@ impl EbpfInsn {
       | ((self.offset as u16 as u64) << 16)
       | ((self.imm as u32 as u64) << 32)
   }
-}
-
-/// Validates that local eBPF calls cannot recurse or exceed the statically
-/// supported call depth, before the bytecode is handed to the JIT.
-pub(crate) fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
-  crate::function_analysis::validate_local_call_graph(code)
 }
 
 /// Relocates an eBPF ELF image in place and returns entrypoint ranges.
@@ -365,6 +357,10 @@ pub fn link_elf(
 mod tests {
   use super::*;
 
+  fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
+    crate::function_analysis::analyze_functions(code).map(|_| ())
+  }
+
   const EBPF_OP_MOV64_IMM: u8 = 0xb7;
 
   fn inst(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> [u8; 8] {
@@ -407,54 +403,30 @@ mod tests {
   }
 
   #[test]
-  fn local_call_graph_allows_max_depth() {
-    let code = local_call_chain(MAX_LOCAL_CALL_DEPTH);
+  fn local_call_graph_allows_deep_acyclic_graphs() {
+    let code = local_call_chain(64);
     validate_local_call_graph(&code).unwrap();
   }
 
   #[test]
-  fn local_call_graph_rejects_excessive_depth() {
-    let code = local_call_chain(MAX_LOCAL_CALL_DEPTH + 1);
-    let err = validate_local_call_graph(&code).unwrap_err();
-    assert!(
-      err.contains("exceeds max"),
-      "unexpected validation error: {err}"
-    );
-  }
-
-  #[test]
-  fn a_long_call_chain_is_rejected_without_overflowing_the_host_stack() {
-    // The depth cap has to bound the *descent*, not just the height reported on
-    // the way back up. A chain this long is still under `MAX_INSTS`, so it is a
-    // program the loader is willing to consider, and validation runs on
-    // whatever thread called `load` - a 2 MiB Tokio worker, typically. Run it on
-    // a deliberately small stack so a regression aborts here rather than
-    // depending on the test harness's default.
+  fn a_long_call_chain_is_analyzed_without_using_the_host_call_stack() {
     let code = local_call_chain(32767);
     let handle = std::thread::Builder::new()
       .stack_size(256 * 1024)
-      .spawn(move || validate_local_call_graph(&code).unwrap_err())
+      .spawn(move || validate_local_call_graph(&code))
       .unwrap();
-    let err = handle.join().unwrap();
-    assert!(
-      err.contains("exceeds max"),
-      "unexpected validation error: {err}"
-    );
+    handle.join().unwrap().unwrap();
   }
 
   #[test]
-  fn local_call_graph_rejects_recursion() {
+  fn local_call_graph_allows_recursion() {
     let mut code = Vec::new();
     code.extend_from_slice(&local_call(0, 2));
     code.extend_from_slice(&exit());
     code.extend_from_slice(&local_call(2, 2));
     code.extend_from_slice(&exit());
 
-    let err = validate_local_call_graph(&code).unwrap_err();
-    assert!(
-      err.contains("recursive"),
-      "unexpected validation error: {err}"
-    );
+    validate_local_call_graph(&code).unwrap();
   }
 
   #[test]
@@ -476,8 +448,8 @@ mod tests {
   }
 
   #[test]
-  fn local_call_graph_rejects_disguised_excessive_depth() {
-    let function_count = MAX_LOCAL_CALL_DEPTH + 1;
+  fn local_call_graph_rejects_disguised_cross_function_control_flow() {
+    let function_count = 9;
     let factory_start = 1;
     let factory_len = function_count - 1;
     let chain_start = factory_start + factory_len + 1;

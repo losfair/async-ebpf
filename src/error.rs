@@ -30,6 +30,9 @@ pub(crate) enum RuntimeError {
 
   #[error("memory fault at virtual address {0:#x}")]
   MemoryFault(usize),
+
+  #[error("local call stack exhausted")]
+  StackExhausted,
 }
 
 #[derive(ThisError, Debug, Clone)]
