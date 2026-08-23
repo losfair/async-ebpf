@@ -1,11 +1,10 @@
 //! The contract between the entry trampoline, the JIT backends, and the
 //! runtime's memory descriptor.
 //!
-//! These displacements are stated in four places today: the `global_asm!`
-//! trampoline in `program.rs`, `JIT_MEMORY_*` in `ubpf_jit_x86_64.c`,
-//! `JIT_MEMORY_*` in `ubpf_jit_arm64.c`, and the `JitMemory` struct. `program.rs`
-//! already carries a comment observing that if they ever drift, the symptom is a
-//! legitimate guest program aborting the process rather than taking a fault.
+//! These displacements are stated in three places: the `global_asm!` entry
+//! trampolines in `program.rs`, the `JitMemory` struct they fill in, and here.
+//! If they ever drift, the symptom is a legitimate guest program corrupting
+//! host memory or aborting the process rather than taking a fault.
 //!
 //! Both emitters read this module. The trampolines do not: their `global_asm!`
 //! blocks are raw string literals with hard-coded displacements, and
@@ -23,8 +22,8 @@
 //! left as a follow-up; it changes generated code, which this port deliberately
 //! does not.
 //!
-//! Both C backends define the same values; they are reproduced once here rather
-//! than per-architecture, and [`tests`] asserts the two stay in agreement.
+//! Both backends use the same values, so they are stated once here rather than
+//! per-architecture.
 
 /// Byte offsets into the `JitMemory` descriptor the runtime builds once per
 /// invocation and whose address lives at [`FRAME_OFFSET`] below the frame
@@ -85,8 +84,7 @@ pub const ACCESS_WIDTHS: [usize; 4] = [1, 2, 4, 8];
 
 /// Maps an access width to its span slot index within a region's block.
 ///
-/// Mirrors `span_slot_index()` in the C backends. A width the table does not
-/// cover has no span slot; the caller must not ask.
+/// A width the table does not cover has no span slot; the caller must not ask.
 pub const fn span_slot_index(width: usize) -> Option<usize> {
   match width {
     1 => Some(0),
@@ -104,8 +102,8 @@ pub const GROUP_BASE_OFFSET: i32 = -144;
 /// all of the above.
 pub const FRAME_RESERVED: i32 = 160;
 
-/// Per-instruction region routing hints. Mirrors `JIT_REGION_*`, and the values
-/// are shared with `crate::region_analysis`.
+/// Per-instruction region routing hints. The values are shared with
+/// `crate::region_analysis`, which produces them.
 pub mod region {
   /// Probe both regions.
   pub const UNKNOWN: u8 = 0;
@@ -120,7 +118,7 @@ pub mod region {
   pub const FRAME: u8 = 3;
 }
 
-/// Access plan roles. Mirrors `JIT_PLAN_ROLE_*`.
+/// Access plan roles.
 pub mod plan_role {
   pub const NONE: u8 = 0;
   pub const LEADER: u8 = 1;
@@ -138,7 +136,7 @@ pub const MAX_GROUP_SPAN: u32 = 4096;
 /// Guest stack charged to each local function.
 pub const LOCAL_FUNCTION_STACK_SIZE: u16 = 4096;
 
-/// Maximum eBPF call depth uBPF permits.
+/// Maximum eBPF call depth permitted.
 pub const MAX_CALL_DEPTH: u32 = 8;
 
 /// Total guest stack `UBPF_EBPF_STACK_SIZE` describes.

@@ -257,7 +257,7 @@ fn check_operand_filter(insn: &Insn) -> Result<(), String> {
   let opcode = insn.opcode;
   let Some(f) = FILTERS[opcode as usize] else {
     // Unreachable in practice: `validate()`'s opcode `switch` refuses every
-    // byte this table lacks an entry for, and does so first. Kept because the C
+    // byte this table lacks an entry for, and does so first. Kept because the
     // keeps it, and because a future opcode added to `Op` but not to the table
     // should say so rather than be waved through.
     return Err(format!("Invalid instruction opcode {opcode:2X}."));
@@ -307,12 +307,12 @@ fn check_operand_filter(insn: &Insn) -> Result<(), String> {
 // Layer 2: whole-program validation
 // ---------------------------------------------------------------------------
 
-/// Validates a decoded program, returning `ubpf_load`'s rejection message.
+/// Validates a decoded program, returning the rejection message on refusal.
 ///
-/// Mirrors `validate()` in `ubpf_vm.c`. The caller has already established that
+/// The caller has already established that
 /// the byte length was a multiple of eight.
 pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
-  // The C's bound is `>=`, not `>`: a program of exactly `UBPF_MAX_INSTS`
+  // The bound is `>=`, not `>`: a program of exactly `MAX_INSTS`
   // instructions is refused. `Translator::load` checks `>` before calling here,
   // so the two together reproduce `>=` — but this must not depend on that, and
   // stating it here is what makes the boundary testable in one place.
@@ -320,7 +320,7 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
     return Err(format!("too many instructions (max {})", abi::MAX_INSTS));
   }
 
-  // `validate()` next calls `ubpf_calculate_stack_usage_for_local_func(vm, 0)`,
+  // Stack usage is checked next,
   // and again for every local call target below. Its only failure mode is a
   // stack usage that is not 16-byte aligned. `async-ebpf` never registers a
   // custom stack-usage calculator, so every function is charged the constant
@@ -492,21 +492,21 @@ fn check_call(config: &Config, insn: &Insn, pc: usize, num_insns: usize) -> Resu
       }
       let known = match (config.dispatcher, config.dispatcher_validate) {
         (Some(_), Some(check)) => {
-          // The C passes the VM itself as the cookie. Nothing here has one, and
+          // Nothing here has a cookie to pass, and
           // no validator in this tree reads it; a null pointer keeps the
           // signature honest about that.
           // SAFETY: the callback is supplied by the embedder alongside the
           // dispatcher and is required to tolerate being asked about any index.
           unsafe { check(insn.imm as u32, std::ptr::null()) }
         }
-        // With no dispatcher the C falls back to its per-index `ext_funcs`
-        // table, populated only by `ubpf_register`. `async-ebpf` never calls
+        // With no dispatcher registered there is nothing to ask, so a helper
+        // call cannot be validated. `async-ebpf` always registers one; never calls
         // it, so that table is empty and every helper index is unknown.
         (None, _) => false,
         (Some(_), None) => {
           debug_assert!(
             false,
-            "Config::dispatcher without dispatcher_validate; the C would call \
+            "Config::dispatcher without dispatcher_validate; a helper call \
              a null function pointer"
           );
           false
@@ -522,7 +522,7 @@ fn check_call(config: &Config, insn: &Insn, pc: usize, num_insns: usize) -> Resu
 
     // Local call: the immediate is a relative instruction displacement.
     1 => {
-      // The C computes `i + (inst.imm + 1)` in `int`, so an immediate of
+      // The target is computed as `i + (imm + 1)` in 32-bit arithmetic, so an immediate of
       // `INT32_MAX` wraps to `INT32_MIN` before the add. Wrapping arithmetic
       // reproduces that; the result is far out of range either way, but the
       // reported target number differs.
@@ -532,7 +532,7 @@ fn check_call(config: &Config, insn: &Insn, pc: usize, num_insns: usize) -> Resu
           "call to local function (at PC {pc}) is out of bounds (target: {target})"
         ));
       }
-      // The C then calls `ubpf_calculate_stack_usage_for_local_func` on the
+      // Stack usage is then computed for the
       // target; see the note in `validate` for why that cannot fail here.
     }
 
@@ -556,7 +556,7 @@ fn check_call(config: &Config, insn: &Insn, pc: usize, num_insns: usize) -> Resu
 /// and the sub-program must end in `exit` or with an unconditional jump as its
 /// second-to-last instruction.
 ///
-/// Two details of the C that are easy to miss and are reproduced here:
+/// Two details that are easy to miss:
 ///
 /// * The start-index array is `calloc`'d one longer than the number of local
 ///   calls and only the call targets are written, so the extra slot stays zero.
@@ -564,7 +564,7 @@ fn check_call(config: &Config, insn: &Insn, pc: usize, num_insns: usize) -> Resu
 ///   sub-program start, which is what makes the main program one.
 /// * The whole function is skipped when the program contains no local call at
 ///   all. A straight-line program is therefore *not* required to terminate; it
-///   may run off the end of the instruction stream. That is uBPF's behaviour and
+///   may run off the end of the instruction stream. That is the accepted behaviour and
 ///   this reproduces it.
 fn check_self_contained_sub_programs(insns: &[Insn]) -> Result<(), String> {
   let num_insns = insns.len();
@@ -647,7 +647,7 @@ mod tests {
 
   #[test]
   fn the_filter_table_covers_exactly_the_defined_opcodes() {
-    // The C table has one entry per named opcode plus one for the `lddw` high
+    // The table has one entry per named opcode plus one for the `lddw` high
     // half, which is not an opcode at all. Any other shape means the table and
     // the decoder have drifted apart.
     for byte in 0u8..=255 {
@@ -662,14 +662,14 @@ mod tests {
     assert_eq!(
       FILTERS.iter().filter(|f| f.is_some()).count(),
       120,
-      "the C table has exactly 120 entries"
+      "the filter table has exactly 120 entries"
     );
   }
 
   #[test]
   fn the_opcode_is_rendered_the_way_printf_renders_it() {
     // `%2X` is space padded, not zero padded. Getting this wrong produces
-    // messages that differ from the C by one character.
+    // messages that differ by one character.
     let err = check_operand_filter(&insn(opcode::JA, 0, 0, 0, 7)).unwrap_err();
     assert_eq!(err, "Invalid immediate value 7 for opcode  5.");
     let err = check_operand_filter(&insn(0xc3, 0, 0, 0, 999)).unwrap_err();
@@ -678,7 +678,7 @@ mod tests {
 
   #[test]
   fn a_program_with_no_local_calls_need_not_terminate() {
-    // uBPF really does accept this: the sub-program check is skipped entirely
+    // This really is accepted: the sub-program check is skipped entirely
     // when there is no local call, so nothing requires a trailing `exit`.
     let config = Config::default();
     assert_eq!(validate(&config, &[insn(0xb7, 0, 0, 0, 1)]), Ok(()));
@@ -1173,7 +1173,7 @@ mod tests {
         // Drop the last instruction: tears a trailing `lddw`, pushes jumps out
         // of range, and strips the terminating `exit`.
         8 => {
-          // Never down to nothing: `ubpf_load` refuses a zero-length program
+          // Never down to nothing: the loader refuses a zero-length program
           // before `validate()` ever sees it. See
           // [`the_empty_program_is_the_one_documented_divergence`].
           if insns.len() > 1 {
@@ -1409,7 +1409,7 @@ mod tests {
         vec![insn(opcode::CALL, 0, 15, 0, 0), exit()],
         // A negative helper index.
         vec![insn(opcode::CALL, 0, 0, 0, -1), exit()],
-        // A local call whose immediate overflows the C's `int` arithmetic.
+        // A local call whose immediate overflows 32-bit arithmetic.
         vec![insn(opcode::CALL, 0, 1, 0, i32::MAX), exit()],
         vec![insn(opcode::CALL, 0, 1, 0, i32::MIN), exit()],
         // A local call landing on the high half of a `lddw`. The sub-program
@@ -1458,10 +1458,9 @@ mod tests {
     /// `lddw` and its high half, exhaustively over the fields that matter.
     ///
     /// The pairing rule is the only place a single instruction reaches across a
-    /// slot boundary, and the tree carries a local patch ("Validate LDDW
-    /// second-half instruction fields") that constrains the high half. It is
-    /// also where the C's reported PC goes off by one, so both halves' register
-    /// nibbles are swept.
+    /// slot boundary: the high half is not an instruction, and its fields are
+    /// constrained rather than decoded. Both halves' register nibbles are swept,
+    /// since a bad nibble in either must be reported against the `lddw` itself.
     #[test]
     fn every_lddw_pairing_is_decided_as_recorded() {
       let config = configs().remove(0).1;

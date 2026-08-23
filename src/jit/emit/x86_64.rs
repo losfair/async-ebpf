@@ -1,10 +1,9 @@
 //! The x86_64 backend.
 //!
-//! A port of `ubpf_translate_function_x86_64` in
-//! `oracle/ubpf-sys/vendor/ubpf/vm/ubpf_jit_x86_64.c`, which always reaches
+//! Translates one function at a time, which always reaches
 //! `translate_range(..., whole_program = false, lazy_local_calls = true)`. The
 //! whole-program entry point, the interpreter and constant blinding are not
-//! reachable from it and are not ported; where the C branches on those they are
+//! reachable and are not implemented; where the code branches on those they are
 //! folded away with a comment saying so.
 //!
 //! # Changing what this emits
@@ -44,7 +43,7 @@ const RCX: u8 = 1;
 const RDX: u8 = 2;
 const RBX: u8 = 3;
 const RSP: u8 = 4;
-/// Also `RIP` in the C, which uses the same number for RIP-relative ModRM.
+/// Also names `RIP`, which shares this number in RIP-relative ModRM.
 const RBP: u8 = 5;
 const RSI: u8 = 6;
 const RDI: u8 = 7;
@@ -60,7 +59,7 @@ const R15: u8 = 15;
 /// Where the entry code parks the embedder's context pointer.
 const VOLATILE_CTXT: u8 = R11;
 /// eBPF `R4` maps here, and shifts need RCX; the helper-call sequence moves it
-/// out of the way. 
+/// out of the way.
 const RCX_ALT: u8 = R10;
 
 /// eBPF register to x86 register, SysV flavour.
@@ -77,7 +76,7 @@ const REGISTER_MAP: [u8; crate::jit::isa::NUM_REGS] = [
 ];
 
 /// The x86 register for an eBPF register.
-/// The C takes `r % _BPF_REG_MAX` behind an `assert`, so a register number the
+/// Wraps modularly rather than panicking, so a register number the
 /// validator should have rejected wraps rather than trapping in a release build
 ///. Reproduced.
 fn map_register(r: u8) -> u8 {
@@ -112,7 +111,7 @@ impl S {
     }
   }
 
-  /// The C recomputes this at every call site as
+  /// Previously recomputed at every call site as
   /// `size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1`.
   fn bytes(self) -> i32 {
     match self {
@@ -124,7 +123,7 @@ impl S {
   }
 }
 
-/// Where one guest region's bounds can be found. Mirrors `struct guest_region`.
+/// Where one guest region's bounds can be found.
 struct GuestRegion {
   desc_bottom: i32,
   desc_top: i32,
@@ -158,7 +157,7 @@ const X64_ALU_OR: u8 = 0x09;
 const X64_ALU_AND: u8 = 0x21;
 const X64_ALU_XOR: u8 = 0x31;
 
-/// Entry point. Mirrors `ubpf_translate_function_x86_64`, which is
+/// Entry point, which is
 /// `translate_range(..., whole_program = false, lazy_local_calls = true)`
 /// followed by `resolve_patchable_relatives`.
 pub fn translate_range(
@@ -181,7 +180,7 @@ struct Emit<'buf, 'ctx, 'in_> {
   t: &'ctx Translator,
   cfg: &'ctx Config,
   inputs: &'ctx TranslationInputs<'in_>,
-  /// Set alongside a [`Progress`] where the C's message needs information only
+  /// Set alongside a [`Progress`] where the message needs information only
   /// the detecting site has.
   errmsg: Option<String>,
 }
@@ -191,7 +190,7 @@ struct Emit<'buf, 'ctx, 'in_> {
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
-  /// Mirrors `emit_bytes`: once the translation has failed,
+  /// Once the translation has failed,
   /// nothing more is written *and the offset does not advance*. The check is
   /// here rather than in [`JitState`] because the shared state is also used by
   /// the arm64 backend.
@@ -229,7 +228,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// Reserves four bytes for a jump displacement and records the fixup.
-  /// Mirrors `emit_jump_address_reloc`; returns where the displacement starts.
+  /// Returns where the displacement starts.
   fn emit_jump_address_reloc(&mut self, target: PatchTarget) -> u32 {
     let at = self.offset();
     self.st.note_jump(at, target);
@@ -247,10 +246,10 @@ impl Emit<'_, '_, '_> {
 
   /// ModRM plus displacement, with the zero-displacement shortcut.
   /// Two irregular
-  /// cases matter and are handled the way the C handles them:
+  /// cases matter:
   /// * `RBP`/`R13` cannot encode a bare `[base]`, so they always get an
   ///   explicit displacement even when it is zero;
-  /// * `R12` needs a SIB byte, which the C emits as `0x24`.
+  /// * `R12` needs a SIB byte, emitted as `0x24`.
   /// `RSP` and `R12` share the low three bits that ModRM encodes, and both
   /// therefore need the SIB byte. No caller passes `RSP` as a base today — the
   /// sequences that address the host stack emit their ModRM and SIB bytes
@@ -285,7 +284,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// REX carrying only the high bits of `src`/`dst`, skipped when no bit would
-  /// be set. 
+  /// be set.
   fn emit_basic_rex(&mut self, w: u8, src: u8, dst: u8) {
     if w != 0 || (src & 8) != 0 || (dst & 8) != 0 {
       self.emit_rex(w, u8::from(src & 8 != 0), 0, u8::from(dst & 8 != 0));
@@ -314,7 +313,7 @@ impl Emit<'_, '_, '_> {
   }
 
   fn emit_alu32_imm8(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
-    // The C parameter is `int8_t`, so the immediate is truncated at the call.
+    // The displacement is a signed byte, so the immediate is truncated here.
     self.emit_alu32(op, src, dst);
     self.emit1(imm as u8);
   }
@@ -366,7 +365,7 @@ impl Emit<'_, '_, '_> {
     self.emit_jump_address_reloc(target)
   }
 
-    /// A near jump emits the two-byte `0xeb rel8` form but still reserves a
+  /// A near jump emits the two-byte `0xeb rel8` form but still reserves a
   /// *four*-byte placeholder, so three bytes are wasted after every one. They
   /// are never executed — the jump is unconditional and lands past them — so
   /// this costs code size and nothing else. Narrowing the reservation would
@@ -398,7 +397,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// Retargets every jump recorded at `jump_src` to the current offset.
-  /// Mirrors `emit_jump_target` in `ubpf_jit_support.c`.
+  /// Resolves one jump target.
   fn emit_jump_target(&mut self, jump_src: u32) {
     let here = self.offset();
     self.st.retarget_jumps(
@@ -430,7 +429,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// `load [src + offset] -> dst`, sign-extending to 64 bits.
-  /// `S64` emits nothing at all, as in the C (there is no `ldxdwsx` encoding,
+  /// `S64` emits nothing at all (there is no `ldxdwsx` encoding,
   /// so no caller reaches it).
   fn emit_load_sx(&mut self, size: S, src: u8, dst: u8, offset: i32) {
     match size {
@@ -553,7 +552,7 @@ impl Emit<'_, '_, '_> {
 impl Emit<'_, '_, '_> {
   /// The same check as [`Self::emit_single_region_address_via_descriptor`],
   /// reading the region's bounds from the frame constants the embedder derived
-  /// once per invocation. 
+  /// once per invocation.
   fn emit_single_region_address_from_frame(
     &mut self,
     dst: u8,
@@ -663,7 +662,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// True when `[base + offset]`, `size` bytes wide, is a frame access that
-  /// needs no bounds check at all. 
+  /// needs no bounds check at all.
   /// This is the one place a runtime check is traded for a static argument, so
   /// three of the four conditions are re-derived here rather than taken from
   /// the hint.
@@ -685,7 +684,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// Resolves `[src + offset]` to a native address in `dst`, emitting whatever
-  /// check that needs. 
+  /// check that needs.
   #[allow(clippy::too_many_arguments)]
   fn emit_masked_address_with_offset(
     &mut self,
@@ -773,7 +772,7 @@ impl Emit<'_, '_, '_> {
 
     if let Some(plan) = plan.filter(|p| p.role == abi::plan_role::MEMBER) {
       // `group` is `Some` only while the backend has established that the
-      // leader ran and that nothing has redefined the base since — the C keeps
+      // leader ran and that nothing has redefined the base since — this keeps
       // the group open and tests a written-register mask instead, which rejects
       // exactly the same accesses.
       let usable = match (&self.st.group, base_ebpf) {
@@ -896,7 +895,7 @@ impl Emit<'_, '_, '_> {
 
 /// The span slot for an access `size` bytes wide, or `None` for a width the
 /// precomputed spans do not cover.
-/// The C's `span_slot_index` returns 3 for anything that is not 1, 2 or 4; the
+/// The span-slot lookup returns 3 for anything that is not 1, 2 or 4; the
 /// caller guards with an explicit `size == 1 || ... || size == 8` test, so the
 /// `default` arm is only ever reached with 8. Returning `None` instead makes
 /// the guard and the lookup one decision.
@@ -912,7 +911,7 @@ fn width_span_slot(size: i32) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 impl Emit<'_, '_, '_> {
-  /// The helper-call sequence. Mirrors `emit_dispatched_external_helper_call`
+  /// The helper-call sequence
   ///, SysV half only.
   /// The generated code decides at *run* time which of two paths to take: if
   /// the dispatcher slot holds an address, control goes there with the helper
@@ -965,7 +964,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// A local call whose target has not been compiled yet: ask the resolver at
-  /// run time, then call what it returns. 
+  /// run time, then call what it returns.
   fn emit_lazy_local_call(&mut self, call_pc: usize) {
     let resolver = match self.cfg.local_call_resolver {
       Some(r) if call_pc < self.inputs.resolver_ids.len() => r,
@@ -1070,7 +1069,7 @@ impl Emit<'_, '_, '_> {
 
   /// x86 has no atomic fetch-and-and/or/xor, and no 64-bit fetch-add that also
   /// yields the old value in the right place, so all four are emulated with a
-  /// compare-exchange loop. 
+  /// compare-exchange loop.
   fn emit_atomic_fetch_alu(&mut self, is_64bit: bool, opcode: u8, src: u8, dst: u8, offset: i32) {
     // Compare-exchange overwrites RAX. If RAX is the source, keep the original
     // in whichever of R10/R11 is not the destination.
@@ -1141,7 +1140,7 @@ impl Emit<'_, '_, '_> {
         self.emit_alu32(0x31, dst, dst);
       } else {
         // Modulo by zero yields the dividend, so this is a self-move — which
-        // the C emits anyway rather than eliding.
+        // emitted rather than elided.
         self.emit_mov(dst, dst);
       }
       return;
@@ -1296,7 +1295,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// Back-patches a one-byte relative displacement written earlier.
-  /// The C writes `state->buf[at]` directly, which is out of bounds when the
+  /// Writing the buffer directly would be out of bounds when the
   /// emit that reserved the byte had already run out of buffer. Going through
   /// `patch_bytes` bounds-checks; the guard on `ok()` keeps the emitted bytes
   /// identical in every case where the translation actually succeeds.
@@ -1373,7 +1372,7 @@ impl Emit<'_, '_, '_> {
 
 impl Emit<'_, '_, '_> {
   /// Returns false
-  /// where the C returns false, which the caller turns into a failure.
+  /// returns false, which the caller turns into a failure.
   fn resolve(&mut self) -> bool {
     let jumps = std::mem::take(&mut self.st.jumps);
     for jump in &jumps {
@@ -1383,7 +1382,7 @@ impl Emit<'_, '_, '_> {
         PatchTarget::Special(SpecialTarget::Retpoline) => (self.st.retpoline_loc, false),
         PatchTarget::Special(_) => return false,
         PatchTarget::EbpfPc { pc, near } => (self.pc_loc(pc), near),
-        // The C holds both fields in one struct and prefers the JIT offset only
+        // Both fields were once held in one struct, preferring the JIT offset only
         // when it is non-zero, falling back to `pc_locs[ebpf_target_pc]`. Every
         // site that sets a JIT offset leaves the eBPF pc at 0, so a zero JIT
         // offset means `pc_locs[0]`.
@@ -1414,7 +1413,7 @@ impl Emit<'_, '_, '_> {
     let local_calls = std::mem::take(&mut self.st.local_calls);
     for call in &local_calls {
       // Lazy local calls emit an indirect call instead, so this table is always
-      // empty on the path this backend is reached through. The C keeps the loop
+      // empty on the path this backend is reached through. The loop is kept
       // and so does this.
       let target_loc = match call.target {
         PatchTarget::EbpfPc { pc, .. } => self.pc_loc(pc),
@@ -1463,7 +1462,7 @@ impl Emit<'_, '_, '_> {
 // The driver
 // ---------------------------------------------------------------------------
 
-/// eBPF registers `inst` may overwrite. 
+/// eBPF registers `inst` may overwrite.
 /// Naming too many registers only ends access groups early; naming too few
 /// would let a group keep addressing a base that has changed, so every class
 /// that writes anything is listed.
@@ -1492,7 +1491,7 @@ fn written_registers_mask(inst: Insn) -> u16 {
 }
 
 /// True when `inst` reads its source register as a *value* rather than as a
-/// memory base or a mode selector. 
+/// memory base or a mode selector.
 /// `STX` is deliberately absent even though it does read a value source:
 /// `emit_masked_store` handles it itself, because the address computation it
 /// performs first would clobber the scratch register the value would sit in.
@@ -1587,12 +1586,12 @@ impl Emit<'_, '_, '_> {
     Ok(self.offset() as usize)
   }
 
-  /// Turns the recorded [`Progress`] into the error the C reports for it.
+  /// Turns the recorded [`Progress`] into the error reported for it.
   fn status_error(&self) -> TranslateError {
     match self.st.status {
       Progress::NotEnoughSpace => TranslateError::OutOfSpace,
       // These two carry a message from the detecting site, because it names the
-      // instruction. The lazy local-call guard sets only the status, so the C
+      // instruction. The lazy local-call guard sets only the status, so this
       // provides a fallback for it.
       Progress::UnexpectedInstruction => {
         TranslateError::Failed(self.errmsg.clone().unwrap_or_else(|| {
@@ -1626,7 +1625,7 @@ impl Emit<'_, '_, '_> {
       }
       // Nothing falls through an EXIT, an unconditional jump or a call, so
       // whatever follows is entered from somewhere else. The bound is written
-      // as the C writes it: `group_barrier` has `num_insts + 1` slots, so the
+      // `group_barrier` has `num_insts + 1` slots, so the
       // instruction one past the end has one too.
       #[allow(clippy::int_plus_one)]
       if i + 1 <= num_insts {
@@ -1647,7 +1646,7 @@ impl Emit<'_, '_, '_> {
     }
   }
 
-  /// The main loop. Returns `Some(message)` for the paths where the C returns
+  /// The main loop. Returns `Some(message)` for the paths that report
   /// immediately with an error rather than recording a status and breaking.
   fn emit_instructions(&mut self, start_pc: usize, end_pc: usize) -> Option<String> {
     let mut i = start_pc;
@@ -1792,7 +1791,7 @@ impl Emit<'_, '_, '_> {
   }
 
   /// One instruction. `pc_cursor` is the driver's loop variable, which `lddw`
-  /// advances past its second slot exactly as the C's `++i` does.
+  /// advances past its second slot, which is data rather than an instruction.
   #[allow(clippy::too_many_arguments)]
   fn emit_one(
     &mut self,
@@ -2037,8 +2036,8 @@ impl Emit<'_, '_, '_> {
         if inst.src == 0 {
           self.emit_mov(RCX_ALT, RCX);
           self.emit_dispatched_external_helper_call(inst.imm as u32);
-          // uBPF defaults the unwind index to -1, so `None` here means a
-          // `call -1` really does take the unwind path, as in the C.
+          // The unwind index defaults to -1, so `None` here means a
+          // `call -1` really does take the unwind path.
           let unwind = self.cfg.unwind_helper_index.map_or(-1i32, |i| i as i32);
           if inst.imm == unwind {
             self.emit_cmp_imm32(map_register(0), 0);
@@ -2049,7 +2048,8 @@ impl Emit<'_, '_, '_> {
           // `emit_local_call` is unreachable and is not ported.
           self.emit_lazy_local_call(pc);
         }
-        // A source field other than 0 or 1 emits nothing at all, as in the C.
+        // A source field other than 0 or 1 emits nothing at all. Unreachable:
+        // the operand filter bounds `call`'s source to 0..=1.
       }
 
       Op::Exit => {
@@ -2092,10 +2092,10 @@ impl Emit<'_, '_, '_> {
 
       Op::LoadImm64 => {
         // The second slot is not an instruction but the high half of the
-        // immediate, so the driver's cursor skips it — the C's `++i` inside the
+        // immediate, so the driver's cursor skips it — the advance inside the
         // `case`, which the `for` then increments again.
         //
-        // A `lddw` in the last slot would send the C's `ubpf_fetch_instruction`
+        // A `lddw` in the last slot would send the high-half fetch
         // one past the end of the program; the validator refuses that, so the
         // zero fallback below is unreachable rather than a behaviour change.
         *pc_cursor += 1;
@@ -2114,7 +2114,7 @@ impl Emit<'_, '_, '_> {
         // The atomic *selector* is not in the opcode — it is the immediate's
         // high nibble, with the fetch flag in its low bit. `Op::from_opcode`
         // therefore cannot fill it in, and `Insn::op_with_imm` is what does,
-        // masking exactly as the C's `switch (inst.imm & EBPF_ALU_OP_MASK)`
+        // masking the immediate's high nibble
         // does. That masking is load-bearing: `imm = 0x02` names a plain atomic
         // add and `imm = 0xe0` an exchange without the fetch flag, and the
         // validator's filter for 32-bit atomics lets both through.
@@ -2140,7 +2140,7 @@ impl Emit<'_, '_, '_> {
         let (selector, fetch) = match inst.op_with_imm() {
           Some(Op::Atomic { op, fetch, .. }) => (op, fetch),
           _ => {
-            // The C returns immediately here, skipping the epilogue entirely.
+            // Returns immediately here, skipping the epilogue entirely.
             return Some(format!(
               "Error: unknown atomic opcode {} at PC {pc}\n",
               inst.imm

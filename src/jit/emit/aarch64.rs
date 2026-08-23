@@ -76,7 +76,7 @@ const TEMP_DIV_REGISTER: u32 = R25;
 /// Temp register for load/store offsets.
 const OFFSET_REGISTER: u32 = R26;
 /// Special register for external dispatcher context. Aliases [`OFFSET_REGISTER`]
-/// in the C too.
+/// here too.
 const VOLATILE_CTXT: u32 = R26;
 
 /// eBPF register to aarch64 register. `R0` is held in `R5` for the
@@ -85,8 +85,8 @@ const VOLATILE_CTXT: u32 = R26;
 const REGISTER_MAP: [u32; 11] = [R5, R0, 1, R2, R3, 4, R19, R20, R21, R22, R23];
 
 /// The aarch64 register holding eBPF register `r`.
-/// Mirrors `map_register` including its modular wrap: with `NDEBUG`
-/// the C's `assert(r < REGISTER_MAP_SIZE)` is gone and `r % 11` is what runs.
+/// Wraps modularly rather than panicking on an out-of-range register, so a
+/// register field the validator would have refused still maps to something.
 fn map_register(r: u8) -> u32 {
   REGISTER_MAP[(r as usize) % REGISTER_MAP.len()]
 }
@@ -107,7 +107,7 @@ fn unmap_register(native: u32) -> Option<u8> {
 /// `AddSubOpcode`, used as the two-bit `op` field at bit 29.
 mod addsub {
   pub const ADD: u32 = 0;
-  /// Reproduced from the C's enum for completeness; nothing this entry point
+  /// Present for completeness; nothing this entry point
   /// reaches emits a flag-setting add.
   #[allow(dead_code)]
   pub const ADDS: u32 = 1;
@@ -245,7 +245,7 @@ fn emit_addsub_immediate(
   let mut imm12 = imm12;
   let mut sh = 0;
   if imm12 >= 0x1000 {
-    // The C asserts the low twelve bits are clear; with the shift on they have
+    // The low twelve bits must be clear; with the shift on they have
     // no bearing on the result. Every reachable caller satisfies it.
     debug_assert_eq!(imm12 & 0xfff, 0);
     imm12 >>= 12;
@@ -369,7 +369,7 @@ fn emit_dataprocessing_threesource(
 /// for `0`, `-1` and any single non-zero halfword, up to four for a value with
 /// four distinct halfwords.
 fn emit_movewide_immediate(st: &mut JitState, sixty_four: bool, rd: u32, imm: u64) {
-  // The C seeds count0000 with 2 in the 32-bit case, standing in for the two
+  // count0000 is seeded with 2 in the 32-bit case, standing in for the two
   // high halfwords it never examines.
   let mut count0000: u32 = if sixty_four { 0 } else { 2 };
   let mut countffff: u32 = 0;
@@ -450,7 +450,7 @@ fn emit_conditionalbranch_immediate(st: &mut JitState, c: u32, target: PatchTarg
 }
 
 /// Retargets the branch emitted at `jump_src` to land here. Mirrors
-/// `emit_jump_target` in `ubpf_jit_support.c`.
+/// Resolves one jump target.
 fn emit_jump_target(st: &mut JitState, jump_src: u32) {
   let here = st.offset;
   st.retarget_jumps(
@@ -847,7 +847,7 @@ fn emit_checked_address(
           plan.region,
         );
         emit_loadstore_immediate(st, ls::STRX, addr_reg, R29, abi::GROUP_BASE_OFFSET as i16);
-        // `base_reg` holds the *native* register here, matching the C's
+        // `base_reg` holds the *native* register here, matching the
         // `state->group_base_reg`; `written` is indexed by eBPF register.
         st.group = Some(OpenGroup {
           leader_pc: pc,
@@ -1289,7 +1289,7 @@ fn is_alu64_op(insn: &Insn) -> bool {
 /// The `add`/`sub` and conditional-jump forms take a 12-bit unsigned immediate.
 /// Everything else — including the logical operations, whose aarch64 immediate
 /// form uses the N/immr/imms bitmask encoding — is lowered to its register
-/// form. The C never attempts the bitmask encoding at all, so no constant is
+/// form. The bitmask encoding is never attempted, so no constant is
 /// ever "not encodable": the fallback is the only path.
 fn is_simple_imm(insn: &Insn) -> bool {
   use crate::jit::isa::{alu, cls};
@@ -1310,7 +1310,7 @@ fn is_simple_imm(insn: &Insn) -> bool {
         _ => insn.imm >= 0 && insn.imm < 0x1000,
       }
     }
-    // The C's `default: assert(false); return false;`. Unreachable for any
+    // Unreachable for any
     // opcode the validator admits.
     _ => false,
   }
@@ -1325,7 +1325,7 @@ fn to_reg_op(opcode: u8) -> u8 {
   } else if class == cls::ST {
     (opcode & !cls::MASK) | cls::STX
   } else {
-    // The C's `assert(false); return 0;`.
+    // Unreachable: every caller passes a width this covers.
     0
   }
 }
@@ -1377,7 +1377,7 @@ fn to_dp1_opcode(imm: i32) -> u32 {
     16 => dp1::REV16,
     32 => dp1::REV32,
     64 => dp1::REV64,
-    // The C's `assert(false); return 0;`.
+    // Unreachable: every caller passes a width this covers.
     _ => 0,
   }
 }
@@ -1447,7 +1447,7 @@ fn resolve_load_literal(st: &mut JitState, instr_offset: u32, target_offset: i32
 /// Patch an `ADR`.
 /// Only the `immhi` field is written; the two `immlo` bits at 30:29 are left
 /// clear, because the caller already divided the displacement by four. That is
-/// what the C does, so it is what this does.
+/// what callers depend on.
 fn resolve_adr(st: &mut JitState, instr_offset: u32, immediate: i32) -> bool {
   if (immediate >> 18) != -1 && (immediate >> 18) != 0 {
     st.fail(Progress::RelocationOutOfRange);
@@ -1459,9 +1459,9 @@ fn resolve_adr(st: &mut JitState, instr_offset: u32, immediate: i32) -> bool {
   true
 }
 
-/// Resolve one patch target to a native offset, mirroring the C's dispatch
+/// Resolve one patch target to a native offset, dispatching
 ///.
-/// The C decides between the two regular flavours with
+/// Decides between the two regular flavours with
 /// `jit_target_pc != 0` — a sentinel that would collide with a real offset of
 /// zero. It cannot here: offset 0 always holds the `bti c`, so nothing is ever
 /// patched to point at it. [`PatchTarget`] keeps the two apart by construction.
@@ -1558,7 +1558,7 @@ fn failed(msg: impl Into<String>) -> TranslateError {
 /// number of bytes written.
 /// Port of `translate_range` with `whole_program = false, lazy_local_calls =
 /// true`, followed by the relocation passes
-/// `ubpf_translate_function_arm64` runs.
+/// translation runs.
 pub fn translate_range(
   t: &Translator,
   inputs: &TranslationInputs<'_>,
@@ -1627,7 +1627,7 @@ pub fn translate_range(
       emit_addsub_immediate(&mut st, true, addsub::SUB, SP, SP, 16);
       emit_loadstorepair_immediate(&mut st, lsp::STPX, TEMP_REGISTER, TEMP_REGISTER, SP, 0);
       // Recorded so a local call can skip it. Every function's prologue is the
-      // same length, which the C asserts.
+      // same length, which the assertion below pins.
       if st.prolog_size == 0 {
         st.prolog_size = (st.offset - prolog_start) as usize;
       } else {
@@ -1724,7 +1724,7 @@ pub fn translate_range(
       None => {
         // An atomic whose selector immediate names no operation is reported
         // differently from an unrecognised opcode. Both arms are
-        // unreachable through `ubpf_load`, whose filter table enumerates the
+        // unreachable through `Translator::load`, whose filter table enumerates the
         // ten legal atomic immediates.
         errmsg = Some(
           if matches!(Insn { opcode, ..insn }.op(), Some(Op::Atomic { .. })) {
@@ -1773,7 +1773,7 @@ pub fn translate_range(
         }
         (JmpOp::Set, Source::Imm) => {
           // Unreachable: JSET_IMM is never "simple", so the lowering above
-          // already rewrote it to JSET_REG. The C lists it under `Unexpected
+          // already rewrote it to JSET_REG. It is listed under `Unexpected
           // instruction`, but that arm has no `break` and falls into
           // `default:`, so the status it reports is `UnknownInstruction`.
           errmsg = Some(format!(
@@ -1815,7 +1815,7 @@ pub fn translate_range(
         if native_frame_base_active(cfg) && insn.src == 10 {
           // Storing R10 stores a pointer, and it has to be the guest one.
           //
-          // The C tests the *raw* `inst.src` nibble, so a `st`
+          // This tests the *raw* `inst.src` nibble, so a `st`
           // instruction that happens to carry src == 10 has the frame pointer
           // materialised over the immediate it just parked in the same
           // register. Reproduced.
@@ -1894,7 +1894,7 @@ pub fn translate_range(
 
     // After the instruction has used its operands, note what it overwrote: an
     // access whose destination is its own base is still valid, but nothing
-    // addressing that base afterwards is. The C accumulates this in a state
+    // addressing that base afterwards is. This accumulates in a state
     // field that a leader resets to zero; here the accumulator lives in the
     // open group, which is created with it already zero, so the two agree.
     if let Some(group) = &mut st.group {
@@ -1954,7 +1954,7 @@ fn is_mov_imm(opcode: u8) -> bool {
     && opcode & src::REG == src::IMM
 }
 
-/// Map a non-`Ok` status to the error the C reports.
+/// Map a non-`Ok` status to the error reported for it.
 fn loop_error(status: Progress, errmsg: Option<String>) -> TranslateError {
   match status {
     Progress::TooManyJumps => failed("Too many jump instructions."),
@@ -2074,7 +2074,7 @@ fn emit_alu(
       }
     }
     // Every remaining immediate form is rewritten to its register form before
-    // the switch, so these arms are unreachable. The C lists them under
+    // the switch, so these arms are unreachable. They are listed under
     // `Unexpected instruction` but that arm has no `break`, so it falls into
     // `default:` and the status the caller sees is `UnknownInstruction`.
     (_, Source::Imm) => {
@@ -2096,7 +2096,7 @@ fn emit_end(st: &mut JitState, kind: EndKind, imm: i32, sixty_four: bool, dst: u
   match kind {
     EndKind::Le => {
       // Little-endian host: the reversal is a no-op. Both supported targets are
-      // little-endian, so the C's `#if __BYTE_ORDER__` never takes the other
+      // little-endian, so the big-endian form never takes the other
       // branch here.
       if imm == 16 {
         emit_instruction(st, UXTH | (dst << 5) | dst);

@@ -582,7 +582,7 @@ fn no_hostile_program_makes_the_translator_panic() {
         }
       }
 
-      // Truncated analysis inputs: the C indexed these by pc against a length
+      // Truncated analysis inputs: these are indexed by pc against a length
       // it was told, so a short slice is the classic out-of-bounds.
       let mut buf = vec![0u8; 1 << 16];
       let inputs = TranslationInputs {
@@ -789,7 +789,7 @@ fn extreme_local_call_displacements_are_refused_without_overflowing() {
   }
 }
 
-/// A program at and around the instruction-count ceiling. The C's bound is
+/// A program at and around the instruction-count ceiling. The bound is
 /// `>=` and `Translator::load`'s is `>`; together they must reject exactly
 /// `MAX_INSTS` and above, and neither may allocate or index off the end.
 #[test]
