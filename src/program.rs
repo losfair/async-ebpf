@@ -145,7 +145,7 @@ const _: () = {
   //    nothing else says so, so say it here - `_run` re-checks the address the
   //    cage actually hands back.
   assert!(
-    SHADOW_STACK_SIZE % 8 == 0,
+    SHADOW_STACK_SIZE.is_multiple_of(8),
     "the guest stack window is not a multiple of 8, so R10's alignment rounding \
      eats into the headroom Tier F frame addressing depends on"
   );

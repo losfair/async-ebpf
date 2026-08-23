@@ -809,7 +809,7 @@ fn emit_checked_address(
       let usable = match (st.group, base_ebpf) {
         (Some(group), Some(base_ebpf)) => {
           group.leader_pc == plan.leader_pc
-            && base_ebpf as u8 == group.base_reg
+            && base_ebpf == group.base_reg
             && group.written & (1u16 << base_ebpf) == 0
             && plan.delta as u64 + width as u64 <= group.span as u64
             && group.lo as i64 + plan.delta as i64 == offset as i64
@@ -851,7 +851,7 @@ fn emit_checked_address(
           leader_pc: pc,
           span: plan.span,
           lo: plan.lo,
-          base_reg: base_ebpf.expect("checked above") as u8,
+          base_reg: base_ebpf.expect("checked above"),
           region: plan.region,
           written: 0,
         });
