@@ -1,9 +1,3461 @@
-//! STUB - replaced by the x86_64 emitter port.
-use crate::jit::{TranslateError, TranslationInputs, Translator};
+//! The x86_64 backend.
+//!
+//! A port of `ubpf_translate_function_x86_64` in
+//! `oracle/ubpf-sys/vendor/ubpf/vm/ubpf_jit_x86_64.c`, which always reaches
+//! `translate_range(..., whole_program = false, lazy_local_calls = true)`. The
+//! whole-program entry point, the interpreter and constant blinding are not
+//! reachable from it and are not ported; where the C branches on those they are
+//! folded away with a comment saying so.
+//!
+//! # Byte-identity
+//!
+//! Until the C oracle is deleted this must emit the *same bytes* as the C for
+//! every program and every configuration, not merely equivalent code. Several
+//! things below therefore look wrong and are wrong: they are reproduced because
+//! reproducing them is what makes the port checkable. Every one of them carries
+//! a comment naming the C line it comes from.
+//!
+//! # Shape of the emitted function
+//!
+//! ```text
+//!   [per-function prologue]  push the callee's guest stack usage
+//!   [instruction stream]
+//!   exit_loc:  add rsp, 8 ; ret
+//!   retpoline
+//!   external dispatcher address     (8 bytes)
+//!   helper table                    (64 * 8 bytes)
+//! ```
+//!
+//! Everything after the instruction stream is emitted unconditionally, which is
+//! why even a two-instruction program is around 600 bytes.
+
+use crate::jit::abi;
+use crate::jit::isa::{
+  cls, opcode, AluOp, AluWidth, AtomicOp, EndKind, Insn, JmpOp, Op, Source, Width,
+};
+use crate::jit::patch::{JitState, OpenGroup, PatchTarget, Progress, SpecialTarget};
+use crate::jit::{Config, PlanEntry, TranslateError, TranslationInputs, Translator};
+
+// ---------------------------------------------------------------------------
+// Native registers
+// ---------------------------------------------------------------------------
+
+const RAX: u8 = 0;
+const RCX: u8 = 1;
+const RDX: u8 = 2;
+const RBX: u8 = 3;
+const RSP: u8 = 4;
+/// Also `RIP` in the C, which uses the same number for RIP-relative ModRM.
+const RBP: u8 = 5;
+const RSI: u8 = 6;
+const RDI: u8 = 7;
+const R8: u8 = 8;
+const R9: u8 = 9;
+const R10: u8 = 10;
+const R11: u8 = 11;
+const R12: u8 = 12;
+const R13: u8 = 13;
+const R14: u8 = 14;
+const R15: u8 = 15;
+
+/// Where the entry code parks the embedder's context pointer.
+const VOLATILE_CTXT: u8 = R11;
+/// eBPF `R4` maps here, and shifts need RCX; the helper-call sequence moves it
+/// out of the way. Mirrors `RCX_ALT` (C line 155).
+const RCX_ALT: u8 = R10;
+
+/// eBPF register to x86 register, SysV flavour (C lines 181-195).
+///
+/// The Windows map differs and is not ported: this crate is Linux/OpenBSD only.
+/// The *structure* is kept — eBPF `R0`-`R5` land on caller-saved registers and
+/// `R6`-`R10` on callee-saved ones — because the helper-call sequence relies on
+/// it to know what it does not have to preserve.
+///
+/// `R15` must stay mapped to eBPF `R10`: the frame-access fast path and the
+/// local-call frame adjustment both name it directly.
+const REGISTER_MAP: [u8; crate::jit::isa::NUM_REGS] = [
+  // Scratch registers.
+  RAX, RDI, RSI, RDX, R10, R8, // Non-volatile registers.
+  RBX, R12, R13, R14, R15,
+];
+
+/// The x86 register for an eBPF register.
+///
+/// The C takes `r % _BPF_REG_MAX` behind an `assert`, so a register number the
+/// validator should have rejected wraps rather than trapping in a release build
+/// (C lines 213-218). Reproduced.
+fn map_register(r: u8) -> u8 {
+  REGISTER_MAP[(r as usize) % crate::jit::isa::NUM_REGS]
+}
+
+/// The eBPF register mapped to `native`, if any. The map is injective, so this
+/// is exact (C lines 200-210).
+fn unmap_register(native: u8) -> Option<u8> {
+  REGISTER_MAP
+    .iter()
+    .position(|&x| x == native)
+    .map(|i| i as u8)
+}
+
+/// Operand size, mirroring `enum operand_size`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum S {
+  S8,
+  S16,
+  S32,
+  S64,
+}
+
+impl S {
+  fn from_width(w: Width) -> S {
+    match w {
+      Width::B => S::S8,
+      Width::H => S::S16,
+      Width::W => S::S32,
+      Width::DW => S::S64,
+    }
+  }
+
+  /// The C recomputes this at every call site as
+  /// `size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1`.
+  fn bytes(self) -> i32 {
+    match self {
+      S::S8 => 1,
+      S::S16 => 2,
+      S::S32 => 4,
+      S::S64 => 8,
+    }
+  }
+}
+
+/// Where one guest region's bounds can be found. Mirrors `struct guest_region`.
+struct GuestRegion {
+  desc_bottom: i32,
+  desc_top: i32,
+  desc_native_base: i32,
+  slot_bottom: i32,
+  slot_delta: i32,
+  slot_span: i32,
+}
+
+const STACK_REGION: GuestRegion = GuestRegion {
+  desc_bottom: abi::memory::STACK_GUEST_BOTTOM,
+  desc_top: abi::memory::STACK_GUEST_TOP,
+  desc_native_base: abi::memory::STACK_NATIVE_BASE,
+  slot_bottom: abi::derived_slot(abi::DERIVED_STACK_BASE + abi::DERIVED_BOTTOM),
+  slot_delta: abi::derived_slot(abi::DERIVED_STACK_BASE + abi::DERIVED_DELTA),
+  slot_span: abi::derived_slot(abi::DERIVED_STACK_BASE + abi::DERIVED_SPAN),
+};
+
+const DATA_REGION: GuestRegion = GuestRegion {
+  desc_bottom: abi::memory::DATA_GUEST_BOTTOM,
+  desc_top: abi::memory::DATA_GUEST_TOP,
+  desc_native_base: abi::memory::DATA_NATIVE_BASE,
+  slot_bottom: abi::derived_slot(abi::DERIVED_DATA_BASE + abi::DERIVED_BOTTOM),
+  slot_delta: abi::derived_slot(abi::DERIVED_DATA_BASE + abi::DERIVED_DELTA),
+  slot_span: abi::derived_slot(abi::DERIVED_DATA_BASE + abi::DERIVED_SPAN),
+};
+
+/// x86 ALU opcodes used by the atomic forms.
+const X64_ALU_ADD: u8 = 0x01;
+const X64_ALU_OR: u8 = 0x09;
+const X64_ALU_AND: u8 = 0x21;
+const X64_ALU_XOR: u8 = 0x31;
+
+/// Entry point. Mirrors `ubpf_translate_function_x86_64`, which is
+/// `translate_range(..., whole_program = false, lazy_local_calls = true)`
+/// followed by `resolve_patchable_relatives` (C lines 3607-3645).
 pub fn translate_range(
-  _t: &Translator,
-  _inputs: &TranslationInputs<'_>,
-  _buffer: &mut [u8],
+  t: &Translator,
+  inputs: &TranslationInputs<'_>,
+  buffer: &mut [u8],
 ) -> Result<usize, TranslateError> {
-  todo!("x86_64 emitter")
+  let mut e = Emit {
+    st: JitState::new(buffer, t.insns().len()),
+    t,
+    cfg: t.config(),
+    inputs,
+    errmsg: None,
+  };
+  e.run()
+}
+
+struct Emit<'buf, 'ctx, 'in_> {
+  st: JitState<'buf>,
+  t: &'ctx Translator,
+  cfg: &'ctx Config,
+  inputs: &'ctx TranslationInputs<'in_>,
+  /// Set alongside a [`Progress`] where the C's message needs information only
+  /// the detecting site has.
+  errmsg: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Primitive emission
+// ---------------------------------------------------------------------------
+
+impl Emit<'_, '_, '_> {
+  /// Mirrors `emit_bytes` (C lines 220-237): once the translation has failed,
+  /// nothing more is written *and the offset does not advance*. The check is
+  /// here rather than in [`JitState`] because the shared state is also used by
+  /// the arm64 backend.
+  #[inline]
+  fn emit_n(&mut self, value: u64, n: usize) {
+    if !self.st.ok() {
+      return;
+    }
+    self.st.emit_bytes(value, n);
+  }
+
+  #[inline]
+  fn emit1(&mut self, x: u8) {
+    self.emit_n(x as u64, 1);
+  }
+
+  #[inline]
+  fn emit2(&mut self, x: u16) {
+    self.emit_n(x as u64, 2);
+  }
+
+  #[inline]
+  fn emit4(&mut self, x: u32) {
+    self.emit_n(x as u64, 4);
+  }
+
+  #[inline]
+  fn emit8(&mut self, x: u64) {
+    self.emit_n(x, 8);
+  }
+
+  #[inline]
+  fn offset(&self) -> u32 {
+    self.st.offset
+  }
+
+  /// Reserves four bytes for a jump displacement and records the fixup.
+  /// Mirrors `emit_jump_address_reloc`; returns where the displacement starts.
+  fn emit_jump_address_reloc(&mut self, target: PatchTarget) -> u32 {
+    let at = self.offset();
+    self.st.note_jump(at, target);
+    self.emit4(0);
+    at
+  }
+
+  fn emit_modrm(&mut self, md: u8, r: u8, m: u8) {
+    self.emit1((md & 0xc0) | ((r & 7) << 3) | (m & 7));
+  }
+
+  fn emit_modrm_reg2reg(&mut self, r: u8, m: u8) {
+    self.emit_modrm(0xc0, r, m);
+  }
+
+  /// ModRM plus displacement, with the zero-displacement shortcut.
+  ///
+  /// Mirrors `emit_modrm_and_displacement` (C lines 319-351). Two irregular
+  /// cases matter and are handled the way the C handles them:
+  ///
+  /// * `RBP`/`R13` cannot encode a bare `[base]`, so they always get an
+  ///   explicit displacement even when it is zero;
+  /// * `R12` needs a SIB byte, which the C emits as `0x24`.
+  ///
+  /// `RSP` is excluded from the zero shortcut but *does not* get a SIB byte,
+  /// which would misencode. The C has the same hole; no caller ever passes
+  /// `RSP` as a base (the sequences that address the host stack emit their
+  /// ModRM+SIB bytes literally), so it is reproduced rather than fixed.
+  fn emit_modrm_and_displacement(&mut self, reg: u8, rm: u8, d: i32) {
+    let rm = rm & 0xf;
+    let reg = reg & 0xf;
+
+    if d == 0 && rm != RSP && rm != RBP && rm != R12 && rm != R13 {
+      self.emit_modrm(0x00, reg, rm);
+      return;
+    }
+
+    let near_disp = (-128..=127).contains(&d);
+    let md = if near_disp { 0x40 } else { 0x80 };
+
+    self.emit_modrm(md, reg, rm);
+    if rm == R12 {
+      self.emit1(0x24);
+    }
+
+    if near_disp {
+      self.emit1(d as u8);
+    } else {
+      self.emit4(d as u32);
+    }
+  }
+
+  fn emit_rex(&mut self, w: u8, r: u8, x: u8, b: u8) {
+    self.emit1(0x40 | (w << 3) | (r << 2) | (x << 1) | b);
+  }
+
+  /// REX carrying only the high bits of `src`/`dst`, skipped when no bit would
+  /// be set. Mirrors `emit_basic_rex`.
+  fn emit_basic_rex(&mut self, w: u8, src: u8, dst: u8) {
+    if w != 0 || (src & 8) != 0 || (dst & 8) != 0 {
+      self.emit_rex(w, u8::from(src & 8 != 0), 0, u8::from(dst & 8 != 0));
+    }
+  }
+
+  fn emit_push(&mut self, r: u8) {
+    self.emit_basic_rex(0, 0, r);
+    self.emit1(0x50 | (r & 7));
+  }
+
+  fn emit_pop(&mut self, r: u8) {
+    self.emit_basic_rex(0, 0, r);
+    self.emit1(0x58 | (r & 7));
+  }
+
+  fn emit_alu32(&mut self, op: u8, src: u8, dst: u8) {
+    self.emit_basic_rex(0, src, dst);
+    self.emit1(op);
+    self.emit_modrm_reg2reg(src, dst);
+  }
+
+  fn emit_alu32_imm32(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
+    self.emit_alu32(op, src, dst);
+    self.emit4(imm as u32);
+  }
+
+  fn emit_alu32_imm8(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
+    // The C parameter is `int8_t`, so the immediate is truncated at the call.
+    self.emit_alu32(op, src, dst);
+    self.emit1(imm as u8);
+  }
+
+  /// `and dst, 0xffffffff` — the zero-extension every 32-bit ALU op ends with.
+  fn emit_truncate_u32(&mut self, dst: u8) {
+    self.emit_alu32_imm32(0x81, 4, dst, u32::MAX as i32);
+  }
+
+  fn emit_alu64(&mut self, op: u8, src: u8, dst: u8) {
+    self.emit_basic_rex(1, src, dst);
+    self.emit1(op);
+    self.emit_modrm_reg2reg(src, dst);
+  }
+
+  fn emit_alu64_imm32(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
+    self.emit_alu64(op, src, dst);
+    self.emit4(imm as u32);
+  }
+
+  fn emit_alu64_imm8(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
+    self.emit_alu64(op, src, dst);
+    self.emit1(imm as u8);
+  }
+
+  fn emit_mov(&mut self, src: u8, dst: u8) {
+    self.emit_alu64(0x89, src, dst);
+  }
+
+  fn emit_cmp_imm32(&mut self, dst: u8, imm: i32) {
+    self.emit_alu64_imm32(0x81, 7, dst, imm);
+  }
+
+  fn emit_cmp32_imm32(&mut self, dst: u8, imm: i32) {
+    self.emit_alu32_imm32(0x81, 7, dst, imm);
+  }
+
+  fn emit_cmp(&mut self, src: u8, dst: u8) {
+    self.emit_alu64(0x39, src, dst);
+  }
+
+  fn emit_cmp32(&mut self, src: u8, dst: u8) {
+    self.emit_alu32(0x39, src, dst);
+  }
+
+  fn emit_jcc(&mut self, code: u8, target: PatchTarget) -> u32 {
+    self.emit1(0x0f);
+    self.emit1(code);
+    self.emit_jump_address_reloc(target)
+  }
+
+  /// Mirrors `emit_jmp` (C lines 1421-1430).
+  ///
+  /// A near jump emits the two-byte `0xeb rel8` form but still reserves a
+  /// *four*-byte placeholder, so three bytes are wasted after it. They are never
+  /// executed — the jump is unconditional and lands past them — so this is
+  /// harmless, and it is reproduced because the offsets of everything after it
+  /// depend on it.
+  fn emit_jmp(&mut self, target: PatchTarget) -> u32 {
+    let near = matches!(
+      target,
+      PatchTarget::EbpfPc { near: true, .. } | PatchTarget::JitOffset { near: true, .. }
+    );
+    self.emit1(if near { 0xeb } else { 0xe9 });
+    self.emit_jump_address_reloc(target)
+  }
+
+  fn emit_call(&mut self, target: PatchTarget) -> u32 {
+    self.emit1(0xe8);
+    let call_src = self.offset();
+    self.emit_jump_address_reloc(target);
+    call_src
+  }
+
+  fn emit_ret(&mut self) {
+    self.emit1(0xc3);
+  }
+
+  fn emit_pause(&mut self) {
+    self.emit1(0xf3);
+    self.emit1(0x90);
+  }
+
+  /// Retargets every jump recorded at `jump_src` to the current offset.
+  /// Mirrors `emit_jump_target` in `ubpf_jit_support.c`.
+  fn emit_jump_target(&mut self, jump_src: u32) {
+    let here = self.offset();
+    self.st.retarget_jumps(
+      jump_src,
+      PatchTarget::JitOffset {
+        offset: here,
+        near: false,
+      },
+    );
+  }
+
+  /// `load [src + offset] -> dst`, zero-extending for the narrow widths.
+  fn emit_load(&mut self, size: S, src: u8, dst: u8, offset: i32) {
+    self.emit_basic_rex(u8::from(size == S::S64), dst, src);
+
+    match size {
+      S::S8 => {
+        self.emit1(0x0f);
+        self.emit1(0xb6);
+      }
+      S::S16 => {
+        self.emit1(0x0f);
+        self.emit1(0xb7);
+      }
+      S::S32 | S::S64 => self.emit1(0x8b),
+    }
+
+    self.emit_modrm_and_displacement(dst, src, offset);
+  }
+
+  /// `load [src + offset] -> dst`, sign-extending to 64 bits.
+  ///
+  /// `S64` emits nothing at all, as in the C (there is no `ldxdwsx` encoding,
+  /// so no caller reaches it).
+  fn emit_load_sx(&mut self, size: S, src: u8, dst: u8, offset: i32) {
+    match size {
+      S::S8 | S::S16 => {
+        self.emit_basic_rex(1, dst, src);
+        self.emit1(0x0f);
+        self.emit1(if size == S::S8 { 0xbe } else { 0xbf });
+        self.emit_modrm_and_displacement(dst, src, offset);
+      }
+      S::S32 => {
+        self.emit_basic_rex(1, dst, src);
+        self.emit1(0x63);
+        self.emit_modrm_and_displacement(dst, src, offset);
+      }
+      S::S64 => {}
+    }
+  }
+
+  /// Materialises a 64-bit immediate, preferring the sign-extended 32-bit form.
+  fn emit_load_imm(&mut self, dst: u8, imm: i64) {
+    if (i32::MIN as i64..=i32::MAX as i64).contains(&imm) {
+      self.emit_alu64_imm32(0xc7, 0, dst, imm as i32);
+    } else {
+      self.emit_basic_rex(1, 0, dst);
+      self.emit1(0xb8 | (dst & 7));
+      self.emit8(imm as u64);
+    }
+  }
+
+  /// `op reg, [base + offset]` at 64 bits, for the `0x2B`/`0x03`/`0x39`/`0x3B`/
+  /// `0x0B` forms the bounds check uses.
+  fn emit_alu64_mem(&mut self, op: u8, reg: u8, base: u8, offset: i32) {
+    self.emit_basic_rex(1, reg, base);
+    self.emit1(op);
+    self.emit_modrm_and_displacement(reg, base, offset);
+  }
+
+  /// `cmovcc dst, src` at 64 bits.
+  fn emit_cmov(&mut self, cc: u8, dst: u8, src: u8) {
+    self.emit_basic_rex(1, dst, src);
+    self.emit1(0x0f);
+    self.emit1(cc);
+    self.emit_modrm_reg2reg(dst, src);
+  }
+
+  /// `store src -> [dst + offset]`.
+  ///
+  /// The `size == S8` term in the REX condition is what makes a byte store
+  /// through `SIL`/`DIL`/`SPL`/`BPL` name the right register: without a REX
+  /// prefix those encodings mean `AH`/`CH`/`DH`/`BH`.
+  fn emit_store(&mut self, size: S, src: u8, dst: u8, offset: i32) {
+    if size == S::S16 {
+      self.emit1(0x66);
+    }
+    let rexw = u8::from(size == S::S64);
+    if rexw != 0 || (src & 8) != 0 || (dst & 8) != 0 || size == S::S8 {
+      self.emit_rex(rexw, u8::from(src & 8 != 0), 0, u8::from(dst & 8 != 0));
+    }
+    self.emit1(if size == S::S8 { 0x88 } else { 0x89 });
+    self.emit_modrm_and_displacement(src, dst, offset);
+  }
+
+  /// `store imm -> [dst + offset]`.
+  fn emit_store_imm32(&mut self, size: S, dst: u8, offset: i32, imm: i32) {
+    if size == S::S16 {
+      self.emit1(0x66);
+    }
+    self.emit_basic_rex(u8::from(size == S::S64), 0, dst);
+    self.emit1(if size == S::S8 { 0xc6 } else { 0xc7 });
+    self.emit_modrm_and_displacement(0, dst, offset);
+    match size {
+      S::S32 | S::S64 => self.emit4(imm as u32),
+      S::S16 => self.emit2(imm as u16),
+      S::S8 => self.emit1(imm as u8),
+    }
+  }
+
+  /// `mov dst, [rip + target]`, with the displacement deferred.
+  fn emit_rip_relative_load(&mut self, dst: u8, target: PatchTarget) -> u32 {
+    self.emit_rex(1, 0, 0, 0);
+    self.emit1(0x8b);
+    self.emit_modrm(0, dst, 0x05);
+
+    let at = self.offset();
+    self.st.note_load(at, target);
+    self.emit4(0);
+    at
+  }
+
+  /// `lea dst, [rip + target]`, with the displacement deferred.
+  ///
+  /// The C emits `REX.WR` unconditionally (C line 1341) rather than deriving
+  /// `R` from `dst`. That happens to be right for the one call site, which
+  /// passes `R10`, and wrong for any other; reproduced as-is.
+  fn emit_rip_relative_lea(&mut self, dst: u8, target: PatchTarget) {
+    self.emit_rex(1, 1, 0, 0);
+    self.emit1(0x8d);
+    self.emit_modrm(0, dst, 0x05);
+    let at = self.offset();
+    self.st.note_lea(at, target);
+    self.emit4(0);
+  }
+
+  fn emit_indirect_call_rax(&mut self) {
+    self.emit1(0xff);
+    self.emit1(0xd0);
+  }
+
+  fn emit_indirect_call_reg(&mut self, reg: u8) {
+    if reg & 8 != 0 {
+      self.emit1(0x41);
+    }
+    self.emit1(0xff);
+    self.emit1(0xd0 | (reg & 7));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The pointer cage
+// ---------------------------------------------------------------------------
+
+impl Emit<'_, '_, '_> {
+  /// The same check as [`Self::emit_single_region_address_via_descriptor`],
+  /// reading the region's bounds from the frame constants the embedder derived
+  /// once per invocation. Mirrors `emit_single_region_address_from_frame`.
+  fn emit_single_region_address_from_frame(
+    &mut self,
+    dst: u8,
+    scratch: u8,
+    size: i32,
+    bottom_slot: i32,
+    delta_slot: i32,
+    span_base: i32,
+  ) {
+    // off = guest - bottom, kept in a register for the comparison below.
+    self.emit_mov(dst, scratch);
+    self.emit_alu64_mem(0x2B, scratch, RBP, bottom_slot);
+
+    // Translate unconditionally; the CMOV below undoes it when out of range.
+    self.emit_alu64_mem(0x03, dst, RBP, delta_slot);
+
+    if let Some(slot) = width_span_slot(size) {
+      let zero = R9;
+      let span_slot = span_base + (slot as i32) * 8;
+
+      // Zero the fault address before the compare, which sets the flags.
+      self.emit_alu64(0x31, zero, zero);
+
+      // 0x39 is `CMP r/m64, r64`, so the memory operand is the left-hand side:
+      // CF is set iff span < off, i.e. iff out of range.
+      self.emit_alu64_mem(0x39, scratch, RBP, span_slot);
+      self.emit_cmov(0x42, dst, zero); // cmovb dst, 0
+    } else {
+      // An access group covers any width up to a page rather than one of the
+      // four the precomputed spans hold, so narrow the width-1 span instead.
+      let span = R9;
+      self.emit_load(S::S64, RBP, span, span_base);
+      self.emit_alu64_imm32(0x81, 5, span, size - 1);
+
+      // Both remaining registers are live across the compare, so the fault
+      // address is zeroed after it with a MOV, which leaves the flags alone.
+      self.emit_alu64(0x39, scratch, span);
+      self.emit_alu64_imm32(0xc7, 0, scratch, 0);
+      self.emit_cmov(0x42, dst, scratch);
+    }
+  }
+
+  /// Bounds-check `[dst, dst+size)` against one guest region described by the
+  /// memory descriptor at `[RBP - 8]`, then translate `dst`. Branchless: a
+  /// final CMOV substitutes address 0 when out of range, so no mis-speculated
+  /// path performs a transient out-of-bounds access.
+  fn emit_single_region_address_via_descriptor(
+    &mut self,
+    dst: u8,
+    scratch: u8,
+    size: i32,
+    bottom_off: i32,
+    top_off: i32,
+    base_off: i32,
+  ) {
+    let span = R9;
+
+    self.emit_load(S::S64, RBP, scratch, abi::FRAME_OFFSET);
+
+    // off = dst - bottom; spill it, then translated = off + base (kept in dst).
+    self.emit_alu64_mem(0x2B, dst, scratch, bottom_off);
+    self.emit_store(S::S64, dst, RBP, abi::SPILL_OFFSET);
+    self.emit_alu64_mem(0x03, dst, scratch, base_off);
+
+    // span = (top - size) - bottom
+    self.emit_load(S::S64, scratch, span, top_off);
+    if size != 0 {
+      self.emit_alu64_imm32(0x81, 5, span, size);
+    }
+    self.emit_alu64_mem(0x2B, span, scratch, bottom_off);
+
+    // Zero the fault address before the compare, which sets the flags.
+    self.emit_alu64(0x31, scratch, scratch);
+
+    self.emit_alu64_mem(0x3B, span, RBP, abi::SPILL_OFFSET);
+    self.emit_cmov(0x42, dst, scratch);
+  }
+
+  fn emit_single_region_address(&mut self, dst: u8, scratch: u8, size: i32, region: &GuestRegion) {
+    if self.cfg.frame_constants {
+      self.emit_single_region_address_from_frame(
+        dst,
+        scratch,
+        size,
+        region.slot_bottom,
+        region.slot_delta,
+        region.slot_span,
+      );
+    } else {
+      self.emit_single_region_address_via_descriptor(
+        dst,
+        scratch,
+        size,
+        region.desc_bottom,
+        region.desc_top,
+        region.desc_native_base,
+      );
+    }
+  }
+
+  /// Materialises the *guest* value of eBPF `R10` into `dst`.
+  ///
+  /// Under a native frame base the register mapped to `R10` holds a host
+  /// address; a program that reads `R10` as a value must still see a guest one.
+  fn emit_guest_frame_pointer(&mut self, dst: u8) {
+    self.emit_mov(map_register(crate::jit::isa::REG_FP), dst);
+    self.emit_alu64_mem(0x2B, dst, RBP, abi::FRAME_DELTA_OFFSET);
+  }
+
+  /// True when `[base + offset]`, `size` bytes wide, is a frame access that
+  /// needs no bounds check at all. Mirrors `emit_frame_access_ok`.
+  ///
+  /// This is the one place a runtime check is traded for a static argument, so
+  /// three of the four conditions are re-derived here rather than taken from
+  /// the hint.
+  fn emit_frame_access_ok(&self, region_hint: u8, base: u8, offset: i32, size: i32) -> bool {
+    if !self.cfg.native_frame_base_active() || region_hint != abi::region::FRAME {
+      return false;
+    }
+    if base != map_register(crate::jit::isa::REG_FP) {
+      return false;
+    }
+    // offset + size <= 0
+    if offset > -size {
+      return false;
+    }
+    if offset < -(abi::LOCAL_FUNCTION_STACK_SIZE as i32) {
+      return false;
+    }
+    true
+  }
+
+  /// Resolves `[src + offset]` to a native address in `dst`, emitting whatever
+  /// check that needs. Mirrors `emit_masked_address_with_offset`.
+  #[allow(clippy::too_many_arguments)]
+  fn emit_masked_address_with_offset(
+    &mut self,
+    src: u8,
+    dst: u8,
+    scratch: u8,
+    offset: i32,
+    size: i32,
+    store: bool,
+    region_hint: u8,
+  ) {
+    debug_assert_ne!(dst, scratch);
+
+    if self.cfg.native_frame_base_active() && src == map_register(crate::jit::isa::REG_FP) {
+      // Everything below works in guest space, so recover the guest frame
+      // pointer before starting.
+      self.emit_guest_frame_pointer(dst);
+    } else if src != dst {
+      self.emit_mov(src, dst);
+    }
+
+    if offset != 0 {
+      self.emit_alu64_imm32(0x81, 0, dst, offset);
+    }
+
+    if self.cfg.pointer_mask != 0 {
+      // Stores are confined to the active stack regardless of the hint, which
+      // is what preserves the read-only guarantee for the data region.
+      if store || region_hint == abi::region::STACK {
+        self.emit_single_region_address(dst, scratch, size, &STACK_REGION);
+        return;
+      }
+      if region_hint == abi::region::DATA {
+        self.emit_single_region_address(dst, scratch, size, &DATA_REGION);
+        return;
+      }
+
+      // Unknown region: probe both branchlessly. The two guest ranges are
+      // disjoint, so at most one candidate is non-zero and OR-ing them recovers
+      // the address (or 0, a guaranteed faulting access, when neither matches).
+      self.emit_store(S::S64, dst, RBP, abi::ADDR_SPILL_OFFSET);
+      self.emit_single_region_address(dst, scratch, size, &STACK_REGION);
+      self.emit_store(S::S64, dst, RBP, abi::ACC_SPILL_OFFSET);
+      self.emit_load(S::S64, RBP, dst, abi::ADDR_SPILL_OFFSET);
+      self.emit_single_region_address(dst, scratch, size, &DATA_REGION);
+      self.emit_alu64_mem(0x0B, dst, RBP, abi::ACC_SPILL_OFFSET);
+    }
+  }
+
+  /// The plan entry for `pc`, or `None` when there is no usable plan.
+  fn access_plan_entry(&self, pc: usize) -> Option<PlanEntry> {
+    self.inputs.plan_entry(self.cfg, pc).copied()
+  }
+
+  /// Resolves `[base + offset]` to a native address and returns the register it
+  /// was left in together with the displacement to use with it. Mirrors
+  /// `emit_checked_address` (C lines 951-1034).
+  ///
+  /// The access plan chooses between the group-member and group-leader paths,
+  /// and it is not taken on trust: every condition the backend can see for
+  /// itself is re-derived here, and any failure drops through to an ordinary
+  /// checked access. A plan that is wrong — or hostile — costs speed and
+  /// nothing else.
+  #[allow(clippy::too_many_arguments)]
+  fn emit_checked_address(
+    &mut self,
+    pc: usize,
+    base: u8,
+    offset: i32,
+    width: i32,
+    store: bool,
+    region_hint: u8,
+    addr_reg: u8,
+    scratch_reg: u8,
+  ) -> (u8, i32) {
+    if self.emit_frame_access_ok(region_hint, base, offset, width) {
+      return (base, offset);
+    }
+
+    if self.cfg.pointer_mask == 0 {
+      return (base, offset);
+    }
+
+    let plan = self.access_plan_entry(pc);
+    let base_ebpf = unmap_register(base);
+
+    if let Some(plan) = plan.filter(|p| p.role == abi::plan_role::MEMBER) {
+      // `group` is `Some` only while the backend has established that the
+      // leader ran and that nothing has redefined the base since — the C keeps
+      // the group open and tests a written-register mask instead, which rejects
+      // exactly the same accesses.
+      let usable = match (&self.st.group, base_ebpf) {
+        (Some(g), Some(base_ebpf)) => {
+          g.leader_pc == plan.leader_pc
+            && base_ebpf == g.base_reg
+            && plan.delta as u64 + width as u64 <= g.span as u64
+            && g.lo as i64 + plan.delta as i64 == offset as i64
+            // A store cannot ride a window checked against the read-only data
+            // region.
+            && (!store || g.region == abi::region::STACK)
+        }
+        _ => false,
+      };
+      if usable {
+        self.emit_load(S::S64, RBP, addr_reg, abi::GROUP_BASE_OFFSET);
+        return (addr_reg, plan.delta as i32);
+      }
+      // Fall through to a checked access. The group stays open: a member the
+      // backend declined does not invalidate the parked base for the ones
+      // after it.
+    }
+
+    if let Some(plan) = plan.filter(|p| p.role == abi::plan_role::LEADER) {
+      let usable = base_ebpf.is_some()
+        && plan.span > 0
+        && plan.span <= abi::MAX_GROUP_SPAN
+        && plan.delta as u64 + width as u64 <= plan.span as u64
+        && plan.lo as i64 + plan.delta as i64 == offset as i64
+        && plan.region != abi::region::FRAME
+        && (!store || plan.region == abi::region::STACK);
+      if usable {
+        self.emit_masked_address_with_offset(
+          base,
+          addr_reg,
+          scratch_reg,
+          plan.lo,
+          plan.span as i32,
+          store,
+          plan.region,
+        );
+        self.emit_store(S::S64, addr_reg, RBP, abi::GROUP_BASE_OFFSET);
+        self.st.group = Some(OpenGroup {
+          leader_pc: pc as u32,
+          span: plan.span,
+          lo: plan.lo,
+          base_reg: base_ebpf.expect("checked above"),
+          region: plan.region,
+          written: 0,
+        });
+        return (addr_reg, plan.delta as i32);
+      }
+    }
+
+    self.emit_masked_address_with_offset(
+      base,
+      addr_reg,
+      scratch_reg,
+      offset,
+      width,
+      store,
+      region_hint,
+    );
+    (addr_reg, 0)
+  }
+
+  fn emit_masked_load(&mut self, size: S, src: u8, dst: u8, offset: i32, hint: u8, pc: usize) {
+    let width = size.bytes();
+    let (addr, disp) = self.emit_checked_address(pc, src, offset, width, false, hint, R11, RCX);
+    self.emit_load(size, addr, dst, disp);
+  }
+
+  fn emit_masked_load_sx(&mut self, size: S, src: u8, dst: u8, offset: i32, hint: u8, pc: usize) {
+    let width = size.bytes();
+    let (addr, disp) = self.emit_checked_address(pc, src, offset, width, false, hint, R11, RCX);
+    self.emit_load_sx(size, addr, dst, disp);
+  }
+
+  fn emit_masked_store(&mut self, size: S, src: u8, dst: u8, offset: i32, hint: u8, pc: usize) {
+    let width = size.bytes();
+    // A program storing R10 stores a pointer, and under a native frame base the
+    // register holds the host one. Recover the guest value — but only after the
+    // address is resolved below, which uses RCX as its scratch.
+    let store_guest_frame_pointer =
+      self.cfg.native_frame_base_active() && src == map_register(crate::jit::isa::REG_FP);
+    let (addr, disp) = self.emit_checked_address(pc, dst, offset, width, true, hint, R11, RCX);
+
+    let mut src = src;
+    if store_guest_frame_pointer {
+      self.emit_guest_frame_pointer(RCX);
+      src = RCX;
+    }
+    self.emit_store(size, src, addr, disp);
+  }
+
+  fn emit_masked_store_imm32(
+    &mut self,
+    size: S,
+    dst: u8,
+    offset: i32,
+    imm: i32,
+    hint: u8,
+    pc: usize,
+  ) {
+    let width = size.bytes();
+    // RCX carries the address here and R11 is the scratch, the other way round
+    // from the register forms, because the immediate still needs a register of
+    // its own once the address is resolved.
+    let (addr, disp) = self.emit_checked_address(pc, dst, offset, width, true, hint, RCX, R11);
+
+    if addr == dst {
+      // No translation was needed, so the guest displacement stands.
+      self.emit_store_imm32(size, addr, disp, imm);
+    } else {
+      self.emit_load_imm(R11, imm as i64);
+      self.emit_store(size, R11, addr, disp);
+    }
+  }
+}
+
+/// The span slot for an access `size` bytes wide, or `None` for a width the
+/// precomputed spans do not cover.
+///
+/// The C's `span_slot_index` returns 3 for anything that is not 1, 2 or 4; the
+/// caller guards with an explicit `size == 1 || ... || size == 8` test, so the
+/// `default` arm is only ever reached with 8. Returning `None` instead makes
+/// the guard and the lookup one decision.
+fn width_span_slot(size: i32) -> Option<usize> {
+  if size < 0 {
+    return None;
+  }
+  abi::span_slot_index(size as usize)
+}
+
+// ---------------------------------------------------------------------------
+// Calls
+// ---------------------------------------------------------------------------
+
+impl Emit<'_, '_, '_> {
+  /// The helper-call sequence. Mirrors `emit_dispatched_external_helper_call`
+  /// (C lines 1448-1639), SysV half only.
+  ///
+  /// The generated code decides at *run* time which of two paths to take: if
+  /// the dispatcher slot holds an address, control goes there with the helper
+  /// index as a sixth argument; otherwise the helper is looked up in the
+  /// embedded table by index.
+  fn emit_dispatched_external_helper_call(&mut self, idx: u32) {
+    // Save the register holding the volatile context. Pushed twice to keep the
+    // host stack 16-byte aligned; the second copy is also where the external
+    // dispatcher's seventh argument ends up.
+    self.emit_push(VOLATILE_CTXT);
+    self.emit_push(VOLATILE_CTXT);
+
+    self.emit_rip_relative_load(RAX, PatchTarget::Special(SpecialTarget::ExternalDispatcher));
+
+    self.emit_cmp_imm32(RAX, 0);
+    // The target here is a placeholder; `emit_jump_target` rewrites it below.
+    let default_tgt = PatchTarget::EbpfPc { pc: 0, near: false };
+    let skip_default_dispatcher = self.emit_jcc(0x85, default_tgt);
+
+    // Default dispatcher: index into the embedded helper table.
+    self.emit_alu32(0xc7, 0, RAX);
+    self.emit4(idx);
+    self.emit_alu64_imm8(0xc1, 4, RAX, 3);
+
+    self.emit_rip_relative_lea(R10, PatchTarget::Special(SpecialTarget::LoadHelperTable));
+
+    self.emit_alu64(0x01, R10, RAX);
+    self.emit_load(S::S64, RAX, RAX, 0);
+
+    // A registered helper takes five arguments and a context, which is the
+    // sixth argument and goes in R9 on SysV.
+    self.emit_mov(VOLATILE_CTXT, R9);
+
+    let skip_external_dispatcher = self.emit_jmp(default_tgt);
+
+    // External dispatcher: seven arguments, the sixth being the helper index.
+    self.emit_jump_target(skip_default_dispatcher);
+    self.emit_load_imm(R9, idx as u64 as i64);
+    // The seventh is already spilled to the stack in the right spot, because we
+    // wanted to save it anyway.
+
+    // Control flow converges for the call.
+    self.emit_jump_target(skip_external_dispatcher);
+
+    self.emit_call(PatchTarget::Special(SpecialTarget::Retpoline));
+
+    // The result is in RAX. Just rationalise the stack.
+    self.emit_pop(VOLATILE_CTXT);
+    self.emit_pop(VOLATILE_CTXT);
+  }
+
+  /// A local call whose target has not been compiled yet: ask the resolver at
+  /// run time, then call what it returns. Mirrors `emit_lazy_local_call`.
+  fn emit_lazy_local_call(&mut self, call_pc: usize) {
+    let resolver = match self.cfg.local_call_resolver {
+      Some(r) if call_pc < self.inputs.resolver_ids.len() => r,
+      _ => {
+        self.st.fail(Progress::UnexpectedInstruction);
+        return;
+      }
+    };
+    let id = self.inputs.resolver_ids[call_pc];
+
+    // Match the normal local-call frame setup: `sub r15, [rsp]` moves R10 down
+    // by the current function's stack usage. Emitted literally because the
+    // ModRM+SIB pair for an `[rsp]` base is not what
+    // `emit_modrm_and_displacement` produces.
+    self.emit1(0x4c);
+    self.emit1(0x2B);
+    self.emit1(0x3C);
+    self.emit1(0x24);
+
+    self.emit_push(map_register(6));
+    self.emit_push(map_register(7));
+    self.emit_push(map_register(8));
+    self.emit_push(map_register(9));
+
+    // The resolver is a host call. Preserve the BPF argument registers across
+    // it so the lazily compiled callee sees the R1-R5 the original local call
+    // would have passed.
+    self.emit_push(map_register(1));
+    self.emit_push(map_register(2));
+    self.emit_push(map_register(3));
+    self.emit_push(map_register(4));
+    self.emit_push(map_register(5));
+    self.emit_push(VOLATILE_CTXT);
+
+    // BPF R0 is mapped to RAX, which is also the host return register, so the
+    // resolver's return value would otherwise be visible to the callee as a
+    // host code pointer. Pushed twice to keep the host stack 16-byte aligned.
+    self.emit_push(map_register(0));
+    self.emit_push(map_register(0));
+
+    self.emit_load_imm(RDI, id as u64 as i64);
+    self.emit_load_imm(RAX, resolver as usize as u64 as i64);
+    self.emit_indirect_call_rax();
+
+    // Stash the resolved callee address in RCX, which is not mapped to any eBPF
+    // register, and restore BPF R0.
+    self.emit_mov(RAX, RCX);
+    self.emit_pop(map_register(0));
+    self.emit_pop(map_register(0));
+
+    self.emit_pop(VOLATILE_CTXT);
+    self.emit_pop(map_register(5));
+    self.emit_pop(map_register(4));
+    self.emit_pop(map_register(3));
+    self.emit_pop(map_register(2));
+    self.emit_pop(map_register(1));
+
+    self.emit_indirect_call_reg(RCX);
+
+    self.emit_pop(map_register(9));
+    self.emit_pop(map_register(8));
+    self.emit_pop(map_register(7));
+    self.emit_pop(map_register(6));
+
+    // `add r15, [rsp]`
+    self.emit1(0x4c);
+    self.emit1(0x03);
+    self.emit1(0x3C);
+    self.emit1(0x24);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Atomics
+// ---------------------------------------------------------------------------
+
+impl Emit<'_, '_, '_> {
+  fn emit_atomic_alu(&mut self, opcode: u8, is_64bit: bool, src: u8, dst: u8, offset: i32) {
+    self.emit1(0xf0); // lock
+    self.emit_basic_rex(u8::from(is_64bit), src, dst);
+    self.emit1(opcode);
+    self.emit_modrm_and_displacement(src, dst, offset);
+  }
+
+  /// `lock cmpxchg [dst + offset], src`, which compares against RAX and leaves
+  /// the previous value there.
+  fn emit_atomic_cmp_exch_with_rax(&mut self, is_64bit: bool, src: u8, dst: u8, offset: i32) {
+    self.emit1(0xf0);
+    self.emit_basic_rex(u8::from(is_64bit), src, dst);
+    self.emit1(0x0f);
+    self.emit1(0xb1);
+    self.emit_modrm_and_displacement(src, dst, offset);
+  }
+
+  /// `xchg [dst + offset], src`, which is implicitly locked.
+  fn emit_atomic_exchange(&mut self, is_64bit: bool, src: u8, dst: u8, offset: i32) {
+    self.emit1(0xf0);
+    self.emit_basic_rex(u8::from(is_64bit), src, dst);
+    self.emit1(0x87);
+    self.emit_modrm_and_displacement(src, dst, offset);
+  }
+
+  /// x86 has no atomic fetch-and-and/or/xor, and no 64-bit fetch-add that also
+  /// yields the old value in the right place, so all four are emulated with a
+  /// compare-exchange loop. Mirrors `emit_atomic_fetch_alu`.
+  fn emit_atomic_fetch_alu(&mut self, is_64bit: bool, opcode: u8, src: u8, dst: u8, offset: i32) {
+    // Compare-exchange overwrites RAX. If RAX is the source, keep the original
+    // in whichever of R10/R11 is not the destination.
+    let actual_src = if src == RAX {
+      if dst == R10 {
+        R11
+      } else {
+        R10
+      }
+    } else {
+      src
+    };
+
+    if src != RAX {
+      self.emit_push(RAX);
+    } else {
+      self.emit_push(actual_src);
+      self.emit_mov(src, actual_src);
+    }
+
+    self.emit_load(if is_64bit { S::S64 } else { S::S32 }, dst, RAX, offset);
+
+    let loop_start = self.offset();
+
+    self.emit_mov(RAX, RCX);
+    // Always the 64-bit form, even for the 32-bit variants: the compare-exchange
+    // below is what narrows the operation, and the high half of RCX is dead.
+    self.emit_alu64(opcode, actual_src, RCX);
+
+    self.emit_atomic_cmp_exch_with_rax(is_64bit, RCX, dst, offset);
+
+    // `jne loop_start`, whose displacement is computed from the position of the
+    // displacement byte itself.
+    self.emit1(0x75);
+    let rel = loop_start.wrapping_sub(self.offset()).wrapping_sub(1);
+    self.emit1(rel as u8);
+
+    if src != RAX {
+      self.emit_mov(RAX, src);
+      self.emit_pop(RAX);
+    } else {
+      self.emit_pop(actual_src);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multiply / divide / modulo
+// ---------------------------------------------------------------------------
+
+impl Emit<'_, '_, '_> {
+  /// Mirrors `emit_muldivmod` (C lines 1900-2103).
+  ///
+  /// eBPF and x86 disagree about division by zero (eBPF yields 0 for `div` and
+  /// the dividend for `mod`; x86 faults) and about `INT_MIN / -1` (eBPF wraps;
+  /// x86 faults), so most of what is emitted here is fixing that up.
+  fn emit_muldivmod(&mut self, op: u8, src: u8, dst: u8, imm: i32, offset: i16) {
+    let alu_op = op & 0xf0;
+    let mul = alu_op == 0x20;
+    let div = alu_op == 0x30;
+    let mod_ = alu_op == 0x90;
+    let is64 = (op & cls::MASK) == cls::ALU64;
+    let reg = (op & 0x08) == 0x08;
+    let is_signed = offset == 1;
+
+    // Short circuit for imm == 0.
+    if !reg && imm == 0 {
+      if div || mul {
+        self.emit_alu32(0x31, dst, dst);
+      } else {
+        // Modulo by zero yields the dividend, so this is a self-move — which
+        // the C emits anyway rather than eliding.
+        self.emit_mov(dst, dst);
+      }
+      return;
+    }
+
+    if dst != RAX {
+      self.emit_push(RAX);
+    }
+    if dst != RDX {
+      self.emit_push(RDX);
+    }
+
+    // Divisor into RCX.
+    if !reg {
+      self.emit_load_imm(RCX, imm as i64);
+    } else {
+      self.emit_mov(src, RCX);
+    }
+
+    // Dividend into RAX.
+    self.emit_mov(dst, RAX);
+
+    if div || mod_ {
+      if is64 {
+        self.emit_alu64(0x85, RCX, RCX);
+      } else {
+        self.emit_alu32(0x85, RCX, RCX);
+      }
+
+      if mod_ {
+        self.emit_push(RAX);
+      }
+
+      self.emit1(0x9c); // pushfq
+
+      // Set the divisor to 1 if it is zero, so the divide does not fault; the
+      // saved flags say afterwards whether it was.
+      self.emit_load_imm(RDX, 1);
+      self.emit1(0x48);
+      self.emit1(0x0f);
+      self.emit1(0x44);
+      self.emit1(0xca); // cmove rcx, rdx
+
+      if is_signed {
+        if is64 {
+          self.emit1(0x48);
+          self.emit1(0x99); // cqo
+        } else {
+          self.emit1(0x99); // cdq
+        }
+      } else {
+        self.emit_alu32(0x31, RDX, RDX);
+      }
+    }
+
+    // INT_MIN / -1 faults on x86 but wraps per RFC 9669.
+    let mut overflow_jump_source = 0u32;
+    if (div || mod_) && is_signed {
+      if is64 {
+        self.emit1(0x48);
+        self.emit1(0x83);
+        self.emit1(0xf9);
+        self.emit1(0xff); // cmp rcx, -1
+      } else {
+        self.emit1(0x83);
+        self.emit1(0xf9);
+        self.emit1(0xff); // cmp ecx, -1
+      }
+      self.emit1(0x75); // jne
+      let jne_source = self.offset();
+      self.emit1(0x00);
+
+      if is64 {
+        self.emit1(0x49);
+        self.emit1(0xbb);
+        self.emit8(0x8000_0000_0000_0000); // mov r11, INT64_MIN
+        self.emit1(0x4c);
+        self.emit1(0x39);
+        self.emit1(0xd8); // cmp rax, r11
+      } else {
+        self.emit1(0x3d);
+        self.emit4(0x8000_0000); // cmp eax, INT32_MIN
+      }
+      self.emit1(0x75); // jne
+      let jne2_source = self.offset();
+      self.emit1(0x00);
+
+      if div {
+        // The result is INT_MIN, which is already in RAX.
+      } else {
+        self.emit_alu32(0x31, RDX, RDX);
+      }
+      self.emit1(0xeb); // jmp short, over the divide
+      overflow_jump_source = self.offset();
+      self.emit1(0x00);
+
+      let here = self.offset();
+      self.patch_rel8(jne_source, here);
+      self.patch_rel8(jne2_source, here);
+    }
+
+    if is64 {
+      self.emit_rex(1, 0, 0, 0);
+    }
+
+    // /4 = MUL, /6 = DIV, /7 = IDIV.
+    let modrm_reg = if mul {
+      4
+    } else if is_signed {
+      7
+    } else {
+      6
+    };
+    self.emit_alu32(0xf7, modrm_reg, RCX);
+
+    if (div || mod_) && is_signed && overflow_jump_source != 0 {
+      let here = self.offset();
+      self.patch_rel8(overflow_jump_source, here);
+    }
+
+    if div || mod_ {
+      self.emit1(0x9d); // popfq
+
+      if div {
+        // Zero flag set means the divisor was zero; substitute the eBPF result.
+        self.emit_load_imm(RCX, 0);
+        self.emit1(0x48);
+        self.emit1(0x0f);
+        self.emit1(0x44);
+        self.emit1(0xc1); // cmove rax, rcx
+      } else {
+        self.emit_pop(RCX);
+        self.emit1(0x48);
+        self.emit1(0x0f);
+        self.emit1(0x44);
+        self.emit1(0xd1); // cmove rdx, rcx
+      }
+    }
+
+    if dst != RDX {
+      if mod_ {
+        self.emit_mov(RDX, dst);
+      }
+      self.emit_pop(RDX);
+    }
+    if dst != RAX {
+      if div || mul {
+        self.emit_mov(RAX, dst);
+      }
+      self.emit_pop(RAX);
+    }
+  }
+
+  /// Back-patches a one-byte relative displacement written earlier.
+  ///
+  /// The C writes `state->buf[at]` directly, which is out of bounds when the
+  /// emit that reserved the byte had already run out of buffer. Going through
+  /// `patch_bytes` bounds-checks; the guard on `ok()` keeps the emitted bytes
+  /// identical in every case where the translation actually succeeds.
+  fn patch_rel8(&mut self, at: u32, target: u32) {
+    if !self.st.ok() {
+      return;
+    }
+    let rel = target.wrapping_sub(at).wrapping_sub(1);
+    self.st.patch_bytes(at, rel as u64, 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Trailer: epilogue, retpoline, dispatcher slot, helper table
+// ---------------------------------------------------------------------------
+
+impl Emit<'_, '_, '_> {
+  /// The retpoline `call *%rax` stand-in, adapted from Intel's guidance.
+  fn emit_retpoline(&mut self) -> u32 {
+    let retpoline_target = self.offset();
+    let label1_call_offset = self.emit_call(PatchTarget::EbpfPc { pc: 0, near: false });
+
+    let capture_ret_spec = self.offset();
+    self.emit_pause();
+    self.emit_jmp(PatchTarget::JitOffset {
+      offset: capture_ret_spec,
+      near: false,
+    });
+
+    // label1: mov [rsp], rax ; ret
+    let label1 = self.offset();
+    self.emit1(0x48);
+    self.emit1(0x89);
+    self.emit1(0x04);
+    self.emit1(0x24);
+    self.emit_ret();
+
+    self.st.retarget_jumps(
+      label1_call_offset,
+      PatchTarget::JitOffset {
+        offset: label1,
+        near: false,
+      },
+    );
+
+    retpoline_target
+  }
+
+  /// The eight bytes holding the external dispatcher's address.
+  fn emit_dispatched_external_helper_address(&mut self) -> u32 {
+    let at = self.offset();
+    let addr = self.cfg.dispatcher.map_or(0u64, |f| f as usize as u64);
+    self.emit8(addr);
+    at
+  }
+
+  /// The table of registered helper addresses, indexed by helper number.
+  ///
+  /// `async-ebpf` never registers individual helpers — it uses the dispatcher —
+  /// so every entry is null. The table is emitted anyway because the default
+  /// dispatch path indexes into it and the trailer's layout is part of the ABI
+  /// the runtime patches through.
+  fn emit_helper_table(&mut self) -> u32 {
+    let at = self.offset();
+    for _ in 0..abi::MAX_EXT_FUNCS {
+      self.emit8(0);
+    }
+    at
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Relocation
+// ---------------------------------------------------------------------------
+
+impl Emit<'_, '_, '_> {
+  /// Mirrors `resolve_patchable_relatives` (C lines 3461-3571). Returns false
+  /// where the C returns false, which the caller turns into a failure.
+  fn resolve(&mut self) -> bool {
+    let jumps = std::mem::take(&mut self.st.jumps);
+    for jump in &jumps {
+      let (target_loc, is_near) = match jump.target {
+        // Only Exit and Retpoline are reachable as special jump targets.
+        PatchTarget::Special(SpecialTarget::Exit) => (self.st.exit_loc, false),
+        PatchTarget::Special(SpecialTarget::Retpoline) => (self.st.retpoline_loc, false),
+        PatchTarget::Special(_) => return false,
+        PatchTarget::EbpfPc { pc, near } => (self.pc_loc(pc), near),
+        // The C holds both fields in one struct and prefers the JIT offset only
+        // when it is non-zero, falling back to `pc_locs[ebpf_target_pc]`. Every
+        // site that sets a JIT offset leaves the eBPF pc at 0, so a zero JIT
+        // offset means `pc_locs[0]`.
+        PatchTarget::JitOffset { offset, near } => {
+          if offset != 0 {
+            (offset, near)
+          } else {
+            (self.pc_loc(0), near)
+          }
+        }
+      };
+
+      if is_near {
+        let rel = target_loc as i64 - (jump.offset_loc as i64 + 1);
+        if !(-128..128).contains(&rel) {
+          return false;
+        }
+        self
+          .st
+          .patch_bytes(jump.offset_loc, rel as i8 as u8 as u64, 1);
+      } else {
+        let rel = target_loc.wrapping_sub(jump.offset_loc.wrapping_add(4));
+        self.st.patch_bytes(jump.offset_loc, rel as u64, 4);
+      }
+    }
+    self.st.jumps = jumps;
+
+    let local_calls = std::mem::take(&mut self.st.local_calls);
+    for call in &local_calls {
+      // Lazy local calls emit an indirect call instead, so this table is always
+      // empty on the path this backend is reached through. The C keeps the loop
+      // and so does this.
+      let target_loc = match call.target {
+        PatchTarget::EbpfPc { pc, .. } => self.pc_loc(pc),
+        _ => return false,
+      };
+      let rel = target_loc
+        .wrapping_sub(call.offset_loc.wrapping_add(4))
+        .wrapping_sub(self.st.prolog_size as u32);
+      self.st.patch_bytes(call.offset_loc, rel as u64, 4);
+    }
+    self.st.local_calls = local_calls;
+
+    let loads = std::mem::take(&mut self.st.loads);
+    for load in &loads {
+      // It is only possible to load from the external dispatcher's position.
+      let target_loc = match load.target {
+        PatchTarget::Special(SpecialTarget::ExternalDispatcher) => self.st.dispatcher_loc,
+        _ => return false,
+      };
+      let rel = target_loc.wrapping_sub(load.offset_loc.wrapping_add(4));
+      self.st.patch_bytes(load.offset_loc, rel as u64, 4);
+    }
+    self.st.loads = loads;
+
+    let leas = std::mem::take(&mut self.st.leas);
+    for lea in &leas {
+      // It is only possible to LEA from the helper table.
+      let target_loc = match lea.target {
+        PatchTarget::Special(SpecialTarget::LoadHelperTable) => self.st.helper_table_loc,
+        _ => return false,
+      };
+      let rel = target_loc.wrapping_sub(lea.offset_loc.wrapping_add(4));
+      self.st.patch_bytes(lea.offset_loc, rel as u64, 4);
+    }
+    self.st.leas = leas;
+
+    true
+  }
+
+  fn pc_loc(&self, pc: u32) -> u32 {
+    self.st.pc_locs.get(pc as usize).copied().unwrap_or(0)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The driver
+// ---------------------------------------------------------------------------
+
+/// eBPF registers `inst` may overwrite. Mirrors `written_registers_mask`.
+///
+/// Naming too many registers only ends access groups early; naming too few
+/// would let a group keep addressing a base that has changed, so every class
+/// that writes anything is listed.
+fn written_registers_mask(inst: Insn) -> u16 {
+  match inst.opcode & cls::MASK {
+    cls::LD | cls::LDX | cls::ALU | cls::ALU64 => 1u16 << inst.dst,
+    cls::STX => {
+      // A fetching atomic writes its source register, and CMPXCHG writes R0.
+      // Plain stores write nothing.
+      if (inst.opcode & 0xe0) == 0xc0 {
+        (1u16 << inst.src) | 1
+      } else {
+        0
+      }
+    }
+    cls::JMP | cls::JMP32 => {
+      // A call clobbers R0-R5 either way; the group ends at the call anyway.
+      if inst.opcode == opcode::CALL {
+        0x3f
+      } else {
+        0
+      }
+    }
+    _ => 0,
+  }
+}
+
+/// True when `inst` reads its source register as a *value* rather than as a
+/// memory base or a mode selector. Mirrors `reads_src_as_value`.
+///
+/// `STX` is deliberately absent even though it does read a value source:
+/// `emit_masked_store` handles it itself, because the address computation it
+/// performs first would clobber the scratch register the value would sit in.
+fn reads_src_as_value(inst: Insn) -> bool {
+  match inst.opcode & cls::MASK {
+    cls::ALU | cls::ALU64 => (inst.opcode & 0x08) == 0x08,
+    cls::JMP | cls::JMP32 => {
+      // CALL and EXIT put a mode selector in the source field rather than a
+      // register number, and JA has no source operand at all.
+      if inst.opcode == opcode::CALL
+        || inst.opcode == opcode::EXIT
+        || inst.opcode == opcode::JA
+        || inst.opcode == opcode::JA32
+      {
+        return false;
+      }
+      (inst.opcode & 0x08) == 0x08
+    }
+    _ => false,
+  }
+}
+
+impl Emit<'_, '_, '_> {
+  fn run(&mut self) -> Result<usize, TranslateError> {
+    let insns = self.t.insns();
+    let num_insts = insns.len();
+    let start_pc = self.inputs.start_pc;
+    let end_pc = self.inputs.end_pc;
+
+    if end_pc > num_insts || start_pc >= end_pc {
+      return Err(TranslateError::Failed(format!(
+        "Invalid function range [{start_pc}, {end_pc})"
+      )));
+    }
+
+    // In function-granular mode the emitted prologue/epilogue assume the range
+    // is exactly one local function: the prologue is only emitted at a function
+    // entry, but the EXIT/epilogue always pops a frame. A start that is not an
+    // entry, or an end that splits a function, would unbalance the host stack.
+    if !(start_pc == 0 || self.t.is_local_func_entry(start_pc)) {
+      return Err(TranslateError::Failed(format!(
+        "Function range start {start_pc} is not a local function entry"
+      )));
+    }
+    if end_pc != num_insts && !self.t.is_local_func_entry(end_pc) {
+      return Err(TranslateError::Failed(format!(
+        "Function range end {end_pc} is not a local function boundary"
+      )));
+    }
+
+    // The whole-program prologue is not emitted here: this entry point is
+    // always reached with `whole_program = false`, and the embedder's own entry
+    // code establishes the frame instead.
+
+    self.mark_barriers(start_pc, end_pc, num_insts);
+
+    if let Some(msg) = self.emit_instructions(start_pc, end_pc) {
+      return Err(TranslateError::Failed(msg));
+    }
+
+    if !self.st.ok() {
+      return Err(self.status_error());
+    }
+
+    // Epilogue: pop the guest stack usage this function pushed, and return.
+    self.st.exit_loc = self.offset();
+    self.emit_alu64_imm32(0x81, 0, RSP, 8);
+    self.emit_ret();
+
+    self.st.retpoline_loc = self.emit_retpoline();
+    self.st.dispatcher_loc = self.emit_dispatched_external_helper_address();
+    self.st.helper_table_loc = self.emit_helper_table();
+
+    // Everything above is emitted after the per-instruction error check, so an
+    // overflow here would otherwise be reported as success. That is not merely
+    // untidy: a patch site whose location was recorded just before the overflow
+    // is still in the jump table, and `resolve` would write four bytes at it.
+    if !self.st.ok() {
+      return Err(if self.st.status == Progress::NotEnoughSpace {
+        TranslateError::OutOfSpace
+      } else {
+        TranslateError::Failed("Failure to emit the function epilogue".to_string())
+      });
+    }
+
+    if !self.resolve() {
+      return Err(TranslateError::Failed(
+        "Could not patch the relative addresses in the JIT'd code".to_string(),
+      ));
+    }
+
+    Ok(self.offset() as usize)
+  }
+
+  /// Turns the recorded [`Progress`] into the error the C reports for it.
+  fn status_error(&self) -> TranslateError {
+    match self.st.status {
+      Progress::NotEnoughSpace => TranslateError::OutOfSpace,
+      // These two carry a message from the detecting site, because it names the
+      // instruction. The lazy local-call guard sets only the status, so the C
+      // provides a fallback for it.
+      Progress::UnexpectedInstruction => {
+        TranslateError::Failed(self.errmsg.clone().unwrap_or_else(|| {
+          "Unexpected instruction or missing local-call resolver during JIT compilation".to_string()
+        }))
+      }
+      Progress::UnknownInstruction => {
+        TranslateError::Failed(self.errmsg.clone().unwrap_or_default())
+      }
+      other => other
+        .into_error()
+        .unwrap_or(TranslateError::Failed(String::new())),
+    }
+  }
+
+  /// Marks every instruction a branch can land on, which closes any access
+  /// group open across it.
+  fn mark_barriers(&mut self, start_pc: usize, end_pc: usize, num_insts: usize) {
+    for i in start_pc..end_pc {
+      let inst = self.t.insns()[i];
+
+      // A local function entry is reached by `call`, never by falling into it,
+      // so a group must not span one.
+      if self.t.is_local_func_entry(i) {
+        self.st.mark_barrier(i);
+      }
+
+      let class = inst.opcode & cls::MASK;
+      if class != cls::JMP && class != cls::JMP32 {
+        continue;
+      }
+      // Nothing falls through an EXIT, an unconditional jump or a call, so
+      // whatever follows is entered from somewhere else. The bound is written
+      // as the C writes it: `group_barrier` has `num_insts + 1` slots, so the
+      // instruction one past the end has one too.
+      #[allow(clippy::int_plus_one)]
+      if i + 1 <= num_insts {
+        self.st.mark_barrier(i + 1);
+      }
+      if inst.opcode == opcode::CALL || inst.opcode == opcode::EXIT {
+        continue;
+      }
+      let delta = if inst.opcode == opcode::JA32 {
+        inst.imm as i64
+      } else {
+        inst.offset as i64
+      };
+      let target = i as i64 + 1 + delta;
+      if target >= 0 && target <= num_insts as i64 {
+        self.st.mark_barrier(target as usize);
+      }
+    }
+  }
+
+  /// The main loop. Returns `Some(message)` for the paths where the C returns
+  /// immediately with an error rather than recording a status and breaking.
+  fn emit_instructions(&mut self, start_pc: usize, end_pc: usize) -> Option<String> {
+    let mut i = start_pc;
+    while i < end_pc {
+      if !self.st.ok() {
+        break;
+      }
+
+      let inst = self.t.insns()[i];
+
+      // A branch can land here, so no group can span it.
+      if self.st.is_barrier(i) {
+        self.st.close_group();
+      }
+
+      let dst = map_register(inst.dst);
+      let mut src = map_register(inst.src);
+
+      let region_hint = self.inputs.hint(i);
+
+      // Use i64 throughout to avoid signed overflow with large immediates.
+      let target_pc_64 = if inst.opcode == opcode::JA32 {
+        i as i64 + inst.imm as i64 + 1
+      } else {
+        i as i64 + inst.offset as i64 + 1
+      };
+      let target_pc = target_pc_64 as u32;
+
+      // A relative branch is resolved against `pc_locs[target_pc]`, and in
+      // function-granular mode only entries inside the range are ever written,
+      // so a target outside it would silently retarget the branch to the top of
+      // the emitted buffer.
+      let branch_cls = inst.opcode & cls::MASK;
+      if (branch_cls == cls::JMP || branch_cls == cls::JMP32)
+        && inst.opcode != opcode::CALL
+        && inst.opcode != opcode::EXIT
+        && ((target_pc as usize) < start_pc || target_pc as usize >= end_pc)
+      {
+        self.st.fail(Progress::UnexpectedInstruction);
+        self.errmsg = Some(format!(
+          "jump target {target_pc} at PC {i} is outside the translation range [{start_pc}, {end_pc})"
+        ));
+        break;
+      }
+
+      let tgt = PatchTarget::EbpfPc {
+        pc: target_pc,
+        near: false,
+      };
+
+      // If the previous instruction could fall through to this one and this one
+      // starts a local function, there has to be a way to jump around the code
+      // that manipulates the host stack.
+      let mut fallthrough_jump_source = None;
+      if i != 0 && self.t.is_local_func_entry(i) {
+        let prev = self.t.insns()[i - 1];
+        if prev.has_fallthrough() {
+          fallthrough_jump_source = Some(self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: true }));
+        }
+      }
+
+      // The top of the host stack always holds the guest stack usage of the
+      // currently-executing eBPF function, so a function entry pushes its own.
+      // Adjusting by 8 keeps the 16-byte alignment, because the `call` that got
+      // here already pushed a return address.
+      if i == 0 || self.t.is_local_func_entry(i) {
+        let prolog_start = self.offset();
+        let stack_usage = self.t.stack_usage_for(i);
+        self.emit_alu64_imm32(0x81, 5, RSP, 8);
+        // `mov qword [rsp], stack_usage`, whose ModRM+SIB pair for an `[rsp]`
+        // base is emitted literally.
+        self.emit1(0x48);
+        self.emit1(0xC7);
+        self.emit1(0x04);
+        self.emit1(0x24);
+        self.emit4(stack_usage as u32);
+
+        let size = (self.offset() - prolog_start) as usize;
+        if self.st.prolog_size == 0 {
+          self.st.prolog_size = size;
+        } else {
+          debug_assert_eq!(self.st.prolog_size, size);
+        }
+      }
+
+      if let Some(source) = fallthrough_jump_source {
+        let here = self.offset();
+        self.st.retarget_jumps(
+          source,
+          PatchTarget::JitOffset {
+            offset: here,
+            near: true,
+          },
+        );
+      }
+      self.st.pc_locs[i] = self.offset();
+
+      // Under a native frame base the register mapped to eBPF R10 holds a host
+      // address, so an instruction reading R10 as a value must see the guest
+      // one. This has to come *after* `pc_locs[i]` is recorded: a branch landing
+      // here has to run the materialisation too.
+      if self.cfg.native_frame_base_active()
+        && inst.src == crate::jit::isa::REG_FP
+        && reads_src_as_value(inst)
+      {
+        self.emit_guest_frame_pointer(RCX);
+        src = RCX;
+      }
+
+      if let Some(msg) = self.emit_one(i, inst, dst, src, region_hint, tgt, &mut i) {
+        return Some(msg);
+      }
+
+      // A 32-bit ALU instruction zero-extends its result. The `end` family is
+      // excluded, which is why `le`/`be` do their own truncation.
+      if (inst.opcode & cls::MASK) == cls::ALU && (inst.opcode & 0xf0) != 0xd0 {
+        self.emit_truncate_u32(dst);
+      }
+
+      // After the instruction has used its operands, note what it overwrote: an
+      // access whose destination is its own base is still valid, but nothing
+      // addressing that base afterwards is.
+      let mask = written_registers_mask(inst);
+      for reg in 0..16u8 {
+        if mask & (1u16 << reg) != 0 {
+          self.st.note_register_written(reg);
+        }
+      }
+
+      i += 1;
+    }
+    None
+  }
+
+  /// One instruction. `pc_cursor` is the driver's loop variable, which `lddw`
+  /// advances past its second slot exactly as the C's `++i` does.
+  #[allow(clippy::too_many_arguments)]
+  fn emit_one(
+    &mut self,
+    pc: usize,
+    inst: Insn,
+    dst: u8,
+    src: u8,
+    region_hint: u8,
+    tgt: PatchTarget,
+    pc_cursor: &mut usize,
+  ) -> Option<String> {
+    let op = match inst.op() {
+      Some(op) => op,
+      None => {
+        self.st.fail(Progress::UnknownInstruction);
+        self.errmsg = Some(format!(
+          "Unknown instruction at PC {pc}: opcode {:02x}",
+          inst.opcode
+        ));
+        return None;
+      }
+    };
+
+    match op {
+      // ------------------------------------------------------------------
+      // ALU
+      // ------------------------------------------------------------------
+      Op::Alu {
+        width,
+        op: alu,
+        source,
+      } => {
+        let w64 = width == AluWidth::W64;
+        match alu {
+          AluOp::Mul | AluOp::Div | AluOp::Mod => {
+            self.emit_muldivmod(inst.opcode, src, dst, inst.imm, inst.offset);
+          }
+          AluOp::Neg => {
+            if w64 {
+              self.emit_alu64(0xf7, 3, dst);
+            } else {
+              self.emit_alu32(0xf7, 3, dst);
+            }
+          }
+          AluOp::Mov => match (w64, source) {
+            (false, Source::Imm) => self.emit_alu32_imm32(0xc7, 0, dst, inst.imm),
+            (true, Source::Imm) => self.emit_load_imm(dst, inst.imm as i64),
+            (false, Source::Reg) => {
+              // MOVSX flavours selected by the offset field (RFC 9669).
+              if inst.offset == 8 {
+                // The explicit REX is what makes a byte source name SIL/DIL/SPL/
+                // BPL rather than AH/CH/DH/BH, so it is emitted even when no
+                // high-register bit is set.
+                self.emit_rex(0, u8::from(dst & 8 != 0), 0, u8::from(src & 8 != 0));
+                self.emit1(0x0f);
+                self.emit1(0xbe);
+                self.emit_modrm_reg2reg(dst, src);
+              } else if inst.offset == 16 {
+                self.emit_basic_rex(0, dst, src);
+                self.emit1(0x0f);
+                self.emit1(0xbf);
+                self.emit_modrm_reg2reg(dst, src);
+              } else {
+                self.emit_mov(src, dst);
+              }
+            }
+            (true, Source::Reg) => {
+              if inst.offset == 8 {
+                self.emit_basic_rex(1, dst, src);
+                self.emit1(0x0f);
+                self.emit1(0xbe);
+                self.emit_modrm_reg2reg(dst, src);
+              } else if inst.offset == 16 {
+                self.emit_basic_rex(1, dst, src);
+                self.emit1(0x0f);
+                self.emit1(0xbf);
+                self.emit_modrm_reg2reg(dst, src);
+              } else if inst.offset == 32 {
+                self.emit_basic_rex(1, dst, src);
+                self.emit1(0x63);
+                self.emit_modrm_reg2reg(dst, src);
+              } else {
+                self.emit_mov(src, dst);
+              }
+            }
+          },
+          AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => {
+            let ext = match alu {
+              AluOp::Lsh => 4,
+              AluOp::Rsh => 5,
+              _ => 7,
+            };
+            match source {
+              Source::Imm => {
+                if w64 {
+                  self.emit_alu64_imm8(0xc1, ext, dst, inst.imm);
+                } else {
+                  self.emit_alu32_imm8(0xc1, ext, dst, inst.imm);
+                }
+              }
+              Source::Reg => {
+                self.emit_mov(src, RCX);
+                if w64 {
+                  self.emit_alu64(0xd3, ext, dst);
+                } else {
+                  self.emit_alu32(0xd3, ext, dst);
+                }
+              }
+            }
+          }
+          AluOp::Add | AluOp::Sub | AluOp::Or | AluOp::And | AluOp::Xor => {
+            // (immediate extension, register-form opcode)
+            let (ext, reg_op) = match alu {
+              AluOp::Add => (0, 0x01),
+              AluOp::Sub => (5, 0x29),
+              AluOp::Or => (1, 0x09),
+              AluOp::And => (4, 0x21),
+              _ => (6, 0x31),
+            };
+            match source {
+              Source::Imm => {
+                if w64 {
+                  self.emit_alu64_imm32(0x81, ext, dst, inst.imm);
+                } else {
+                  self.emit_alu32_imm32(0x81, ext, dst, inst.imm);
+                }
+              }
+              Source::Reg => {
+                if w64 {
+                  self.emit_alu64(reg_op, src, dst);
+                } else {
+                  self.emit_alu32(reg_op, src, dst);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // Byte order
+      // ------------------------------------------------------------------
+      Op::End(EndKind::Le) => {
+        // x86 is already little-endian, so this is a truncation and nothing
+        // else. An immediate other than 16 or 32 emits nothing at all.
+        if inst.imm == 16 {
+          self.emit_alu32_imm32(0x81, 4, dst, 0xffff);
+        } else if inst.imm == 32 {
+          self.emit_alu32_imm32(0x81, 4, dst, 0xffff_ffffu32 as i32);
+        }
+      }
+      Op::End(EndKind::Be) => {
+        if inst.imm == 16 {
+          self.emit1(0x66); // 16-bit override
+          self.emit_alu32_imm8(0xc1, 0, dst, 8); // rol
+          self.emit_alu32_imm32(0x81, 4, dst, 0xffff);
+        } else if inst.imm == 32 || inst.imm == 64 {
+          self.emit_basic_rex(u8::from(inst.imm == 64), 0, dst);
+          self.emit1(0x0f);
+          self.emit1(0xc8 | (dst & 7));
+        }
+      }
+      Op::End(EndKind::Bswap) => {
+        if inst.imm == 16 {
+          self.emit1(0x66);
+          self.emit_alu32_imm8(0xc1, 0, dst, 8);
+          self.emit_alu64_imm32(0x81, 4, dst, 0xffff);
+        } else if inst.imm == 32 {
+          self.emit_basic_rex(0, 0, dst);
+          self.emit1(0x0f);
+          self.emit1(0xc8 | (dst & 7));
+          // Zero-extend to 64 bits.
+          self.emit_alu32(0x89, dst, dst);
+        } else if inst.imm == 64 {
+          self.emit_basic_rex(1, 0, dst);
+          self.emit1(0x0f);
+          self.emit1(0xc8 | (dst & 7));
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // Control flow
+      // ------------------------------------------------------------------
+      Op::Ja { .. } => {
+        self.emit_jmp(tgt);
+      }
+      Op::Jmp {
+        width,
+        op: cond,
+        source,
+      } => {
+        let w64 = width == AluWidth::W64;
+        let code = match cond {
+          JmpOp::Eq => 0x84,
+          JmpOp::Gt => 0x87,
+          JmpOp::Ge => 0x83,
+          JmpOp::Lt => 0x82,
+          JmpOp::Le => 0x86,
+          JmpOp::Set => 0x85,
+          JmpOp::Ne => 0x85,
+          JmpOp::Sgt => 0x8f,
+          JmpOp::Sge => 0x8d,
+          JmpOp::Slt => 0x8c,
+          JmpOp::Sle => 0x8e,
+        };
+        match (cond, source) {
+          (JmpOp::Set, Source::Imm) => {
+            if w64 {
+              self.emit_alu64_imm32(0xf7, 0, dst, inst.imm);
+            } else {
+              self.emit_alu32_imm32(0xf7, 0, dst, inst.imm);
+            }
+          }
+          (JmpOp::Set, Source::Reg) => {
+            if w64 {
+              self.emit_alu64(0x85, src, dst);
+            } else {
+              self.emit_alu32(0x85, src, dst);
+            }
+          }
+          (_, Source::Imm) => {
+            if w64 {
+              self.emit_cmp_imm32(dst, inst.imm);
+            } else {
+              self.emit_cmp32_imm32(dst, inst.imm);
+            }
+          }
+          (_, Source::Reg) => {
+            if w64 {
+              self.emit_cmp(src, dst);
+            } else {
+              self.emit_cmp32(src, dst);
+            }
+          }
+        }
+        self.emit_jcc(code, tgt);
+      }
+
+      Op::Call => {
+        // RCX is reserved for shifts, so the register mapped to eBPF R4 has to
+        // move out of the way before the host call.
+        if inst.src == 0 {
+          self.emit_mov(RCX_ALT, RCX);
+          self.emit_dispatched_external_helper_call(inst.imm as u32);
+          // uBPF defaults the unwind index to -1, so `None` here means a
+          // `call -1` really does take the unwind path, as in the C.
+          let unwind = self.cfg.unwind_helper_index.map_or(-1i32, |i| i as i32);
+          if inst.imm == unwind {
+            self.emit_cmp_imm32(map_register(0), 0);
+            self.emit_jcc(0x84, PatchTarget::Special(SpecialTarget::Exit));
+          }
+        } else if inst.src == 1 {
+          // This entry point always compiles local calls lazily; the eager
+          // `emit_local_call` is unreachable and is not ported.
+          self.emit_lazy_local_call(pc);
+        }
+        // A source field other than 0 or 1 emits nothing at all, as in the C.
+      }
+
+      Op::Exit => {
+        // Pop the guest stack usage this function pushed, then return.
+        self.emit_alu64_imm32(0x81, 0, RSP, 8);
+        self.emit_ret();
+      }
+
+      // ------------------------------------------------------------------
+      // Memory
+      // ------------------------------------------------------------------
+      Op::Load { width, signed } => {
+        let size = S::from_width(width);
+        if signed {
+          self.emit_masked_load_sx(size, src, dst, inst.offset as i32, region_hint, pc);
+        } else {
+          self.emit_masked_load(size, src, dst, inst.offset as i32, region_hint, pc);
+        }
+      }
+      Op::StoreImm { width } => {
+        self.emit_masked_store_imm32(
+          S::from_width(width),
+          dst,
+          inst.offset as i32,
+          inst.imm,
+          region_hint,
+          pc,
+        );
+      }
+      Op::StoreReg { width } => {
+        self.emit_masked_store(
+          S::from_width(width),
+          src,
+          dst,
+          inst.offset as i32,
+          region_hint,
+          pc,
+        );
+      }
+
+      Op::LoadImm64 => {
+        // The second slot is not an instruction but the high half of the
+        // immediate, so the driver's cursor skips it — the C's `++i` inside the
+        // `case`, which the `for` then increments again.
+        //
+        // A `lddw` in the last slot would send the C's `ubpf_fetch_instruction`
+        // one past the end of the program; the validator refuses that, so the
+        // zero fallback below is unreachable rather than a behaviour change.
+        *pc_cursor += 1;
+        let second = self.t.insns().get(*pc_cursor).copied().unwrap_or(Insn {
+          opcode: 0,
+          dst: 0,
+          src: 0,
+          offset: 0,
+          imm: 0,
+        });
+        let imm = (inst.imm as u32 as u64) | ((second.imm as u32 as u64) << 32);
+        self.emit_load_imm(dst, imm as i64);
+      }
+
+      Op::Atomic { width, .. } => {
+        // The atomic *selector* is not in the opcode — it is the immediate's
+        // high nibble, with the fetch flag in its low bit. `Op::from_opcode`
+        // therefore cannot fill it in, and `Insn::op_with_imm` is what does,
+        // masking exactly as the C's `switch (inst.imm & EBPF_ALU_OP_MASK)`
+        // does. That masking is load-bearing: `imm = 0x02` names a plain atomic
+        // add and `imm = 0xe0` an exchange without the fetch flag, and the
+        // validator's filter for 32-bit atomics lets both through.
+        let is64 = width == Width::DW;
+        let mut atomic_dst = dst;
+        let mut atomic_offset = inst.offset as i32;
+        if self.cfg.pointer_mask != 0 {
+          // The hint is forced to UNKNOWN, but `store` is true, so this is a
+          // stack-region check regardless: an atomic is a write.
+          self.emit_masked_address_with_offset(
+            dst,
+            R11,
+            RCX,
+            inst.offset as i32,
+            if is64 { 8 } else { 4 },
+            true,
+            abi::region::UNKNOWN,
+          );
+          atomic_dst = R11;
+          atomic_offset = 0;
+        }
+
+        let (selector, fetch) = match inst.op_with_imm() {
+          Some(Op::Atomic { op, fetch, .. }) => (op, fetch),
+          _ => {
+            // The C returns immediately here, skipping the epilogue entirely.
+            return Some(format!(
+              "Error: unknown atomic opcode {} at PC {pc}\n",
+              inst.imm
+            ));
+          }
+        };
+
+        match selector {
+          AtomicOp::Add | AtomicOp::Or | AtomicOp::And | AtomicOp::Xor => {
+            let x64_op = match selector {
+              AtomicOp::Add => X64_ALU_ADD,
+              AtomicOp::Or => X64_ALU_OR,
+              AtomicOp::And => X64_ALU_AND,
+              _ => X64_ALU_XOR,
+            };
+            if fetch {
+              self.emit_atomic_fetch_alu(is64, x64_op, src, atomic_dst, atomic_offset);
+            } else {
+              self.emit_atomic_alu(x64_op, is64, src, atomic_dst, atomic_offset);
+            }
+          }
+          // The fetch flag is ignored for these two: both always yield the
+          // previous value, one in the source register and one in R0.
+          AtomicOp::Xchg => {
+            self.emit_atomic_exchange(is64, src, atomic_dst, atomic_offset);
+            if !is64 {
+              self.emit_truncate_u32(src);
+            }
+          }
+          AtomicOp::Cmpxchg => {
+            self.emit_atomic_cmp_exch_with_rax(is64, src, atomic_dst, atomic_offset);
+            if !is64 {
+              self.emit_truncate_u32(map_register(0));
+            }
+          }
+        }
+      }
+    }
+
+    None
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // Everything below the register-map test needs the C to compare against, so
+  // it is all gated on the oracle feature; without it this module still builds
+  // and still checks the one property that needs no oracle.
+  #[cfg(feature = "oracle")]
+  use crate::jit::isa::{alu, jmp, mode, size, src as srcbit, Insn};
+  #[cfg(feature = "oracle")]
+  use crate::jit::oracle::{config_sweep, diff, plain_inputs};
+  #[cfg(feature = "oracle")]
+  use crate::jit::Target;
+
+  #[cfg(feature = "oracle")]
+  fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Insn {
+    Insn {
+      opcode,
+      dst,
+      src,
+      offset,
+      imm,
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  fn exit() -> Insn {
+    insn(opcode::EXIT, 0, 0, 0, 0)
+  }
+
+  /// `mov64 dst, imm`
+  #[cfg(feature = "oracle")]
+  fn movi(dst: u8, imm: i32) -> Insn {
+    insn(cls::ALU64 | alu::MOV, dst, 0, 0, imm)
+  }
+
+  /// Runs one program through the whole x86_64 configuration sweep and asserts
+  /// the C and Rust backends agreed — on the emitted bytes, or on the refusal.
+  ///
+  /// Returns whether any configuration actually produced code, which
+  /// [`check_prog`] uses to reject a test that has quietly degraded into "both
+  /// sides rejected the program at load".
+  #[cfg(feature = "oracle")]
+  #[track_caller]
+  fn check(code: &[u8], inputs: &TranslationInputs<'_>) -> bool {
+    let capacity = 262_144;
+    let mut emitted = false;
+    let mut outcomes = Vec::new();
+    for (name, config) in config_sweep(Target::X86_64) {
+      let d = diff(&config, code, inputs, capacity);
+      assert!(d.is_same(), "x86_64 backends disagree under {name:?}\n{d}");
+      emitted |= matches!(d, crate::jit::oracle::Diff::Same { .. });
+      outcomes.push(format!("  {name}: {d}"));
+    }
+    if !emitted {
+      LAST_OUTCOMES.with(|c| *c.borrow_mut() = outcomes.join("\n"));
+    }
+    emitted
+  }
+
+  // Why the last `check` produced no code, for the assertion message.
+  #[cfg(feature = "oracle")]
+  thread_local! {
+    static LAST_OUTCOMES: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+  }
+
+  /// As [`check`], and additionally insists the program really was translated.
+  ///
+  /// Without this a test whose program the validator happens to refuse would
+  /// still pass — both sides having produced nothing is agreement, and it is
+  /// exactly the kind of agreement that tests nothing.
+  #[cfg(feature = "oracle")]
+  #[track_caller]
+  fn check_prog(insns: &[Insn]) {
+    let code = Insn::encode_all(insns);
+    assert!(
+      check(&code, &plain_inputs(insns.len())),
+      "no configuration translated this program; it is being rejected rather \
+       than exercising the emitter:\n{insns:#?}\n{}",
+      LAST_OUTCOMES.with(|c| c.borrow().clone())
+    );
+  }
+
+  // -----------------------------------------------------------------------
+  // Structure
+  // -----------------------------------------------------------------------
+
+  #[test]
+  fn the_register_map_is_injective_and_pins_r10_to_r15() {
+    let mut seen = std::collections::BTreeSet::new();
+    for r in 0..crate::jit::isa::NUM_REGS as u8 {
+      assert!(
+        seen.insert(map_register(r)),
+        "register map is not injective"
+      );
+      assert_eq!(unmap_register(map_register(r)), Some(r));
+    }
+    // The frame-access fast path and the local-call frame adjustment both name
+    // R15 directly, so this mapping is load-bearing.
+    assert_eq!(map_register(crate::jit::isa::REG_FP), R15);
+    // RCX and R11 are the scratch registers, so nothing may map to them.
+    assert_eq!(unmap_register(RCX), None);
+    assert_eq!(unmap_register(R11), None);
+    assert_eq!(unmap_register(R9), None);
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn the_minimal_program_matches() {
+    check_prog(&[movi(0, 42), exit()]);
+  }
+
+  // -----------------------------------------------------------------------
+  // ALU
+  // -----------------------------------------------------------------------
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn every_alu_op_matches_at_both_widths_and_both_sources() {
+    let ops = [
+      alu::ADD,
+      alu::SUB,
+      alu::MUL,
+      alu::DIV,
+      alu::OR,
+      alu::AND,
+      alu::LSH,
+      alu::RSH,
+      alu::MOD,
+      alu::XOR,
+      alu::MOV,
+      alu::ARSH,
+    ];
+    for class in [cls::ALU, cls::ALU64] {
+      for op in ops {
+        // The register forms take no immediate and the immediate forms take no
+        // source register; the validator refuses anything else.
+        for imm in [0i32, 1, 7, -1, i32::MIN, i32::MAX] {
+          check_prog(&[insn(class | op, 1, 0, 0, imm), exit()]);
+        }
+        for src in [0u8, 2, 9, 10] {
+          check_prog(&[insn(class | op | srcbit::REG, 1, src, 0, 0), exit()]);
+        }
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn signed_division_and_modulo_match() {
+    for class in [cls::ALU, cls::ALU64] {
+      for op in [alu::DIV, alu::MOD] {
+        // `offset == 1` selects the signed flavour (RFC 9669), which is where
+        // the INT_MIN / -1 fixup lives.
+        for imm in [1i32, -1, 3, 0] {
+          check_prog(&[insn(class | op, 1, 0, 1, imm), exit()]);
+        }
+        check_prog(&[insn(class | op | srcbit::REG, 1, 2, 1, 0), exit()]);
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn muldivmod_matches_for_every_destination_register() {
+    // The sequence pushes RAX and RDX conditionally on the destination, so each
+    // eBPF register that maps onto one of them takes a different path.
+    for dst in 0..10u8 {
+      for op in [alu::MUL, alu::DIV, alu::MOD] {
+        check_prog(&[insn(cls::ALU64 | op, dst, 0, 0, 7), exit()]);
+        check_prog(&[insn(cls::ALU64 | op | srcbit::REG, dst, 2, 0, 0), exit()]);
+        check_prog(&[insn(cls::ALU | op, dst, 0, 0, 7), exit()]);
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn neg_matches_at_both_widths() {
+    for dst in 0..10u8 {
+      check_prog(&[insn(cls::ALU | alu::NEG, dst, 0, 0, 0), exit()]);
+      check_prog(&[insn(cls::ALU64 | alu::NEG, dst, 0, 0, 0), exit()]);
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn sign_extending_moves_match() {
+    for offset in [0i16, 8, 16, 32] {
+      for dst in 0..10u8 {
+        check_prog(&[
+          insn(cls::ALU64 | alu::MOV | srcbit::REG, dst, 2, offset, 0),
+          exit(),
+        ]);
+        // The 32-bit form only defines 8 and 16.
+        if offset != 32 {
+          check_prog(&[
+            insn(cls::ALU | alu::MOV | srcbit::REG, dst, 2, offset, 0),
+            exit(),
+          ]);
+        }
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn byte_order_conversions_match_at_every_width() {
+    for imm in [16i32, 32, 64] {
+      for dst in 0..10u8 {
+        check_prog(&[insn(opcode::LE, dst, 0, 0, imm), exit()]);
+        check_prog(&[insn(opcode::BE, dst, 0, 0, imm), exit()]);
+        check_prog(&[insn(opcode::BSWAP, dst, 0, 0, imm), exit()]);
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Jumps
+  // -----------------------------------------------------------------------
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn every_conditional_jump_matches_at_both_widths_and_both_sources() {
+    let ops = [
+      jmp::JEQ,
+      jmp::JGT,
+      jmp::JGE,
+      jmp::JSET,
+      jmp::JNE,
+      jmp::JSGT,
+      jmp::JSGE,
+      jmp::JLT,
+      jmp::JLE,
+      jmp::JSLT,
+      jmp::JSLE,
+    ];
+    for class in [cls::JMP, cls::JMP32] {
+      for op in ops {
+        // Immediate form: no source register. Register form: no immediate.
+        for (src, imm) in [(0u8, 7i32), (2, 0)] {
+          let source = if src == 0 { srcbit::IMM } else { srcbit::REG };
+          check_prog(&[
+            insn(class | op | source, 1, src, 1, imm),
+            movi(0, 1),
+            exit(),
+          ]);
+          // A backward branch, which exercises the negative displacement. It
+          // has to reach past the instruction before it: uBPF refuses a
+          // displacement of -1 as an infinite loop.
+          check_prog(&[
+            movi(0, 1),
+            movi(0, 2),
+            insn(class | op | source, 1, src, -2, imm),
+            exit(),
+          ]);
+        }
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn unconditional_jumps_match_in_both_encodings() {
+    check_prog(&[insn(opcode::JA, 0, 0, 1, 0), movi(0, 1), exit()]);
+    check_prog(&[insn(opcode::JA32, 0, 0, 0, 1), movi(0, 1), exit()]);
+    // Jumping to the instruction that follows, i.e. a displacement of zero.
+    check_prog(&[insn(opcode::JA, 0, 0, 0, 0), exit()]);
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_jump_out_of_the_translation_range_is_rejected_the_same_way() {
+    // The whole program loads; only the sub-range translation refuses it.
+    let insns = [insn(opcode::JA, 0, 0, 1, 0), movi(0, 1), exit()];
+    let code = Insn::encode_all(&insns);
+    let inputs = TranslationInputs {
+      start_pc: 0,
+      end_pc: 1,
+      ..Default::default()
+    };
+    assert!(
+      !check(&code, &inputs),
+      "the branch leaves the range, so neither backend may translate it"
+    );
+  }
+
+  // -----------------------------------------------------------------------
+  // Memory
+  // -----------------------------------------------------------------------
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn loads_and_stores_match_at_every_width() {
+    for sz in [size::B, size::H, size::W, size::DW] {
+      for offset in [0i16, 1, 8, -8, 127, 128, -128, -129, 4096, -4096] {
+        check_prog(&[insn(cls::LDX | mode::MEM | sz, 1, 2, offset, 0), exit()]);
+        check_prog(&[insn(cls::STX | mode::MEM | sz, 1, 2, offset, 0), exit()]);
+        check_prog(&[insn(cls::ST | mode::MEM | sz, 1, 0, offset, 0x55), exit()]);
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn sign_extending_loads_match() {
+    for sz in [size::B, size::H, size::W] {
+      for offset in [0i16, 4, -4, 1000] {
+        check_prog(&[insn(cls::LDX | mode::MEMSX | sz, 1, 2, offset, 0), exit()]);
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn memory_access_matches_for_every_base_and_destination_register() {
+    // R6-R9 map onto RBX/R12/R13/R14 and R10 onto R15: R12 needs a SIB byte as
+    // a base and R13 needs an explicit zero displacement, and the byte forms of
+    // RSI/RDI need a REX prefix to name SIL/DIL. This is where a hand-written
+    // encoder goes wrong.
+    for base in 0..11u8 {
+      for other in [0u8, 1, 6, 7, 8, 9] {
+        // A load may read through R10 but may not write it.
+        check_prog(&[
+          insn(cls::LDX | mode::MEM | size::B, other, base, 0, 0),
+          exit(),
+        ]);
+        check_prog(&[
+          insn(cls::LDX | mode::MEM | size::DW, other, base, 0, 0),
+          exit(),
+        ]);
+      }
+      for other in 0..11u8 {
+        // A store may name R10 on either side; storing it exercises the
+        // guest-frame-pointer recovery.
+        check_prog(&[
+          insn(cls::STX | mode::MEM | size::B, base, other, 0, 0),
+          exit(),
+        ]);
+        check_prog(&[
+          insn(cls::STX | mode::MEM | size::DW, base, other, 0, 0),
+          exit(),
+        ]);
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn store_immediates_match_for_every_base_register() {
+    for base in 0..11u8 {
+      for sz in [size::B, size::H, size::W, size::DW] {
+        check_prog(&[insn(cls::ST | mode::MEM | sz, base, 0, 0, -1), exit()]);
+        check_prog(&[insn(cls::ST | mode::MEM | sz, base, 0, 16, 0x1234), exit()]);
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Atomics
+  // -----------------------------------------------------------------------
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn every_atomic_matches_at_both_widths() {
+    let selectors = [
+      alu::ADD as i32,
+      alu::OR as i32,
+      alu::AND as i32,
+      alu::XOR as i32,
+      alu::ADD as i32 | 1,
+      alu::OR as i32 | 1,
+      alu::AND as i32 | 1,
+      alu::XOR as i32 | 1,
+      0xe1,
+      0xf1,
+    ];
+    for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
+      for sel in selectors {
+        for offset in [0i16, 8, -8] {
+          check_prog(&[insn(op, 1, 2, offset, sel), exit()]);
+        }
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn non_canonical_atomic_selectors_match() {
+    // The C switches on `imm & 0xf0` and reads the fetch flag out of bit 0, so
+    // bits 1 through 3 are dead and several immediates that name no operation
+    // in the ISA still emit code. The validator's filter for 32-bit atomics
+    // bounds the immediate at 0..=255 rather than enumerating it, so these
+    // reach the backend on programs that load — and a decode that is merely
+    // "correct" rather than identical diverges here.
+    //
+    //   0x02  -> plain atomic add, no fetch
+    //   0x0f  -> atomic add *with* fetch
+    //   0x4e  -> atomic or, no fetch
+    //   0xe3  -> exchange, the two dead bits set
+    //   0xff  -> compare-exchange, likewise
+    //
+    // 0xe0 and 0xf0 — exchange and compare-exchange with the fetch flag clear —
+    // are included too, but the *validator* refuses those at both widths, so
+    // they never reach the emitter through a program that loads. The backend
+    // would handle them; this only checks the two sides agree about the
+    // refusal.
+    for sel in [
+      0x02i32, 0x0f, 0xe0, 0xf0, 0x4e, 0x53, 0xa8, 0xff, 0xe3, 0xf3,
+    ] {
+      for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
+        for offset in [0i16, 8] {
+          let insns = [insn(op, 1, 2, offset, sel), exit()];
+          let code = Insn::encode_all(&insns);
+          // The 64-bit form's filter enumerates its immediates, so some of
+          // these load only at 32-bit width; agreement is what matters, and
+          // `check` asserts it either way.
+          check(&code, &plain_inputs(insns.len()));
+        }
+      }
+    }
+    // At 32-bit width every one of them must actually translate, which is what
+    // makes this test more than an agreement about refusals.
+    for sel in [0x02i32, 0x0f, 0x4e, 0x53, 0xa8, 0xe3, 0xff] {
+      check_prog(&[insn(opcode::ATOMIC32_STORE, 1, 2, 0, sel), exit()]);
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn an_unknown_atomic_selector_is_refused_identically() {
+    // `imm & 0xf0` landing on a nibble the switch does not name is the one
+    // place the C abandons translation mid-instruction and returns without
+    // emitting an epilogue at all.
+    for sel in [
+      0x10i32, 0x20, 0x30, 0x60, 0x70, 0x80, 0x90, 0xb0, 0xc0, 0xd0,
+    ] {
+      for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
+        let insns = [insn(op, 1, 2, 0, sel), exit()];
+        let code = Insn::encode_all(&insns);
+        check(&code, &plain_inputs(insns.len()));
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn fetching_atomics_match_when_the_source_is_r0() {
+    // R0 maps to RAX, which the compare-exchange loop clobbers, so the sequence
+    // takes a different path and shuffles through R10/R11 instead.
+    for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
+      for sel in [alu::ADD as i32 | 1, alu::XOR as i32 | 1] {
+        for dst in 0..10u8 {
+          check_prog(&[insn(op, dst, 0, 0, sel), exit()]);
+        }
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Calls
+  // -----------------------------------------------------------------------
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn helper_calls_match() {
+    for idx in [0i32, 1, 3, 63] {
+      check_prog(&[movi(1, 0), insn(opcode::CALL, 0, 0, 0, idx), exit()]);
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_local_call_without_a_resolver_id_fails_the_same_way() {
+    // With no resolver ids the C never registers the resolver at all, so the
+    // lazy local call is refused.
+    let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
+    let code = Insn::encode_all(&insns);
+    assert!(
+      !check(&code, &plain_inputs(insns.len())),
+      "with no resolver ids the C never registers the resolver, so the lazy \
+       local call must be refused"
+    );
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_local_call_with_a_resolver_id_matches() {
+    let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
+    let code = Insn::encode_all(&insns);
+    let ids = [11u32, 22, 33, 44];
+    let inputs = TranslationInputs {
+      resolver_ids: &ids,
+      start_pc: 0,
+      end_pc: insns.len(),
+      ..Default::default()
+    };
+    assert!(check(&code, &inputs));
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn translating_one_local_function_of_a_program_matches() {
+    // Two functions; translate only the second, which is a strict sub-range.
+    let insns = [
+      insn(opcode::CALL, 0, 1, 0, 1),
+      exit(),
+      movi(0, 7),
+      insn(cls::ALU64 | alu::ADD, 0, 0, 0, 1),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let ids = [1u32, 2, 3, 4, 5];
+    for (start, end) in [(0usize, 2usize), (2, 5)] {
+      let inputs = TranslationInputs {
+        resolver_ids: &ids,
+        start_pc: start,
+        end_pc: end,
+        ..Default::default()
+      };
+      assert!(check(&code, &inputs), "nothing was translated");
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_range_that_is_not_a_function_boundary_is_rejected_the_same_way() {
+    let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
+    let code = Insn::encode_all(&insns);
+    for (start, end) in [(1usize, 4usize), (0, 3), (3, 3), (0, 99)] {
+      let inputs = TranslationInputs {
+        start_pc: start,
+        end_pc: end,
+        ..Default::default()
+      };
+      assert!(
+        !check(&code, &inputs),
+        "the range is not a function, so it must be refused"
+      );
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_fallthrough_into_a_local_function_entry_matches() {
+    // The instruction before the entry falls through, so a jump around the
+    // per-function prologue has to be emitted.
+    // Reaching a local function entry by falling into it takes some arranging.
+    // uBPF requires each sub-program to end in EXIT or to carry an
+    // unconditional jump in its second-to-last slot, and refuses a jump that
+    // crosses a sub-program boundary — but `ubpf_instruction_has_fallthrough`
+    // reports true for everything except EXIT, so a sub-program ending in a
+    // `ja` followed by an ordinary instruction both validates and falls
+    // through. That is the shape the backend's bypass jump exists for.
+    let insns = [
+      insn(opcode::CALL, 0, 1, 0, 2),
+      insn(opcode::JA, 0, 0, 0, 0),
+      movi(0, 1),
+      movi(0, 7),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let ids = [1u32, 2, 3, 4, 5];
+    let inputs = TranslationInputs {
+      resolver_ids: &ids,
+      start_pc: 0,
+      end_pc: insns.len(),
+      ..Default::default()
+    };
+    assert!(
+      check(&code, &inputs),
+      "nothing was translated\n{}",
+      LAST_OUTCOMES.with(|c| c.borrow().clone())
+    );
+  }
+
+  // -----------------------------------------------------------------------
+  // lddw
+  // -----------------------------------------------------------------------
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn lddw_matches_for_small_and_large_immediates() {
+    for (lo, hi) in [
+      (0i32, 0i32),
+      (1, 0),
+      (-1, 0),
+      (0x1234_5678, 0x9abc_def0u32 as i32),
+      (0, 1),
+    ] {
+      check_prog(&[
+        insn(opcode::LDDW, 3, 0, 0, lo),
+        insn(0, 0, 0, 0, hi),
+        exit(),
+      ]);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Region hints and access plans
+  // -----------------------------------------------------------------------
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn every_region_hint_matches() {
+    for hint in [
+      abi::region::UNKNOWN,
+      abi::region::STACK,
+      abi::region::DATA,
+      abi::region::FRAME,
+    ] {
+      for base in [1u8, 10] {
+        for offset in [0i16, -8, -4096, -4097, 8] {
+          for sz in [size::B, size::W, size::DW] {
+            let insns = [insn(cls::LDX | mode::MEM | sz, 1, base, offset, 0), exit()];
+            let code = Insn::encode_all(&insns);
+            let hints = [hint, abi::region::UNKNOWN];
+            let inputs = TranslationInputs {
+              hints: &hints,
+              start_pc: 0,
+              end_pc: insns.len(),
+              ..Default::default()
+            };
+            assert!(check(&code, &inputs), "nothing was translated");
+          }
+        }
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_well_formed_access_plan_matches() {
+    // Two loads off R2 at +0 and +8, grouped: the first leads, the second
+    // rides the base it parked.
+    let insns = [
+      insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+      insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    for region in [abi::region::STACK, abi::region::DATA] {
+      let plan = [
+        PlanEntry {
+          role: abi::plan_role::LEADER,
+          region,
+          delta: 0,
+          span: 16,
+          lo: 0,
+          leader_pc: 0,
+        },
+        PlanEntry {
+          role: abi::plan_role::MEMBER,
+          region,
+          delta: 8,
+          span: 16,
+          lo: 0,
+          leader_pc: 0,
+        },
+        PlanEntry::default(),
+      ];
+      let inputs = TranslationInputs {
+        plan: &plan,
+        start_pc: 0,
+        end_pc: insns.len(),
+        ..Default::default()
+      };
+      assert!(check(&code, &inputs), "nothing was translated");
+    }
+  }
+
+  /// Bytes the production configuration emits for one translation.
+  ///
+  /// Only meaningful once [`check`] has established the C emits the same count;
+  /// it exists so a test can assert that a fast path was *taken*, not merely
+  /// that both backends agreed about not taking it.
+  #[cfg(feature = "oracle")]
+  fn production_len(code: &[u8], inputs: &TranslationInputs<'_>) -> usize {
+    let config = config_sweep(Target::X86_64)
+      .into_iter()
+      .find(|(name, _)| *name == "production")
+      .expect("the sweep has a production configuration")
+      .1;
+    let t =
+      crate::jit::Translator::load(std::sync::Arc::new(config), code).expect("program must load");
+    let mut buf = vec![0u8; 262_144];
+    t.translate_range(inputs, &mut buf).expect("must translate")
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_well_formed_access_plan_is_actually_taken() {
+    // Agreement is not enough on its own: a plan the backend silently declined
+    // would agree with a C that declined it too, and neither the leader nor the
+    // member path would ever be exercised. A grouped pair has to come out
+    // shorter than the same pair checked one access at a time.
+    let insns = [
+      insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+      insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let plan = [
+      PlanEntry {
+        role: abi::plan_role::LEADER,
+        region: abi::region::STACK,
+        delta: 0,
+        span: 16,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region: abi::region::STACK,
+        delta: 8,
+        span: 16,
+        lo: 0,
+        leader_pc: 0,
+      },
+      PlanEntry::default(),
+    ];
+    let planned = TranslationInputs {
+      plan: &plan,
+      start_pc: 0,
+      end_pc: insns.len(),
+      ..Default::default()
+    };
+    let unplanned = plain_inputs(insns.len());
+
+    assert!(check(&code, &planned));
+    assert!(check(&code, &unplanned));
+    assert!(
+      production_len(&code, &planned) < production_len(&code, &unplanned),
+      "the access plan did not shorten the emitted code, so the group paths \
+       were never exercised: planned {} vs unplanned {}",
+      production_len(&code, &planned),
+      production_len(&code, &unplanned)
+    );
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn the_frame_hint_is_actually_taken() {
+    // Same argument as above for the one hint that removes the check rather
+    // than narrowing it.
+    let insns = [insn(cls::LDX | mode::MEM | size::DW, 1, 10, -8, 0), exit()];
+    let code = Insn::encode_all(&insns);
+    let framed = [abi::region::FRAME, abi::region::UNKNOWN];
+    let unknown = [abi::region::UNKNOWN, abi::region::UNKNOWN];
+    let mk = |hints: &'static [u8]| TranslationInputs {
+      hints,
+      start_pc: 0,
+      end_pc: 2,
+      ..Default::default()
+    };
+    let framed: &'static [u8] = Box::leak(Box::new(framed));
+    let unknown: &'static [u8] = Box::leak(Box::new(unknown));
+    assert!(check(&code, &mk(framed)));
+    assert!(check(&code, &mk(unknown)));
+    assert!(
+      production_len(&code, &mk(framed)) < production_len(&code, &mk(unknown)),
+      "the frame hint did not remove the bounds check"
+    );
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn stores_match_under_every_region_hint() {
+    // The store paths are not the load paths: a store is pinned to the stack
+    // region whatever the hint says, and the immediate form swaps the address
+    // and scratch registers around.
+    for hint in [
+      abi::region::UNKNOWN,
+      abi::region::STACK,
+      abi::region::DATA,
+      abi::region::FRAME,
+    ] {
+      for base in [1u8, 10] {
+        for offset in [0i16, -8, -4096, -4097] {
+          for sz in [size::B, size::H, size::W, size::DW] {
+            for insn_ in [
+              insn(cls::STX | mode::MEM | sz, base, 2, offset, 0),
+              insn(cls::ST | mode::MEM | sz, base, 0, offset, 0x33),
+            ] {
+              let insns = [insn_, exit()];
+              let code = Insn::encode_all(&insns);
+              let hints = [hint, abi::region::UNKNOWN];
+              let inputs = TranslationInputs {
+                hints: &hints,
+                start_pc: 0,
+                end_pc: insns.len(),
+                ..Default::default()
+              };
+              assert!(check(&code, &inputs), "nothing was translated");
+            }
+          }
+        }
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn atomics_match_for_every_base_register() {
+    // The cage rewrites the base into R11 and the scratch is RCX, so a base
+    // that already maps onto one of them would collide; none does, and this is
+    // what checks that.
+    for base in 0..11u8 {
+      for src in 0..10u8 {
+        for op in [opcode::ATOMIC_STORE, opcode::ATOMIC32_STORE] {
+          check_prog(&[insn(op, base, src, 0, 0), exit()]);
+          check_prog(&[insn(op, base, src, 8, 0x01), exit()]);
+        }
+      }
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_hostile_access_plan_is_declined_identically() {
+    let insns = [
+      insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+      insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+      insn(cls::STX | mode::MEM | size::DW, 2, 3, 8, 0),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+
+    // Every one of these should make the backend fall back to a checked access,
+    // and the C has to fall back in exactly the same places.
+    let hostile: [[PlanEntry; 4]; 8] = [
+      // A span of zero.
+      plan3(abi::plan_role::LEADER, abi::region::STACK, 0, 0, 0, 0),
+      // A span wider than a page.
+      plan3(abi::plan_role::LEADER, abi::region::STACK, 0, 8192, 0, 0),
+      // The access does not fit inside the window.
+      plan3(abi::plan_role::LEADER, abi::region::STACK, 0, 4, 0, 0),
+      // `lo + delta` is not the displacement the instruction names.
+      plan3(abi::plan_role::LEADER, abi::region::STACK, 0, 64, 32, 0),
+      // A leader claiming the frame region, which is never groupable.
+      plan3(abi::plan_role::LEADER, abi::region::FRAME, 0, 64, 0, 0),
+      // A member naming a leader that never ran.
+      plan3(abi::plan_role::MEMBER, abi::region::STACK, 8, 64, 0, 99),
+      // A member whose delta lands outside the leader's window.
+      plan3(abi::plan_role::MEMBER, abi::region::STACK, 4096, 64, 0, 0),
+      // A store riding a window checked against the read-only data region.
+      plan3(abi::plan_role::LEADER, abi::region::DATA, 0, 64, 0, 0),
+    ];
+    for plan in hostile {
+      let inputs = TranslationInputs {
+        plan: &plan,
+        start_pc: 0,
+        end_pc: insns.len(),
+        ..Default::default()
+      };
+      assert!(check(&code, &inputs), "nothing was translated");
+    }
+  }
+
+  /// Builds a three-instruction plan whose first entry carries the parameters
+  /// under test and whose second is a member of it.
+  #[cfg(feature = "oracle")]
+  fn plan3(role: u8, region: u8, delta: u16, span: u32, lo: i32, leader_pc: u32) -> [PlanEntry; 4] {
+    [
+      PlanEntry {
+        role,
+        region,
+        delta,
+        span,
+        lo,
+        leader_pc,
+      },
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region,
+        delta: 8,
+        span,
+        lo,
+        leader_pc: 0,
+      },
+      PlanEntry {
+        role: abi::plan_role::MEMBER,
+        region,
+        delta: 8,
+        span,
+        lo,
+        leader_pc: 0,
+      },
+      PlanEntry::default(),
+    ]
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn a_group_broken_by_a_barrier_or_a_redefined_base_is_declined_identically() {
+    // A branch lands between the leader and the member, and separately the base
+    // register is rewritten between them. Both must close the group.
+    let programs: [Vec<Insn>; 2] = [
+      vec![
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+        insn(cls::JMP | jmp::JEQ, 1, 0, 0, 0),
+        insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+        exit(),
+      ],
+      vec![
+        insn(cls::LDX | mode::MEM | size::DW, 1, 2, 0, 0),
+        insn(cls::ALU64 | alu::ADD, 2, 0, 0, 1),
+        insn(cls::LDX | mode::MEM | size::DW, 3, 2, 8, 0),
+        exit(),
+      ],
+    ];
+    for insns in programs {
+      let code = Insn::encode_all(&insns);
+      let plan = [
+        PlanEntry {
+          role: abi::plan_role::LEADER,
+          region: abi::region::STACK,
+          delta: 0,
+          span: 16,
+          lo: 0,
+          leader_pc: 0,
+        },
+        PlanEntry::default(),
+        PlanEntry {
+          role: abi::plan_role::MEMBER,
+          region: abi::region::STACK,
+          delta: 8,
+          span: 16,
+          lo: 0,
+          leader_pc: 0,
+        },
+        PlanEntry::default(),
+      ];
+      let inputs = TranslationInputs {
+        plan: &plan,
+        start_pc: 0,
+        end_pc: insns.len(),
+        ..Default::default()
+      };
+      assert!(check(&code, &inputs), "nothing was translated");
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Exhaustive opcode census
+  // -----------------------------------------------------------------------
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn every_opcode_byte_agrees_with_the_c() {
+    // The C switches on the raw opcode byte with a `default` that reports an
+    // unknown instruction. Sweeping all 256 values is what proves the Rust
+    // `match` over `Op` covers exactly the same set, including the encodings
+    // neither accepts.
+    // Each opcode admits a different operand shape, so every byte is tried
+    // against a spread of them: one that suits an immediate form, one a
+    // register form, one an endian width, one a branch displacement, and so on.
+    // A byte counts as covered when any shape translates.
+    let candidates: [(u8, u8, i16, i32); 8] = [
+      (1, 0, 0, 7),  // immediate ALU, `st`, conditional jump against an immediate
+      (1, 2, 0, 0),  // register ALU, `ldx`, `stx`, conditional jump against a register
+      (0, 0, 0, 0),  // `exit`, and anything taking no operands
+      (1, 0, 0, 16), // `le` / `be` / `bswap`
+      (1, 2, 1, 0),  // the signed `div` / `mod` flavour, and a forward branch
+      (0, 0, 1, 0),  // `ja`
+      (0, 0, 0, 1),  // `ja32`, helper `call`
+      (1, 2, 0, 1),  // atomic read-modify-write with the fetch bit
+    ];
+
+    let mut translated = 0usize;
+    for byte in 0u16..=255 {
+      let byte = byte as u8;
+      let mut covered = false;
+      for (dst, src, offset, imm) in candidates {
+        let insns = if byte == opcode::LDDW {
+          vec![insn(byte, dst, 0, 0, imm), insn(0, 0, 0, 0, 0), exit()]
+        } else {
+          vec![insn(byte, dst, src, offset, imm), movi(0, 1), exit()]
+        };
+        let code = Insn::encode_all(&insns);
+        let ids = vec![1u32; insns.len()];
+        let inputs = TranslationInputs {
+          resolver_ids: &ids,
+          start_pc: 0,
+          end_pc: insns.len(),
+          ..Default::default()
+        };
+        covered |= check(&code, &inputs);
+      }
+      if covered {
+        translated += 1;
+      }
+    }
+    // Most of the census is meant to *emit* something; if the operands chosen
+    // above ever stopped satisfying the validator this would quietly become a
+    // test that only the rejections agree.
+    assert!(
+      translated >= 110,
+      "only {translated} of the 119 defined opcode bytes were translated at \
+       all; the census has degraded into a test that only rejections agree"
+    );
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn out_of_space_is_reported_identically() {
+    let insns = [movi(0, 42), exit()];
+    let code = Insn::encode_all(&insns);
+    let inputs = plain_inputs(insns.len());
+    for capacity in [0usize, 1, 8, 64, 512, 600] {
+      for (name, config) in config_sweep(Target::X86_64) {
+        let d = diff(&config, &code, &inputs, capacity);
+        assert!(
+          d.is_same(),
+          "capacity {capacity} under {name:?} disagrees\n{d}"
+        );
+      }
+    }
+  }
+
+  /// A deterministic xorshift, so a failure is reproducible from the seed
+  /// printed in the assertion.
+  #[cfg(feature = "oracle")]
+  struct Rng(u64);
+
+  #[cfg(feature = "oracle")]
+  impl Rng {
+    fn next(&mut self) -> u64 {
+      self.0 ^= self.0 << 13;
+      self.0 ^= self.0 >> 7;
+      self.0 ^= self.0 << 17;
+      self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+      self.next() % n
+    }
+    fn reg(&mut self, max: u8) -> u8 {
+      self.below(max as u64 + 1) as u8
+    }
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn randomised_programs_hints_and_plans_match() {
+    // The hand-written cases above each aim at one path. This aims at their
+    // *interactions*: a plan whose leader is three instructions from its
+    // member, a hint that contradicts the plan's region, a group closed by a
+    // branch nobody was thinking about. The plans are generated without regard
+    // for whether they are sane, which is the point — a wrong or hostile plan
+    // has to be declined by both backends in exactly the same places.
+    //
+    // The seed range is kept small so this stays a fast test; it was run over
+    // 60,000 seeds (360,000 diffs) while the port was being written, with no
+    // divergence. Widen the range here to reproduce that.
+    let ops = [
+      alu::ADD,
+      alu::SUB,
+      alu::MUL,
+      alu::DIV,
+      alu::OR,
+      alu::AND,
+      alu::LSH,
+      alu::RSH,
+      alu::MOD,
+      alu::XOR,
+      alu::MOV,
+      alu::ARSH,
+    ];
+    // Deliberately includes non-canonical selectors: the C masks with 0xf0 and
+    // reads the fetch flag out of bit 0, so 0x02, 0x0f, 0xe0 and 0xf0 all name
+    // operations even though the ISA does not spell them that way.
+    let atomic_selectors = [
+      0i32, 1, 0x02, 0x0f, 0x40, 0x41, 0x4e, 0x50, 0x51, 0xa0, 0xa1, 0xe1, 0xe3, 0xf1, 0xff, 0x30,
+    ];
+    let sizes = [size::B, size::H, size::W, size::DW];
+    let jump_ops = [
+      jmp::JEQ,
+      jmp::JGT,
+      jmp::JGE,
+      jmp::JSET,
+      jmp::JNE,
+      jmp::JSGT,
+      jmp::JSGE,
+      jmp::JLT,
+      jmp::JLE,
+      jmp::JSLT,
+      jmp::JSLE,
+    ];
+
+    let mut translated = 0usize;
+    let mut total = 0usize;
+
+    for seed in 1..=500u64 {
+      let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+      let len = 3 + rng.below(22) as usize;
+
+      let mut insns = Vec::with_capacity(len + 1);
+      for i in 0..len {
+        let class32 = rng.below(2) == 0;
+        let alu_class = if class32 { cls::ALU } else { cls::ALU64 };
+        let op = ops[rng.below(ops.len() as u64) as usize];
+        let sz = sizes[rng.below(4) as usize];
+        // Only jump forwards, and never past the trailing `exit`.
+        let room = (len - i) as i16;
+        let jump_class = if rng.below(2) == 0 {
+          cls::JMP
+        } else {
+          cls::JMP32
+        };
+        let jump_op = jump_ops[rng.below(jump_ops.len() as u64) as usize];
+        let endian = [opcode::LE, opcode::BE, opcode::BSWAP][rng.below(3) as usize];
+        insns.push(match rng.below(14) {
+          0 => insn(alu_class | op, rng.reg(9), 0, 0, rng.next() as i32),
+          1 => insn(alu_class | op | srcbit::REG, rng.reg(9), rng.reg(10), 0, 0),
+          2 => insn(
+            cls::LDX | mode::MEM | sz,
+            rng.reg(9),
+            rng.reg(10),
+            rng.next() as i16,
+            0,
+          ),
+          3 => insn(
+            cls::STX | mode::MEM | sz,
+            rng.reg(10),
+            rng.reg(10),
+            rng.next() as i16,
+            0,
+          ),
+          4 => insn(
+            cls::ST | mode::MEM | sz,
+            rng.reg(10),
+            0,
+            rng.next() as i16,
+            rng.next() as i32,
+          ),
+          5 => insn(
+            if rng.below(2) == 0 {
+              opcode::ATOMIC_STORE
+            } else {
+              opcode::ATOMIC32_STORE
+            },
+            rng.reg(10),
+            rng.reg(9),
+            rng.next() as i16,
+            atomic_selectors[rng.below(atomic_selectors.len() as u64) as usize],
+          ),
+          6 => insn(
+            endian,
+            rng.reg(9),
+            0,
+            0,
+            [16, 32, 64][rng.below(3) as usize],
+          ),
+          7 => insn(opcode::CALL, 0, 0, 0, rng.below(64) as i32),
+          8 => insn(
+            cls::LDX | mode::MEMSX | [size::B, size::H, size::W][rng.below(3) as usize],
+            rng.reg(9),
+            rng.reg(10),
+            rng.next() as i16,
+            0,
+          ),
+          9 => insn(
+            alu_class | alu::MOV | srcbit::REG,
+            rng.reg(9),
+            rng.reg(10),
+            // 32 is only a defined sign-extension width at 64-bit class.
+            if class32 {
+              [0i16, 8, 16][rng.below(3) as usize]
+            } else {
+              [0i16, 8, 16, 32][rng.below(4) as usize]
+            },
+            0,
+          ),
+          10 => insn(alu_class | alu::NEG, rng.reg(9), 0, 0, 0),
+          11 => insn(
+            alu_class | [alu::DIV, alu::MOD][rng.below(2) as usize] | srcbit::REG,
+            rng.reg(9),
+            rng.reg(10),
+            rng.below(2) as i16,
+            0,
+          ),
+          12 => {
+            // `ja` forwards; `ja32` carries its displacement in the immediate.
+            let hop = rng.below(room.max(1) as u64) as i32;
+            if rng.below(2) == 0 {
+              insn(opcode::JA, 0, 0, hop as i16, 0)
+            } else {
+              insn(opcode::JA32, 0, 0, 0, hop)
+            }
+          }
+          _ => {
+            // A conditional jump takes either a source register or an
+            // immediate, never both.
+            let hop = rng.below(room.max(1) as u64) as i16;
+            if rng.below(2) == 0 {
+              insn(
+                jump_class | jump_op | srcbit::REG,
+                rng.reg(9),
+                rng.reg(10),
+                hop,
+                0,
+              )
+            } else {
+              insn(jump_class | jump_op, rng.reg(9), 0, hop, rng.next() as i32)
+            }
+          }
+        });
+      }
+      insns.push(exit());
+
+      let code = Insn::encode_all(&insns);
+      let hints: Vec<u8> = (0..insns.len()).map(|_| rng.below(4) as u8).collect();
+      let plan: Vec<PlanEntry> = (0..insns.len())
+        .map(|_| PlanEntry {
+          role: rng.below(3) as u8,
+          region: rng.below(4) as u8,
+          delta: rng.below(64) as u16,
+          span: rng.below(8192) as u32,
+          lo: rng.next() as i16 as i32,
+          leader_pc: rng.below(insns.len() as u64) as u32,
+        })
+        .collect();
+      let ids: Vec<u32> = (0..insns.len()).map(|_| rng.next() as u32).collect();
+
+      let inputs = TranslationInputs {
+        hints: &hints,
+        plan: &plan,
+        resolver_ids: &ids,
+        start_pc: 0,
+        end_pc: insns.len(),
+      };
+
+      total += 1;
+      // `check` panics with the differing offset and the program if the two
+      // backends disagree, so the seed is only needed for the summary below.
+      if check(&code, &inputs) {
+        translated += 1;
+      }
+    }
+
+    assert!(
+      translated * 2 >= total,
+      "only {translated} of {total} random programs translated; the generator \
+       is producing programs the validator refuses rather than exercising the \
+       emitter"
+    );
+  }
+
+  #[cfg(feature = "oracle")]
+  #[test]
+  fn deep_register_pressure_matches() {
+    // Every eBPF register as both source and destination of a 64-bit ALU op,
+    // which is where the REX bits and the ModRM low three bits interact.
+    let mut insns = Vec::new();
+    for dst in 0..10u8 {
+      for src in 0..11u8 {
+        insns.push(insn(cls::ALU64 | alu::ADD | srcbit::REG, dst, src, 0, 0));
+        insns.push(insn(cls::ALU | alu::XOR | srcbit::REG, dst, src, 0, 0));
+      }
+    }
+    insns.push(exit());
+    check_prog(&insns);
+  }
 }

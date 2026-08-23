@@ -307,7 +307,9 @@ impl<'a> Interpreter<'a> {
             Source::Imm => insn.imm as i64 as u64,
             Source::Reg => regs[src],
           };
-          regs[dst] = alu(width, op, regs[dst], operand);
+          // `div`/`mod` carry their signedness in the offset field rather than
+          // in a distinct opcode; every other operation ignores it.
+          regs[dst] = alu_signed(width, op, regs[dst], operand, is_signed_divmod(&insn));
         }
 
         Op::End(kind) => match end(kind, regs[dst], insn.imm) {
@@ -563,7 +565,29 @@ fn sign_extend(value: u64, width: Width) -> u64 {
 /// extension — that single conversion is the whole of the "32-bit ALU
 /// zero-extends" rule, applied uniformly to every operation including `mov` and
 /// a shift whose masked amount is zero.
+/// Whether a `div`/`mod` is the signed flavour.
+///
+/// There is no separate `sdiv`/`smod` opcode in this ISA generation — `ebpf.h`
+/// names none, which makes it easy to conclude the operation does not exist.
+/// It does: signedness rides in the *offset field* of the ordinary `div`/`mod`
+/// opcode, and both JIT backends read it
+/// (`is_signed = (offset == 1)`, `ubpf_jit_x86_64.c:1907`,
+/// `ubpf_jit_arm64.c:2535`). The validator's filter bounds that offset at
+/// `0..=1`, so both flavours load.
+///
+/// Note that the C *interpreter* does not implement this at all — `is_signed`
+/// appears nowhere in `ubpf_vm.c`. So the vendored tree's JIT and interpreter
+/// genuinely disagree about what `div r1, r2` with `offset == 1` computes. This
+/// interpreter follows the JIT, because its job is to be an oracle for the JIT.
+pub fn is_signed_divmod(insn: &Insn) -> bool {
+  insn.offset == 1
+}
+
 fn alu(width: AluWidth, op: AluOp, dst: u64, operand: u64) -> u64 {
+  alu_signed(width, op, dst, operand, false)
+}
+
+fn alu_signed(width: AluWidth, op: AluOp, dst: u64, operand: u64, signed: bool) -> u64 {
   match width {
     AluWidth::W64 => match op {
       AluOp::Add => dst.wrapping_add(operand),
@@ -571,6 +595,27 @@ fn alu(width: AluWidth, op: AluOp, dst: u64, operand: u64) -> u64 {
       AluOp::Mul => dst.wrapping_mul(operand),
       // Division by zero is defined to produce zero, and modulo by zero to
       // leave the destination alone. Neither faults.
+      //
+      // The signed flavours additionally have to survive `INT_MIN / -1`, whose
+      // true quotient is not representable. Both backends special-case it: the
+      // result wraps to `INT_MIN` for division and is 0 for modulo, which is
+      // what `wrapping_div`/`wrapping_rem` already do. Doing it with plain `/`
+      // would panic in debug and trap on x86 `idiv` — the reason the C emits an
+      // explicit overflow check around it.
+      AluOp::Div if signed => {
+        if operand == 0 {
+          0
+        } else {
+          (dst as i64).wrapping_div(operand as i64) as u64
+        }
+      }
+      AluOp::Mod if signed => {
+        if operand == 0 {
+          dst
+        } else {
+          (dst as i64).wrapping_rem(operand as i64) as u64
+        }
+      }
       AluOp::Div => {
         if operand == 0 {
           0
@@ -603,6 +648,20 @@ fn alu(width: AluWidth, op: AluOp, dst: u64, operand: u64) -> u64 {
         AluOp::Add => a.wrapping_add(b),
         AluOp::Sub => a.wrapping_sub(b),
         AluOp::Mul => a.wrapping_mul(b),
+        AluOp::Div if signed => {
+          if b == 0 {
+            0
+          } else {
+            (a as i32).wrapping_div(b as i32) as u32
+          }
+        }
+        AluOp::Mod if signed => {
+          if b == 0 {
+            a
+          } else {
+            (a as i32).wrapping_rem(b as i32) as u32
+          }
+        }
         AluOp::Div => {
           if b == 0 {
             0
@@ -1549,5 +1608,148 @@ mod tests {
     let run = exec(&[exit()]);
     assert_eq!(run.termination, Termination::Exit(0));
     assert_eq!(run.steps, 1);
+  }
+}
+
+#[cfg(test)]
+mod signed_divmod_tests {
+  use super::*;
+  use crate::jit::isa::{alu as alu_bits, cls, opcode, src as src_bits};
+
+  fn divmod(op_bits: u8, width_cls: u8, dst_init: u64, operand: u64, signed: bool) -> u64 {
+    let program = [
+      Insn {
+        opcode: opcode::LDDW,
+        dst: 1,
+        src: 0,
+        offset: 0,
+        imm: dst_init as u32 as i32,
+      },
+      Insn {
+        opcode: 0,
+        dst: 0,
+        src: 0,
+        offset: 0,
+        imm: (dst_init >> 32) as u32 as i32,
+      },
+      Insn {
+        opcode: opcode::LDDW,
+        dst: 2,
+        src: 0,
+        offset: 0,
+        imm: operand as u32 as i32,
+      },
+      Insn {
+        opcode: 0,
+        dst: 0,
+        src: 0,
+        offset: 0,
+        imm: (operand >> 32) as u32 as i32,
+      },
+      Insn {
+        opcode: width_cls | src_bits::REG | op_bits,
+        dst: 1,
+        src: 2,
+        offset: if signed { 1 } else { 0 },
+        imm: 0,
+      },
+      Insn {
+        opcode: cls::ALU64 | src_bits::REG | alu_bits::MOV,
+        dst: 0,
+        src: 1,
+        offset: 0,
+        imm: 0,
+      },
+      Insn {
+        opcode: opcode::EXIT,
+        dst: 0,
+        src: 0,
+        offset: 0,
+        imm: 0,
+      },
+    ];
+    match Interpreter::new(&program, vec![0; 64])
+      .run(|_, _| 0)
+      .termination
+    {
+      Termination::Exit(v) => v,
+      other => panic!("unexpected termination: {other:?}"),
+    }
+  }
+
+  /// The corner the C emits an explicit overflow check for: on x86 `idiv`,
+  /// `INT_MIN / -1` raises #DE rather than producing a value. Both backends
+  /// special-case it so the result wraps.
+  #[test]
+  fn signed_division_of_the_minimum_by_minus_one_wraps_instead_of_trapping() {
+    assert_eq!(
+      divmod(
+        alu_bits::DIV,
+        cls::ALU64,
+        i64::MIN as u64,
+        -1i64 as u64,
+        true
+      ),
+      i64::MIN as u64
+    );
+    assert_eq!(
+      divmod(
+        alu_bits::MOD,
+        cls::ALU64,
+        i64::MIN as u64,
+        -1i64 as u64,
+        true
+      ),
+      0
+    );
+    // And at 32 bits, where the result is zero-extended.
+    assert_eq!(
+      divmod(
+        alu_bits::DIV,
+        cls::ALU,
+        i32::MIN as u32 as u64,
+        -1i32 as u32 as u64,
+        true
+      ),
+      i32::MIN as u32 as u64
+    );
+  }
+
+  #[test]
+  fn the_offset_field_selects_between_signed_and_unsigned_division() {
+    // -6 / 2. Unsigned reads the dividend as a huge positive number; signed
+    // gives -3. Same opcode, same operands, different offset.
+    let dividend = -6i64 as u64;
+    assert_eq!(
+      divmod(alu_bits::DIV, cls::ALU64, dividend, 2, true),
+      -3i64 as u64
+    );
+    assert_eq!(
+      divmod(alu_bits::DIV, cls::ALU64, dividend, 2, false),
+      dividend / 2
+    );
+    assert_ne!(
+      divmod(alu_bits::DIV, cls::ALU64, dividend, 2, true),
+      divmod(alu_bits::DIV, cls::ALU64, dividend, 2, false),
+      "signed and unsigned division must not coincide on this input"
+    );
+  }
+
+  #[test]
+  fn signed_division_still_defines_division_by_zero() {
+    assert_eq!(divmod(alu_bits::DIV, cls::ALU64, -6i64 as u64, 0, true), 0);
+    assert_eq!(
+      divmod(alu_bits::MOD, cls::ALU64, -6i64 as u64, 0, true),
+      -6i64 as u64
+    );
+  }
+
+  #[test]
+  fn signed_modulo_takes_the_sign_of_the_dividend() {
+    assert_eq!(
+      divmod(alu_bits::MOD, cls::ALU64, -7i64 as u64, 2, true),
+      -1i64 as u64
+    );
+    assert_eq!(divmod(alu_bits::MOD, cls::ALU64, 7, -2i64 as u64, true), 1);
   }
 }

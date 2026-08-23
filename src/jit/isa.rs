@@ -354,7 +354,11 @@ pub enum Op {
   /// `lddw` — 64-bit immediate load, occupying two instruction slots.
   LoadImm64,
   /// Atomic read-modify-write against `[dst + offset]`.
-  Atomic { width: Width, op: AtomicOp, fetch: bool },
+  Atomic {
+    width: Width,
+    op: AtomicOp,
+    fetch: bool,
+  },
   /// Unconditional jump. `JMP` uses `offset`, `JMP32` uses `imm`.
   Ja { width: AluWidth },
   /// Conditional jump.
@@ -526,14 +530,17 @@ impl Insn {
         //
         // That matters more than it looks. Clearing only the fetch bit — the
         // obvious reading — decodes every canonical selector correctly and then
-        // diverges on the non-canonical ones the C happily accepts: `imm = 0x02`
-        // masks to `ALU_OP_ADD` and emits a plain atomic add, and `imm = 0xe0`
-        // is an `xchg` without the fetch flag. The validator's filter for
-        // 32-bit atomics bounds the immediate at `0..=255` rather than
-        // enumerating legal values, so both of those reach the backend on a
-        // program that loads. A stricter decode here turns them into
-        // `UnknownInstruction` where the C emits code — a byte-level
-        // divergence, on an input a fuzzer reaches quickly.
+        // diverges on the non-canonical ones the C accepts. The validator's
+        // filter for 32-bit atomics bounds the immediate at `0..=255` rather
+        // than enumerating legal values, so any immediate whose dead middle
+        // bits are set still loads: `imm = 0x02` and `0x0f` mask to
+        // `ALU_OP_ADD`, `0x4e` to `OR`, `0xff` to `CMPXCHG`. A stricter decode
+        // here turns those into `UnknownInstruction` where the C emits code — a
+        // byte-level divergence, on inputs a fuzzer reaches quickly.
+        //
+        // `imm = 0xe0` and `0xf0` are decoded the same way for consistency but
+        // do not in fact reach a backend: `validate` refuses exchange and
+        // compare-exchange with the fetch bit clear, at both widths.
         let fetch = self.imm & atomic::OP_FETCH != 0;
         let op = match (self.imm & alu::MASK as i32) as u8 {
           alu::ADD => AtomicOp::Add,
@@ -580,7 +587,10 @@ mod tests {
   fn the_end_family_is_selected_by_class_and_source_together() {
     assert_eq!(Op::from_opcode(opcode::LE), Some(Op::End(EndKind::Le)));
     assert_eq!(Op::from_opcode(opcode::BE), Some(Op::End(EndKind::Be)));
-    assert_eq!(Op::from_opcode(opcode::BSWAP), Some(Op::End(EndKind::Bswap)));
+    assert_eq!(
+      Op::from_opcode(opcode::BSWAP),
+      Some(Op::End(EndKind::Bswap))
+    );
     // ALU64 | SRC_REG | END is not a defined encoding.
     assert_eq!(Op::from_opcode(cls::ALU64 | src::REG | alu::END), None);
   }
@@ -588,7 +598,11 @@ mod tests {
   #[test]
   fn a_sign_extending_doubleword_load_is_not_an_encoding() {
     assert_eq!(Op::from_opcode(cls::LDX | mode::MEMSX | size::DW), None);
-    for (bits, width) in [(size::B, Width::B), (size::H, Width::H), (size::W, Width::W)] {
+    for (bits, width) in [
+      (size::B, Width::B),
+      (size::H, Width::H),
+      (size::W, Width::W),
+    ] {
       assert_eq!(
         Op::from_opcode(cls::LDX | mode::MEMSX | bits),
         Some(Op::Load {
@@ -750,14 +764,14 @@ mod tests {
   /// encodings that went missing and the five byte values that were accepted
   /// but name nothing.
   const C_NAMED_OPCODES: [u8; 119] = [
-    0x04, 0x05, 0x06, 0x07, 0x0c, 0x0f, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1c, 0x1d, 0x1e, 0x1f,
-    0x24, 0x25, 0x26, 0x27, 0x2c, 0x2d, 0x2e, 0x2f, 0x34, 0x35, 0x36, 0x37, 0x3c, 0x3d, 0x3e,
-    0x3f, 0x44, 0x45, 0x46, 0x47, 0x4c, 0x4d, 0x4e, 0x4f, 0x54, 0x55, 0x56, 0x57, 0x5c, 0x5d,
-    0x5e, 0x5f, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
-    0x6f, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f,
-    0x81, 0x84, 0x85, 0x87, 0x89, 0x91, 0x94, 0x95, 0x97, 0x9c, 0x9f, 0xa4, 0xa5, 0xa6, 0xa7,
-    0xac, 0xad, 0xae, 0xaf, 0xb4, 0xb5, 0xb6, 0xb7, 0xbc, 0xbd, 0xbe, 0xbf, 0xc3, 0xc4, 0xc5,
-    0xc6, 0xc7, 0xcc, 0xcd, 0xce, 0xcf, 0xd4, 0xd5, 0xd6, 0xd7, 0xdb, 0xdc, 0xdd, 0xde,
+    0x04, 0x05, 0x06, 0x07, 0x0c, 0x0f, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1c, 0x1d, 0x1e, 0x1f, 0x24,
+    0x25, 0x26, 0x27, 0x2c, 0x2d, 0x2e, 0x2f, 0x34, 0x35, 0x36, 0x37, 0x3c, 0x3d, 0x3e, 0x3f, 0x44,
+    0x45, 0x46, 0x47, 0x4c, 0x4d, 0x4e, 0x4f, 0x54, 0x55, 0x56, 0x57, 0x5c, 0x5d, 0x5e, 0x5f, 0x61,
+    0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x71, 0x72, 0x73,
+    0x74, 0x75, 0x76, 0x77, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x81, 0x84, 0x85, 0x87, 0x89,
+    0x91, 0x94, 0x95, 0x97, 0x9c, 0x9f, 0xa4, 0xa5, 0xa6, 0xa7, 0xac, 0xad, 0xae, 0xaf, 0xb4, 0xb5,
+    0xb6, 0xb7, 0xbc, 0xbd, 0xbe, 0xbf, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xcc, 0xcd, 0xce, 0xcf, 0xd4,
+    0xd5, 0xd6, 0xd7, 0xdb, 0xdc, 0xdd, 0xde,
   ];
 
   #[test]
@@ -765,10 +779,18 @@ mod tests {
     use std::collections::BTreeSet;
     let named: BTreeSet<u8> = C_NAMED_OPCODES.into_iter().collect();
     assert_eq!(named.len(), 119, "the reference set has a duplicate");
-    let decoded: BTreeSet<u8> = (0u8..=255).filter(|&b| Op::from_opcode(b).is_some()).collect();
+    let decoded: BTreeSet<u8> = (0u8..=255)
+      .filter(|&b| Op::from_opcode(b).is_some())
+      .collect();
 
-    let missing: Vec<String> = named.difference(&decoded).map(|b| format!("{b:#04x}")).collect();
-    let extra: Vec<String> = decoded.difference(&named).map(|b| format!("{b:#04x}")).collect();
+    let missing: Vec<String> = named
+      .difference(&decoded)
+      .map(|b| format!("{b:#04x}"))
+      .collect();
+    let extra: Vec<String> = decoded
+      .difference(&named)
+      .map(|b| format!("{b:#04x}"))
+      .collect();
     assert!(
       missing.is_empty() && extra.is_empty(),
       "decoder disagrees with ebpf.h\n  named but rejected: {missing:?}\n  accepted but unnamed: {extra:?}"
