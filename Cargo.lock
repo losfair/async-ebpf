@@ -50,9 +50,7 @@ version = "0.4.0-alpha.6"
 dependencies = [
  "anyhow",
  "async-ebpf",
- "bindgen",
  "cfg-if",
- "cmake",
  "criterion",
  "elf",
  "futures",
@@ -65,6 +63,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-test",
+ "ubpf-sys",
 ]
 
 [[package]]
@@ -1069,6 +1068,14 @@ checksum = "04659ddb06c87d233c566112c1c9c5b9e98256d9af50ec3bc9c8327f873a7568"
 dependencies = [
  "quote",
  "syn",
+]
+
+[[package]]
+name = "ubpf-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cmake",
 ]
 
 [[package]]

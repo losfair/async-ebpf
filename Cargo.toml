@@ -1,3 +1,6 @@
+[workspace]
+members = ["oracle/ubpf-sys"]
+
 [package]
 name = "async-ebpf"
 version = "0.4.0-alpha.6"
@@ -29,10 +32,7 @@ scopeguard = "1"
 thiserror = "1"
 tokio = { version = "1", optional = true, features = ["full"] }
 tracing = "0.1"
-
-[build-dependencies]
-bindgen = "0.72"
-cmake = "0.1"
+ubpf-sys = { path = "oracle/ubpf-sys" }
 
 [dev-dependencies]
 async-ebpf = { path = ".", features = ["testing"] }

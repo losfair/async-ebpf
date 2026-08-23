@@ -1,0 +1,14 @@
+[package]
+name = "ubpf-sys"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Raw bindings to the vendored uBPF C runtime, kept as a differential-testing oracle for the Rust JIT backend"
+license = "Apache-2.0"
+links = "ubpf"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"

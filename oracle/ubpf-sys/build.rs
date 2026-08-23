@@ -60,9 +60,17 @@ fn main() {
   );
   println!("cargo:rustc-link-lib=static=ubpf");
 
+  // `wrapper.h` pulls in the internal header as well as the public one, so the
+  // differential harness can reach `ubpf_translate_function_x86_64` and
+  // `ubpf_translate_function_arm64` directly. Both are linked into the library
+  // on every host; only `ubpf_create()`'s function-pointer selection is
+  // `#if`-gated, so either backend can be byte-diffed from either host.
+  println!("cargo:rerun-if-changed=wrapper.h");
   let bindings = bindgen::Builder::default()
-    .header("vendor/ubpf/vm/inc/ubpf.h")
+    .header("wrapper.h")
     .clang_arg(format!("-I{}", dst.join("build/vm").display()))
+    .clang_arg("-Ivendor/ubpf/vm")
+    .clang_arg("-Ivendor/ubpf/vm/inc")
     .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
     .generate()
     .expect("Unable to generate bindings");
