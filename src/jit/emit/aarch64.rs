@@ -988,9 +988,8 @@ fn emit_dispatched_external_helper_call(st: &mut JitState, idx: u32) {
 
   emit_jump_target(st, external_dispatcher_jump_source);
 
-  // Dispatcher path: the helper index, then the context.
+  // Dispatcher path: the helper index is its sixth and final argument.
   emit_movewide_immediate(st, true, R5, idx as u64);
-  emit_logical_register(st, true, log::ORR, R6, RZ, VOLATILE_CTXT);
 
   emit_jump_target(st, no_dispatcher_jump_source);
 

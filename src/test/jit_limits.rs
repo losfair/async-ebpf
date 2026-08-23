@@ -55,7 +55,6 @@ unsafe extern "C" fn stub_dispatcher(
   _arg4: u64,
   _arg5: u64,
   _index: u32,
-  _cookie: *mut std::ffi::c_void,
 ) -> u64 {
   0
 }

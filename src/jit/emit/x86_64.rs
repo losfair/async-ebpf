@@ -918,12 +918,6 @@ impl Emit<'_, '_, '_> {
   /// index as a sixth argument; otherwise the helper is looked up in the
   /// embedded table by index.
   fn emit_dispatched_external_helper_call(&mut self, idx: u32) {
-    // Save the register holding the volatile context. Pushed twice to keep the
-    // host stack 16-byte aligned; the second copy is also where the external
-    // dispatcher's seventh argument ends up.
-    self.emit_push(VOLATILE_CTXT);
-    self.emit_push(VOLATILE_CTXT);
-
     self.emit_rip_relative_load(RAX, PatchTarget::Special(SpecialTarget::ExternalDispatcher));
 
     self.emit_cmp_imm32(RAX, 0);
@@ -947,20 +941,16 @@ impl Emit<'_, '_, '_> {
 
     let skip_external_dispatcher = self.emit_jmp(default_tgt);
 
-    // External dispatcher: seven arguments, the sixth being the helper index.
+    // External dispatcher: six arguments, the last being the helper index.
     self.emit_jump_target(skip_default_dispatcher);
     self.emit_load_imm(R9, idx as u64 as i64);
-    // The seventh is already spilled to the stack in the right spot, because we
-    // wanted to save it anyway.
 
     // Control flow converges for the call.
     self.emit_jump_target(skip_external_dispatcher);
 
     self.emit_call(PatchTarget::Special(SpecialTarget::Retpoline));
 
-    // The result is in RAX. Just rationalise the stack.
-    self.emit_pop(VOLATILE_CTXT);
-    self.emit_pop(VOLATILE_CTXT);
+    // The result is in RAX.
   }
 
   /// A local call whose target has not been compiled yet: ask the resolver at
@@ -997,6 +987,8 @@ impl Emit<'_, '_, '_> {
     self.emit_push(map_register(3));
     self.emit_push(map_register(4));
     self.emit_push(map_register(5));
+    // Keep the host stack aligned for the resolver call. R11 is not a guest
+    // register and is restored only to keep this sequence balanced.
     self.emit_push(VOLATILE_CTXT);
 
     // BPF R0 is mapped to RAX, which is also the host return register, so the

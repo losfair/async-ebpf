@@ -778,6 +778,14 @@ struct ActiveJitCodeZone {
   yielder: Cell<Option<NonNull<Yielder<u64, Dispatch>>>>,
 }
 
+#[cfg(test)]
+pub(crate) fn active_jit_state_is_clear_for_tests() -> bool {
+  let zone_is_clear =
+    ACTIVE_JIT_CODE_ZONE.with(|x| !x.valid.load(Ordering::Relaxed) && x.yielder.get().is_none());
+  let program_is_clear = ACTIVE_PROGRAM.with(|x| x.get().is_null());
+  zone_is_clear && program_is_clear
+}
+
 /// Hooks for observing program execution events.
 pub trait ProgramEventListener: Send + Sync + 'static {
   /// Called after an async preemption is triggered.
@@ -824,11 +832,10 @@ pub struct UnboundProgram {
   sections: RefCell<Vec<Section>>,
   resolvers: RefCell<HashMap<u32, ResolverInfo>>,
   next_resolver_id: Cell<u32>,
-  /// Set once the code budget runs out. Unlike a per-variant compilation
-  /// failure, this is terminal for the whole program: the arena never shrinks,
-  /// so no further function can ever be compiled. Recorded here so later runs
-  /// fail immediately instead of re-executing everything up to the call that
-  /// cannot be resolved.
+  /// Set when the code arena becomes unusable. Unlike a per-variant compilation
+  /// failure, this is terminal for the whole program: a full arena cannot grow,
+  /// and a page-protection failure leaves code permissions indeterminate.
+  /// Recorded here so later runs fail before entering previously generated code.
   code_exhausted: RefCell<Option<RuntimeError>>,
 }
 
@@ -1296,6 +1303,20 @@ impl Program {
     Ok(())
   }
 
+  /// Removes every permission from the code arena after a failed protection
+  /// transition. The caller marks the program terminal regardless of whether
+  /// this best-effort quarantine succeeds, so generated code is never entered
+  /// again through this `Program`.
+  fn quarantine_code_pages(&self) {
+    unsafe {
+      let _ = libc::mprotect(
+        self.unbound.code_base as *mut _,
+        self.unbound.code_size,
+        libc::PROT_NONE,
+      );
+    }
+  }
+
   fn compile_function(
     &self,
     section_index: usize,
@@ -1427,7 +1448,14 @@ impl Program {
     let written_len = match outcome {
       Ok(written_len) => written_len,
       Err(reason) => {
-        let _ = self.protect_code_pages(arena.used);
+        if let Err(err) = self.protect_code_pages(arena.used) {
+          self.quarantine_code_pages();
+          *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
+          section.functions[function_index]
+            .compiled
+            .insert(signature, FunctionCompilation::Failed(err.clone()));
+          return Err(err);
+        }
 
         let err = match reason {
           // The function translates; there was just no room left for it. That is
@@ -1466,6 +1494,8 @@ impl Program {
     // and do not register its resolvers.
     let new_used = arena.used + written_len;
     if let Err(err) = self.protect_code_pages(new_used) {
+      self.quarantine_code_pages();
+      *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
       section.functions[function_index]
         .compiled
         .insert(signature, FunctionCompilation::Failed(err.clone()));
@@ -1627,6 +1657,16 @@ impl Program {
           x.valid.store(true, Ordering::Relaxed);
         });
         ACTIVE_PROGRAM.with(|x| x.set(self as *const _));
+        let active_jit_zone = scopeguard::guard((), |()| {
+          ACTIVE_PROGRAM.with(|x| x.set(std::ptr::null()));
+          ACTIVE_JIT_CODE_ZONE.with(|x| {
+            x.valid.store(false, Ordering::Relaxed);
+            compiler_fence(Ordering::Release);
+            x.yielder.set(None);
+            x.code_range.set((0, 0));
+            x.pointer_cage_protected_range.set((0, 0));
+          });
+        });
 
         // If the previous iteration wants to write back to machine state
         if let Some((helper_name, prev_async_task_output)) = prev_async_task_output.take() {
@@ -1644,11 +1684,17 @@ impl Program {
 
         let ret = co.0 .0.resume(resume_input);
         ACTIVE_PROGRAM.with(|x| x.set(std::ptr::null()));
-        ACTIVE_JIT_CODE_ZONE.with(|x| {
+        let next_yielder = ACTIVE_JIT_CODE_ZONE.with(|x| {
           x.valid.store(false, Ordering::Relaxed);
           compiler_fence(Ordering::Release);
-          yielder = x.yielder.get().map(AssumeSend);
+          let yielder = x.yielder.get().map(AssumeSend);
+          x.yielder.set(None);
+          x.code_range.set((0, 0));
+          x.pointer_cage_protected_range.set((0, 0));
+          yielder
         });
+        yielder = next_yielder;
+        std::mem::forget(active_jit_zone);
 
         let dispatch: Dispatch = match ret {
           CoroutineResult::Return(x) => break x,
@@ -2164,7 +2210,6 @@ unsafe extern "C" fn tls_dispatcher(
   arg4: u64,
   arg5: u64,
   index: std::os::raw::c_uint,
-  _cookie: *mut std::os::raw::c_void,
 ) -> u64 {
   let yielder = ACTIVE_JIT_CODE_ZONE
     .with(|x| x.yielder.get())

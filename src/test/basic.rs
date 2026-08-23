@@ -11,6 +11,7 @@ static HELPERS: &'static [(&'static str, Helper)] = &[
   ("return_5", h_return_5),
   ("return_7_async", h_return_7_async),
 ];
+static FAILING_ASYNC_HELPERS: &[(&str, Helper)] = &[("fail_async", h_fail_async)];
 
 #[tokio::test]
 #[tracing_test::traced_test]
@@ -33,6 +34,23 @@ async fn test_sync_and_async_call() {
   .await
   .unwrap();
   assert_eq!(ret, 5 * 3 + 7 * 2);
+}
+
+#[tokio::test]
+async fn an_async_completion_error_clears_the_active_jit_state() {
+  let result = run_one_program(
+    RunOpts::simple(vec![FAILING_ASYNC_HELPERS], "test"),
+    r#"
+    extern int fail_async(void);
+    int __attribute__((section("test"))) entry(void) {
+      return fail_async();
+    }
+    "#,
+  )
+  .await;
+
+  assert!(result.is_err());
+  assert!(crate::program::active_jit_state_is_clear_for_tests());
 }
 
 #[tokio::test]
@@ -570,6 +588,14 @@ fn h_return_7_async(
     tokio::time::sleep(Duration::from_millis(5)).await;
     |_: &HelperScope| Ok(7)
   });
+  Ok(0)
+}
+
+fn h_fail_async(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+  fn fail(_: &HelperScope) -> Result<u64, ()> {
+    Err(())
+  }
+  scope.post_task(async { fail });
   Ok(0)
 }
 

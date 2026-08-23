@@ -87,12 +87,8 @@ impl Target {
 
 /// The external helper dispatcher the JIT emits calls to.
 ///
-/// Five guest arguments, then the helper index, then an opaque cookie. The index
-/// precedes the cookie — the emitted call sequence loads them into that argument
-/// order, so getting it backwards would compile and then pass a pointer where an
-/// index belongs.
-pub type Dispatcher =
-  unsafe extern "C" fn(u64, u64, u64, u64, u64, u32, *mut std::ffi::c_void) -> u64;
+/// Five guest arguments followed by the helper index.
+pub type Dispatcher = unsafe extern "C" fn(u64, u64, u64, u64, u64, u32) -> u64;
 
 /// Validates that a helper index is one the embedder registered.
 ///
@@ -129,7 +125,6 @@ pub struct Config {
   /// The embedder's entry code fills in the twelve derived bounds-check
   /// constants below the frame pointer. Enables access plans.
   pub frame_constants: bool,
-
 
   /// Helper dispatch. Both must be set together or neither.
   pub dispatcher: Option<Dispatcher>,

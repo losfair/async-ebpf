@@ -771,7 +771,6 @@ mod tests {
       _: u64,
       _: u64,
       _: u32,
-      _: *mut std::ffi::c_void,
     ) -> u64 {
       unreachable!("validation never executes anything")
     }
