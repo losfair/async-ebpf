@@ -583,10 +583,6 @@ pub fn is_signed_divmod(insn: &Insn) -> bool {
   insn.offset == 1
 }
 
-fn alu(width: AluWidth, op: AluOp, dst: u64, operand: u64) -> u64 {
-  alu_signed(width, op, dst, operand, false)
-}
-
 fn alu_signed(width: AluWidth, op: AluOp, dst: u64, operand: u64, signed: bool) -> u64 {
   match width {
     AluWidth::W64 => match op {

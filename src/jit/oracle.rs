@@ -61,7 +61,15 @@ impl COracle {
           vm,
           Some(std::mem::transmute::<
             super::Dispatcher,
-            unsafe extern "C" fn(u64, u64, u64, u64, u64, ::std::os::raw::c_uint, *mut std::ffi::c_void) -> u64,
+            unsafe extern "C" fn(
+              u64,
+              u64,
+              u64,
+              u64,
+              u64,
+              ::std::os::raw::c_uint,
+              *mut std::ffi::c_void,
+            ) -> u64,
           >(dispatcher)),
           Some(std::mem::transmute::<
             super::DispatcherValidate,
@@ -244,7 +252,10 @@ pub enum Diff {
     rust: Result<usize, TranslateError>,
   },
   /// The two disagreed about whether the program loads at all.
-  Load { c: Option<String>, rust: Option<String> },
+  Load {
+    c: Option<String>,
+    rust: Option<String>,
+  },
 }
 
 impl Diff {
@@ -258,16 +269,17 @@ impl std::fmt::Display for Diff {
     match self {
       Diff::Same { len } => write!(f, "identical ({len} bytes)"),
       Diff::SameError(e) => write!(f, "both failed identically: {e}"),
-      Diff::Load { c, rust } => write!(
-        f,
-        "load disagreement\n     C: {c:?}\n  Rust: {rust:?}"
-      ),
-      Diff::Outcome { c, rust } => write!(
-        f,
-        "outcome disagreement\n     C: {c:?}\n  Rust: {rust:?}"
-      ),
+      Diff::Load { c, rust } => write!(f, "load disagreement\n     C: {c:?}\n  Rust: {rust:?}"),
+      Diff::Outcome { c, rust } => {
+        write!(f, "outcome disagreement\n     C: {c:?}\n  Rust: {rust:?}")
+      }
       Diff::Bytes { c, rust, first } => {
-        writeln!(f, "byte mismatch: C emitted {}, Rust {}", c.len(), rust.len())?;
+        writeln!(
+          f,
+          "byte mismatch: C emitted {}, Rust {}",
+          c.len(),
+          rust.len()
+        )?;
         match first {
           Some(at) => {
             let lo = at.saturating_sub(16);
@@ -324,12 +336,10 @@ pub fn diff(config: &Config, code: &[u8], inputs: &TranslationInputs<'_>, capaci
 
   let c_out = c_vm.translate(config.target, inputs, capacity);
   let mut rust_buf = vec![0u8; capacity];
-  let rust_out = rust_vm
-    .translate_range(inputs, &mut rust_buf)
-    .map(|len| {
-      rust_buf.truncate(len);
-      rust_buf.clone()
-    });
+  let rust_out = rust_vm.translate_range(inputs, &mut rust_buf).map(|len| {
+    rust_buf.truncate(len);
+    rust_buf.clone()
+  });
 
   match (c_out, rust_out) {
     (Ok(c), Ok(r)) => {
@@ -490,8 +500,20 @@ mod tests {
   /// `mov r0, 42; exit`
   fn trivial() -> Vec<u8> {
     Insn::encode_all(&[
-      Insn { opcode: 0xb7, dst: 0, src: 0, offset: 0, imm: 42 },
-      Insn { opcode: opcode::EXIT, dst: 0, src: 0, offset: 0, imm: 0 },
+      Insn {
+        opcode: 0xb7,
+        dst: 0,
+        src: 0,
+        offset: 0,
+        imm: 42,
+      },
+      Insn {
+        opcode: opcode::EXIT,
+        dst: 0,
+        src: 0,
+        offset: 0,
+        imm: 0,
+      },
     ])
   }
 
@@ -527,8 +549,20 @@ mod tests {
     // A jump past the end of the program. uBPF does accept a program that
     // does not end in `exit`, so that is not the case to use here.
     let code = Insn::encode_all(&[
-      Insn { opcode: opcode::JA, dst: 0, src: 0, offset: 99, imm: 0 },
-      Insn { opcode: opcode::EXIT, dst: 0, src: 0, offset: 0, imm: 0 },
+      Insn {
+        opcode: opcode::JA,
+        dst: 0,
+        src: 0,
+        offset: 99,
+        imm: 0,
+      },
+      Insn {
+        opcode: opcode::EXIT,
+        dst: 0,
+        src: 0,
+        offset: 0,
+        imm: 0,
+      },
     ]);
     let err = COracle::load(&oracle_config(Target::X86_64), &code)
       .expect_err("a program that runs off the end must be rejected");

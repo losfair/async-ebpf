@@ -304,7 +304,9 @@ impl<'a> JitState<'a> {
       self.fail(Progress::TooManyLocalCalls);
       return;
     }
-    self.local_calls.push(PatchableRelative { offset_loc, target });
+    self
+      .local_calls
+      .push(PatchableRelative { offset_loc, target });
   }
 
   /// Retargets every jump fixup that was emitted at `src` to `target`.
@@ -399,7 +401,10 @@ mod tests {
     state.note_register_written(5);
     assert!(state.group.is_some(), "an unrelated write keeps the group");
     state.note_register_written(3);
-    assert!(state.group.is_none(), "writing the base must close the group");
+    assert!(
+      state.group.is_none(),
+      "writing the base must close the group"
+    );
   }
 
   #[test]
@@ -417,7 +422,13 @@ mod tests {
     state.note_jump(4, PatchTarget::EbpfPc { pc: 1, near: false });
     state.note_jump(8, PatchTarget::EbpfPc { pc: 2, near: false });
     state.retarget_jumps(8, PatchTarget::Special(SpecialTarget::Exit));
-    assert_eq!(state.jumps[0].target, PatchTarget::EbpfPc { pc: 1, near: false });
-    assert_eq!(state.jumps[1].target, PatchTarget::Special(SpecialTarget::Exit));
+    assert_eq!(
+      state.jumps[0].target,
+      PatchTarget::EbpfPc { pc: 1, near: false }
+    );
+    assert_eq!(
+      state.jumps[1].target,
+      PatchTarget::Special(SpecialTarget::Exit)
+    );
   }
 }

@@ -42,7 +42,9 @@ pub mod validate;
 #[cfg(any(test, feature = "testing"))]
 pub mod interp;
 
-#[cfg(any(test, feature = "oracle"))]
+// Strictly feature-gated, not `cfg(test)`: this is the only thing that links
+// the vendored C, and a plain `cargo test` must not need cmake or bindgen.
+#[cfg(feature = "oracle")]
 pub mod oracle;
 
 use std::sync::Arc;

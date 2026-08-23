@@ -17,7 +17,6 @@ mod pointer_cage;
 /// Program loading and execution APIs.
 pub mod program;
 mod region_analysis;
-mod ubpf;
 mod util;
 
 #[cfg(test)]

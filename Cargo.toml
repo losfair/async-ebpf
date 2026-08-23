@@ -18,8 +18,9 @@ required-features = ["testing"]
 [features]
 default = []
 testing = ["anyhow", "tokio", "rand/default"]
-# Differential-test the Rust JIT against the vendored C. Test-only.
-oracle = []
+# Differential-test the Rust JIT against the vendored C. Test-only: this is
+# the only thing that pulls in cmake, bindgen and the vendored C at all.
+oracle = ["ubpf-sys"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
@@ -34,7 +35,7 @@ scopeguard = "1"
 thiserror = "1"
 tokio = { version = "1", optional = true, features = ["full"] }
 tracing = "0.1"
-ubpf-sys = { path = "oracle/ubpf-sys" }
+ubpf-sys = { path = "oracle/ubpf-sys", optional = true }
 
 [dev-dependencies]
 async-ebpf = { path = ".", features = ["testing"] }
