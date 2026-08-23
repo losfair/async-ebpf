@@ -170,6 +170,14 @@ pub struct OpenGroup {
   /// The low bound, relative to the base register.
   pub lo: i32,
   /// eBPF register the group is based on.
+  ///
+  /// An *eBPF* register number in both backends, so that it can be compared
+  /// against the bits of [`written`](Self::written) and against the argument of
+  /// [`JitState::note_register_written`]. aarch64 used to park the native
+  /// register here instead, which left the two backends invalidating groups by
+  /// different halves of this struct - and left `note_register_written`'s
+  /// `reg & 0xf` silently aliasing x24, x25 and x26 onto eBPF r8, r9 and r10 for
+  /// anyone who wired the shared helper up to that backend.
   pub base_reg: u8,
   /// Region the leader checked against.
   pub region: u8,
@@ -398,7 +406,16 @@ impl<'a> JitState<'a> {
   }
 
   /// Notes that `reg` has been written, invalidating any group based on it.
+  ///
+  /// `reg` is an eBPF register number. Passing a native one would both set the
+  /// wrong bit of `written` and compare against the wrong `base_reg`, so the
+  /// mistake is worth catching in debug rather than leaving to the `& 0xf`
+  /// below to fold into some unrelated register.
   pub fn note_register_written(&mut self, reg: u8) {
+    debug_assert!(
+      reg < 16,
+      "note_register_written takes an eBPF register number, not a native one"
+    );
     if let Some(group) = &mut self.group {
       group.written |= 1u16 << (reg & 0xf);
       if group.base_reg == reg {
