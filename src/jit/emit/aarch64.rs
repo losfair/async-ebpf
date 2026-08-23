@@ -994,6 +994,15 @@ fn emit_dispatched_external_helper_call(st: &mut JitState, idx: u32) {
     emit_logical_register(st, true, log::ORR, dest, RZ, R0);
   }
 
+  // eBPF R1-R5 are x0-x4, all caller-saved: the helper path used them freely,
+  // from the dispatcher to whatever it suspended into. The call convention
+  // clobbers them, so the guest may read anything here except host state -
+  // scrub them to zero.
+  for r in 1..=5u8 {
+    let r = map_register(r);
+    emit_logical_register(st, true, log::ORR, r, RZ, RZ);
+  }
+
   emit_loadstore_immediate(st, ls::LDRX, R30, SP, 0);
   emit_addsub_immediate(st, true, addsub::ADD, SP, SP, stack_movement);
 }

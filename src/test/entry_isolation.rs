@@ -5,7 +5,11 @@
 //! a read of a register that was never assigned, so a program that simply reads
 //! one sees whatever was left there.
 
-use crate::test::raw_elf::{run_raw, Insn};
+use crate::{
+  helpers::Helper,
+  program::HelperScope,
+  test::raw_elf::{run_raw, run_raw_with_helpers, Insn},
+};
 
 /// Every eBPF register except `r1` (the context) and `r10` (the frame pointer)
 /// must read zero at entry.
@@ -85,4 +89,44 @@ async fn local_callee_observes_the_callers_r0() {
     Insn::exit(),
   ];
   assert_eq!(run_raw(&code, &[], &[], true).await.unwrap(), 0x5eed);
+}
+
+fn noop_helper(_: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+  Ok(0)
+}
+
+/// A helper call must not leave host state in the argument registers.
+///
+/// eBPF `r1`-`r5` live in caller-saved native registers, and the helper path
+/// runs arbitrary host code with them live: the dispatcher, and whatever it
+/// suspended into up to the whole run loop. The call convention clobbers them,
+/// so the guest may read anything afterwards - except host addresses. The
+/// backends scrub the five registers when the call returns, keeping only the
+/// `r0` return value.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn helper_call_scrubs_the_argument_registers() {
+  const PROBED: [u8; 5] = [1, 2, 3, 4, 5];
+
+  // Spill before computing anything: any instruction with a destination would
+  // destroy the value under test.
+  let mut code = vec![Insn::call_helper()];
+  for (index, reg) in PROBED.iter().enumerate() {
+    code.push(Insn::stx_dw(10, *reg, -8 - 8 * (index as i16)));
+  }
+  code.push(Insn::mov64_imm(0, 0));
+  for index in 0..PROBED.len() {
+    code.push(Insn::ldx_dw(1, 10, -8 - 8 * (index as i16)));
+    code.push(Insn::or64_reg(0, 1));
+  }
+  code.push(Insn::exit());
+
+  let helpers: &[(&'static str, Helper)] = &[("h", noop_helper)];
+  let observed = run_raw_with_helpers(&code, &[], &[], true, &[helpers])
+    .await
+    .unwrap();
+  assert_eq!(
+    observed, 0,
+    "registers {PROBED:?} must all be zero after a helper call"
+  );
 }
