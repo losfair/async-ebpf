@@ -37,6 +37,73 @@ jobs:
       - name: Run unit tests
         run: cargo test --features testing
 
+      # The default build must not need cmake or libclang: the vendored C is
+      # behind the `oracle` feature now, and this is what stops it quietly
+      # becoming a build dependency again.
+      - name: Build without the C oracle
+        run: cargo build --locked
+
+  differential:
+    name: JIT differential vs vendored C (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            llvm
+
+      # Byte-for-byte comparison of the Rust JIT against the vendored C, over
+      # the corpus and the configuration sweep. Both backends are covered on
+      # both runners: ubpf_jit_x86_64.c and ubpf_jit_arm64.c are compiled in
+      # unconditionally and translation never executes what it emits, so the
+      # cross-architecture half of this runs anywhere. Only the execution
+      # differential needs a matching host, which is why this is a matrix.
+      - name: Byte-identical translation
+        run: cargo test --features testing,oracle --lib jit:: -- --nocapture
+
+      - name: Execution differential and full suite
+        run: cargo test --features testing,oracle
+
+  miri:
+    name: Miri (pure JIT subtree)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri
+          rustup +nightly component add rust-src
+
+      # The decoder, validator, patch machinery, emitters and reference
+      # interpreter are pure functions over slices with no unsafe, so Miri can
+      # actually run them. It cannot run JIT'd code, which is exactly why the
+      # emitters were written to produce bytes into a &mut [u8] rather than to
+      # manage their own executable memory.
+      - name: Run Miri over the JIT modules
+        run: |
+          cargo +nightly miri test --features testing --lib \
+            jit::isa jit::abi jit::patch jit::stack jit::validate jit::interp jit::emit
+
   openbsd-tests:
     name: OpenBSD unit tests (${{ matrix.arch }})
     runs-on: ubuntu-24.04
