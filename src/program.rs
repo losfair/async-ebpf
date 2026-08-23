@@ -104,18 +104,50 @@ const _: () = {
   );
 };
 
+// What Tier F needs from the guest stack window, stated as the three facts that
+// can each drift on their own.
+//
+// The obvious phrasing - "SHADOW_STACK_SIZE, less the calldata, less the frames
+// below the entry one, still leaves FRAME_WINDOW" - cannot fail. Substituting
+// the definition of SHADOW_STACK_SIZE cancels the calldata term against itself
+// and the budget against the frames, leaving `FRAME_WINDOW >= FRAME_WINDOW`:
+// true for every value of every constant it names, including all the ones it is
+// supposed to be watching. Each assertion below is instead written against
+// constants that are *not* derived from the one being checked, so raising
+// MAX_CALLDATA_SIZE, charging a local function more than one frame, or
+// redefining the window all fail the build rather than quietly eating the
+// margin Tier F addresses within.
 const _: () = {
-  // What the window has left below the deepest frame pointer the loader accepts.
-  let headroom = SHADOW_STACK_SIZE
-    - MAX_CALLDATA_SIZE.next_multiple_of(8)
-    - (MAX_LOCAL_CALL_DEPTH - 1) * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
-  // Tight today - headroom is exactly one frame. Raising MAX_CALLDATA_SIZE,
-  // shrinking SHADOW_STACK_SIZE or charging local functions more than one frame
-  // would each silently invalidate Tier F's proof, so fail the build instead.
+  // 1. The unchecked window fits in the frame every local call is charged.
   assert!(
-    headroom >= FRAME_WINDOW,
+    FRAME_WINDOW <= crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize,
+    "the Tier F frame window is wider than the frame a local call is charged, \
+     so the deepest accepted chain can address below the guest stack"
+  );
+  // 2. The budget really does cover a frame per accepted call depth.
+  assert!(
+    LOCAL_CALL_FRAME_BUDGET
+      >= MAX_LOCAL_CALL_DEPTH * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize,
+    "the local call frame budget no longer covers MAX_LOCAL_CALL_DEPTH frames"
+  );
+  // 3. The window covers that budget *and* the largest calldata a caller can
+  //    pass, rounded the way R10's 8-alignment rounds it.
+  assert!(
+    SHADOW_STACK_SIZE >= LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8),
     "the guest stack window no longer covers FRAME_WINDOW below the deepest \
      accepted frame pointer; Tier F frame addressing would be unsound"
+  );
+  // 4. R10 starts at the first 8-aligned address below the calldata, which the
+  //    runtime computes with `& !0x7`. Assertion 3 models that rounding as
+  //    `next_multiple_of(8)` of the calldata size, and the two agree only while
+  //    the top of the window is itself 8-aligned. That follows today from the
+  //    guard being page-aligned and the window being a multiple of 8, but
+  //    nothing else says so, so say it here - `_run` re-checks the address the
+  //    cage actually hands back.
+  assert!(
+    SHADOW_STACK_SIZE % 8 == 0,
+    "the guest stack window is not a multiple of 8, so R10's alignment rounding \
+     eats into the headroom Tier F frame addressing depends on"
   );
 };
 
@@ -1598,6 +1630,22 @@ impl Program {
     let program_ret: u64 = {
       let guest_stack_top = self.unbound.cage.stack_top();
       let guest_stack_bottom = self.unbound.cage.stack_bottom();
+      // Tier F addresses `[R10 - FRAME_WINDOW, R10)` with no bounds check, so
+      // the deepest frame pointer the loader will accept has to leave that much
+      // above the bottom of the window. The constants are asserted at compile
+      // time; this is the same fact against the addresses the cage actually
+      // handed back, including the `& !0x7` rounding below and the real calldata
+      // length, neither of which a const assertion can see.
+      debug_assert!(
+        ((guest_stack_top - calldata_len) & !0x7)
+          .checked_sub(
+            (MAX_LOCAL_CALL_DEPTH - 1) * crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize
+          )
+          .and_then(|deepest_r10| deepest_r10.checked_sub(FRAME_WINDOW))
+          .is_some_and(|floor| floor >= guest_stack_bottom),
+        "the deepest accepted frame pointer no longer leaves FRAME_WINDOW above \
+         the guest stack bottom"
+      );
       let ctx = &mut *ectx.ctx;
       let mut memory = JitMemory {
         stack_guest_bottom: guest_stack_bottom,
