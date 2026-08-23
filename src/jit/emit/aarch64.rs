@@ -1609,7 +1609,7 @@ pub fn translate_range(
     // starts a local function, jump around the stack manipulation.
     let mut fallthrough_jump_source = 0u32;
     let mut fallthrough_jump_present = false;
-    if i != 0 && t.is_local_func_entry(i) && insns[i - 1].has_fallthrough() {
+    if i != start_pc && t.is_local_func_entry(i) && insns[i - 1].has_fallthrough() {
       fallthrough_jump_source = emit_unconditionalbranch_immediate(
         &mut st,
         ubr::B,
@@ -2353,6 +2353,49 @@ mod tests {
   // -------------------------------------------------------------------------
   // Shape
   // -------------------------------------------------------------------------
+
+  #[test]
+  fn a_function_granular_callee_does_not_skip_its_own_prologue() {
+    // The preceding, unreachable JA is deliberately treated as potentially
+    // falling through by Insn::has_fallthrough. Whole-program translation
+    // needs a jump around a later function's prologue in that case, but a
+    // buffer translated for the callee starts at pc 4 and must enter its own
+    // prologue directly.
+    let insns = vec![
+      insn(opcode::CALL, 0, 1, 0, 3), // pc 0 -> pc 4
+      exit(),
+      insn(opcode::JA, 0, 0, 0, 0),
+      insn(opcode::CALL, 0, 0, 0, 0),
+      insn(cls::ALU64 | alu::MOV, 0, 0, 0, 7),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let config = Config {
+      target: Target::Aarch64,
+      dispatcher: Some(stand_in_dispatcher()),
+      dispatcher_validate: Some(accept_every_helper),
+      local_call_resolver: Some(stand_in_resolver()),
+      ..Default::default()
+    };
+    let translator = Translator::load(std::sync::Arc::new(config), &code).unwrap();
+    let resolver_ids = [1u32; 6];
+    let inputs = TranslationInputs {
+      resolver_ids: &resolver_ids,
+      start_pc: 4,
+      end_pc: 6,
+      ..Default::default()
+    };
+    let mut out = vec![0u8; 4096];
+    let len = translator.translate_range(&inputs, &mut out).unwrap();
+
+    assert!(len >= 8);
+    assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), BTI_C);
+    assert_ne!(
+      u32::from_le_bytes(out[4..8].try_into().unwrap()) & 0xfc00_0000,
+      ubr::B,
+      "the callee entry jumped past its own prologue"
+    );
+  }
 
   #[test]
   fn prologue_epilogue_and_exit() {

@@ -1696,7 +1696,7 @@ impl Emit<'_, '_, '_> {
       // starts a local function, there has to be a way to jump around the code
       // that manipulates the host stack.
       let mut fallthrough_jump_source = None;
-      if i != 0 && self.t.is_local_func_entry(i) {
+      if i != start_pc && self.t.is_local_func_entry(i) {
         let prev = self.t.insns()[i - 1];
         if prev.has_fallthrough() {
           fallthrough_jump_source = Some(self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: true }));
@@ -2186,7 +2186,7 @@ mod tests {
   use std::sync::Arc;
 
   use crate::jit::golden;
-  use crate::jit::isa::{alu, jmp, mode, size, src as srcbit, Insn};
+  use crate::jit::isa::{alu, jmp, mode, opcode, size, src as srcbit, Insn};
   use crate::jit::{Dispatcher, LocalCallResolver, Target};
 
   // -----------------------------------------------------------------------
@@ -2622,6 +2622,44 @@ mod tests {
   #[test]
   fn the_minimal_program_matches() {
     check_prog(&[movi(0, 42), exit()]);
+  }
+
+  #[test]
+  fn a_function_granular_callee_does_not_skip_its_own_prologue() {
+    // The preceding, unreachable JA is conservatively considered to have
+    // fallthrough. That needs a bypass in whole-program translation, but not
+    // when this buffer begins at the local callee itself.
+    let insns = vec![
+      insn(opcode::CALL, 0, 1, 0, 3), // pc 0 -> pc 4
+      exit(),
+      insn(opcode::JA, 0, 0, 0, 0),
+      insn(opcode::CALL, 0, 0, 0, 0),
+      movi(0, 7),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let config = Config {
+      target: Target::X86_64,
+      dispatcher: Some(dispatcher()),
+      dispatcher_validate: Some(accept_every_helper),
+      local_call_resolver: Some(local_call_resolver()),
+      ..Default::default()
+    };
+    let translator = Translator::load(Arc::new(config), &code).unwrap();
+    let resolver_ids = [1u32; 6];
+    let inputs = TranslationInputs {
+      resolver_ids: &resolver_ids,
+      start_pc: 4,
+      end_pc: 6,
+      ..Default::default()
+    };
+    let mut out = vec![0u8; CAPACITY];
+    translator.translate_range(&inputs, &mut out).unwrap();
+
+    assert_ne!(
+      out[0], 0xeb,
+      "the callee entry jumped past its own prologue"
+    );
   }
 
   // -----------------------------------------------------------------------
