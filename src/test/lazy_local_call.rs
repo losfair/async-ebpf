@@ -40,6 +40,20 @@ fn load_raw(code: &[Insn], rodata: &[u8]) -> Program {
   .pin_to_current_thread(t_env)
 }
 
+fn load_raw_unbounded(code: &[Insn], rodata: &[u8]) -> Program {
+  let (_, t_env) = gt_env();
+  ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_guest_stack_size(8 * 1024 * 1024)
+  .with_unbounded_local_calls(true)
+  .load(&mut rand::thread_rng(), &build_elf(code, rodata))
+  .unwrap()
+  .pin_to_current_thread(t_env)
+}
+
 async fn run(program: &Program, calldata: &[u8]) -> Result<i64, Error> {
   let (_, t_env) = gt_env();
   let mut resources: [&mut dyn Any; 0] = [];
@@ -80,6 +94,56 @@ async fn the_deepest_accepted_call_chain_fits_alongside_calldata() {
       "{calldata_len} bytes of calldata pushed the deepest frame off the stack: {ret:?}"
     );
   }
+}
+
+#[tokio::test]
+async fn ninth_local_call_preserves_r6_with_an_enlarged_guest_stack() {
+  let mut code = Vec::new();
+  for _ in 0..7 {
+    code.push(Insn::call_local(1));
+    code.push(Insn::exit());
+  }
+  code.extend_from_slice(&Insn::lddw_data(6, 0));
+  code.push(Insn::call_local(2));
+  code.push(Insn::ldx_b(0, 6, 0));
+  code.push(Insn::exit());
+  code.push(Insn::mov64_imm(6, 0));
+  code.push(Insn::exit());
+
+  let program = load_raw_unbounded(&code, &[0x5a]);
+  assert_eq!(run(&program, &[]).await.unwrap(), 0x5a);
+}
+
+#[tokio::test]
+async fn cold_local_callee_observes_callers_r6() {
+  let mut code = Vec::new();
+  code.extend_from_slice(&Insn::lddw_data(6, 0));
+  code.push(Insn::call_local(1)); // pc 2 -> pc 4
+  code.push(Insn::exit());
+  code.push(Insn::ldx_b(0, 6, 0));
+  code.push(Insn::exit());
+
+  let program = load_raw(&code, &[0x5a]);
+  assert_eq!(run(&program, &[]).await.unwrap(), 0x5a);
+}
+
+#[tokio::test]
+async fn deep_local_calls_preserve_r6_with_an_enlarged_guest_stack() {
+  const DEPTH: usize = 64;
+  let mut code = Vec::new();
+  for _ in 0..DEPTH - 2 {
+    code.push(Insn::call_local(1));
+    code.push(Insn::exit());
+  }
+  code.extend_from_slice(&Insn::lddw_data(6, 0));
+  code.push(Insn::call_local(2));
+  code.push(Insn::ldx_b(0, 6, 0));
+  code.push(Insn::exit());
+  code.push(Insn::mov64_imm(6, 0));
+  code.push(Insn::exit());
+
+  let program = load_raw_unbounded(&code, &[0x5a]);
+  assert_eq!(run(&program, &[]).await.unwrap(), 0x5a);
 }
 
 /// The resolver is a full host call — it suspends the guest, runs the region
@@ -380,6 +444,38 @@ fn h_bump(_: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64
 }
 
 static BUDGET_HELPERS: &[(&str, Helper)] = &[("bump", h_bump)];
+
+/// A cold local call suspends to compile its target, and every helper call also
+/// suspends to the host. Nest the two paths to ensure the native lazy-call save
+/// areas survive repeated coroutine switches at every supported call depth.
+#[tokio::test]
+async fn nested_cold_calls_and_helpers_preserve_native_call_frames() {
+  let source = br#"
+    extern int bump(void);
+    #define F __attribute__((noinline, section("test")))
+    static int F f6(void) { bump(); return 1; }
+    static int F f5(void) { bump(); return f6() + 1; }
+    static int F f4(void) { bump(); return f5() + 1; }
+    static int F f3(void) { bump(); return f4() + 1; }
+    static int F f2(void) { bump(); return f3() + 1; }
+    static int F f1(void) { bump(); return f2() + 1; }
+    static int F f0(void) { bump(); return f1() + 1; }
+    int F entry(void) { bump(); return f0() + 1; }
+  "#;
+  let binary = compile_ebpf(source.to_vec()).await.unwrap();
+  let (_, t_env) = gt_env();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[BUDGET_HELPERS],
+  )
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(t_env);
+
+  assert_eq!(run(&program, &[]).await.unwrap(), 8);
+  assert_eq!(program.compiled_function_count_for_tests(), 8);
+}
 
 /// Exhausting the budget is terminal for the whole program - the arena never
 /// shrinks, so nothing can be compiled from there on. Later runs must fail

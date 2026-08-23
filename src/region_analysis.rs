@@ -639,9 +639,9 @@ fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
 /// any read on every path, so no hint, no unresolved access and no onward
 /// signature can depend on it.
 ///
-/// `callee_live_in` maps a local call's target PC to that callee's mask, so
-/// callers must compute masks bottom-up over the call graph (a DAG, since
-/// recursion is rejected at load).
+/// `callee_live_in` maps a local call's target PC to that callee's current
+/// summary. Callers iterate this monotone transfer function to a least fixed
+/// point over the call graph.
 pub(crate) fn function_live_in(
   code: &[u8],
   start_pc: usize,

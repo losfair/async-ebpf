@@ -713,11 +713,11 @@ impl Emit<'_, '_, '_> {
     if self.cfg.pointer_mask != 0 {
       // Stores are confined to the active stack regardless of the hint, which
       // is what preserves the read-only guarantee for the data region.
-      if store || region_hint == abi::region::STACK {
+      if !self.cfg.writable_data && (store || region_hint == abi::region::STACK) {
         self.emit_single_region_address(dst, scratch, size, &STACK_REGION);
         return;
       }
-      if region_hint == abi::region::DATA {
+      if !self.cfg.writable_data && region_hint == abi::region::DATA {
         self.emit_single_region_address(dst, scratch, size, &DATA_REGION);
         return;
       }
@@ -786,7 +786,7 @@ impl Emit<'_, '_, '_> {
             && g.lo as i64 + plan.delta as i64 == offset as i64
             // A store cannot ride a window checked against the read-only data
             // region.
-            && (!store || g.region == abi::region::STACK)
+            && (!store || self.cfg.writable_data || g.region == abi::region::STACK)
         }
         _ => false,
       };
@@ -806,7 +806,7 @@ impl Emit<'_, '_, '_> {
         && plan.delta as u64 + width as u64 <= plan.span as u64
         && plan.lo as i64 + plan.delta as i64 == offset as i64
         && plan.region != abi::region::FRAME
-        && (!store || plan.region == abi::region::STACK);
+        && (!store || self.cfg.writable_data || plan.region == abi::region::STACK);
       if usable {
         self.emit_masked_address_with_offset(
           base,
@@ -968,14 +968,14 @@ impl Emit<'_, '_, '_> {
     };
     let id = self.inputs.resolver_ids[call_pc];
 
-    // Match the normal local-call frame setup: `sub r15, [rsp]` moves R10 down
-    // by the current function's stack usage. Emitted literally because the
-    // ModRM+SIB pair for an `[rsp]` base is not what
-    // `emit_modrm_and_displacement` produces.
-    self.emit1(0x4c);
-    self.emit1(0x2B);
-    self.emit1(0x3C);
-    self.emit1(0x24);
+    // Every local function has the same fixed guest-frame charge. Keep R10
+    // independent of host stack bookkeeping across coroutine suspension.
+    self.emit_alu64_imm32(
+      0x81,
+      5,
+      map_register(10),
+      abi::LOCAL_FUNCTION_STACK_SIZE as i32,
+    );
 
     self.emit_push(map_register(6));
     self.emit_push(map_register(7));
@@ -1024,11 +1024,12 @@ impl Emit<'_, '_, '_> {
     self.emit_pop(map_register(7));
     self.emit_pop(map_register(6));
 
-    // `add r15, [rsp]`
-    self.emit1(0x4c);
-    self.emit1(0x03);
-    self.emit1(0x3C);
-    self.emit1(0x24);
+    self.emit_alu64_imm32(
+      0x81,
+      0,
+      map_register(10),
+      abi::LOCAL_FUNCTION_STACK_SIZE as i32,
+    );
   }
 }
 

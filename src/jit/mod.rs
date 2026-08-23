@@ -126,6 +126,15 @@ pub struct Config {
   /// constants below the frame pointer. Enables access plans.
   pub frame_constants: bool,
 
+  /// Permit stores into the ELF data region. Disabled by default.
+  pub writable_data: bool,
+
+  /// Exclusive upper bound on decoded eBPF instruction slots.
+  pub instruction_limit: usize,
+
+  /// Permit recursive or otherwise statically unbounded local-call graphs.
+  pub allow_unbounded_local_calls: bool,
+
   /// Helper dispatch. Both must be set together or neither.
   pub dispatcher: Option<Dispatcher>,
   pub dispatcher_validate: Option<DispatcherValidate>,
@@ -145,6 +154,9 @@ impl Default for Config {
       pointer_offset: 0,
       native_frame_base: false,
       frame_constants: false,
+      writable_data: false,
+      instruction_limit: abi::MAX_INSTS as usize,
+      allow_unbounded_local_calls: false,
       // Safe default: a caller that has not set up a pointer cage should have
       // to say explicitly that it wants unchecked guest accesses.
       dispatcher: None,
@@ -168,7 +180,7 @@ impl Config {
   /// check the cage would otherwise emit, and its members read the leader's
   /// translated base out of the frame constants.
   pub const fn access_plans_active(&self) -> bool {
-    self.pointer_mask != 0 && self.frame_constants
+    self.pointer_mask != 0 && self.frame_constants && !self.writable_data
   }
 }
 
@@ -300,10 +312,10 @@ impl Translator {
       return Err(LoadError("program is empty".to_string()));
     }
     let insns = Insn::decode_all(code).expect("length checked above");
-    if insns.len() > abi::MAX_INSTS as usize {
+    if insns.len() > config.instruction_limit {
       return Err(LoadError(format!(
         "too many instructions (max {})",
-        abi::MAX_INSTS
+        config.instruction_limit
       )));
     }
 

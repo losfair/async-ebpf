@@ -31,7 +31,9 @@ use crate::{
     Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
   },
   error::{Error, RuntimeError},
-  function_analysis::{analyze_functions, FunctionLayout, MAX_LOCAL_CALL_DEPTH},
+  function_analysis::{
+    analyze_functions, analyze_functions_unbounded, FunctionLayout, MAX_LOCAL_CALL_DEPTH,
+  },
   helpers::Helper,
   linker::{link_elf, validate_local_call_graph},
   pointer_cage::PointerCage,
@@ -57,7 +59,8 @@ const LOCAL_CALL_FRAME_BUDGET: usize =
 /// leaves no slack: the deepest call chain the loader accepts would then run off
 /// the bottom of the stack by as much calldata as was passed, and a program that
 /// works with none would fault with any.
-const SHADOW_STACK_SIZE: usize = LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8);
+pub const DEFAULT_GUEST_STACK_SIZE: usize =
+  LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8);
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
 
@@ -107,9 +110,9 @@ const _: () = {
 // What Tier F needs from the guest stack window, stated as the three facts that
 // can each drift on their own.
 //
-// The obvious phrasing - "SHADOW_STACK_SIZE, less the calldata, less the frames
+// The obvious phrasing - "DEFAULT_GUEST_STACK_SIZE, less the calldata, less the frames
 // below the entry one, still leaves FRAME_WINDOW" - cannot fail. Substituting
-// the definition of SHADOW_STACK_SIZE cancels the calldata term against itself
+// the definition of DEFAULT_GUEST_STACK_SIZE cancels the calldata term against itself
 // and the budget against the frames, leaving `FRAME_WINDOW >= FRAME_WINDOW`:
 // true for every value of every constant it names, including all the ones it is
 // supposed to be watching. Each assertion below is instead written against
@@ -133,7 +136,7 @@ const _: () = {
   // 3. The window covers that budget *and* the largest calldata a caller can
   //    pass, rounded the way R10's 8-alignment rounds it.
   assert!(
-    SHADOW_STACK_SIZE >= LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8),
+    DEFAULT_GUEST_STACK_SIZE >= LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8),
     "the guest stack window no longer covers FRAME_WINDOW below the deepest \
      accepted frame pointer; Tier F frame addressing would be unsound"
   );
@@ -145,7 +148,7 @@ const _: () = {
   //    nothing else says so, so say it here - `_run` re-checks the address the
   //    cage actually hands back.
   assert!(
-    SHADOW_STACK_SIZE.is_multiple_of(8),
+    DEFAULT_GUEST_STACK_SIZE.is_multiple_of(8),
     "the guest stack window is not a multiple of 8, so R10's alignment rounding \
      eats into the headroom Tier F frame addressing depends on"
   );
@@ -532,8 +535,8 @@ impl<'a, 'b> HelperScope<'a, 'b> {
   }
 }
 
-/// Native backing for one invocation's guest stack, in its own mapping with a
-/// `PROT_NONE` page on each side.
+/// Native backing for one invocation-local guest region, in its own mapping
+/// with a `PROT_NONE` page on each side.
 ///
 /// The guest stack used to be a plain heap allocation, which was fine while
 /// every guest access carried a runtime bounds check: an out-of-range address
@@ -543,29 +546,32 @@ impl<'a, 'b> HelperScope<'a, 'b> {
 /// in the backend test that enforces it - into a fault instead of a silent read
 /// or write of whatever the allocator happened to place next to the stack.
 ///
-/// The window is laid out flush against the *low* guard, because that is the
-/// direction frame addressing runs: `R10` descends with call depth and every
-/// frame displacement is negative.
-struct GuardedStack {
+/// This backs both the guest stack and private writable ELF data. The usable
+/// window is laid out flush against the low guard, which is load-bearing for
+/// the stack because `R10` descends with call depth and every frame displacement
+/// is negative. For data, both guards are defense in depth around the JIT's
+/// explicit region checks.
+struct GuardedRegion {
   region: MmapRaw,
   offset: usize,
+  len: usize,
 }
 
-impl GuardedStack {
-  fn new() -> Result<Self, RuntimeError> {
+impl GuardedRegion {
+  fn new(size: usize) -> Result<Self, RuntimeError> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 {
       return Err(RuntimeError::PlatformError("failed to query page size"));
     }
     let page_size = page_size as usize;
-    let len = SHADOW_STACK_SIZE.next_multiple_of(page_size);
+    let len = size.next_multiple_of(page_size);
     let total = len + 2 * page_size;
 
     let region = MmapRaw::from(
       MmapOptions::new()
         .len(total)
         .map_anon()
-        .map_err(|_| RuntimeError::PlatformError("failed to allocate guest stack"))?,
+        .map_err(|_| RuntimeError::PlatformError("failed to allocate guarded guest memory"))?,
     );
     unsafe {
       if libc::mprotect(region.as_ptr() as *mut _, total, libc::PROT_NONE) != 0
@@ -576,7 +582,7 @@ impl GuardedStack {
         ) != 0
       {
         return Err(RuntimeError::PlatformError(
-          "failed to protect guest stack guard pages",
+          "failed to protect guarded guest memory",
         ));
       }
     }
@@ -584,34 +590,38 @@ impl GuardedStack {
     Ok(Self {
       region,
       offset: page_size,
+      len: size,
     })
   }
 
   fn as_mut_slice(&mut self) -> &mut [u8] {
     unsafe {
-      std::slice::from_raw_parts_mut(
-        self.region.as_ptr().add(self.offset) as *mut u8,
-        SHADOW_STACK_SIZE,
-      )
+      std::slice::from_raw_parts_mut(self.region.as_ptr().add(self.offset) as *mut u8, self.len)
     }
   }
 
   fn as_mut_ptr(&mut self) -> *mut u8 {
     unsafe { self.region.as_ptr().add(self.offset) as *mut u8 }
   }
+
+  fn len(&self) -> usize {
+    self.len
+  }
 }
 
 struct ExecContext {
   native_stack: DefaultStack,
-  guest_stack: GuardedStack,
+  guest_stack: GuardedRegion,
 }
 
 impl ExecContext {
-  fn new() -> Self {
+  fn new(guest_stack_size: usize) -> Self {
     Self {
-      native_stack: DefaultStack::new(NATIVE_STACK_SIZE)
+      // Local eBPF calls are native calls after JIT compilation. A large guest
+      // stack therefore needs matching native call-stack headroom as well.
+      native_stack: DefaultStack::new(NATIVE_STACK_SIZE.max(guest_stack_size))
         .expect("failed to initialize native stack"),
-      guest_stack: GuardedStack::new().expect("failed to initialize guest stack"),
+      guest_stack: GuardedRegion::new(guest_stack_size).expect("failed to initialize guest stack"),
     }
   }
 }
@@ -806,11 +816,16 @@ struct BorrowedExecContext {
 }
 
 impl BorrowedExecContext {
-  fn new() -> Self {
+  fn new(guest_stack_size: usize) -> Self {
     let mut me = Self {
-      ctx: ManuallyDrop::new(
-        EXEC_CONTEXT_POOL.with(|x| x.borrow_mut().pop().unwrap_or_else(ExecContext::new)),
-      ),
+      ctx: ManuallyDrop::new(EXEC_CONTEXT_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let ctx = pool
+          .iter()
+          .position(|ctx| ctx.guest_stack.len() == guest_stack_size)
+          .map(|index| pool.swap_remove(index));
+        ctx.unwrap_or_else(|| ExecContext::new(guest_stack_size))
+      })),
     };
     me.ctx.guest_stack.as_mut_slice().fill(0x8e);
     me
@@ -866,6 +881,10 @@ pub struct ProgramLoader {
   helper_id_xor: u16,
   helpers: Arc<Vec<(u16, &'static str, Helper)>>,
   code_size_limit: usize,
+  instruction_limit: usize,
+  guest_stack_size: usize,
+  allow_unbounded_local_calls: bool,
+  writable_data: bool,
   require_static_regions: bool,
 }
 
@@ -876,6 +895,8 @@ pub struct UnboundProgram {
   code_base: usize,
   code_size: usize,
   page_size: usize,
+  guest_stack_size: usize,
+  writable_data: bool,
   code_arena: RefCell<CodeArena>,
   cage: PointerCage,
   helper_id_xor: u16,
@@ -1805,12 +1826,34 @@ impl Program {
       }
     }
 
-    let mut ectx = BorrowedExecContext::new();
-
     if calldata.len() > MAX_CALLDATA_SIZE {
       return Err(RuntimeError::InvalidArgument("calldata too large"));
     }
-    ectx.ctx.guest_stack.as_mut_slice()[SHADOW_STACK_SIZE - calldata.len()..]
+
+    let guest_stack_size = self.unbound.guest_stack_size;
+    let mut ectx = BorrowedExecContext::new(guest_stack_size);
+
+    // Mutable ELF state belongs to an invocation, not to the loaded program.
+    // Runs may interleave while an async helper is pending, so sharing this
+    // backing would let one invocation observe and overwrite another's globals.
+    // The cage remains the relocated, read-only initial image; writable runs
+    // get the same guest address range backed by a guarded private copy.
+    let data_len = self.unbound.cage.data_top() - self.unbound.cage.data_bottom();
+    let mut private_data = if self.unbound.writable_data {
+      let mut region = GuardedRegion::new(data_len)?;
+      let initial = self
+        .unbound
+        .cage
+        .data_slice(self.unbound.cage.data_bottom(), data_len)
+        .expect("the cage owns its full data range");
+      let initial = unsafe { std::slice::from_raw_parts(initial.as_ptr() as *const u8, data_len) };
+      region.as_mut_slice().copy_from_slice(initial);
+      Some(region)
+    } else {
+      None
+    };
+
+    ectx.ctx.guest_stack.as_mut_slice()[guest_stack_size - calldata.len()..]
       .copy_from_slice(calldata);
     let calldata_len = calldata.len();
 
@@ -1840,7 +1883,11 @@ impl Program {
         stack_native_base: ctx.guest_stack.as_mut_ptr() as usize,
         data_guest_bottom: self.unbound.cage.data_bottom(),
         data_guest_top: self.unbound.cage.data_top(),
-        data_native_base: self.unbound.cage.data_native_base(),
+        data_native_base: private_data
+          .as_mut()
+          .map(GuardedRegion::as_mut_ptr)
+          .map(|ptr| ptr as usize)
+          .unwrap_or_else(|| self.unbound.cage.data_native_base()),
         derived: [0; 12],
       };
       memory.fill_derived();
@@ -1954,7 +2001,7 @@ impl Program {
 
         if let Some(si_addr) = dispatch.memory_access_error {
           let vaddr = if si_addr >= memory.stack_native_base
-            && si_addr < memory.stack_native_base + SHADOW_STACK_SIZE
+            && si_addr < memory.stack_native_base + guest_stack_size
           {
             memory.stack_guest_bottom + (si_addr - memory.stack_native_base)
           } else if si_addr >= memory.data_native_base
@@ -2115,7 +2162,12 @@ impl Program {
 /// apart: `native_frame_base` and `frame_constants` are on because both entry
 /// trampolines above establish exactly the frame the backend expects, and
 /// neither means anything without the pointer cage.
-fn jit_config(cage: &PointerCage) -> crate::jit::Config {
+fn jit_config(
+  cage: &PointerCage,
+  writable_data: bool,
+  instruction_limit: usize,
+  allow_unbounded_local_calls: bool,
+) -> crate::jit::Config {
   crate::jit::Config {
     target: crate::jit::Target::host(),
     pointer_mask: cage.mask(),
@@ -2123,6 +2175,9 @@ fn jit_config(cage: &PointerCage) -> crate::jit::Config {
     // Both entry trampolines establish the frame these describe.
     native_frame_base: true,
     frame_constants: true,
+    writable_data,
+    instruction_limit,
+    allow_unbounded_local_calls,
     dispatcher: Some(tls_dispatcher),
     dispatcher_validate: Some(std_validator),
     unwind_helper_index: None,
@@ -2236,6 +2291,10 @@ impl ProgramLoader {
       helpers_inverse,
       event_listener,
       code_size_limit: DEFAULT_CODE_SIZE_LIMIT,
+      instruction_limit: crate::jit::abi::MAX_INSTS as usize,
+      guest_stack_size: DEFAULT_GUEST_STACK_SIZE,
+      allow_unbounded_local_calls: false,
+      writable_data: false,
       require_static_regions: false,
     }
   }
@@ -2291,6 +2350,52 @@ impl ProgramLoader {
     self
   }
 
+  /// Sets the exclusive upper bound on decoded eBPF instruction slots.
+  pub fn with_instruction_limit(mut self, limit: usize) -> Self {
+    assert!(limit > 0, "instruction limit must be non-zero");
+    assert!(
+      limit <= i32::MAX as usize,
+      "instruction limit must fit in a signed 32-bit PC"
+    );
+    self.instruction_limit = limit;
+    self
+  }
+
+  /// Sets the writable guest stack window size used by each invocation.
+  ///
+  /// Space beyond the fixed eBPF call-frame budget can be used by a guest as a
+  /// caller-managed arena. The default remains [`DEFAULT_GUEST_STACK_SIZE`].
+  pub fn with_guest_stack_size(mut self, size: usize) -> Self {
+    assert!(
+      size >= DEFAULT_GUEST_STACK_SIZE,
+      "guest stack size must be at least {DEFAULT_GUEST_STACK_SIZE} bytes"
+    );
+    self.guest_stack_size = size;
+    self
+  }
+
+  /// Allows recursive local calls and call graphs deeper than the default
+  /// static limit.
+  ///
+  /// This is intended for trusted compiler-generated userspace guests. Such a
+  /// program is responsible for bounding its own recursion; the configured
+  /// guest stack and matching native coroutine stack are its only hard limit.
+  pub fn with_unbounded_local_calls(mut self, allow: bool) -> Self {
+    self.allow_unbounded_local_calls = allow;
+    self
+  }
+
+  /// Allows the guest to mutate a private copy of allocated ELF data sections.
+  ///
+  /// Each invocation starts from the relocated load-time image and receives
+  /// its own guarded backing, so globals cannot leak across interleaved async
+  /// executions. The loaded program image remains read-only. Disabled by
+  /// default.
+  pub fn with_writable_data(mut self, writable: bool) -> Self {
+    self.writable_data = writable;
+    self
+  }
+
   /// Loads an ELF image into a new `UnboundProgram`.
   pub fn load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, Error> {
     self._load(rng, elf).map_err(Error)
@@ -2298,7 +2403,7 @@ impl ProgramLoader {
 
   fn _load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, RuntimeError> {
     let start_time = Instant::now();
-    let cage = PointerCage::new(rng, SHADOW_STACK_SIZE, elf.len())?;
+    let cage = PointerCage::new(rng, self.guest_stack_size, elf.len())?;
 
     let code_sections = {
       let mut data = cage.data_slice(cage.data_bottom(), elf.len()).unwrap();
@@ -2355,7 +2460,12 @@ impl ProgramLoader {
     let resolvers = HashMap::new();
     let next_resolver_id = 1u32;
 
-    let config = std::sync::Arc::new(jit_config(&cage));
+    let config = std::sync::Arc::new(jit_config(
+      &cage,
+      self.writable_data,
+      self.instruction_limit,
+      self.allow_unbounded_local_calls,
+    ));
 
     for (section_name, code_vaddr_size) in code_sections {
       let code = cage
@@ -2367,18 +2477,23 @@ impl ProgramLoader {
       // here an oversized section is walked twice and given per-instruction
       // tables by the two analyses below, only to be refused afterwards for a
       // reason that was knowable from its length.
-      if code_bytes.len() / 8 > crate::jit::abi::MAX_INSTS as usize {
+      if code_bytes.len() / 8 > self.instruction_limit as usize {
         return Err(RuntimeError::InvalidArgumentOwned(format!(
           "too many instructions in {section_name} (max {})",
-          crate::jit::abi::MAX_INSTS
+          self.instruction_limit
         )));
       }
-      validate_local_call_graph(code_bytes).map_err(|err| {
-        RuntimeError::InvalidArgumentOwned(format!(
-          "local call graph validation failed in {section_name}: {err}"
-        ))
-      })?;
-      let layout = analyze_functions(code_bytes).map_err(|err| {
+      let layout_result = if self.allow_unbounded_local_calls {
+        analyze_functions_unbounded(code_bytes)
+      } else {
+        validate_local_call_graph(code_bytes).map_err(|err| {
+          RuntimeError::InvalidArgumentOwned(format!(
+            "local call graph validation failed in {section_name}: {err}"
+          ))
+        })?;
+        analyze_functions(code_bytes)
+      };
+      let layout = layout_result.map_err(|err| {
         RuntimeError::InvalidArgumentOwned(format!(
           "local function analysis failed in {section_name}: {err}"
         ))
@@ -2432,6 +2547,8 @@ impl ProgramLoader {
       code_base,
       code_size: code_len_allocated,
       page_size,
+      guest_stack_size: self.guest_stack_size,
+      writable_data: self.writable_data,
       code_arena: RefCell::new(CodeArena { used: 0 }),
       cage,
       helper_id_xor: self.helper_id_xor,

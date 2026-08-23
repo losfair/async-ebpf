@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::region_analysis::{function_live_in, RegMask};
 
@@ -263,27 +263,60 @@ fn visit_local_call_graph(
   Ok(max_depth)
 }
 
-/// Depth-first post-order over the call DAG, so a function is emitted after
-/// every function it calls. Cycles are impossible here: `visit_local_call_graph`
-/// has already rejected recursion, and it caps the depth at
-/// `MAX_LOCAL_CALL_DEPTH`, so this recursion is bounded too.
-fn call_graph_post_order(
-  edges: &[Vec<usize>],
-  func_index: usize,
-  seen: &mut [bool],
-  out: &mut Vec<usize>,
-) {
-  if seen[func_index] {
-    return;
+/// Computes the least fixed point of the per-function live-in equations.
+///
+/// Starting at the empty masks is important: these masks control lazy JIT
+/// specialization, so an all-register over-approximation can multiply native
+/// variants at every call around a recursive component. `function_live_in` is
+/// monotone in its callee summaries. Each successful update therefore only
+/// adds bits, and a changed callee needs to wake only its direct callers. With
+/// a finite `RegMask`, every function can change at most once per register bit.
+fn live_in_fixed_point(
+  code: &[u8],
+  starts: &[usize],
+  pc_to_func: &[usize],
+  callers: &[Vec<usize>],
+) -> Vec<RegMask> {
+  let num_insns = code.len() / 8;
+  let mut arg_masks = vec![0 as RegMask; starts.len()];
+  let mut pending = (0..starts.len()).collect::<VecDeque<_>>();
+  let mut queued = vec![true; starts.len()];
+
+  while let Some(func_index) = pending.pop_front() {
+    queued[func_index] = false;
+    let start = starts[func_index];
+    let end = starts.get(func_index + 1).copied().unwrap_or(num_insns);
+    let computed = function_live_in(code, start, end, &|target| {
+      pc_to_func
+        .get(target)
+        .and_then(|&callee| arg_masks.get(callee).copied())
+        .unwrap_or(crate::region_analysis::ALL_SIGNATURE_REGS)
+    });
+
+    // The transfer function is monotone, so a recomputation after callee masks
+    // grow cannot lose bits. Keep the union in release builds as a safe
+    // backstop if that invariant is accidentally broken by a future change.
+    debug_assert_eq!(arg_masks[func_index] & !computed, 0);
+    let next = arg_masks[func_index] | computed;
+    if next == arg_masks[func_index] {
+      continue;
+    }
+    arg_masks[func_index] = next;
+    for &caller in &callers[func_index] {
+      if !queued[caller] {
+        queued[caller] = true;
+        pending.push_back(caller);
+      }
+    }
   }
-  seen[func_index] = true;
-  for &callee in &edges[func_index] {
-    call_graph_post_order(edges, callee, seen, out);
-  }
-  out.push(func_index);
+
+  arg_masks
 }
 
-pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
+fn analyze_functions_impl(
+  code: &[u8],
+  enforce_bounded_call_graph: bool,
+) -> Result<FunctionLayout, String> {
   if code.len() % 8 != 0 {
     return Err("code length is not a multiple of 8".to_string());
   }
@@ -314,33 +347,12 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
 
   let edges = scan_local_function_ranges(code, &starts, &pc_to_func)?;
 
-  let mut states = vec![0u8; starts.len()];
-  let mut depths = vec![0usize; starts.len()];
-  for func_index in 0..starts.len() {
-    visit_local_call_graph(&edges, &starts, &mut states, &mut depths, func_index, 1)?;
-  }
-
-  // Live-in masks, bottom-up: a caller's mask depends on its callees'.
-  let mut order = Vec::with_capacity(starts.len());
-  let mut seen = vec![false; starts.len()];
-  for func_index in 0..starts.len() {
-    call_graph_post_order(&edges, func_index, &mut seen, &mut order);
-  }
-  let mut arg_masks = vec![0 as RegMask; starts.len()];
-  for &func_index in &order {
-    let start = starts[func_index];
-    let end = starts.get(func_index + 1).copied().unwrap_or(num_insns);
-    let mask = {
-      let arg_masks = &arg_masks;
-      let pc_to_func = &pc_to_func;
-      function_live_in(code, start, end, &|target| {
-        pc_to_func
-          .get(target)
-          .and_then(|&callee| arg_masks.get(callee).copied())
-          .unwrap_or(crate::region_analysis::ALL_SIGNATURE_REGS)
-      })
-    };
-    arg_masks[func_index] = mask;
+  if enforce_bounded_call_graph {
+    let mut states = vec![0u8; starts.len()];
+    let mut depths = vec![0usize; starts.len()];
+    for func_index in 0..starts.len() {
+      visit_local_call_graph(&edges, &starts, &mut states, &mut depths, func_index, 1)?;
+    }
   }
 
   let mut callers = vec![Vec::new(); starts.len()];
@@ -349,6 +361,8 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
       callers[callee].push(caller);
     }
   }
+
+  let arg_masks = live_in_fixed_point(code, &starts, &pc_to_func, &callers);
 
   let functions = starts
     .iter()
@@ -368,6 +382,64 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
   })
 }
 
+pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
+  analyze_functions_impl(code, true)
+}
+
+pub(crate) fn analyze_functions_unbounded(code: &[u8]) -> Result<FunctionLayout, String> {
+  analyze_functions_impl(code, false)
+}
+
 pub(crate) fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
   analyze_functions(code).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    bytes[0] = opcode;
+    bytes[1] = dst | (src << 4);
+    bytes[2..4].copy_from_slice(&offset.to_le_bytes());
+    bytes[4..8].copy_from_slice(&imm.to_le_bytes());
+    bytes
+  }
+
+  fn local_call(pc: usize, target: usize) -> [u8; 8] {
+    insn(EBPF_OP_CALL, 0, 1, 0, target as i32 - pc as i32 - 1)
+  }
+
+  fn exit() -> [u8; 8] {
+    insn(EBPF_OP_EXIT, 0, 0, 0, 0)
+  }
+
+  #[test]
+  fn an_unused_recursive_component_has_empty_live_in_masks() {
+    let code = [local_call(0, 2), exit(), local_call(2, 0), exit()].concat();
+    let layout = analyze_functions_unbounded(&code).unwrap();
+
+    assert_eq!(layout.arg_masks, vec![0, 0]);
+  }
+
+  #[test]
+  fn live_in_bits_propagate_all_the_way_around_a_recursive_component() {
+    // The queue initially visits A then B then C. Only C directly reads R8,
+    // so reaching A requires two caller wakeups after C is first analyzed:
+    // C -> B -> A. A one-pass treatment of the cycle misses both callers.
+    let code = [
+      local_call(0, 2),
+      exit(),
+      local_call(2, 4),
+      exit(),
+      local_call(4, 0),
+      insn(0x71, 0, 8, 0, 0), // r0 = *(u8 *)r8
+      exit(),
+    ]
+    .concat();
+    let layout = analyze_functions_unbounded(&code).unwrap();
+
+    assert_eq!(layout.arg_masks, vec![1 << 8; 3]);
+  }
 }

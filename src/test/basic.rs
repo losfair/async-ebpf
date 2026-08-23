@@ -1,4 +1,6 @@
-use std::{sync::Arc, time::Duration};
+use std::{any::Any, sync::Arc, time::Duration};
+
+use tokio::sync::Barrier;
 
 use crate::{
   error::{Error, RuntimeError},
@@ -7,11 +9,151 @@ use crate::{
   test_util::{compile_ebpf, gt_env, run_one_program, timeslice_config, RunOpts, TokioTimeslicer},
 };
 
+#[tokio::test]
+async fn configurable_guest_stack_exposes_a_larger_writable_window() {
+  const STACK_SIZE: usize = 2 * 1024 * 1024;
+  let binary = compile_ebpf(
+    br#"
+      unsigned long long __attribute__((section("test"))) entry(unsigned long long *input) {
+        volatile unsigned char *arena = (unsigned char *)input - 1024 * 1024;
+        arena[0] = 0x5a;
+        arena[1024] = 0xa5;
+        return arena[0] | ((unsigned long long)arena[1024] << 8);
+      }
+    "#
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let (_, t_env) = crate::test_util::gt_env();
+  let loader = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_guest_stack_size(STACK_SIZE);
+  let prog = loader
+    .load(&mut rand::thread_rng(), &binary)
+    .unwrap()
+    .pin_to_current_thread(t_env);
+  let preemption = PreemptionEnabled::new(prog.thread_env());
+  let ret = prog
+    .run(
+      &crate::test_util::timeslice_config(),
+      &crate::test_util::TokioTimeslicer,
+      "test",
+      &mut [],
+      &0u64.to_ne_bytes(),
+      &preemption,
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 0xa55a);
+}
+
 static HELPERS: &'static [(&'static str, Helper)] = &[
   ("return_5", h_return_5),
   ("return_7_async", h_return_7_async),
 ];
 static FAILING_ASYNC_HELPERS: &[(&str, Helper)] = &[("fail_async", h_fail_async)];
+
+struct InterleavingGate(Arc<Barrier>);
+
+fn h_wait_for_peer(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+  let barrier =
+    scope.with_resource_mut::<InterleavingGate, _>(|gate| gate.map(|gate| Arc::clone(&gate.0)))?;
+  scope.post_task(async move {
+    barrier.wait().await;
+    |_: &HelperScope| Ok(0)
+  });
+  Ok(0)
+}
+
+static INTERLEAVING_HELPERS: &[(&str, Helper)] = &[("wait_for_peer", h_wait_for_peer)];
+
+#[tokio::test]
+async fn writable_globals_are_private_to_interleaved_invocations() {
+  let binary = compile_ebpf(
+    br#"
+      extern void wait_for_peer(void);
+      volatile unsigned long long shared_name_but_private_state = 7;
+      volatile unsigned long long *state_pointer = &shared_name_but_private_state;
+
+      unsigned long long __attribute__((section("test")))
+      entry(unsigned long long *input) {
+        *state_pointer = *input;
+        wait_for_peer();
+        return *state_pointer;
+      }
+
+      unsigned long long __attribute__((section("initial")))
+      read_initial(void) {
+        return *state_pointer;
+      }
+    "#
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let (_, t_env) = gt_env();
+  let loader = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[INTERLEAVING_HELPERS],
+  )
+  .with_writable_data(true);
+  let prog = loader
+    .load(&mut rand::thread_rng(), &binary)
+    .unwrap()
+    .pin_to_current_thread(t_env);
+
+  let barrier = Arc::new(Barrier::new(2));
+  let mut gate_a = InterleavingGate(Arc::clone(&barrier));
+  let mut gate_b = InterleavingGate(barrier);
+  let mut resources_a: [&mut dyn Any; 1] = [&mut gate_a];
+  let mut resources_b: [&mut dyn Any; 1] = [&mut gate_b];
+  let input_a = 0xaaaa_u64.to_ne_bytes();
+  let input_b = 0xbbbb_u64.to_ne_bytes();
+  let preemption_a = PreemptionEnabled::new(prog.thread_env());
+  let preemption_b = PreemptionEnabled::new(prog.thread_env());
+  let timeslice = timeslice_config();
+  let timeslicer = TokioTimeslicer;
+
+  let (result_a, result_b) = tokio::join!(
+    prog.run(
+      &timeslice,
+      &timeslicer,
+      "test",
+      &mut resources_a,
+      &input_a,
+      &preemption_a,
+    ),
+    prog.run(
+      &timeslice,
+      &timeslicer,
+      "test",
+      &mut resources_b,
+      &input_b,
+      &preemption_b,
+    ),
+  );
+
+  assert_eq!(result_a.unwrap(), 0xaaaa);
+  assert_eq!(result_b.unwrap(), 0xbbbb);
+
+  let initial = prog
+    .run(
+      &timeslice,
+      &timeslicer,
+      "initial",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(prog.thread_env()),
+    )
+    .await
+    .unwrap();
+  assert_eq!(initial, 7);
+}
 
 #[tokio::test]
 #[tracing_test::traced_test]

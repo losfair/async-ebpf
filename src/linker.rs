@@ -13,6 +13,7 @@ const SHF_ALLOC: u64 = 1 << 1;
 const SHF_EXECINSTR: u64 = 1 << 2;
 
 const R_BPF_64_64: u32 = 1;
+const R_BPF_64_ABS64: u32 = 2;
 const R_BPF_64_32: u32 = 10;
 
 const EBPF_OP_CALL: u8 = 0x05u8 | 0x80u8;
@@ -156,6 +157,8 @@ pub fn link_elf(
   }
 
   let mut insn_rewrites: Vec<(usize, u64)> = vec![];
+  let mut data_rewrites: Vec<(usize, u64)> = vec![];
+  let mut relocation_count = 0usize;
   // Relocation sections are not required to describe distinct bytes either, so
   // one valid relocation blob can be replayed against the same target by any
   // number of SHT_REL headers.
@@ -166,16 +169,19 @@ pub fn link_elf(
       continue;
     }
     let target_section_index = sec.sh_info as usize;
-    if !code_section_indexes.contains(&target_section_index) {
+    let target_section = sht.get(target_section_index)?;
+    let target_is_code = code_section_indexes.contains(&target_section_index);
+    let target_is_data =
+      target_section.sh_type == SHT_PROGBITS && (target_section.sh_flags & SHF_ALLOC) != 0;
+    if !target_is_code && !target_is_data {
       continue;
     }
     if !relocated_sections.insert(target_section_index) {
       return Err(LinkerError::InvalidElf(
-        "more than one relocation section targets the same code section",
+        "more than one relocation section targets the same section",
       ));
     }
 
-    let target_section = sht.get(target_section_index)?;
     let target_section_name = sht_strtab
       .get(target_section.sh_name as usize)
       .unwrap_or_default();
@@ -186,14 +192,45 @@ pub fn link_elf(
       // Checked per relocation rather than once against the section length,
       // because the rewrites are buffered and applied afterwards: without this
       // the whole buffer is built before anything rejects it.
-      if insn_rewrites.len() >= MAX_RELOCATIONS {
+      if relocation_count >= MAX_RELOCATIONS {
         return Err(LinkerError::InvalidElf(
           "too many relocations in one object",
         ));
       }
+      relocation_count += 1;
       let end = (reloc.r_offset as usize).saturating_add(8);
       if reloc.r_offset % 8 != 0 || end > target_section_data.len() {
         return Err(LinkerError::InvalidElf("relocation: invalid offset"));
+      }
+
+      let sym = symtab.0.get(reloc.r_sym as usize)?;
+      let sym_name = symtab.1.get(sym.st_name as usize)?;
+
+      if !target_is_code {
+        if reloc.r_type != R_BPF_64_ABS64 {
+          continue;
+        }
+        let data_section = sht.get(sym.st_shndx as usize)?;
+        if data_section.sh_type != SHT_PROGBITS || (data_section.sh_flags & SHF_ALLOC) == 0 {
+          return Err(LinkerError::Reloc(
+            "R_BPF_64_ABS64: symbol is not in allocated data".to_string(),
+            reloc,
+          ));
+        }
+        let addend = u64::from_le_bytes(
+          target_section_data[reloc.r_offset as usize..end]
+            .try_into()
+            .unwrap(),
+        );
+        let value = (vbase as u64)
+          .wrapping_add(data_section.sh_offset)
+          .wrapping_add(sym.st_value)
+          .wrapping_add(addend);
+        data_rewrites.push((
+          target_section.sh_offset as usize + reloc.r_offset as usize,
+          value,
+        ));
+        continue;
       }
 
       let insn = u64::from_le_bytes(
@@ -202,9 +239,6 @@ pub fn link_elf(
           .unwrap(),
       );
       let mut insn = EbpfInsn::from_u64(insn);
-      let sym = symtab.0.get(reloc.r_sym as usize)?;
-      let sym_name = symtab.1.get(sym.st_name as usize)?;
-
       if reloc.r_type == R_BPF_64_32 {
         if insn.opcode != EBPF_OP_CALL {
           return Err(LinkerError::Reloc(
@@ -306,6 +340,9 @@ pub fn link_elf(
   }
 
   for (offset, value) in insn_rewrites {
+    input[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+  }
+  for (offset, value) in data_rewrites {
     input[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
   }
 

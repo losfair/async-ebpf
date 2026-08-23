@@ -740,11 +740,13 @@ fn emit_masked_address_with_offset(
   if cfg.pointer_mask != 0 {
     // Stores are always confined to the active stack regardless of the hint,
     // preserving the read-only guarantee for the data region.
-    if store || region_hint == abi::region::STACK || region_hint == abi::region::FRAME {
+    if !cfg.writable_data
+      && (store || region_hint == abi::region::STACK || region_hint == abi::region::FRAME)
+    {
       emit_region_address(cfg, st, dst, scratch, size, &GUEST_STACK_REGION);
       return;
     }
-    if region_hint == abi::region::DATA {
+    if !cfg.writable_data && region_hint == abi::region::DATA {
       emit_region_address(cfg, st, dst, scratch, size, &GUEST_DATA_REGION);
       return;
     }
@@ -813,7 +815,7 @@ fn emit_checked_address(
             && group.written & (1u16 << base_ebpf) == 0
             && plan.delta as u64 + width as u64 <= group.span as u64
             && group.lo as i64 + plan.delta as i64 == offset as i64
-            && (!store || group.region == abi::region::STACK)
+            && (!store || cfg.writable_data || group.region == abi::region::STACK)
         }
         _ => false,
       };
@@ -831,7 +833,7 @@ fn emit_checked_address(
         && plan.delta as u64 + width as u64 <= plan.span as u64
         && plan.lo as i64 + plan.delta as i64 == offset as i64
         && plan.region != abi::region::FRAME
-        && (!store || plan.region == abi::region::STACK)
+        && (!store || cfg.writable_data || plan.region == abi::region::STACK)
         && plan.lo >= i16::MIN as i32
         && plan.lo <= i16::MAX as i32;
       if usable {
@@ -1022,7 +1024,16 @@ fn emit_lazy_local_call(
     }
   };
 
-  emit_loadstore_immediate(st, ls::LDRX, TEMP_REGISTER, SP, 0);
+  // Stack usage is fixed for every local function. Materialise the constant
+  // directly instead of reloading the prologue's bookkeeping slot: a coroutine
+  // suspension may use host stack storage below the current frame, while R10
+  // is guest state and must not depend on that storage surviving a yield.
+  emit_movewide_immediate(
+    st,
+    true,
+    TEMP_REGISTER,
+    abi::LOCAL_FUNCTION_STACK_SIZE as u64,
+  );
   emit_addsub_register(
     st,
     true,
@@ -1036,7 +1047,6 @@ fn emit_lazy_local_call(
   emit_addsub_immediate(st, true, addsub::SUB, SP, SP, stack_movement);
 
   emit_loadstore_immediate(st, ls::STRX, R30, SP, 0);
-  emit_loadstore_immediate(st, ls::STRX, TEMP_REGISTER, SP, 8);
   emit_loadstorepair_immediate(st, lsp::STPX, map_register(6), map_register(7), SP, 16);
   emit_loadstorepair_immediate(st, lsp::STPX, map_register(8), map_register(9), SP, 32);
 
@@ -1059,14 +1069,18 @@ fn emit_lazy_local_call(
   emit_addsub_immediate(st, true, addsub::ADD, SP, SP, arg_stack_movement);
 
   emit_unconditionalbranch_register(st, br::BLR, R17);
-
   emit_loadstore_immediate(st, ls::LDRX, R30, SP, 0);
-  emit_loadstore_immediate(st, ls::LDRX, TEMP_REGISTER, SP, 8);
   emit_loadstorepair_immediate(st, lsp::LDPX, map_register(6), map_register(7), SP, 16);
   emit_loadstorepair_immediate(st, lsp::LDPX, map_register(8), map_register(9), SP, 32);
 
   emit_addsub_immediate(st, true, addsub::ADD, SP, SP, stack_movement);
 
+  emit_movewide_immediate(
+    st,
+    true,
+    TEMP_REGISTER,
+    abi::LOCAL_FUNCTION_STACK_SIZE as u64,
+  );
   emit_addsub_register(
     st,
     true,

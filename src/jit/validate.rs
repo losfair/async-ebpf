@@ -55,8 +55,10 @@
 //! assemble an empty program. See
 //! `tests::decisions::the_empty_program_is_refused_by_the_loader_not_the_validator`.
 
+#[cfg(test)]
+use super::abi;
 use super::isa::{cls, opcode, AluOp, AluWidth, Insn, Op};
-use super::{abi, Config};
+use super::Config;
 
 // ---------------------------------------------------------------------------
 // Layer 1: the per-opcode operand filter
@@ -316,8 +318,11 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
   // instructions is refused. `Translator::load` checks `>` before calling here,
   // so the two together reproduce `>=` — but this must not depend on that, and
   // stating it here is what makes the boundary testable in one place.
-  if insns.len() >= abi::MAX_INSTS as usize {
-    return Err(format!("too many instructions (max {})", abi::MAX_INSTS));
+  if insns.len() >= config.instruction_limit {
+    return Err(format!(
+      "too many instructions (max {})",
+      config.instruction_limit
+    ));
   }
 
   // Stack usage is checked next,
@@ -436,7 +441,11 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
     i += 1 + usize::from(skip_next);
   }
 
-  check_self_contained_sub_programs(insns)
+  if config.allow_unbounded_local_calls {
+    Ok(())
+  } else {
+    check_self_contained_sub_programs(insns)
+  }
 }
 
 /// Checks the operation selector an atomic store carries in its immediate.
