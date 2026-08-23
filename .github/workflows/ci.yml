@@ -99,10 +99,12 @@ jobs:
       # actually run them. It cannot run JIT'd code, which is exactly why the
       # emitters were written to produce bytes into a &mut [u8] rather than to
       # manage their own executable memory.
+      #
+      # `cargo test` takes a single positional filter, so this is one prefix
+      # rather than a list of module paths. Without the `oracle` feature: the
+      # differential tests call into the C, which Miri cannot execute.
       - name: Run Miri over the JIT modules
-        run: |
-          cargo +nightly miri test --features testing --lib \
-            jit::isa jit::abi jit::patch jit::stack jit::validate jit::interp jit::emit
+        run: cargo +nightly miri test --features testing --lib -- jit::
 
   openbsd-tests:
     name: OpenBSD unit tests (${{ matrix.arch }})
