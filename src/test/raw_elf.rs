@@ -20,12 +20,17 @@ use crate::{
 /// Symbol the read-only data section exports at offset 0.
 const DATA_SYM: &str = "DATA_SYM";
 
+/// Symbol helper calls relocate against; resolved by name in the loader's
+/// registered helper tables.
+const HELPER_SYM: &str = "h";
+
 /// One instruction slot, plus whether it carries a relocation against
 /// [`DATA_SYM`].
 #[derive(Clone, Copy)]
 pub(crate) struct Insn {
   value: u64,
   data_reloc: bool,
+  helper_reloc: bool,
 }
 
 impl Insn {
@@ -37,6 +42,7 @@ impl Insn {
         | ((offset as u16 as u64) << 16)
         | ((imm as u32 as u64) << 32),
       data_reloc: false,
+      helper_reloc: false,
     }
   }
 
@@ -75,6 +81,13 @@ impl Insn {
   /// Local call to `pc + imm + 1`.
   pub(crate) fn call_local(imm: i32) -> Self {
     Self::raw(0x85, 0, 1, 0, imm)
+  }
+
+  /// Call the helper registered under [`HELPER_SYM`].
+  pub(crate) fn call_helper() -> Self {
+    let mut call = Self::raw(0x85, 0, 0, 0, 0);
+    call.helper_reloc = true;
+    call
   }
 
   /// `lddw dst, &DATA_SYM + addend`, as the two slots it occupies.
@@ -131,13 +144,24 @@ pub(crate) async fn run_raw(
   calldata: &[u8],
   require_static_regions: bool,
 ) -> Result<i64, Error> {
+  run_raw_with_helpers(code, rodata, calldata, require_static_regions, &[]).await
+}
+
+/// [`run_raw`] with helper tables registered on the loader.
+pub(crate) async fn run_raw_with_helpers(
+  code: &[Insn],
+  rodata: &[u8],
+  calldata: &[u8],
+  require_static_regions: bool,
+  helpers: &[&[(&'static str, crate::helpers::Helper)]],
+) -> Result<i64, Error> {
   let (_, t_env) = gt_env();
   let elf = build_elf(code, rodata);
 
   let program = ProgramLoader::new(
     &mut rand::thread_rng(),
     Arc::new(DummyProgramEventListener),
-    &[],
+    helpers,
   )
   .require_static_region_analysis(require_static_regions)
   .load(&mut rand::thread_rng(), &elf)?
@@ -164,6 +188,7 @@ pub(crate) fn build_elf(code: &[Insn], rodata: &[u8]) -> Vec<u8> {
   const SHF_ALLOC: u64 = 1 << 1;
   const SHF_EXECINSTR: u64 = 1 << 2;
   const R_BPF_64_64: u64 = 1;
+  const R_BPF_64_32: u64 = 10;
 
   // Section header string table, in the order the headers are written below.
   let mut shstrtab = vec![0u8];
@@ -188,11 +213,16 @@ pub(crate) fn build_elf(code: &[Insn], rodata: &[u8]) -> Vec<u8> {
   const SEC_SHSTRTAB: u16 = 6;
   const SEC_COUNT: u16 = 7;
 
-  // Symbol table: index 0 is the mandatory null entry, index 1 is DATA_SYM.
+  // Symbol table: index 0 is the mandatory null entry, index 1 is DATA_SYM,
+  // index 2 is the undefined helper symbol.
   const DATA_SYM_INDEX: u32 = 1;
+  const HELPER_SYM_INDEX: u32 = 2;
   let mut strtab = vec![0u8];
   let data_sym_name = strtab.len() as u32;
   strtab.extend_from_slice(DATA_SYM.as_bytes());
+  strtab.push(0);
+  let helper_sym_name = strtab.len() as u32;
+  strtab.extend_from_slice(HELPER_SYM.as_bytes());
   strtab.push(0);
 
   let mut symtab = vec![0u8; 24];
@@ -202,6 +232,12 @@ pub(crate) fn build_elf(code: &[Insn], rodata: &[u8]) -> Vec<u8> {
   symtab.extend_from_slice(&SEC_RODATA.to_le_bytes());
   symtab.extend_from_slice(&0u64.to_le_bytes()); // st_value
   symtab.extend_from_slice(&(rodata.len() as u64).to_le_bytes()); // st_size
+  symtab.extend_from_slice(&helper_sym_name.to_le_bytes());
+  symtab.push(0x10); // st_info: GLOBAL / NOTYPE
+  symtab.push(0); // st_other
+  symtab.extend_from_slice(&0u16.to_le_bytes()); // st_shndx: SHN_UNDEF
+  symtab.extend_from_slice(&0u64.to_le_bytes());
+  symtab.extend_from_slice(&0u64.to_le_bytes());
 
   let mut text = Vec::with_capacity(code.len() * 8);
   let mut rels = Vec::new();
@@ -210,6 +246,10 @@ pub(crate) fn build_elf(code: &[Insn], rodata: &[u8]) -> Vec<u8> {
     if insn.data_reloc {
       rels.extend_from_slice(&((index * 8) as u64).to_le_bytes());
       rels.extend_from_slice(&(((DATA_SYM_INDEX as u64) << 32) | R_BPF_64_64).to_le_bytes());
+    }
+    if insn.helper_reloc {
+      rels.extend_from_slice(&((index * 8) as u64).to_le_bytes());
+      rels.extend_from_slice(&(((HELPER_SYM_INDEX as u64) << 32) | R_BPF_64_32).to_le_bytes());
     }
   }
 

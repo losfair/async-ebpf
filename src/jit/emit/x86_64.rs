@@ -949,6 +949,15 @@ impl Emit<'_, '_, '_> {
     self.emit_call(PatchTarget::Special(SpecialTarget::Retpoline));
 
     // The result is in RAX.
+    //
+    // The registers backing eBPF R1-R5 are all caller-saved, and the helper
+    // path used them freely: the dispatcher, and whatever it suspended into,
+    // up to the whole run loop. The call convention clobbers them, so the
+    // guest may read anything here except host state - scrub them to zero.
+    for r in 1..=5 {
+      let r = map_register(r);
+      self.emit_alu64(X64_ALU_XOR, r, r);
+    }
   }
 
   /// A local call whose target has not been compiled yet: ask the resolver at

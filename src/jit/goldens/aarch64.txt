@@ -10,12 +10,12 @@ a branch can land between leader and member/cage only.a713d5f5934a8626ea5b3cd6|8
 a branch can land between leader and member/no cage.910cf41ebf877b0458fa08a6|564:hb9a781b29da23a89352080bc878399f2
 a branch can land between leader and member/production + unwind helper.3516b8aca648b4e92dabecf9|684:hd99465a27434acf278e9505d3e654ae8
 a branch can land between leader and member/production.d30ee7820a5fb918a1b1298a|684:hd99465a27434acf278e9505d3e654ae8
-a call sits between leader and member/cage + frame constants.5d029efb903e46c52a406d3d|756:ha435d3d147496694d841a85e78c1b967
-a call sits between leader and member/cage + native frame base.2635562ad144ab1cbe60214d|904:h0245928b3f27f07fec9c4e9c335aa4ba
-a call sits between leader and member/cage only.04f54f7903b6ea2560b9eb9c|904:h0245928b3f27f07fec9c4e9c335aa4ba
-a call sits between leader and member/no cage.057c4120028e86f4097307c2|636:hd542d33d354b7bfc6a24b69e1eaeb92a
-a call sits between leader and member/production + unwind helper.d57c555ff2920d6c1cd17ffa|756:ha435d3d147496694d841a85e78c1b967
-a call sits between leader and member/production.8080f121f291f1bd2b4297fa|756:ha435d3d147496694d841a85e78c1b967
+a call sits between leader and member/cage + frame constants.5d029efb903e46c52a406d3d|776:hadc3c570bb4a28e2209a82b11d536906
+a call sits between leader and member/cage + native frame base.2635562ad144ab1cbe60214d|924:hec18cf776759357d18266d69c58b1b49
+a call sits between leader and member/cage only.04f54f7903b6ea2560b9eb9c|924:hec18cf776759357d18266d69c58b1b49
+a call sits between leader and member/no cage.057c4120028e86f4097307c2|656:hfd2f0de673f2cef4f73560ec498c0439
+a call sits between leader and member/production + unwind helper.d57c555ff2920d6c1cd17ffa|776:hadc3c570bb4a28e2209a82b11d536906
+a call sits between leader and member/production.8080f121f291f1bd2b4297fa|776:hadc3c570bb4a28e2209a82b11d536906
 a store member against the data region/cage + frame constants.3e1735d284531d3c15cfe31c|604:h2f254f3edd8661838e515a3ec0d5c304
 a store member against the data region/cage + native frame base.59210b99fc9a021e6f77e069|828:hc80834a55bceb3566b3493e81b0f8106
 a store member against the data region/cage only.0831c13f09f962c9ad083c80|828:hc80834a55bceb3566b3493e81b0f8106
@@ -208,12 +208,12 @@ group/cage only.9e32c2b471a013db7df28fd8|828:h7b37291d5bec90e3aecdef45efb77432
 group/no cage.fdec19161c4f5905d2897e1e|560:h56f6eacf0dbc071af14ede50e0a6235b
 group/production + unwind helper.acd2d432de62ef25044931c3|604:hd114cb250373a6aad190442ff862f4d8
 group/production.4b72f971a153d956f96a0464|604:hd114cb250373a6aad190442ff862f4d8
-helper calls/cage + frame constants.867e077bceff3aa6c09da6f3|856:hb135d96e3bc0b15603d36080516b0076
-helper calls/cage + native frame base.a7de673809d75cd040b1821a|856:hb135d96e3bc0b15603d36080516b0076
-helper calls/cage only.9203d00d544e081e5d35aa86|856:hb135d96e3bc0b15603d36080516b0076
-helper calls/no cage.51854fc2b5ec3017eedeab88|856:hb135d96e3bc0b15603d36080516b0076
-helper calls/production + unwind helper.b209a418e2cb217bc3ecc7be|864:hcbc7d9648d69fa20d6ec652e48cad51c
-helper calls/production.cb91f401c52639966ee05401|856:hb135d96e3bc0b15603d36080516b0076
+helper calls/cage + frame constants.867e077bceff3aa6c09da6f3|936:hc825d90180789f7cff8b910fd3b75b26
+helper calls/cage + native frame base.a7de673809d75cd040b1821a|936:hc825d90180789f7cff8b910fd3b75b26
+helper calls/cage only.9203d00d544e081e5d35aa86|936:hc825d90180789f7cff8b910fd3b75b26
+helper calls/no cage.51854fc2b5ec3017eedeab88|936:hc825d90180789f7cff8b910fd3b75b26
+helper calls/production + unwind helper.b209a418e2cb217bc3ecc7be|944:h945968fd8ac458146090b95718f8a22e
+helper calls/production.cb91f401c52639966ee05401|936:hc825d90180789f7cff8b910fd3b75b26
 ja/cage + frame constants.79c8c84da67a652a1f64984c|572:hde8371c5a0481ded152ad6fbcd5257fd
 ja/cage + native frame base.d9897bded2b2045ebf21797a|572:hde8371c5a0481ded152ad6fbcd5257fd
 ja/cage only.41e4b517ac72d8370b147e1c|572:hde8371c5a0481ded152ad6fbcd5257fd
@@ -262,8 +262,8 @@ leader low bound is out of the offset field's range/cage only.93b1129655d225c423
 leader low bound is out of the offset field's range/no cage.3cad060f9c62435dfca756ce|560:h56f6eacf0dbc071af14ede50e0a6235b
 leader low bound is out of the offset field's range/production + unwind helper.743283e939402e41f9f3bb7b|716:h739236982f782b8e276e54d858182a38
 leader low bound is out of the offset field's range/production.41e2b8c02b5bc0b42b682b47|716:h739236982f782b8e276e54d858182a38
-literal load at 1 MiB n=7708.a3b489a5795e9be4ed62dd23|1048916:h892b56fdeebc8df24ff8f43103251786
-literal load at 1 MiB n=7709.1f7bdd9fbb52da6a9ccd4401|1049052:hbf06dad9333abb9f4ae60741fea2fa52
+literal load at 1 MiB n=7708.a3b489a5795e9be4ed62dd23|1048936:haf279a47822a89705efba40eae5ef7bf
+literal load at 1 MiB n=7709.1f7bdd9fbb52da6a9ccd4401|1049072:h9a703e7f6418574777b2bed23289d8ed
 literal load at 1 MiB n=7710.9fbc7bcfe9c658f2c03441db|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
 literal load at 1 MiB n=7711.60de6ce0d7a61431bfec7040|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
 literal load at 1 MiB n=7712.b7b0941ae4d3114f8ffe3a59|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
@@ -447,24 +447,24 @@ store immediates/cage only.9feba65509b3555daed4fa83|8568:h4ad5d50491a1519fbb2044
 store immediates/no cage.ed61d13f96ef4e0e4b451e42|1064:h149ac91650ef1b49fdd0035f7c537891
 store immediates/production + unwind helper.1bb3898661582e7790306a77|5544:h110a21b0a25e65e6eee45b2886b9a0ca
 store immediates/production.ccfdecc75385f899f9f364ff|5544:h110a21b0a25e65e6eee45b2886b9a0ca
-sweep.audit-barrier-sources|48:48:0b4b1c7ca6187ef8339f043b6bba32040ca46790c8925385dd68a58c582237b4
+sweep.audit-barrier-sources|48:48:94e4b6270d903848a3277fd89272b0a18e3034893eeb5f65901697a8fbacfa3f
 sweep.audit-escaping-jump-capacity|384:0:f428581ff49e176ed5e8cff07db1b66e25aa99815feff7f41aa0f4f966acfe98
-sweep.audit-every-capacity|5684:720:c378dad4ca32433847e6519d02bea9e3eb400df2aa6c6599918d96bf2cfc7ae2
+sweep.audit-every-capacity|5804:720:0a0ca33c7da0c5accd5d0cff6d10430c61f91415883785e6a216fcbbbb79f06a
 sweep.audit-fallthrough-entry|24:24:e5f26c4424712de15ef89c4bd4f359097510b3dee8ae2c8cb7160e457b634179
 sweep.audit-full-buffer-masks-a-later-error|390:0:ac8e9b68af9eabde09e594188b75764f15a9ae774a09d54e17d3ddef7beda9c8
 sweep.audit-group-boundaries|2970:2970:d0a8454203e44c62e06f1ed33802dd543142b9191f527bd6906d564818ce8062
 sweep.audit-group-interactions|48:48:01702790ba053d00aa25ec735dfd994dd9d2d4a81dcd903f85157d87f4be362f
 sweep.audit-more-hostile-plans|408:408:875c20683e826d16974b7b517b0396d736dce2f0921403af6b812504bd888fa7
-sweep.audit-probe-batch|570:558:b694c29203f4f908f872a490e83c296816a1eddf98c6625ea8e65796c105779b
+sweep.audit-probe-batch|570:558:2dd96c2737a3b2372abc24a9c0be1c5bc97d9bb3d0eea72b58a2b956f6c2b541
 sweep.audit-short-hint-array|120:120:b52db95fc43a1d2991f13cf3140aa9d077dfb5815293dcb6d09027f6c9e5a23b
-sweep.audit-wide-multi-function-ranges|20904:20904:0a5ad7ddc4a9f65faadda9a9d2b533c76560b96bc0f3db6c1d6fb986a72dfd93
-sweep.audit-wide-randomised-plans|3000:3000:8fde9da655e2aa27a8f596c123c10094f557e8a6f39f5daf5dc5ec739af034ab
-sweep.randomised-multi-function-programs|2730:2730:d8df79345e75b20328a0920272ebe26d6a3ff77fd330926667b73367b37087af
-sweep.randomised-programs|2400:2400:0ec58233d2f09065955970434cc925cc302f1b8fc6c0e0909b107c1bccb92dfd
+sweep.audit-wide-multi-function-ranges|20904:20904:4db64c2496882caa8a4efbb1a8a30ef6803c5b2d07549cca0b5b1097aa51fab2
+sweep.audit-wide-randomised-plans|3000:3000:9d030c703fe2cb4bbd33067fe9262ee39cde9c9e47dfccea8510f392be7b45b3
+sweep.randomised-multi-function-programs|2730:2730:e838e45f8d6259002c873067cad485be8f349eb3c835bd81ba7e9f7b5e3d2e85
+sweep.randomised-programs|2400:2400:2f2c3f76761a58ddc7199475c58bbcea461881e9511ee47675e8fd8bc2ee414f
 sweep.region-hints|96:96:911af86c557c53c242b4fe5d9cec96901a0f4a2265cf6341f8546b61958e7c9e
-unwind branch to the epilogue at 1 MiB n=13104.765e4514aa8c588a8a7dd406|1048956:h55fdfdfa1958d34790c7c112a2eaabd1
-unwind branch to the epilogue at 1 MiB n=13105.5ccc35da77ed62916ae02c61|1049036:hba8acbe6ea480c2e0dfd07646d5dbf24
-unwind branch to the epilogue at 1 MiB n=13106.d290564fe1099600cb666e84|1049116:h5f441842b2a1100f9b2d2c7ed7f2d401
+unwind branch to the epilogue at 1 MiB n=13104.765e4514aa8c588a8a7dd406|1048976:h9a2b05214670ab2eb5c74e5941740231
+unwind branch to the epilogue at 1 MiB n=13105.5ccc35da77ed62916ae02c61|1049056:ha90869e79fc420e8144ebe74ecfd4691
+unwind branch to the epilogue at 1 MiB n=13106.d290564fe1099600cb666e84|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
 unwind branch to the epilogue at 1 MiB n=13107.bed870b633d60ea7a5adbb6b|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
 unwind branch to the epilogue at 1 MiB n=13108.b586f453a7bf23c8b1fe9dce|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
 unwind branch to the epilogue at 1 MiB n=13109.c073345e358817fc56328ffc|err:Branch or load target out of range in the JIT'd code (the program is too large for arm64 PC-relative addressing).
