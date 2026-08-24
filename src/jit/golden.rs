@@ -246,6 +246,16 @@ pub fn key(label: &str, config: &Config, code: &[u8], inputs: &TranslationInputs
     config.local_call_resolver.is_some() as u8,
   ]);
   h.update(&config.unwind_helper_index.unwrap_or(u32::MAX).to_le_bytes());
+  // Preserve historical keys for the ABI defaults, while ensuring a custom
+  // logical frame or sparse guarded-frame stride cannot alias its output onto
+  // the same golden entry.
+  if config.stack_frame_size != super::abi::LOCAL_FUNCTION_STACK_SIZE
+    || config.stack_frame_stride != super::abi::LOCAL_FUNCTION_STACK_SIZE as u32
+  {
+    h.update(b"stack-layout");
+    h.update(&config.stack_frame_size.to_le_bytes());
+    h.update(&config.stack_frame_stride.to_le_bytes());
+  }
   format!("{label}.{}", &h.finish()[..24])
 }
 
@@ -507,6 +517,12 @@ mod tests {
       ..base.clone()
     };
     assert_ne!(k, key("t", &framed, &code, &plain));
+
+    let sparse = Config {
+      stack_frame_stride: 65_536,
+      ..base.clone()
+    };
+    assert_ne!(k, key("t", &sparse, &code, &plain));
 
     // And the same input must be stable across calls.
     assert_eq!(k, key("t", &base, &code, &plain));

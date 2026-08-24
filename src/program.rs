@@ -52,14 +52,13 @@ const DEFAULT_LOCAL_CALL_FRAME_BUDGET: usize = crate::jit::abi::EBPF_STACK_SIZE 
 /// Guest stack bytes charged to each local function by default.
 pub const DEFAULT_STACK_FRAME_SIZE: usize = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
 
-/// The guest stack window.
+/// Writable guest-stack capacity.
 ///
-/// Calldata is copied into the top of this window and `R10` starts at the first
-/// 8-aligned address below it, so the window has to cover the frame budget *and*
-/// the largest calldata a caller can pass. Sizing it to the frame budget alone
-/// leaves no slack: the eighth default frame would then run off the bottom of
-/// the stack by as much calldata as was passed, and a program that works with
-/// none would fault with any.
+/// The guarded layout derives eight mapped frame islands plus a fixed calldata
+/// slab from this capacity. In contiguous compatibility mode, calldata is
+/// copied into the top of the window and `R10` starts at the first 8-aligned
+/// address below it. Either layout therefore needs capacity for the frame
+/// budget *and* the largest calldata a caller can pass.
 pub const DEFAULT_GUEST_STACK_SIZE: usize =
   DEFAULT_LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8);
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
@@ -540,6 +539,120 @@ impl<'a, 'b> HelperScope<'a, 'b> {
   }
 }
 
+const MIN_GUARDED_FRAME_GAP: usize = 1 << 15;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GuestStackLayout {
+  address_span: usize,
+  frame_size: usize,
+  frame_stride: usize,
+  frame_count: usize,
+  calldata_offset: usize,
+  calldata_capacity: usize,
+  guarded_frames: bool,
+}
+
+impl GuestStackLayout {
+  fn contiguous(guest_stack_size: usize, frame_size: usize) -> Self {
+    Self {
+      address_span: guest_stack_size,
+      frame_size,
+      frame_stride: frame_size,
+      frame_count: guest_stack_size.div_ceil(frame_size),
+      calldata_offset: guest_stack_size,
+      calldata_capacity: MAX_CALLDATA_SIZE,
+      guarded_frames: false,
+    }
+  }
+
+  fn guarded(
+    guest_stack_size: usize,
+    frame_size: usize,
+    page_size: usize,
+  ) -> Result<Self, RuntimeError> {
+    if !frame_size.is_multiple_of(page_size) {
+      return Err(RuntimeError::InvalidArgumentOwned(format!(
+        "guarded stack frames require the {frame_size}-byte frame size to be a multiple of the \
+         host page size ({page_size} bytes)"
+      )));
+    }
+
+    let frame_bytes = guest_stack_size
+      .checked_sub(MAX_CALLDATA_SIZE.next_multiple_of(8))
+      .ok_or(RuntimeError::InvalidArgument(
+        "guest stack is too small for guarded stack frames",
+      ))?;
+    let frame_count = frame_bytes / frame_size;
+    if frame_count == 0 {
+      return Err(RuntimeError::InvalidArgument(
+        "guest stack cannot hold a guarded stack frame",
+      ));
+    }
+
+    let frame_stride = frame_size
+      .checked_add(MIN_GUARDED_FRAME_GAP)
+      .and_then(usize::checked_next_power_of_two)
+      .ok_or(RuntimeError::InvalidArgument(
+        "guarded stack frame stride overflow",
+      ))?;
+    let calldata_capacity = MAX_CALLDATA_SIZE.next_multiple_of(page_size);
+    let calldata_offset = (frame_count - 1)
+      .checked_mul(frame_stride)
+      .and_then(|offset| offset.checked_add(frame_size))
+      .ok_or(RuntimeError::InvalidArgument(
+        "guarded stack frame span overflow",
+      ))?;
+    let address_span =
+      calldata_offset
+        .checked_add(calldata_capacity)
+        .ok_or(RuntimeError::InvalidArgument(
+          "guarded stack calldata span overflow",
+        ))?;
+    u32::try_from(frame_stride).map_err(|_| {
+      RuntimeError::InvalidArgument("guarded stack frame stride does not fit in the JIT ABI")
+    })?;
+
+    Ok(Self {
+      address_span,
+      frame_size,
+      frame_stride,
+      frame_count,
+      calldata_offset,
+      calldata_capacity,
+      guarded_frames: true,
+    })
+  }
+
+  fn entry_offsets(&self, calldata_len: usize) -> (usize, usize) {
+    if self.guarded_frames {
+      (self.calldata_offset, self.calldata_offset)
+    } else {
+      let calldata = self.address_span - calldata_len;
+      (calldata, calldata & !0x7)
+    }
+  }
+}
+
+#[cfg(test)]
+mod guest_stack_layout_tests {
+  use super::*;
+
+  #[test]
+  fn default_guarded_layout_has_eight_frames_and_an_unskippable_gap() {
+    let layout = GuestStackLayout::guarded(DEFAULT_GUEST_STACK_SIZE, 4096, 4096).unwrap();
+    assert_eq!(layout.frame_count, 8);
+    assert_eq!(layout.frame_stride, 65_536);
+    assert!(layout.frame_stride - layout.frame_size > i16::MAX as usize);
+    assert_eq!(layout.calldata_offset, 7 * 65_536 + 4096);
+    assert_eq!(layout.address_span, layout.calldata_offset + 4096);
+  }
+
+  #[test]
+  fn guarded_layout_rejects_a_logical_frame_smaller_than_the_page() {
+    assert!(GuestStackLayout::guarded(DEFAULT_GUEST_STACK_SIZE, 4096, 16_384).is_err());
+  }
+}
+
 /// Native backing for one invocation-local guest region, in its own mapping
 /// with a `PROT_NONE` page on each side.
 ///
@@ -608,20 +721,143 @@ impl GuardedRegion {
   fn as_mut_ptr(&mut self) -> *mut u8 {
     unsafe { self.region.as_ptr().add(self.offset) as *mut u8 }
   }
+}
 
-  fn len(&self) -> usize {
-    self.len
+/// Native guest-stack backing with one mapped island per eBPF frame.
+///
+/// The mapping starts and ends with an outer guard. Within its usable address
+/// span only the frame islands and fixed calldata slab are writable; every
+/// inter-frame gap remains `PROT_NONE`.
+struct SparseGuestStack {
+  region: MmapRaw,
+  offset: usize,
+  layout: GuestStackLayout,
+}
+
+impl SparseGuestStack {
+  fn new(layout: GuestStackLayout, page_size: usize) -> Result<Self, RuntimeError> {
+    debug_assert!(layout.guarded_frames);
+    let total =
+      layout
+        .address_span
+        .checked_add(2 * page_size)
+        .ok_or(RuntimeError::PlatformError(
+          "guarded guest stack mapping size overflow",
+        ))?;
+    let region = MmapRaw::from(
+      MmapOptions::new()
+        .len(total)
+        .map_anon()
+        .map_err(|_| RuntimeError::PlatformError("failed to allocate sparse guest stack"))?,
+    );
+
+    unsafe {
+      if libc::mprotect(region.as_ptr() as *mut _, total, libc::PROT_NONE) != 0 {
+        return Err(RuntimeError::PlatformError(
+          "failed to protect sparse guest stack",
+        ));
+      }
+      let base = region.as_ptr().add(page_size);
+      for frame in 0..layout.frame_count {
+        if libc::mprotect(
+          base.add(frame * layout.frame_stride) as *mut _,
+          layout.frame_size,
+          libc::PROT_READ | libc::PROT_WRITE,
+        ) != 0
+        {
+          return Err(RuntimeError::PlatformError(
+            "failed to map guarded guest stack frame",
+          ));
+        }
+      }
+      if libc::mprotect(
+        base.add(layout.calldata_offset) as *mut _,
+        layout.calldata_capacity,
+        libc::PROT_READ | libc::PROT_WRITE,
+      ) != 0
+      {
+        return Err(RuntimeError::PlatformError(
+          "failed to map guarded guest stack calldata",
+        ));
+      }
+    }
+
+    Ok(Self {
+      region,
+      offset: page_size,
+      layout,
+    })
+  }
+
+  fn as_mut_ptr(&mut self) -> *mut u8 {
+    unsafe { self.region.as_ptr().add(self.offset) as *mut u8 }
+  }
+
+  fn scrub(&mut self) {
+    let base = self.as_mut_ptr();
+    for frame in 0..self.layout.frame_count {
+      unsafe {
+        std::slice::from_raw_parts_mut(
+          base.add(frame * self.layout.frame_stride),
+          self.layout.frame_size,
+        )
+        .fill(0x8e);
+      }
+    }
+    unsafe {
+      std::slice::from_raw_parts_mut(
+        base.add(self.layout.calldata_offset),
+        self.layout.calldata_capacity,
+      )
+      .fill(0x8e);
+    }
+  }
+}
+
+enum GuestStack {
+  Contiguous(GuardedRegion),
+  Sparse(SparseGuestStack),
+}
+
+impl GuestStack {
+  fn new(layout: GuestStackLayout, page_size: usize) -> Result<Self, RuntimeError> {
+    if layout.guarded_frames {
+      SparseGuestStack::new(layout, page_size).map(Self::Sparse)
+    } else {
+      GuardedRegion::new(layout.address_span).map(Self::Contiguous)
+    }
+  }
+
+  fn as_mut_ptr(&mut self) -> *mut u8 {
+    match self {
+      Self::Contiguous(stack) => stack.as_mut_ptr(),
+      Self::Sparse(stack) => stack.as_mut_ptr(),
+    }
+  }
+
+  fn scrub(&mut self) {
+    match self {
+      Self::Contiguous(stack) => stack.as_mut_slice().fill(0x8e),
+      Self::Sparse(stack) => stack.scrub(),
+    }
+  }
+
+  fn copy_calldata(&mut self, layout: GuestStackLayout, calldata: &[u8]) {
+    let (offset, _) = layout.entry_offsets(calldata.len());
+    unsafe {
+      std::slice::from_raw_parts_mut(self.as_mut_ptr().add(offset), calldata.len())
+        .copy_from_slice(calldata);
+    }
   }
 }
 
 struct ExecContext {
   native_stack: DefaultStack,
-  guest_stack: GuardedRegion,
-  stack_frame_size: u16,
+  guest_stack: GuestStack,
+  stack_layout: GuestStackLayout,
 }
 
-fn native_stack_size(guest_stack_size: usize, stack_frame_size: u16) -> usize {
-  let frame_capacity = guest_stack_size.div_ceil(stack_frame_size as usize);
+fn native_stack_size(frame_capacity: usize) -> usize {
   NATIVE_STACK_RESERVE
     .checked_add(
       frame_capacity
@@ -635,36 +871,33 @@ fn native_stack_size(guest_stack_size: usize, stack_frame_size: u16) -> usize {
 #[test]
 fn native_coroutine_stack_is_derived_but_smaller_than_the_guest_stack() {
   let guest_stack_size = 8 * 1024 * 1024;
+  let frame_count = guest_stack_size / crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
   assert_eq!(
-    native_stack_size(guest_stack_size, crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE),
+    native_stack_size(frame_count),
     NATIVE_STACK_RESERVE
       + guest_stack_size / crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize
         * crate::jit::abi::NATIVE_LOCAL_CALL_BUDGET
   );
-  assert!(
-    native_stack_size(guest_stack_size, crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE)
-      < guest_stack_size
-  );
+  assert!(native_stack_size(frame_count) < guest_stack_size);
   assert!(
     native_stack_size(
-      DEFAULT_GUEST_STACK_SIZE,
-      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE
+      DEFAULT_GUEST_STACK_SIZE.div_ceil(crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize)
     ) < DEFAULT_GUEST_STACK_SIZE
   );
 }
 
 impl ExecContext {
-  fn new(guest_stack_size: usize, stack_frame_size: u16) -> Self {
-    Self {
+  fn new(stack_layout: GuestStackLayout, page_size: usize) -> Result<Self, RuntimeError> {
+    Ok(Self {
       // A persistent native call frame is under 128 bytes on both backends.
       // Charge a deliberately conservative 256 bytes per possible guest frame,
       // plus a fixed reserve for transient Rust resolver/dispatcher frames and
       // the stack-exhaustion callback.
-      native_stack: DefaultStack::new(native_stack_size(guest_stack_size, stack_frame_size))
-        .expect("failed to initialize native stack"),
-      guest_stack: GuardedRegion::new(guest_stack_size).expect("failed to initialize guest stack"),
-      stack_frame_size,
-    }
+      native_stack: DefaultStack::new(native_stack_size(stack_layout.frame_count))
+        .map_err(|_| RuntimeError::PlatformError("failed to initialize native stack"))?,
+      guest_stack: GuestStack::new(stack_layout, page_size)?,
+      stack_layout,
+    })
   }
 }
 
@@ -693,6 +926,14 @@ struct JitMemory {
   /// Lowest native SP from which a local call can consume its conservative
   /// native frame budget without entering the emergency reserve.
   local_call_native_floor: usize,
+  /// Helper-only sparse-stack metadata. Generated code deliberately keeps
+  /// using the affine whole-span bounds constants above; mapped gaps enforce
+  /// frame isolation without an added instruction.
+  stack_frame_size: usize,
+  stack_frame_stride: usize,
+  stack_frame_count: usize,
+  stack_calldata_bottom: usize,
+  stack_calldata_top: usize,
 }
 
 /// The entry trampoline reaches into this layout with literal displacements,
@@ -708,7 +949,8 @@ const _: () = {
   assert!(std::mem::offset_of!(JitMemory, derived) == 48);
   assert!(std::mem::offset_of!(JitMemory, local_call_guest_floor) == 144);
   assert!(std::mem::offset_of!(JitMemory, local_call_native_floor) == 152);
-  assert!(std::mem::size_of::<JitMemory>() == 160);
+  assert!(std::mem::offset_of!(JitMemory, stack_frame_size) == 160);
+  assert!(std::mem::size_of::<JitMemory>() == 200);
 };
 
 impl JitMemory {
@@ -785,19 +1027,55 @@ impl JitMemory {
     }
   }
 
+  fn checked_stack_region(&self, guest: usize, size: usize) -> Option<NonNull<[u8]>> {
+    if self.stack_frame_stride == self.stack_frame_size {
+      return Self::checked_region(
+        guest,
+        size,
+        self.stack_guest_bottom,
+        self.stack_guest_top,
+        self.stack_native_base,
+      );
+    }
+    if size == 0 {
+      return Some(NonNull::slice_from_raw_parts(NonNull::dangling(), 0));
+    }
+
+    if let Some(calldata) = Self::checked_region(
+      guest,
+      size,
+      self.stack_calldata_bottom,
+      self.stack_calldata_top,
+      self.stack_native_base + (self.stack_calldata_bottom - self.stack_guest_bottom),
+    ) {
+      return Some(calldata);
+    }
+
+    guest.checked_add(size)?;
+    let offset = guest.checked_sub(self.stack_guest_bottom)?;
+    let slot = offset / self.stack_frame_stride;
+    let within = offset % self.stack_frame_stride;
+    if slot >= self.stack_frame_count
+      || within >= self.stack_frame_size
+      || size > self.stack_frame_size - within
+    {
+      return None;
+    }
+    let native = self.stack_native_base.checked_add(offset)? as *mut u8;
+    unsafe {
+      Some(NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(
+        native, size,
+      )))
+    }
+  }
+
   fn safe_deref_for_write(
     &self,
     guest: usize,
     size: usize,
     writable_data_bottom: Option<usize>,
   ) -> Option<NonNull<[u8]>> {
-    let stack = Self::checked_region(
-      guest,
-      size,
-      self.stack_guest_bottom,
-      self.stack_guest_top,
-      self.stack_native_base,
-    );
+    let stack = self.checked_stack_region(guest, size);
     if let Some(writable_data_bottom) = writable_data_bottom {
       stack.or_else(|| {
         Self::checked_region(
@@ -814,14 +1092,7 @@ impl JitMemory {
   }
 
   fn safe_deref_for_read(&self, guest: usize, size: usize) -> Option<NonNull<[u8]>> {
-    Self::checked_region(
-      guest,
-      size,
-      self.stack_guest_bottom,
-      self.stack_guest_top,
-      self.stack_native_base,
-    )
-    .or_else(|| {
+    self.checked_stack_region(guest, size).or_else(|| {
       Self::checked_region(
         guest,
         size,
@@ -884,21 +1155,22 @@ struct BorrowedExecContext {
 }
 
 impl BorrowedExecContext {
-  fn new(guest_stack_size: usize, stack_frame_size: u16) -> Self {
+  fn new(stack_layout: GuestStackLayout, page_size: usize) -> Result<Self, RuntimeError> {
+    let ctx = EXEC_CONTEXT_POOL.with(|pool| {
+      let mut pool = pool.borrow_mut();
+      pool
+        .iter()
+        .position(|ctx| ctx.stack_layout == stack_layout)
+        .map(|index| pool.swap_remove(index))
+    });
     let mut me = Self {
-      ctx: ManuallyDrop::new(EXEC_CONTEXT_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        let ctx = pool
-          .iter()
-          .position(|ctx| {
-            ctx.guest_stack.len() == guest_stack_size && ctx.stack_frame_size == stack_frame_size
-          })
-          .map(|index| pool.swap_remove(index));
-        ctx.unwrap_or_else(|| ExecContext::new(guest_stack_size, stack_frame_size))
-      })),
+      ctx: ManuallyDrop::new(match ctx {
+        Some(ctx) => ctx,
+        None => ExecContext::new(stack_layout, page_size)?,
+      }),
     };
-    me.ctx.guest_stack.as_mut_slice().fill(0x8e);
-    me
+    me.ctx.guest_stack.scrub();
+    Ok(me)
   }
 }
 
@@ -915,6 +1187,7 @@ struct ActiveJitCodeZone {
   code_range: Cell<(usize, usize)>,
   pointer_cage_protected_range: Cell<(usize, usize)>,
   data_range: Cell<(usize, usize)>,
+  stack_range: Cell<(usize, usize)>,
   yielder: Cell<Option<NonNull<Yielder<u64, Dispatch>>>>,
 }
 
@@ -945,6 +1218,13 @@ impl ProgramEventListener for DummyProgramEventListener {}
 /// Default limit for the total JIT-compiled native code size of one program.
 pub const DEFAULT_CODE_SIZE_LIMIT: usize = 1 << 20;
 
+#[derive(Clone, Copy)]
+enum GuardedStackFrames {
+  Auto,
+  Enabled,
+  Disabled,
+}
+
 /// Prepares helper tables and loads eBPF programs.
 pub struct ProgramLoader {
   helpers_inverse: HashMap<&'static str, i32>,
@@ -955,6 +1235,7 @@ pub struct ProgramLoader {
   instruction_limit: usize,
   guest_stack_size: usize,
   stack_frame_size: u16,
+  guarded_stack_frames: GuardedStackFrames,
   require_static_regions: bool,
 }
 
@@ -965,8 +1246,8 @@ pub struct UnboundProgram {
   code_base: usize,
   code_size: usize,
   page_size: usize,
-  guest_stack_size: usize,
   stack_frame_size: u16,
+  stack_layout: GuestStackLayout,
   run_lock: RwLock<()>,
   data_protection_failed: Cell<bool>,
   code_arena: RefCell<CodeArena>,
@@ -1997,24 +2278,30 @@ impl Program {
       return Err(RuntimeError::InvalidArgument("calldata too large"));
     }
 
-    let guest_stack_size = self.unbound.guest_stack_size;
     let stack_frame_size = self.unbound.stack_frame_size;
-    let mut ectx = BorrowedExecContext::new(guest_stack_size, stack_frame_size);
+    let stack_layout = self.unbound.stack_layout;
+    let mut ectx = BorrowedExecContext::new(stack_layout, self.unbound.page_size)?;
 
-    ectx.ctx.guest_stack.as_mut_slice()[guest_stack_size - calldata.len()..]
-      .copy_from_slice(calldata);
+    ectx.ctx.guest_stack.copy_calldata(stack_layout, calldata);
     let calldata_len = calldata.len();
 
     let program_ret: u64 = {
-      let guest_stack_top = self.unbound.cage.stack_top();
       let guest_stack_bottom = self.unbound.cage.stack_bottom();
+      debug_assert_eq!(
+        self.unbound.cage.stack_top() - guest_stack_bottom,
+        stack_layout.address_span
+      );
       let guest_frame = stack_frame_size as usize;
+      let (calldata_offset, root_frame_offset) = stack_layout.entry_offsets(calldata_len);
+      let calldata_start = guest_stack_bottom + calldata_offset;
+      let root_frame = guest_stack_bottom + root_frame_offset;
+      let guest_stack_top = calldata_start + calldata_len;
       // Tier F addresses `[R10 - stack_frame_size, R10)` with no bounds check. The
       // root must leave that window above the stack bottom; every later local
       // call establishes the same invariant dynamically before entering its
       // callee.
       debug_assert!(
-        ((guest_stack_top - calldata_len) & !0x7)
+        root_frame
           .checked_sub(guest_frame)
           .is_some_and(|floor| floor >= guest_stack_bottom),
         "the entry frame pointer does not leave a complete frame above the guest stack bottom"
@@ -2023,7 +2310,7 @@ impl Program {
       let stack_native_base = ctx.guest_stack.as_mut_ptr() as usize;
       let local_call_guest_floor = stack_native_base
         .checked_add(guest_frame)
-        .and_then(|floor| floor.checked_add(guest_frame))
+        .and_then(|floor| floor.checked_add(stack_layout.frame_stride))
         .expect("local-call guest stack floor overflow");
       let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
       if page_size <= 0 {
@@ -2049,6 +2336,11 @@ impl Program {
         derived: [0; 12],
         local_call_guest_floor,
         local_call_native_floor,
+        stack_frame_size: stack_layout.frame_size,
+        stack_frame_stride: stack_layout.frame_stride,
+        stack_frame_count: stack_layout.frame_count,
+        stack_calldata_bottom: calldata_start,
+        stack_calldata_top: guest_stack_top,
       };
       memory.fill_derived();
       let memory = memory;
@@ -2060,9 +2352,7 @@ impl Program {
           ACTIVE_JIT_CODE_ZONE.with(|x| {
             x.yielder.set(NonNull::new(yielder as *const _ as *mut _));
           });
-          let calldata_start = guest_stack_top - calldata_len;
-          let stack_top = calldata_start & !0x7;
-          let stack_len = stack_top - guest_stack_bottom;
+          let stack_len = root_frame - guest_stack_bottom;
           async_ebpf_entry_trampoline(
             entrypoint.code_ptr,
             calldata_start,
@@ -2099,6 +2389,10 @@ impl Program {
             memory.data_native_base,
             memory.data_native_base + (memory.data_guest_top - memory.data_guest_bottom),
           ));
+          x.stack_range.set((
+            memory.stack_native_base,
+            memory.stack_native_base + stack_layout.address_span,
+          ));
           compiler_fence(Ordering::Release);
           x.valid.store(true, Ordering::Relaxed);
         });
@@ -2112,6 +2406,7 @@ impl Program {
             x.code_range.set((0, 0));
             x.pointer_cage_protected_range.set((0, 0));
             x.data_range.set((0, 0));
+            x.stack_range.set((0, 0));
           });
         });
 
@@ -2149,6 +2444,7 @@ impl Program {
           x.code_range.set((0, 0));
           x.pointer_cage_protected_range.set((0, 0));
           x.data_range.set((0, 0));
+          x.stack_range.set((0, 0));
           yielder
         });
         yielder = next_yielder;
@@ -2173,7 +2469,7 @@ impl Program {
 
         if let Some(si_addr) = dispatch.memory_access_error {
           let vaddr = if si_addr >= memory.stack_native_base
-            && si_addr < memory.stack_native_base + guest_stack_size
+            && si_addr < memory.stack_native_base + stack_layout.address_span
           {
             memory.stack_guest_bottom + (si_addr - memory.stack_native_base)
           } else if si_addr >= memory.data_native_base
@@ -2339,6 +2635,7 @@ fn jit_config(
   cage: &PointerCage,
   instruction_limit: usize,
   stack_frame_size: u16,
+  stack_frame_stride: u32,
 ) -> crate::jit::Config {
   crate::jit::Config {
     target: crate::jit::Target::host(),
@@ -2349,6 +2646,7 @@ fn jit_config(
     frame_constants: true,
     instruction_limit,
     stack_frame_size,
+    stack_frame_stride,
     dispatcher: Some(tls_dispatcher),
     dispatcher_validate: Some(std_validator),
     unwind_helper_index: None,
@@ -2466,6 +2764,7 @@ impl ProgramLoader {
       instruction_limit: crate::jit::abi::MAX_INSTS as usize,
       guest_stack_size: DEFAULT_GUEST_STACK_SIZE,
       stack_frame_size: crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
+      guarded_stack_frames: GuardedStackFrames::Auto,
       require_static_regions: false,
     }
   }
@@ -2538,7 +2837,9 @@ impl ProgramLoader {
   /// [`Self::with_stack_frame_size`]. Recursive and statically deep call
   /// graphs are admitted, then stopped with a runtime error before the next
   /// complete frame would cross this window's bottom. Space not consumed by
-  /// call frames can be used as a caller-managed arena. The default remains
+  /// call frames can be used as a caller-managed arena in the contiguous
+  /// layout. Guarded-frame mode rounds down to a whole number of
+  /// mapped frames and leaves any remainder unavailable. The default remains
   /// [`DEFAULT_GUEST_STACK_SIZE`].
   pub fn with_guest_stack_size(mut self, size: usize) -> Self {
     assert!(
@@ -2572,6 +2873,24 @@ impl ProgramLoader {
     self
   }
 
+  /// Enables inaccessible virtual-address gaps between eBPF stack frames.
+  ///
+  /// Guarded frames are enabled by default whenever the logical frame size is
+  /// aligned to the host page size; the default automatically uses the
+  /// contiguous layout otherwise. Passing `true` requires guarded frames and
+  /// makes an incompatible frame size a load error. Passing `false` explicitly
+  /// selects the contiguous layout. Valid frame accesses keep their existing
+  /// instruction sequence; local calls move `R10` by a larger sparse stride
+  /// instead of the logical frame size.
+  pub fn with_guarded_stack_frames(mut self, enabled: bool) -> Self {
+    self.guarded_stack_frames = if enabled {
+      GuardedStackFrames::Enabled
+    } else {
+      GuardedStackFrames::Disabled
+    };
+    self
+  }
+
   /// Loads an ELF image into a new `UnboundProgram`.
   pub fn load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, Error> {
     self._load(rng, elf).map_err(Error)
@@ -2586,8 +2905,37 @@ impl ProgramLoader {
         self.stack_frame_size
       )));
     }
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+      return Err(RuntimeError::PlatformError("failed to get page size"));
+    }
+    let page_size = page_size as usize;
+    let guarded_layout = || {
+      GuestStackLayout::guarded(
+        self.guest_stack_size,
+        self.stack_frame_size as usize,
+        page_size,
+      )
+    };
+    let stack_layout = match self.guarded_stack_frames {
+      GuardedStackFrames::Enabled => guarded_layout()?,
+      GuardedStackFrames::Disabled => {
+        GuestStackLayout::contiguous(self.guest_stack_size, self.stack_frame_size as usize)
+      }
+      GuardedStackFrames::Auto if (self.stack_frame_size as usize).is_multiple_of(page_size) => {
+        guarded_layout()?
+      }
+      GuardedStackFrames::Auto => {
+        GuestStackLayout::contiguous(self.guest_stack_size, self.stack_frame_size as usize)
+      }
+    };
     let writable_plan = plan_writable_data(elf).map_err(RuntimeError::Linker)?;
-    let cage = PointerCage::new(rng, self.guest_stack_size, elf.len(), writable_plan.size)?;
+    let cage = PointerCage::new(
+      rng,
+      stack_layout.address_span,
+      elf.len(),
+      writable_plan.size,
+    )?;
 
     let code_sections = {
       let mut data = cage.data_slice(cage.data_bottom(), elf.len()).unwrap();
@@ -2619,12 +2967,6 @@ impl ProgramLoader {
       }
     }
     cage.freeze_data();
-
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page_size < 0 {
-      return Err(RuntimeError::PlatformError("failed to get page size"));
-    }
-    let page_size = page_size as usize;
 
     let guard_size_before = rng.gen_range(16..128) * page_size;
     let guard_size_after = rng.gen_range(16..128) * page_size;
@@ -2670,6 +3012,7 @@ impl ProgramLoader {
       &cage,
       self.instruction_limit,
       self.stack_frame_size,
+      u32::try_from(stack_layout.frame_stride).expect("stack stride validated above"),
     ));
 
     for (section_name, code_vaddr_size) in code_sections {
@@ -2742,8 +3085,8 @@ impl ProgramLoader {
       code_base,
       code_size: code_len_allocated,
       page_size,
-      guest_stack_size: self.guest_stack_size,
       stack_frame_size: self.stack_frame_size,
+      stack_layout,
       run_lock: RwLock::new(()),
       data_protection_failed: Cell::new(false),
       code_arena: RefCell::new(CodeArena { used: 0 }),
@@ -2887,19 +3230,22 @@ unsafe extern "C" fn fault_handler(
 ) {
   let fail = || chain_to_previous_fault_handler(sig);
 
-  let Some((jit_code_zone, pointer_cage, data_range, yielder)) = ACTIVE_JIT_CODE_ZONE.with(|x| {
-    if x.valid.load(Ordering::Relaxed) {
-      compiler_fence(Ordering::Acquire);
-      Some((
-        x.code_range.get(),
-        x.pointer_cage_protected_range.get(),
-        x.data_range.get(),
-        x.yielder.get(),
-      ))
-    } else {
-      None
-    }
-  }) else {
+  let Some((jit_code_zone, pointer_cage, data_range, stack_range, yielder)) = ACTIVE_JIT_CODE_ZONE
+    .with(|x| {
+      if x.valid.load(Ordering::Relaxed) {
+        compiler_fence(Ordering::Acquire);
+        Some((
+          x.code_range.get(),
+          x.pointer_cage_protected_range.get(),
+          x.data_range.get(),
+          x.stack_range.get(),
+          x.yielder.get(),
+        ))
+      } else {
+        None
+      }
+    })
+  else {
     return fail();
   };
 
@@ -2918,7 +3264,8 @@ unsafe extern "C" fn fault_handler(
   let si_addr = (*siginfo).si_addr() as usize;
   let in_fault_window = si_addr >= pointer_cage.0 && si_addr < pointer_cage.1;
   let in_data = si_addr >= data_range.0 && si_addr < data_range.1;
-  if !in_fault_window && !in_data {
+  let in_stack = si_addr >= stack_range.0 && si_addr < stack_range.1;
+  if !in_fault_window && !in_data && !in_stack {
     return fail();
   }
 

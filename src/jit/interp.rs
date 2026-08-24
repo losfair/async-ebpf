@@ -180,6 +180,8 @@ pub struct Interpreter<'a> {
   step_budget: u64,
   max_call_depth: usize,
   frame_size: u64,
+  frame_stride: u64,
+  guarded_frame_size: Option<u64>,
   check_alignment: bool,
   preserve_callee_saved: bool,
 }
@@ -209,6 +211,8 @@ impl<'a> Interpreter<'a> {
       step_budget: DEFAULT_STEP_BUDGET,
       max_call_depth: abi::MAX_CALL_DEPTH as usize,
       frame_size: abi::LOCAL_FUNCTION_STACK_SIZE as u64,
+      frame_stride: abi::LOCAL_FUNCTION_STACK_SIZE as u64,
+      guarded_frame_size: None,
       check_alignment: true,
       preserve_callee_saved: true,
     }
@@ -241,6 +245,30 @@ impl<'a> Interpreter<'a> {
       "stack frame size must be a non-zero multiple of 16"
     );
     self.frame_size = bytes as u64;
+    if self.guarded_frame_size.is_none() {
+      self.frame_stride = bytes as u64;
+    }
+    self
+  }
+
+  /// Places inaccessible logical gaps between local-function stack frames.
+  ///
+  /// `stride` is the distance between successive frame pointers and must be at
+  /// least the configured frame size. The stack vector is expanded to model
+  /// the sparse address span while preserving its current logical frame count.
+  pub fn with_guarded_stack_frames(mut self, stride: u32) -> Self {
+    assert!(
+      stride as u64 >= self.frame_size && stride.is_multiple_of(16),
+      "stack frame stride must be a multiple of 16 and at least the frame size"
+    );
+    let frame_count = self.stack.len().div_ceil(self.frame_size as usize);
+    let span = (frame_count - 1)
+      .checked_mul(stride as usize)
+      .and_then(|bytes| bytes.checked_add(self.frame_size as usize))
+      .expect("guarded interpreter stack span overflow");
+    self.stack.resize(span, 0);
+    self.frame_stride = stride as u64;
+    self.guarded_frame_size = Some(self.frame_size);
     self
   }
 
@@ -441,7 +469,7 @@ impl<'a> Interpreter<'a> {
           let fp = &mut regs[REG_FP as usize];
           let saved_fp = *fp;
           // Each nested function gets its own frame below the caller's.
-          *fp = saved_fp - self.frame_size;
+          *fp = saved_fp - self.frame_stride;
           frames.push(Frame {
             return_pc: pc,
             saved_fp,
@@ -503,6 +531,12 @@ impl<'a> Interpreter<'a> {
       }
     };
     if let Some(off) = region(self.stack_base, self.stack.len()) {
+      if let Some(frame_size) = self.guarded_frame_size {
+        let within = off as u64 % self.frame_stride;
+        if within >= frame_size || len as u64 > frame_size - within {
+          return Err(FaultKind::OutOfBounds);
+        }
+      }
       return Ok(&mut self.stack[off..off + len]);
     }
     if let Some(off) = region(self.mem_base, self.memory.len()) {
@@ -1517,6 +1551,28 @@ mod tests {
       DEFAULT_STACK_BASE + run.stack.len() as u64,
       "the frame pointer comes back"
     );
+  }
+
+  #[test]
+  fn guarded_local_call_faults_in_the_gap_above_the_callee() {
+    let p = [
+      i(opcode::CALL, 0, 1, 0, 1),
+      exit(),
+      i(cls::LDX | mode::MEM | size::B, 0, 10, 1, 0),
+      exit(),
+    ];
+    let run = Interpreter::new(&p, Vec::new())
+      .with_guarded_stack_frames(65_536)
+      .run(|_, _| 0);
+    assert!(matches!(
+      run.termination,
+      Termination::Fault {
+        addr: _,
+        len: 1,
+        kind: FaultKind::OutOfBounds,
+        ..
+      }
+    ));
   }
 
   #[test]

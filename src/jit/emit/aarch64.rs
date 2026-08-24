@@ -1067,7 +1067,7 @@ fn emit_lazy_local_call(
   // directly instead of reloading the prologue's bookkeeping slot: a coroutine
   // suspension may use host stack storage below the current frame, while R10
   // is guest state and must not depend on that storage surviving a yield.
-  emit_movewide_immediate(st, true, TEMP_REGISTER, cfg.stack_frame_size as u64);
+  emit_movewide_immediate(st, true, TEMP_REGISTER, cfg.stack_frame_stride as u64);
   emit_addsub_register(
     st,
     true,
@@ -1109,7 +1109,7 @@ fn emit_lazy_local_call(
 
   emit_addsub_immediate(st, true, addsub::ADD, SP, SP, stack_movement);
 
-  emit_movewide_immediate(st, true, TEMP_REGISTER, cfg.stack_frame_size as u64);
+  emit_movewide_immediate(st, true, TEMP_REGISTER, cfg.stack_frame_stride as u64);
   emit_addsub_register(
     st,
     true,
@@ -2856,6 +2856,39 @@ mod tests {
         ..plain_inputs(insns.len())
       },
     );
+  }
+
+  #[test]
+  fn guarded_local_call_uses_sparse_frame_stride() {
+    let insns = vec![
+      insn(opcode::CALL, 0, 1, 0, 1),
+      exit(),
+      insn(0xb7, 0, 0, 0, 7),
+      exit(),
+    ];
+    let code = Insn::encode_all(&insns);
+    let ids = [11u32, 0, 0, 0];
+    let inputs = TranslationInputs {
+      resolver_ids: &ids,
+      end_pc: 2,
+      ..plain_inputs(insns.len())
+    };
+    let mut config = Config {
+      target: Target::Aarch64,
+      dispatcher: Some(stand_in_dispatcher()),
+      dispatcher_validate: Some(accept_every_helper),
+      local_call_resolver: Some(stand_in_resolver()),
+      local_call_stack_exhausted: Some(stand_in_stack_exhausted()),
+      ..Default::default()
+    };
+    config.stack_frame_stride = 65_536;
+    assert!(golden_case(
+      "guarded local call stride",
+      &config,
+      &code,
+      &inputs,
+      262_144
+    ));
   }
 
   #[test]

@@ -136,6 +136,7 @@ cage-only.f6dcbb738cea1fcbe9e2b42c|894:hf44de007e15ff6a6851885d0b1e7bfdf
 cage-only.fb3b25e916df7bc3dbd45b49|783:h2d561fd41eaaa4831f5ee78e3ca753da
 cage-only.fd832a3ff0752b5959b014d1|load-err:jump to middle of lddw at PC 1
 cage-only.fe7afba8b3d7c95f5124ff8b|580:h47e796768def417427455d5bdcff0c00
+guarded local call stride.653fadfc08d6f32f78eaafcc|731:hbb70cce3f5189cd015391915114faa9a
 no-cage.03e3b04764122247f1f38577|err:Function range end 1 is not a local function boundary
 no-cage.06ff1e5ba8276c5a42e709b7|575:h1358e0ece0e73369fbc0dae99f167ae3
 no-cage.105e1d60ef328dc52f767ca4|588:hdc3ac01c9c3871e5eee4cb806565b666

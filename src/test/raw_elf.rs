@@ -147,6 +147,24 @@ pub(crate) async fn run_raw(
   run_raw_with_helpers(code, rodata, calldata, require_static_regions, &[]).await
 }
 
+/// [`run_raw`] using the contiguous stack compatibility layout.
+pub(crate) async fn run_raw_contiguous(
+  code: &[Insn],
+  rodata: &[u8],
+  calldata: &[u8],
+  require_static_regions: bool,
+) -> Result<i64, Error> {
+  run_raw_configured(
+    code,
+    rodata,
+    calldata,
+    require_static_regions,
+    &[],
+    Some(false),
+  )
+  .await
+}
+
 /// [`run_raw`] with helper tables registered on the loader.
 pub(crate) async fn run_raw_with_helpers(
   code: &[Insn],
@@ -155,17 +173,41 @@ pub(crate) async fn run_raw_with_helpers(
   require_static_regions: bool,
   helpers: &[&[(&'static str, crate::helpers::Helper)]],
 ) -> Result<i64, Error> {
+  run_raw_configured(
+    code,
+    rodata,
+    calldata,
+    require_static_regions,
+    helpers,
+    None,
+  )
+  .await
+}
+
+async fn run_raw_configured(
+  code: &[Insn],
+  rodata: &[u8],
+  calldata: &[u8],
+  require_static_regions: bool,
+  helpers: &[&[(&'static str, crate::helpers::Helper)]],
+  guarded_stack_frames: Option<bool>,
+) -> Result<i64, Error> {
   let (_, t_env) = gt_env();
   let elf = build_elf(code, rodata);
 
-  let program = ProgramLoader::new(
+  let loader = ProgramLoader::new(
     &mut rand::thread_rng(),
     Arc::new(DummyProgramEventListener),
     helpers,
-  )
-  .require_static_region_analysis(require_static_regions)
-  .load(&mut rand::thread_rng(), &elf)?
-  .pin_to_current_thread(t_env);
+  );
+  let loader = match guarded_stack_frames {
+    Some(enabled) => loader.with_guarded_stack_frames(enabled),
+    None => loader,
+  };
+  let program = loader
+    .require_static_region_analysis(require_static_regions)
+    .load(&mut rand::thread_rng(), &elf)?
+    .pin_to_current_thread(t_env);
 
   let mut resources: [&mut dyn Any; 0] = [];
   program

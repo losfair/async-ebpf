@@ -91,6 +91,12 @@ coroutine stack retains its emergency reserve. Exhaustion terminates the run
 with a controlled error, so recursive and statically deep graphs need no loader
 escape hatch.
 
+[Sparse guarded eBPF stack frames](guarded-stack-frames.md) describes the
+default guest-stack layout on compatible page sizes, which places inaccessible
+virtual-address gaps between eBPF frames without changing the native coroutine
+stack. Loaders automatically fall back when a logical frame cannot be
+page-isolated and can explicitly select the contiguous compatibility layout.
+
 ## Runtime structures
 
 An entrypoint is a lazy handle rather than a raw native pointer. Per section:

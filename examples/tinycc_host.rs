@@ -86,6 +86,9 @@ fn main() -> anyhow::Result<()> {
     Arc::new(DummyProgramEventListener),
     &[TINYCC_HELPERS],
   )
+  // TinyCC deliberately treats most of its configured stack as a contiguous
+  // arena for source and compiler state rather than as local-call frames.
+  .with_guarded_stack_frames(false)
   .with_guest_stack_size(guest_stack_size)
   .with_instruction_limit(1_000_000)
   .with_code_size_limit(64 * 1024 * 1024);
