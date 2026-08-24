@@ -138,7 +138,7 @@ pub mod plan_role {
 /// bounds delta, and with it the span, at one page.
 pub const MAX_GROUP_SPAN: u32 = 4096;
 
-/// Guest stack charged to each local function.
+/// Guest stack charged to each local function by default.
 pub const LOCAL_FUNCTION_STACK_SIZE: u16 = 4096;
 
 /// Conservative persistent native-stack charge per local eBPF call.
@@ -155,7 +155,7 @@ pub const NATIVE_LOCAL_CALL_BUDGET: usize = 256;
 /// when the configured guest stack can carry them.
 pub const MAX_CALL_DEPTH: u32 = 8;
 
-/// Total guest stack `UBPF_EBPF_STACK_SIZE` describes.
+/// Total guest stack the historical default describes.
 pub const EBPF_STACK_SIZE: u32 = MAX_CALL_DEPTH * LOCAL_FUNCTION_STACK_SIZE as u32;
 
 /// Maximum instructions in a single loaded program.
@@ -201,16 +201,10 @@ mod tests {
 
   /// The numbers themselves, written out.
   ///
-  /// Every constant below is part of the contract with loaded programs and with
-  /// the entry trampolines: change one and previously valid programs are
-  /// refused, or the stack the guest is given stops matching the stack the
-  /// prologue reserves. None of them can be derived from anything else in the
-  /// tree, so restating them here is what makes an edit to one of them a
-  /// deliberate act rather than a typo nobody notices.
+  /// The default values, written out so changing one is deliberate.
   #[test]
   fn the_constants_are_the_ones_the_contract_names() {
-    // One local eBPF function's stack frame and the historical eight-frame
-    // default retained by the interpreter and JIT stack default.
+    // The default local-function frame and historical eight-frame stack.
     assert_eq!(LOCAL_FUNCTION_STACK_SIZE, 4096);
     assert_eq!(NATIVE_LOCAL_CALL_BUDGET, 256);
     assert_eq!(MAX_CALL_DEPTH, 8);

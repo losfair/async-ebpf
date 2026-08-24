@@ -326,6 +326,7 @@ pub mod region_analysis {
       data_lo,
       data_hi,
       &layout,
+      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
     );
     let mut call_signatures: Vec<_> = result
       .call_signatures

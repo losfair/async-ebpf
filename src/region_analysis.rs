@@ -312,13 +312,12 @@ fn access_width(opcode: u8) -> usize {
 ///    the loader refuses every program that tries, but an assignment would show
 ///    up here as `Unknown`, so check rather than assume. This is the only part
 ///    of the claim the backend cannot re-derive for itself.
-///  * **The access lies in `[R10 - FRAME_WINDOW, R10)`.** That window is inside
-///    the guest stack at every call depth the loader accepts; see
-///    [`crate::program::FRAME_WINDOW`] for the derivation.
+///  * **The access lies in `[R10 - frame_size, R10)`.** That window is inside
+///    the guest stack at every call depth the loader accepts.
 ///
 /// Atomics are excluded: a fetching atomic writes its source register, so it is
 /// not purely an access, and the loader refuses the frame-pointer cases anyway.
-fn frame_access(state: &State, inst: &Inst, base: usize) -> bool {
+fn frame_access(state: &State, inst: &Inst, base: usize, frame_size: u16) -> bool {
   if base != R10 || state.regs[R10] != RegKind::Stack(StackKind::Current(Some(0))) {
     return false;
   }
@@ -327,7 +326,7 @@ fn frame_access(state: &State, inst: &Inst, base: usize) -> bool {
   }
   let width = access_width(inst.opcode) as i32;
   let offset = inst.offset as i32;
-  offset >= -(crate::program::FRAME_WINDOW as i32) && offset <= -width
+  offset >= -(frame_size as i32) && offset <= -width
 }
 
 fn stack_access_start(base: RegKind, offset: i16) -> Option<i32> {
@@ -420,7 +419,12 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
       _ => continue,
     };
     let region = states[pc].regs[base].region();
-    let hint = if frame_access(&states[pc], &inst, base) {
+    let hint = if frame_access(
+      &states[pc],
+      &inst,
+      base,
+      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
+    ) {
       REGION_FRAME
     } else {
       region
@@ -442,6 +446,7 @@ pub(crate) fn analyze_function(
   data_lo: u64,
   data_hi: u64,
   layout: &crate::function_analysis::FunctionLayout,
+  frame_size: u16,
 ) -> FunctionRegionAnalysis {
   let num_slots = code.len() / 8;
   let mut hints = vec![REGION_UNKNOWN; num_slots];
@@ -503,7 +508,7 @@ pub(crate) fn analyze_function(
       _ => continue,
     };
     let region = states[pc].regs[base].region();
-    let hint = if frame_access(&states[pc], &inst, base) {
+    let hint = if frame_access(&states[pc], &inst, base, frame_size) {
       REGION_FRAME
     } else {
       region
@@ -1204,6 +1209,7 @@ mod tests {
       DATA_LO,
       DATA_HI,
       &crate::function_analysis::FunctionLayout::unmasked(code.len() / 8),
+      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
     )
   }
 
@@ -1267,11 +1273,11 @@ mod tests {
     }
   }
 
-  /// The frame window is `[R10 - FRAME_WINDOW, R10)`, closed at the bottom and
-  /// open at the top, for every width.
+  /// The default frame window is closed at the bottom and open at the top, for
+  /// every width.
   #[test]
   fn frame_hint_window_boundaries() {
-    const W: i16 = crate::program::FRAME_WINDOW as i16;
+    const W: i16 = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as i16;
     for (opcode, width) in [(LDXB, 1i16), (LDXH, 2), (LDXW, 4), (LDXDW, 8)] {
       for (offset, want_frame) in [
         (-W, true),          // lowest byte of the window
@@ -1297,6 +1303,22 @@ mod tests {
         );
       }
     }
+  }
+
+  #[test]
+  fn configured_frame_size_changes_the_unchecked_window() {
+    let code = flatten(&[slot(LDXDW, 0, 10, -8192, 0), slot(EBPF_OP_EXIT, 0, 0, 0, 0)]);
+    let result = analyze_function(
+      &code,
+      0,
+      code.len() / 8,
+      PointerSignature::entry(),
+      DATA_LO,
+      DATA_HI,
+      &crate::function_analysis::FunctionLayout::unmasked(code.len() / 8),
+      8192,
+    );
+    assert_eq!(result.hints[0], REGION_FRAME);
   }
 
   /// The sign-extended loads carry their width in the same bits, so they get
@@ -1686,6 +1708,7 @@ mod tests {
         DATA_LO,
         DATA_HI,
         &crate::function_analysis::FunctionLayout::unmasked(code.len() / 8),
+        crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
       )
       .plan;
       assert_eq!(plan[4].role, PLAN_ROLE_LEADER, "src {src}");
@@ -1726,6 +1749,7 @@ mod tests {
         DATA_LO,
         DATA_HI,
         &layout,
+        crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
       );
       assert_eq!(r.hints.len(), slots, "[{start}, {end})");
       assert_eq!(r.plan.len(), slots, "[{start}, {end})");
@@ -1753,6 +1777,7 @@ mod tests {
       DATA_LO,
       DATA_HI,
       &crate::function_analysis::FunctionLayout::unmasked(slots),
+      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
     )
     .plan;
     assert_eq!(plan[0], PlanEntry::default());
@@ -1905,6 +1930,7 @@ mod tests {
       DATA_LO,
       DATA_HI,
       &layout,
+      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
     );
     assert_eq!(r.hints[2], REGION_FRAME);
   }
@@ -2313,6 +2339,7 @@ mod tests {
       DATA_LO,
       DATA_HI,
       &crate::function_analysis::FunctionLayout::unmasked(code.len() / 8),
+      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
     );
     assert_eq!(result.hints[4], REGION_STACK);
     assert!(

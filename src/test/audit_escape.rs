@@ -177,7 +177,7 @@ async fn no_reading_of_the_frame_pointer_yields_a_host_address() {
 
 /// The frame window's bottom edge, exercised as a *write* at the deepest call
 /// depth the loader accepts with the largest calldata a caller may pass. This
-/// is the exact corner the `FRAME_WINDOW` static assertion is about: one byte
+/// is the exact corner the frame-window invariant is about: one byte
 /// further down is the `PROT_NONE` guard page, and an unchecked store there
 /// would take the process out rather than raise a guest fault.
 #[tokio::test]

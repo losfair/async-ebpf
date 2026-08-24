@@ -1,9 +1,8 @@
 //! Per-local-function guest stack usage.
 //!
-//! Every local function is charged the same fixed frame,
-//! [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`], regardless of what it
-//! actually uses. Nothing inspects the instruction stream, so this file is
-//! almost entirely a constant behind a lookup.
+//! Every local function is charged the configured fixed frame, regardless of
+//! what it actually uses. Nothing inspects the instruction stream, so this
+//! file is almost entirely a configured value behind a lookup.
 //!
 //! That the answer is uniform is what makes the runtime's stack budget a matter
 //! of arithmetic rather than call-graph analysis. Before every local call the
@@ -12,26 +11,24 @@
 //! special case. A per-function calculation would make that runtime check
 //! depend on which functions are on the dynamic stack.
 //!
-//! The 16-byte alignment check below is load-bearing: the generated prologue
-//! subtracts this size from the native stack pointer, so an unaligned value
-//! would show up as a misaligned native stack in generated code rather than as
-//! a diagnostic here.
-
-use super::abi;
 use super::isa::Insn;
 
 /// Stack usage lookup for a program's local functions.
 ///
 /// Kept as a type rather than a bare constant so that reinstating a per-function
-/// calculation later is a change to one file. It holds no state today.
-#[derive(Debug, Default)]
+/// calculation later is a change to one file.
+#[derive(Debug)]
 pub struct StackUsage {
   num_insns: usize,
+  frame_size: u16,
 }
 
 impl StackUsage {
-  pub fn new(num_insns: usize) -> Self {
-    Self { num_insns }
+  pub fn new(num_insns: usize, frame_size: u16) -> Self {
+    Self {
+      num_insns,
+      frame_size,
+    }
   }
 
   /// Guest stack bytes charged to the local function beginning at `pc`.
@@ -44,19 +41,9 @@ impl StackUsage {
       "stack usage asked for pc {pc} outside a program of {} instructions",
       self.num_insns
     );
-    abi::LOCAL_FUNCTION_STACK_SIZE
+    self.frame_size
   }
 }
-
-/// The generated prologue subtracts this from the native stack pointer, which
-/// must stay 16-byte aligned on both supported architectures.
-const _: () = {
-  assert!(
-    abi::LOCAL_FUNCTION_STACK_SIZE % 16 == 0,
-    "local function stack size is not 16-byte aligned; the generated prologue \
-     would misalign the native stack"
-  );
-};
 
 #[cfg(test)]
 mod tests {
@@ -64,9 +51,9 @@ mod tests {
 
   #[test]
   fn every_local_function_is_charged_one_fixed_frame() {
-    let usage = StackUsage::new(4);
+    let usage = StackUsage::new(4, 768);
     for pc in 0..4 {
-      assert_eq!(usage.for_function(&[], pc), 4096);
+      assert_eq!(usage.for_function(&[], pc), 768);
     }
   }
 }

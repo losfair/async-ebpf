@@ -134,6 +134,12 @@ pub struct Config {
   /// Exclusive upper bound on decoded eBPF instruction slots.
   pub instruction_limit: usize,
 
+  /// Guest stack bytes charged to every local function.
+  ///
+  /// Must be non-zero and 16-byte aligned. [`Translator::load`] rejects an
+  /// invalid value before any code is emitted.
+  pub stack_frame_size: u16,
+
   /// Helper dispatch. Both must be set together or neither.
   pub dispatcher: Option<Dispatcher>,
   pub dispatcher_validate: Option<DispatcherValidate>,
@@ -158,6 +164,7 @@ impl Default for Config {
       native_frame_base: false,
       frame_constants: false,
       instruction_limit: abi::MAX_INSTS as usize,
+      stack_frame_size: abi::LOCAL_FUNCTION_STACK_SIZE,
       // Safe default: a caller that has not set up a pointer cage should have
       // to say explicitly that it wants unchecked guest accesses.
       dispatcher: None,
@@ -313,6 +320,11 @@ impl Translator {
     if code.is_empty() {
       return Err(LoadError("program is empty".to_string()));
     }
+    if config.stack_frame_size == 0 || !config.stack_frame_size.is_multiple_of(16) {
+      return Err(LoadError(
+        "stack frame size must be a non-zero multiple of 16".to_string(),
+      ));
+    }
     let insns = Insn::decode_all(code).expect("length checked above");
     if insns.len() > config.instruction_limit {
       return Err(LoadError(format!(
@@ -343,7 +355,7 @@ impl Translator {
     }
 
     let insns = insns.into_boxed_slice();
-    let stack_usage = stack::StackUsage::new(insns.len());
+    let stack_usage = stack::StackUsage::new(insns.len(), config.stack_frame_size);
 
     Ok(Translator {
       config,

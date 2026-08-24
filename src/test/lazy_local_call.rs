@@ -53,6 +53,19 @@ fn load_raw_with_large_stack(code: &[Insn], rodata: &[u8]) -> Program {
   .pin_to_current_thread(t_env)
 }
 
+fn load_raw_with_frame_size(code: &[Insn], rodata: &[u8], frame_size: usize) -> Program {
+  let (_, t_env) = gt_env();
+  ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_stack_frame_size(frame_size)
+  .load(&mut rand::thread_rng(), &build_elf(code, rodata))
+  .unwrap()
+  .pin_to_current_thread(t_env)
+}
+
 async fn run(program: &Program, calldata: &[u8]) -> Result<i64, Error> {
   let (_, t_env) = gt_env();
   let mut resources: [&mut dyn Any; 0] = [];
@@ -113,6 +126,27 @@ async fn a_call_beyond_the_default_guest_stack_returns_stack_exhausted() {
     run(&program, &[]).await,
     Err(Error(RuntimeError::StackExhausted))
   ));
+}
+
+#[tokio::test]
+async fn configurable_frame_size_controls_local_call_stack_movement() {
+  const FRAME_SIZE: i16 = 512;
+  let code = [
+    Insn::call_local(2),
+    Insn::ldx_dw(0, 10, -FRAME_SIZE - 8),
+    Insn::exit(),
+    Insn::mov64_imm(0, 0x5a),
+    Insn::stx_dw(10, 0, -8),
+    Insn::exit(),
+  ];
+  let program = load_raw_with_frame_size(&code, &[], FRAME_SIZE as usize);
+  assert_eq!(run(&program, &[]).await.unwrap(), 0x5a);
+}
+
+#[tokio::test]
+async fn smaller_frames_increase_the_default_call_capacity() {
+  let program = load_raw_with_frame_size(&local_call_chain(9), &[], 2048);
+  assert!(run(&program, &[]).await.is_ok());
 }
 
 /// Entry keeps the calldata pointer in callee-saved R6. The recursive function

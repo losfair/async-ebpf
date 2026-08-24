@@ -49,6 +49,9 @@ pub(crate) const MAX_CALLDATA_SIZE: usize = 512;
 /// window cannot hold the next complete frame.
 const DEFAULT_LOCAL_CALL_FRAME_BUDGET: usize = crate::jit::abi::EBPF_STACK_SIZE as usize;
 
+/// Guest stack bytes charged to each local function by default.
+pub const DEFAULT_STACK_FRAME_SIZE: usize = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
+
 /// The guest stack window.
 ///
 /// Calldata is copied into the top of this window and `R10` starts at the first
@@ -61,24 +64,6 @@ pub const DEFAULT_GUEST_STACK_SIZE: usize =
   DEFAULT_LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8);
 const MAX_MUTABLE_DEREF_REGIONS: usize = 4;
 const MAX_IMMUTABLE_DEREF_REGIONS: usize = 16;
-
-/// Displacement below `R10` that a frame access may use without a runtime bounds
-/// check.
-///
-/// This is the one place the runtime trades a per-access check for a static
-/// argument, so the argument is worth spelling out. `R10` starts at
-/// `stack_top - calldata`, rounded down to 8, and drops one
-/// [`crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE`] frame per local call. Before
-/// every local call the backend checks that the callee's R10 will leave this
-/// complete window above the invocation's stack bottom. The entry trampoline
-/// establishes the same invariant for the root. `[r10 + k]` with
-/// `-FRAME_WINDOW <= k` and `k + width <= 0` is therefore inside the guarded
-/// guest-stack backing at every admitted dynamic depth, which is what lets the
-/// backend emit it as a plain native access.
-///
-/// `src/test/lazy_local_call.rs::the_default_call_capacity_fits_alongside_calldata`
-/// exercises exactly this corner at run time.
-pub(crate) const FRAME_WINDOW: usize = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
 
 /// Guest addresses the SIGSEGV/SIGBUS handlers claim as a guest fault rather
 /// than a host crash: `(0, POINTER_CAGE_PROTECTED_WINDOW)`.
@@ -105,40 +90,21 @@ const _: () = {
   );
 };
 
-// What Tier F needs from the guest stack window, stated as the facts that
-// can each drift on their own.
-//
-// The obvious phrasing - "DEFAULT_GUEST_STACK_SIZE, less the calldata, less the frames
-// below the entry one, still leaves FRAME_WINDOW" - cannot fail. Substituting
-// the definition of DEFAULT_GUEST_STACK_SIZE cancels the calldata term against itself
-// and the budget against the frames, leaving `FRAME_WINDOW >= FRAME_WINDOW`:
-// true for every value of every constant it names, including all the ones it is
-// supposed to be watching. Each assertion below is instead written against
-// constants that are *not* derived from the one being checked, so raising
-// MAX_CALLDATA_SIZE, charging a local function more than one frame, or
-// redefining the window all fail the build rather than quietly eating the
-// margin Tier F addresses within.
 const _: () = {
-  // 1. The unchecked window fits in the frame every local call is charged.
-  assert!(
-    FRAME_WINDOW <= crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize,
-    "the Tier F frame window is wider than the frame a local call is charged, \
-     so an admitted dynamic frame can address below the guest stack"
-  );
-  // 2. The historical default really does retain eight complete frames.
+  // The historical default retains eight complete frames.
   assert!(
     DEFAULT_LOCAL_CALL_FRAME_BUDGET >= crate::jit::abi::EBPF_STACK_SIZE as usize,
     "the default local-call frame budget no longer covers the ABI default"
   );
-  // 3. The window covers that budget *and* the largest calldata a caller can
+  // The window covers that budget *and* the largest calldata a caller can
   //    pass, rounded the way R10's 8-alignment rounds it.
   assert!(
     DEFAULT_GUEST_STACK_SIZE
       >= DEFAULT_LOCAL_CALL_FRAME_BUDGET + MAX_CALLDATA_SIZE.next_multiple_of(8),
-    "the guest stack window no longer covers FRAME_WINDOW below the deepest \
+    "the guest stack window no longer covers a complete frame below the deepest \
      accepted frame pointer; Tier F frame addressing would be unsound"
   );
-  // 4. R10 starts at the first 8-aligned address below the calldata, which the
+  // R10 starts at the first 8-aligned address below the calldata, which the
   //    runtime computes with `& !0x7`. Assertion 3 models that rounding as
   //    `next_multiple_of(8)` of the calldata size, and the two agree only while
   //    the top of the window is itself 8-aligned. That follows today from the
@@ -580,10 +546,10 @@ impl<'a, 'b> HelperScope<'a, 'b> {
 /// The guest stack used to be a plain heap allocation, which was fine while
 /// every guest access carried a runtime bounds check: an out-of-range address
 /// was rejected before it was ever dereferenced. Tier F frame accesses are
-/// emitted without that check, on the static argument recorded at
-/// [`FRAME_WINDOW`]. Guard pages are what turns a mistake in that argument - or
-/// in the backend test that enforces it - into a fault instead of a silent read
-/// or write of whatever the allocator happened to place next to the stack.
+/// emitted without that check when their displacement fits the configured
+/// frame size. Guard pages turn a mistake in that argument - or in the backend
+/// test that enforces it - into a fault instead of a silent read or write of
+/// whatever the allocator happened to place next to the stack.
 ///
 /// This backs the guest stack. The usable
 /// window is laid out flush against the low guard, which is load-bearing for
@@ -651,11 +617,11 @@ impl GuardedRegion {
 struct ExecContext {
   native_stack: DefaultStack,
   guest_stack: GuardedRegion,
+  stack_frame_size: u16,
 }
 
-fn native_stack_size(guest_stack_size: usize) -> usize {
-  let guest_frame = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
-  let frame_capacity = guest_stack_size.div_ceil(guest_frame);
+fn native_stack_size(guest_stack_size: usize, stack_frame_size: u16) -> usize {
+  let frame_capacity = guest_stack_size.div_ceil(stack_frame_size as usize);
   NATIVE_STACK_RESERVE
     .checked_add(
       frame_capacity
@@ -670,25 +636,34 @@ fn native_stack_size(guest_stack_size: usize) -> usize {
 fn native_coroutine_stack_is_derived_but_smaller_than_the_guest_stack() {
   let guest_stack_size = 8 * 1024 * 1024;
   assert_eq!(
-    native_stack_size(guest_stack_size),
+    native_stack_size(guest_stack_size, crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE),
     NATIVE_STACK_RESERVE
       + guest_stack_size / crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize
         * crate::jit::abi::NATIVE_LOCAL_CALL_BUDGET
   );
-  assert!(native_stack_size(guest_stack_size) < guest_stack_size);
-  assert!(native_stack_size(DEFAULT_GUEST_STACK_SIZE) < DEFAULT_GUEST_STACK_SIZE);
+  assert!(
+    native_stack_size(guest_stack_size, crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE)
+      < guest_stack_size
+  );
+  assert!(
+    native_stack_size(
+      DEFAULT_GUEST_STACK_SIZE,
+      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE
+    ) < DEFAULT_GUEST_STACK_SIZE
+  );
 }
 
 impl ExecContext {
-  fn new(guest_stack_size: usize) -> Self {
+  fn new(guest_stack_size: usize, stack_frame_size: u16) -> Self {
     Self {
-      // A guest frame is 4 KiB but its persistent native call frame is under
-      // 128 bytes on both backends. Charge a deliberately conservative 256
-      // bytes per possible guest frame, plus a fixed reserve for transient Rust
-      // resolver/dispatcher frames and the stack-exhaustion callback.
-      native_stack: DefaultStack::new(native_stack_size(guest_stack_size))
+      // A persistent native call frame is under 128 bytes on both backends.
+      // Charge a deliberately conservative 256 bytes per possible guest frame,
+      // plus a fixed reserve for transient Rust resolver/dispatcher frames and
+      // the stack-exhaustion callback.
+      native_stack: DefaultStack::new(native_stack_size(guest_stack_size, stack_frame_size))
         .expect("failed to initialize native stack"),
       guest_stack: GuardedRegion::new(guest_stack_size).expect("failed to initialize guest stack"),
+      stack_frame_size,
     }
   }
 }
@@ -909,15 +884,17 @@ struct BorrowedExecContext {
 }
 
 impl BorrowedExecContext {
-  fn new(guest_stack_size: usize) -> Self {
+  fn new(guest_stack_size: usize, stack_frame_size: u16) -> Self {
     let mut me = Self {
       ctx: ManuallyDrop::new(EXEC_CONTEXT_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         let ctx = pool
           .iter()
-          .position(|ctx| ctx.guest_stack.len() == guest_stack_size)
+          .position(|ctx| {
+            ctx.guest_stack.len() == guest_stack_size && ctx.stack_frame_size == stack_frame_size
+          })
           .map(|index| pool.swap_remove(index));
-        ctx.unwrap_or_else(|| ExecContext::new(guest_stack_size))
+        ctx.unwrap_or_else(|| ExecContext::new(guest_stack_size, stack_frame_size))
       })),
     };
     me.ctx.guest_stack.as_mut_slice().fill(0x8e);
@@ -977,6 +954,7 @@ pub struct ProgramLoader {
   code_size_limit: usize,
   instruction_limit: usize,
   guest_stack_size: usize,
+  stack_frame_size: u16,
   require_static_regions: bool,
 }
 
@@ -988,6 +966,7 @@ pub struct UnboundProgram {
   code_size: usize,
   page_size: usize,
   guest_stack_size: usize,
+  stack_frame_size: u16,
   run_lock: RwLock<()>,
   data_protection_failed: Cell<bool>,
   code_arena: RefCell<CodeArena>,
@@ -1746,6 +1725,7 @@ impl Program {
       self.unbound.cage.data_bottom() as u64,
       self.unbound.cage.data_top() as u64,
       &section.layout,
+      self.unbound.stack_frame_size,
     );
     if self.unbound.require_static_regions && !region_analysis.unresolved.is_empty() {
       let err = RuntimeError::InvalidArgumentOwned(format!(
@@ -2018,7 +1998,8 @@ impl Program {
     }
 
     let guest_stack_size = self.unbound.guest_stack_size;
-    let mut ectx = BorrowedExecContext::new(guest_stack_size);
+    let stack_frame_size = self.unbound.stack_frame_size;
+    let mut ectx = BorrowedExecContext::new(guest_stack_size, stack_frame_size);
 
     ectx.ctx.guest_stack.as_mut_slice()[guest_stack_size - calldata.len()..]
       .copy_from_slice(calldata);
@@ -2027,21 +2008,21 @@ impl Program {
     let program_ret: u64 = {
       let guest_stack_top = self.unbound.cage.stack_top();
       let guest_stack_bottom = self.unbound.cage.stack_bottom();
-      // Tier F addresses `[R10 - FRAME_WINDOW, R10)` with no bounds check. The
+      let guest_frame = stack_frame_size as usize;
+      // Tier F addresses `[R10 - stack_frame_size, R10)` with no bounds check. The
       // root must leave that window above the stack bottom; every later local
       // call establishes the same invariant dynamically before entering its
       // callee.
       debug_assert!(
         ((guest_stack_top - calldata_len) & !0x7)
-          .checked_sub(FRAME_WINDOW)
+          .checked_sub(guest_frame)
           .is_some_and(|floor| floor >= guest_stack_bottom),
-        "the entry frame pointer does not leave FRAME_WINDOW above the guest stack bottom"
+        "the entry frame pointer does not leave a complete frame above the guest stack bottom"
       );
       let ctx = &mut *ectx.ctx;
       let stack_native_base = ctx.guest_stack.as_mut_ptr() as usize;
-      let guest_frame = crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE as usize;
       let local_call_guest_floor = stack_native_base
-        .checked_add(FRAME_WINDOW)
+        .checked_add(guest_frame)
         .and_then(|floor| floor.checked_add(guest_frame))
         .expect("local-call guest stack floor overflow");
       let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -2354,7 +2335,11 @@ impl Program {
 /// apart: `native_frame_base` and `frame_constants` are on because both entry
 /// trampolines above establish exactly the frame the backend expects, and
 /// neither means anything without the pointer cage.
-fn jit_config(cage: &PointerCage, instruction_limit: usize) -> crate::jit::Config {
+fn jit_config(
+  cage: &PointerCage,
+  instruction_limit: usize,
+  stack_frame_size: u16,
+) -> crate::jit::Config {
   crate::jit::Config {
     target: crate::jit::Target::host(),
     pointer_mask: cage.mask(),
@@ -2363,6 +2348,7 @@ fn jit_config(cage: &PointerCage, instruction_limit: usize) -> crate::jit::Confi
     native_frame_base: true,
     frame_constants: true,
     instruction_limit,
+    stack_frame_size,
     dispatcher: Some(tls_dispatcher),
     dispatcher_validate: Some(std_validator),
     unwind_helper_index: None,
@@ -2479,6 +2465,7 @@ impl ProgramLoader {
       code_size_limit: DEFAULT_CODE_SIZE_LIMIT,
       instruction_limit: crate::jit::abi::MAX_INSTS as usize,
       guest_stack_size: DEFAULT_GUEST_STACK_SIZE,
+      stack_frame_size: crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
       require_static_regions: false,
     }
   }
@@ -2547,17 +2534,41 @@ impl ProgramLoader {
 
   /// Sets the writable guest stack window size used by each invocation.
   ///
-  /// Each dynamic local call consumes one fixed 4 KiB guest frame. Recursive
-  /// and statically deep call graphs are admitted, then stopped with a runtime
-  /// error before the next complete frame would cross this window's bottom.
-  /// Space not consumed by call frames can be used as a caller-managed arena.
-  /// The default remains [`DEFAULT_GUEST_STACK_SIZE`].
+  /// Each dynamic local call consumes the frame configured by
+  /// [`Self::with_stack_frame_size`]. Recursive and statically deep call
+  /// graphs are admitted, then stopped with a runtime error before the next
+  /// complete frame would cross this window's bottom. Space not consumed by
+  /// call frames can be used as a caller-managed arena. The default remains
+  /// [`DEFAULT_GUEST_STACK_SIZE`].
   pub fn with_guest_stack_size(mut self, size: usize) -> Self {
     assert!(
       size >= DEFAULT_GUEST_STACK_SIZE,
       "guest stack size must be at least {DEFAULT_GUEST_STACK_SIZE} bytes"
     );
     self.guest_stack_size = size;
+    self
+  }
+
+  /// Sets the guest stack bytes charged to every local function.
+  ///
+  /// This controls how far `R10` moves on a local call and the complete
+  /// frame-relative window available to each function. The total invocation
+  /// stack remains controlled independently by [`Self::with_guest_stack_size`].
+  /// This value must match the stack-frame size used by the eBPF compiler; the
+  /// loader cannot infer that compiler setting from the bytecode. The default
+  /// is [`DEFAULT_STACK_FRAME_SIZE`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `size` is zero, is not 16-byte aligned, or does not fit in a
+  /// `u16`. Loading also rejects a frame that cannot fit in the configured
+  /// guest stack alongside the maximum calldata.
+  pub fn with_stack_frame_size(mut self, size: usize) -> Self {
+    assert!(
+      size != 0 && size.is_multiple_of(16),
+      "guest stack frame size must be a non-zero multiple of 16"
+    );
+    self.stack_frame_size = u16::try_from(size).expect("guest stack frame size must fit in u16");
     self
   }
 
@@ -2568,6 +2579,13 @@ impl ProgramLoader {
 
   fn _load(&self, rng: &mut impl rand::Rng, elf: &[u8]) -> Result<UnboundProgram, RuntimeError> {
     let start_time = Instant::now();
+    let minimum_stack_size = self.stack_frame_size as usize + MAX_CALLDATA_SIZE.next_multiple_of(8);
+    if self.guest_stack_size < minimum_stack_size {
+      return Err(RuntimeError::InvalidArgumentOwned(format!(
+        "guest stack size must be at least {minimum_stack_size} bytes for a {}-byte frame",
+        self.stack_frame_size
+      )));
+    }
     let writable_plan = plan_writable_data(elf).map_err(RuntimeError::Linker)?;
     let cage = PointerCage::new(rng, self.guest_stack_size, elf.len(), writable_plan.size)?;
 
@@ -2648,7 +2666,11 @@ impl ProgramLoader {
     let resolvers = HashMap::new();
     let next_resolver_id = 1u32;
 
-    let config = std::sync::Arc::new(jit_config(&cage, self.instruction_limit));
+    let config = std::sync::Arc::new(jit_config(
+      &cage,
+      self.instruction_limit,
+      self.stack_frame_size,
+    ));
 
     for (section_name, code_vaddr_size) in code_sections {
       let code = cage
@@ -2721,6 +2743,7 @@ impl ProgramLoader {
       code_size: code_len_allocated,
       page_size,
       guest_stack_size: self.guest_stack_size,
+      stack_frame_size: self.stack_frame_size,
       run_lock: RwLock::new(()),
       data_protection_failed: Cell::new(false),
       code_arena: RefCell::new(CodeArena { used: 0 }),

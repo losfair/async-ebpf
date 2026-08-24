@@ -678,7 +678,7 @@ impl Emit<'_, '_, '_> {
     if offset > -size {
       return false;
     }
-    if offset < -(abi::LOCAL_FUNCTION_STACK_SIZE as i32) {
+    if offset < -(self.cfg.stack_frame_size as i32) {
       return false;
     }
     true
@@ -984,9 +984,9 @@ impl Emit<'_, '_, '_> {
 
     // R10 is already a native pointer into the per-invocation guest stack.
     // Refuse the call unless subtracting one frame still leaves a complete
-    // FRAME_WINDOW below the callee's R10. Independently reserve enough native
-    // coroutine stack for the persistent call frame and the non-returning
-    // exhaustion callback.
+    // one complete frame below the callee's R10. Independently reserve enough
+    // native coroutine stack for the persistent call frame and the
+    // non-returning exhaustion callback.
     self.emit_load(S::S64, RBP, RCX, abi::FRAME_OFFSET);
     self.emit_load(S::S64, RCX, RCX, abi::memory::LOCAL_CALL_GUEST_FLOOR);
     self.emit_cmp(RCX, map_register(10));
@@ -1005,12 +1005,7 @@ impl Emit<'_, '_, '_> {
 
     // Every local function has the same fixed guest-frame charge. Keep R10
     // independent of host stack bookkeeping across coroutine suspension.
-    self.emit_alu64_imm32(
-      0x81,
-      5,
-      map_register(10),
-      abi::LOCAL_FUNCTION_STACK_SIZE as i32,
-    );
+    self.emit_alu64_imm32(0x81, 5, map_register(10), self.cfg.stack_frame_size as i32);
 
     self.emit_push(map_register(6));
     self.emit_push(map_register(7));
@@ -1059,12 +1054,7 @@ impl Emit<'_, '_, '_> {
     self.emit_pop(map_register(7));
     self.emit_pop(map_register(6));
 
-    self.emit_alu64_imm32(
-      0x81,
-      0,
-      map_register(10),
-      abi::LOCAL_FUNCTION_STACK_SIZE as i32,
-    );
+    self.emit_alu64_imm32(0x81, 0, map_register(10), self.cfg.stack_frame_size as i32);
 
     let skip_exhausted = self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: false });
     self.emit_jump_target(guest_exhausted);

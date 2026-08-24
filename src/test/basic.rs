@@ -1068,3 +1068,14 @@ fn test_invalid_code_size_limit() {
   )
   .with_code_size_limit(4096);
 }
+
+#[test]
+#[should_panic(expected = "stack frame size must be a non-zero multiple of 16")]
+fn test_invalid_stack_frame_size() {
+  let _ = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .with_stack_frame_size(24);
+}

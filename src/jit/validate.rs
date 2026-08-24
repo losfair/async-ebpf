@@ -325,14 +325,6 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
     ));
   }
 
-  // Stack usage is checked next,
-  // and again for every local call target below. Its only failure mode is a
-  // stack usage that is not 16-byte aligned. `async-ebpf` never registers a
-  // custom stack-usage calculator, so every function is charged the constant
-  // `LOCAL_FUNCTION_STACK_SIZE` — see `stack.rs`, which carries a `const`
-  // assertion that the constant is aligned. The check can therefore never fire
-  // and is not reproduced as a runtime test.
-
   let num_insns = insns.len();
   let mut i = 0usize;
   while i < num_insns {

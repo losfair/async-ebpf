@@ -208,6 +208,7 @@ fn hostile_config(target: Target) -> Arc<Config> {
     native_frame_base: true,
     frame_constants: true,
     instruction_limit: crate::jit::abi::MAX_INSTS as usize,
+    stack_frame_size: crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
     dispatcher: Some(never_called_dispatcher),
     dispatcher_validate: Some(accept_every_helper),
     unwind_helper_index: None,

@@ -641,7 +641,7 @@ fn emit_frame_access_ok(cfg: &Config, region_hint: u8, base: u32, offset: i16, s
   if (offset as i32) > -size {
     return false;
   }
-  if (offset as i32) < -(abi::LOCAL_FUNCTION_STACK_SIZE as i32) {
+  if (offset as i32) < -(cfg.stack_frame_size as i32) {
     return false;
   }
   // The unscaled load/store form this turns into reaches -256 only.
@@ -1067,12 +1067,7 @@ fn emit_lazy_local_call(
   // directly instead of reloading the prologue's bookkeeping slot: a coroutine
   // suspension may use host stack storage below the current frame, while R10
   // is guest state and must not depend on that storage surviving a yield.
-  emit_movewide_immediate(
-    st,
-    true,
-    TEMP_REGISTER,
-    abi::LOCAL_FUNCTION_STACK_SIZE as u64,
-  );
+  emit_movewide_immediate(st, true, TEMP_REGISTER, cfg.stack_frame_size as u64);
   emit_addsub_register(
     st,
     true,
@@ -1114,12 +1109,7 @@ fn emit_lazy_local_call(
 
   emit_addsub_immediate(st, true, addsub::ADD, SP, SP, stack_movement);
 
-  emit_movewide_immediate(
-    st,
-    true,
-    TEMP_REGISTER,
-    abi::LOCAL_FUNCTION_STACK_SIZE as u64,
-  );
+  emit_movewide_immediate(st, true, TEMP_REGISTER, cfg.stack_frame_size as u64);
   emit_addsub_register(
     st,
     true,

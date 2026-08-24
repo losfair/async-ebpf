@@ -234,6 +234,16 @@ impl<'a> Interpreter<'a> {
     self
   }
 
+  /// Sets the guest stack bytes consumed by each local call.
+  pub fn with_stack_frame_size(mut self, bytes: u16) -> Self {
+    assert!(
+      bytes != 0 && bytes.is_multiple_of(16),
+      "stack frame size must be a non-zero multiple of 16"
+    );
+    self.frame_size = bytes as u64;
+    self
+  }
+
   /// Caps instructions retired.
   pub fn with_step_budget(mut self, steps: u64) -> Self {
     self.step_budget = steps;
