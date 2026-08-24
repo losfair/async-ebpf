@@ -140,6 +140,14 @@ pub struct Config {
   /// invalid value before any code is emitted.
   pub stack_frame_size: u16,
 
+  /// Guest-address distance between successive local-function frame pointers.
+  ///
+  /// This normally equals `stack_frame_size`. A larger value lets the runtime
+  /// place inaccessible address-space gaps between mapped frames without
+  /// changing the valid frame-relative window. It must fit in `i32`, be
+  /// 16-byte aligned, and be at least `stack_frame_size`.
+  pub stack_frame_stride: u32,
+
   /// Helper dispatch. Both must be set together or neither.
   pub dispatcher: Option<Dispatcher>,
   pub dispatcher_validate: Option<DispatcherValidate>,
@@ -165,6 +173,7 @@ impl Default for Config {
       frame_constants: false,
       instruction_limit: abi::MAX_INSTS as usize,
       stack_frame_size: abi::LOCAL_FUNCTION_STACK_SIZE,
+      stack_frame_stride: abi::LOCAL_FUNCTION_STACK_SIZE as u32,
       // Safe default: a caller that has not set up a pointer cage should have
       // to say explicitly that it wants unchecked guest accesses.
       dispatcher: None,
@@ -323,6 +332,15 @@ impl Translator {
     if config.stack_frame_size == 0 || !config.stack_frame_size.is_multiple_of(16) {
       return Err(LoadError(
         "stack frame size must be a non-zero multiple of 16".to_string(),
+      ));
+    }
+    if config.stack_frame_stride < config.stack_frame_size as u32
+      || !config.stack_frame_stride.is_multiple_of(16)
+      || config.stack_frame_stride > i32::MAX as u32
+    {
+      return Err(LoadError(
+        "stack frame stride must fit in i32, be a multiple of 16, and be at least the frame size"
+          .to_string(),
       ));
     }
     let insns = Insn::decode_all(code).expect("length checked above");

@@ -61,6 +61,7 @@ fn load_raw_with_frame_size(code: &[Insn], rodata: &[u8], frame_size: usize) -> 
     &[],
   )
   .with_stack_frame_size(frame_size)
+  .with_guarded_stack_frames(false)
   .load(&mut rand::thread_rng(), &build_elf(code, rodata))
   .unwrap()
   .pin_to_current_thread(t_env)

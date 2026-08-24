@@ -208,6 +208,7 @@ group/cage only.9e32c2b471a013db7df28fd8|828:h7b37291d5bec90e3aecdef45efb77432
 group/no cage.fdec19161c4f5905d2897e1e|560:h56f6eacf0dbc071af14ede50e0a6235b
 group/production + unwind helper.acd2d432de62ef25044931c3|604:hd114cb250373a6aad190442ff862f4d8
 group/production.4b72f971a153d956f96a0464|604:hd114cb250373a6aad190442ff862f4d8
+guarded local call stride.f84a541055ec3b144ab31fb5|712:h736ec578563ef5526afe9c5ee204ff2b
 helper calls/cage + frame constants.867e077bceff3aa6c09da6f3|936:hc825d90180789f7cff8b910fd3b75b26
 helper calls/cage + native frame base.a7de673809d75cd040b1821a|936:hc825d90180789f7cff8b910fd3b75b26
 helper calls/cage only.9203d00d544e081e5d35aa86|936:hc825d90180789f7cff8b910fd3b75b26

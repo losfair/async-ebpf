@@ -1005,7 +1005,12 @@ impl Emit<'_, '_, '_> {
 
     // Every local function has the same fixed guest-frame charge. Keep R10
     // independent of host stack bookkeeping across coroutine suspension.
-    self.emit_alu64_imm32(0x81, 5, map_register(10), self.cfg.stack_frame_size as i32);
+    self.emit_alu64_imm32(
+      0x81,
+      5,
+      map_register(10),
+      self.cfg.stack_frame_stride as i32,
+    );
 
     self.emit_push(map_register(6));
     self.emit_push(map_register(7));
@@ -1054,7 +1059,12 @@ impl Emit<'_, '_, '_> {
     self.emit_pop(map_register(7));
     self.emit_pop(map_register(6));
 
-    self.emit_alu64_imm32(0x81, 0, map_register(10), self.cfg.stack_frame_size as i32);
+    self.emit_alu64_imm32(
+      0x81,
+      0,
+      map_register(10),
+      self.cfg.stack_frame_stride as i32,
+    );
 
     let skip_exhausted = self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: false });
     self.emit_jump_target(guest_exhausted);
@@ -3102,6 +3112,28 @@ mod tests {
       ..Default::default()
     };
     assert!(check(&code, &inputs));
+  }
+
+  #[test]
+  fn guarded_local_call_uses_sparse_frame_stride() {
+    let insns = [insn(opcode::CALL, 0, 1, 0, 1), exit(), movi(0, 7), exit()];
+    let code = Insn::encode_all(&insns);
+    let ids = [11u32, 22, 33, 44];
+    let inputs = TranslationInputs {
+      resolver_ids: &ids,
+      start_pc: 0,
+      end_pc: insns.len(),
+      ..Default::default()
+    };
+    let mut config = base_config(Target::X86_64);
+    config.stack_frame_stride = 65_536;
+    assert!(check_one(
+      "guarded local call stride",
+      &config,
+      &code,
+      &inputs,
+      CAPACITY
+    ));
   }
 
   #[test]

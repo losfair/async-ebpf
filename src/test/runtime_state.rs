@@ -246,21 +246,23 @@ fn the_frame_slots_survive_preemption_inside_a_lazy_callee() {
 /// leaves in its frame must not be readable by the next.
 ///
 /// The backing store changed in this branch from a heap allocation to a guarded
-/// mapping, and only `SHADOW_STACK_SIZE` bytes of it are scrubbed - the mapping
-/// itself is page-rounded and so slightly larger. This checks the scrub still
-/// covers everything a guest can address, at the top of the window, in the
-/// middle, and at the very bottom.
+/// mapping. This checks the scrub covers mapped islands at the top and bottom
+/// of the sparse address span without walking through the inaccessible gaps.
 #[tokio::test]
 async fn the_pooled_guest_stack_is_scrubbed_between_invocations() {
+  if unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != 4096 {
+    return;
+  }
   const MARKER: i32 = 0x5a5a5a5a;
-  // Offsets a guest can reach: the first two through the unchecked frame path,
-  // the last through an ordinary checked stack access.
+  // The default has eight 4 KiB frames at a 64 KiB stride. Moving down seven
+  // strides reaches the deepest mapped island.
+  const DEEPEST_FRAME: i32 = -(7 * 65536);
   let writer = vec![
     st_dw(10, -8, MARKER),
     st_dw(10, -4096, MARKER),
     Insn::mov64_reg(1, 10),
-    Insn::add64_imm(1, -32768),
-    st_dw(1, 0, MARKER),
+    Insn::add64_imm(1, DEEPEST_FRAME),
+    st_dw(1, -8, MARKER),
     Insn::mov64_imm(0, 0),
     Insn::exit(),
   ];
@@ -269,8 +271,8 @@ async fn the_pooled_guest_stack_is_scrubbed_between_invocations() {
     Insn::ldx_dw(2, 10, -4096),
     Insn::or64_reg(0, 2),
     Insn::mov64_reg(1, 10),
-    Insn::add64_imm(1, -32768),
-    Insn::ldx_dw(2, 1, 0),
+    Insn::add64_imm(1, DEEPEST_FRAME),
+    Insn::ldx_dw(2, 1, -8),
     Insn::or64_reg(0, 2),
     Insn::exit(),
   ];

@@ -8,7 +8,7 @@
 
 use crate::{
   error::{Error, RuntimeError},
-  test::raw_elf::{run_raw, Insn},
+  test::raw_elf::{run_raw, run_raw_contiguous, Insn},
 };
 
 const RODATA: [u8; 8] = 0x1122334455667788u64.to_le_bytes();
@@ -230,7 +230,10 @@ async fn a_run_wider_than_the_cap_still_works() {
     Insn::or64_reg(0, 2),
     Insn::exit(),
   ]);
-  assert_eq!(run_raw(&code, &RODATA, &[], true).await.unwrap(), 0x3);
+  assert_eq!(
+    run_raw_contiguous(&code, &RODATA, &[], true).await.unwrap(),
+    0x3
+  );
 }
 
 /// Grouping must not change what a program computes when the base is only known

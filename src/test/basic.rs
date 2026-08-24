@@ -31,6 +31,7 @@ async fn configurable_guest_stack_exposes_a_larger_writable_window() {
     Arc::new(DummyProgramEventListener),
     &[],
   )
+  .with_guarded_stack_frames(false)
   .with_guest_stack_size(STACK_SIZE);
   let prog = loader
     .load(&mut rand::thread_rng(), &binary)
