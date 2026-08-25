@@ -216,7 +216,7 @@ impl State {
   }
 
   /// Per-element meet with `other`; returns whether `self` changed.
-  fn meet_from(&mut self, other: &State) -> bool {
+  fn meet_from(&mut self, other: &State, cap_warning_emitted: &mut bool) -> bool {
     let mut changed = false;
     for r in 0..NUM_REGS {
       let merged = self.regs[r].meet(other.regs[r]);
@@ -227,40 +227,64 @@ impl State {
     }
     // Meet slots over the union of keys; an absent slot is Uninit (top).
     if self.slots.is_empty() {
-        // Nothing tracked yet means every key of `other` meets Uninit (top)
-        // into itself, so adopt the incoming map wholesale. The clone is O(1)
-        // under structural sharing, which is what keeps straight-line analysis
-        // linear in the number of distinct spill offsets. The epoch is adopted
-        // with it: the entries' epochs are all consistent with `other`'s
-        // counter, and `self` having no entries means its own (possibly higher)
-        // epoch is irrelevant — it only ever matters for entries, and none
-        // survive.
-        if !other.slots.is_empty() {
-          self.slots = other.slots.clone();
-          self.invalid_epoch = other.invalid_epoch;
-          changed = true;
-        }
-      } else {
-        for (&off, &(other_epoch, other_kind)) in &other.slots {
-          let cur = self
-            .slots
-            .get(&off)
-            .map(|&(e, k)| self.effective_kind(e, k))
-            .unwrap_or(RegKind::Uninit);
-          let merged = cur.meet(other.effective_kind(other_epoch, other_kind));
-          if merged != cur {
-            // Cap the map: a key the cap refuses stays untracked (reads as
-            // Scalar), the same safe fallback as an absent key. Skipping the
-            // insert leaves `changed` false: the state's observable behavior
-            // is unchanged, so the fixpoint terminates as before.
-            if self.slots.contains_key(&off) || self.slots.size() < MAX_TRACKED_SLOTS {
-              self.slots = self.slots.insert(off, (self.invalid_epoch, merged));
-              changed = true;
-            }
+      // Nothing tracked yet means every key of `other` meets Uninit (top)
+      // into itself, so adopt the incoming map wholesale. The clone is O(1)
+      // under structural sharing, which is what keeps straight-line analysis
+      // linear in the number of distinct spill offsets. The epoch is adopted
+      // with it: the entries' epochs are all consistent with `other`'s
+      // counter, and `self` having no entries means its own (possibly higher)
+      // epoch is irrelevant — it only ever matters for entries, and none
+      // survive.
+      if !other.slots.is_empty() {
+        self.slots = other.slots.clone();
+        self.invalid_epoch = other.invalid_epoch;
+        changed = true;
+      }
+    } else {
+      for (&off, &(other_epoch, other_kind)) in &other.slots {
+        let cur = self
+          .slots
+          .get(&off)
+          .map(|&(e, k)| self.effective_kind(e, k))
+          .unwrap_or(RegKind::Uninit);
+        let merged = cur.meet(other.effective_kind(other_epoch, other_kind));
+        if merged != cur {
+          // Cap the map: a key the cap refuses stays untracked (reads as
+          // Scalar), the same safe fallback as an absent key. Skipping the
+          // insert leaves `changed` false: the state's observable behavior
+          // is unchanged, so the fixpoint terminates as before.
+          if self.insert_slot(off, (self.invalid_epoch, merged), cap_warning_emitted) {
+            changed = true;
           }
         }
       }
+    }
     changed
+  }
+
+  /// Inserts one spill entry if it is already tracked or the cap has room.
+  /// Warns at most once per analysis when a new offset has to be refused.
+  fn insert_slot(
+    &mut self,
+    off: i32,
+    entry: (u64, RegKind),
+    cap_warning_emitted: &mut bool,
+  ) -> bool {
+    if self.slots.contains_key(&off) || self.slots.size() < MAX_TRACKED_SLOTS {
+      self.slots = self.slots.insert(off, entry);
+      return true;
+    }
+
+    if !*cap_warning_emitted {
+      tracing::warn!(
+        max_tracked_slots = MAX_TRACKED_SLOTS,
+        spill_offset = off,
+        "region analysis spill-slot tracking cap reached; additional offsets will use dynamic \
+         region routing"
+      );
+      *cap_warning_emitted = true;
+    }
+    false
   }
 
   /// Marks every tracked slot `Unknown` after a store that may alias the
@@ -314,7 +338,9 @@ impl State {
     // they read as invalidated while entries outside the range keep their
     // kinds.
     for off in affected {
-      self.slots = self.slots.insert(off, (self.invalid_epoch, RegKind::Unknown));
+      self.slots = self
+        .slots
+        .insert(off, (self.invalid_epoch, RegKind::Unknown));
     }
   }
 }
@@ -483,17 +509,25 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   let mut worklist: Vec<usize> = vec![0];
   let mut on_list = vec![false; num_slots];
   on_list[0] = true;
+  let mut cap_warning_emitted = false;
 
   while let Some(pc) = worklist.pop() {
     on_list[pc] = false;
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
     let lddw_addr = lddw_full_imm(code, pc, &inst);
-    let out = transfer(&states[pc], &inst, lddw_addr, data_lo, data_hi);
+    let out = transfer(
+      &states[pc],
+      &inst,
+      lddw_addr,
+      data_lo,
+      data_hi,
+      &mut cap_warning_emitted,
+    );
 
     for succ in successors(pc, &inst, num_slots) {
       let was_reached = reached[succ];
       reached[succ] = true;
-      let changed = states[succ].meet_from(&out);
+      let changed = states[succ].meet_from(&out, &mut cap_warning_emitted);
       if (!was_reached || changed) && !on_list[succ] {
         on_list[succ] = true;
         worklist.push(succ);
@@ -567,6 +601,7 @@ pub(crate) fn analyze_function(
   let mut worklist = vec![start_pc];
   let mut on_list = vec![false; num_slots];
   on_list[start_pc] = true;
+  let mut cap_warning_emitted = false;
 
   while let Some(pc) = worklist.pop() {
     on_list[pc] = false;
@@ -581,12 +616,19 @@ pub(crate) fn analyze_function(
       call_signatures.insert(pc, PointerSignature::from_state(&states[pc]).masked(mask));
     }
     let lddw_addr = lddw_full_imm(code, pc, &inst);
-    let out = transfer(&states[pc], &inst, lddw_addr, data_lo, data_hi);
+    let out = transfer(
+      &states[pc],
+      &inst,
+      lddw_addr,
+      data_lo,
+      data_hi,
+      &mut cap_warning_emitted,
+    );
 
     for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
       let was_reached = reached[succ];
       reached[succ] = true;
-      let changed = states[succ].meet_from(&out);
+      let changed = states[succ].meet_from(&out, &mut cap_warning_emitted);
       if (!was_reached || changed) && !on_list[succ] {
         on_list[succ] = true;
         worklist.push(succ);
@@ -883,7 +925,14 @@ fn function_successors(
 }
 
 /// Abstract transfer function: register/slot state after executing `inst`.
-fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi: u64) -> State {
+fn transfer(
+  in_state: &State,
+  inst: &Inst,
+  lddw_addr: u64,
+  data_lo: u64,
+  data_hi: u64,
+  cap_warning_emitted: &mut bool,
+) -> State {
   let mut s = in_state.clone();
   let cls = inst.opcode & EBPF_CLS_MASK;
 
@@ -955,9 +1004,7 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
             // tracked slot always updates in place, a new one only while room
             // remains. Refused slots stay untracked and read back as scalars —
             // the same fallback as slots the analysis never saw.
-            if s.slots.contains_key(&start) || s.slots.size() < MAX_TRACKED_SLOTS {
-              s.slots = s.slots.insert(start, (s.invalid_epoch, stored));
-            }
+            s.insert_slot(start, (s.invalid_epoch, stored), cap_warning_emitted);
           }
         }
       } else if s.regs[inst.dst] != RegKind::Data {

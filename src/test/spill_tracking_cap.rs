@@ -62,6 +62,34 @@ fn slots_beyond_the_cap_are_not_tracked() {
   );
 }
 
+#[test]
+#[tracing_test::traced_test]
+fn reaching_the_cap_logs_one_warning() {
+  let mut code = Vec::new();
+  code.extend(lddw_data_reg());
+  for i in 0..SPILLS {
+    code.push(Insn::stx_dw(10, 1, -((i as i16) + 1) * 8));
+  }
+  code.push(Insn::exit());
+
+  let code_bytes: Vec<u8> = code.iter().flat_map(|i| i.value.to_le_bytes()).collect();
+  let _ = analyze_section(&code_bytes, DATA_LO, DATA_HI);
+
+  logs_assert(|lines| {
+    let warnings = lines
+      .iter()
+      .filter(|line| line.contains("region analysis spill-slot tracking cap reached"))
+      .count();
+    if warnings == 1 {
+      Ok(())
+    } else {
+      Err(format!(
+        "expected exactly one spill-cap warning, got {warnings}"
+      ))
+    }
+  });
+}
+
 #[tokio::test]
 async fn spills_beyond_the_cap_still_run_correctly() {
   // The same shape through the real loader: spill a data pointer 40 times,
