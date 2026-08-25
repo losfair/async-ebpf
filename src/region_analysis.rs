@@ -150,17 +150,68 @@ const R10: usize = 10;
 /// Spill/fill tracking lets the analysis follow pointers that the compiler
 /// round-trips through the stack (e.g. argument spills), which is the dominant
 /// pattern in `-O2` BPF output. Absent register/slot entries are `Uninit` (top).
+/// The spill map is a persistent red-black tree rather than a plain map so
+/// that `State::clone` is O(1) (structural sharing) and every insert is
+/// O(log k). A straight-line function with `n` distinct store offsets would
+/// otherwise cost Θ(n²) time and retained memory: each instruction clones the
+/// whole map and every slot's state keeps its own merged copy. With a
+/// persistent map the retained states share their trees, so the analysis
+/// stays O(n log n) no matter how many offsets a hostile program invents.
+///
+/// Invalidation (an unpinnable stack write) is the same shape of trap at one
+/// remove: it maps *every* value to the same constant `Unknown`, so rewriting
+/// the map per event costs O(k). Instead each entry carries the state's
+/// invalidation epoch at write time, and an entry older than the state's
+/// current epoch reads as `Unknown`. Whole-map invalidation is then a single
+/// epoch bump, O(1), while a spill written after the bump keeps its kind —
+/// exactly what eager rewriting would produce.
+///
+/// The number of distinct spill offsets one state may track is capped at
+/// [`MAX_TRACKED_SLOTS`]. The map is pure precision, never soundness — a slot
+/// the cap refuses reads back as a scalar and falls back to the JIT's
+/// dual-region probe, the same path every untracked slot already takes — and
+/// the cap is what bounds a hostile function that invents distinct store
+/// offsets: time O(n · M · log M) and a retained node pool of O(n · log M)
+/// instead of Θ(n²) time and memory (measured worst case ≈ 0.1 s / 140 MB at
+/// M = 32 for a maximum-size program). Real code — including unoptimized
+/// builds — stays far below it: three measured objects (redis.sock and two
+/// zeroserve variants) peak at 13 distinct offsets per function.
+/// How many distinct `R10`-relative spill offsets one state may track.
+///
+/// See the [`State`] docs for the cost bound and the precision fallback; the
+/// value covers everything measured in real builds (max 13 per function,
+/// including unoptimized ones) with headroom, while keeping a hostile
+/// function's worst case at ~0.1 s / ~140 MB.
+const MAX_TRACKED_SLOTS: usize = 32;
+
 #[derive(Clone, PartialEq, Eq)]
 struct State {
   regs: [RegKind; NUM_REGS],
-  slots: std::collections::BTreeMap<i32, RegKind>,
+  /// Spill slots, keyed by `R10`-relative byte offset. The value is the kind
+  /// stored there together with the state's invalidation epoch at write time;
+  /// an entry is effectively `Unknown` when its epoch predates
+  /// [`State::invalid_epoch`].
+  slots: rpds::RedBlackTreeMap<i32, (u64, RegKind)>,
+  /// Bumped by [`State::invalidate_slots`]; every entry written before the
+  /// current value reads as `Unknown`.
+  invalid_epoch: u64,
 }
 
 impl State {
   fn top() -> State {
     State {
       regs: [RegKind::Uninit; NUM_REGS],
-      slots: std::collections::BTreeMap::new(),
+      slots: rpds::RedBlackTreeMap::new(),
+      invalid_epoch: 0,
+    }
+  }
+
+  /// The kind an entry written at `epoch` with value `kind` currently has.
+  fn effective_kind(&self, epoch: u64, kind: RegKind) -> RegKind {
+    if epoch >= self.invalid_epoch {
+      kind
+    } else {
+      RegKind::Unknown
     }
   }
 
@@ -175,24 +226,50 @@ impl State {
       }
     }
     // Meet slots over the union of keys; an absent slot is Uninit (top).
-    for (&off, &k) in &other.slots {
-      let cur = self.slots.get(&off).copied().unwrap_or(RegKind::Uninit);
-      let merged = cur.meet(k);
-      if merged != cur {
-        self.slots.insert(off, merged);
-        changed = true;
+    if self.slots.is_empty() {
+        // Nothing tracked yet means every key of `other` meets Uninit (top)
+        // into itself, so adopt the incoming map wholesale. The clone is O(1)
+        // under structural sharing, which is what keeps straight-line analysis
+        // linear in the number of distinct spill offsets. The epoch is adopted
+        // with it: the entries' epochs are all consistent with `other`'s
+        // counter, and `self` having no entries means its own (possibly higher)
+        // epoch is irrelevant — it only ever matters for entries, and none
+        // survive.
+        if !other.slots.is_empty() {
+          self.slots = other.slots.clone();
+          self.invalid_epoch = other.invalid_epoch;
+          changed = true;
+        }
+      } else {
+        for (&off, &(other_epoch, other_kind)) in &other.slots {
+          let cur = self
+            .slots
+            .get(&off)
+            .map(|&(e, k)| self.effective_kind(e, k))
+            .unwrap_or(RegKind::Uninit);
+          let merged = cur.meet(other.effective_kind(other_epoch, other_kind));
+          if merged != cur {
+            // Cap the map: a key the cap refuses stays untracked (reads as
+            // Scalar), the same safe fallback as an absent key. Skipping the
+            // insert leaves `changed` false: the state's observable behavior
+            // is unchanged, so the fixpoint terminates as before.
+            if self.slots.contains_key(&off) || self.slots.size() < MAX_TRACKED_SLOTS {
+              self.slots = self.slots.insert(off, (self.invalid_epoch, merged));
+              changed = true;
+            }
+          }
+        }
       }
-    }
     changed
   }
 
-  /// Marks every tracked slot `Unknown` after a store/call that may alias the
-  /// stack at an offset we cannot pin down. Entries are set rather than removed
-  /// so the imprecision survives control-flow joins.
+  /// Marks every tracked slot `Unknown` after a store that may alias the
+  /// stack at an offset we cannot pin down. Lazy: bumping the epoch makes
+  /// every entry written before it read as `Unknown`, so the map itself is
+  /// untouched — O(1) however large it is — and the imprecision still
+  /// survives control-flow joins, because the entries remain present.
   fn invalidate_slots(&mut self) {
-    for v in self.slots.values_mut() {
-      *v = RegKind::Unknown;
-    }
+    self.invalid_epoch += 1;
   }
 
   /// Invalidates tracked R10-relative spill slots overlapped by a stack write.
@@ -208,15 +285,36 @@ impl State {
       return;
     };
 
-    for (&slot_off, value) in self.slots.iter_mut() {
-      let slot_start = slot_off as i32;
-      let Some(slot_end) = slot_start.checked_add(8) else {
-        *value = RegKind::Unknown;
-        continue;
-      };
-      if start < slot_end && slot_start < end {
-        *value = RegKind::Unknown;
-      }
+    // Only slots overlapping [start, start + width) can be affected, and
+    // overlapping slots are contiguous in offset order, so a range scan
+    // replaces a full-map scan: O(log k + overlaps) instead of O(k) per
+    // stack write. A hostile straight-line program of distinct-offset
+    // stores would otherwise still be quadratic, one full scan per store.
+    // The saturating bounds only widen the range at the extremes of i32;
+    // every candidate is still re-checked below.
+    let affected: Vec<i32> = self
+      .slots
+      .range((
+        std::ops::Bound::Included(start.saturating_sub(7)),
+        std::ops::Bound::Included(end.saturating_sub(1)),
+      ))
+      .filter_map(|(&slot_off, _)| {
+        let slot_start = slot_off;
+        let Some(slot_end) = slot_start.checked_add(8) else {
+          return Some(slot_off);
+        };
+        if start < slot_end && slot_start < end {
+          Some(slot_off)
+        } else {
+          None
+        }
+      })
+      .collect();
+    // Stamp the affected entries with the current epoch and `Unknown`, so
+    // they read as invalidated while entries outside the range keep their
+    // kinds.
+    for off in affected {
+      self.slots = self.slots.insert(off, (self.invalid_epoch, RegKind::Unknown));
     }
   }
 }
@@ -817,8 +915,8 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
       // stack buffer after a helper call, which must not poison later pointer
       // arithmetic that uses it as an index.
       s.regs[inst.dst] = if inst.src == R10 {
-        match s.slots.get(&(inst.offset as i32)).copied() {
-          Some(k) if k.is_pointer() => k,
+        match s.slots.get(&(inst.offset as i32)) {
+          Some(&(e, k)) if e >= s.invalid_epoch && k.is_pointer() => k,
           _ => RegKind::Scalar,
         }
       } else {
@@ -853,7 +951,13 @@ fn transfer(in_state: &State, inst: &Inst, lddw_addr: u64, data_lo: u64, data_hi
         };
         if !is_atomic && width == 8 {
           if let Some(start) = stack_access_start(stack_base, inst.offset) {
-            s.slots.insert(start, stored);
+            // Cap the map at MAX_TRACKED_SLOTS distinct offsets: an already
+            // tracked slot always updates in place, a new one only while room
+            // remains. Refused slots stay untracked and read back as scalars —
+            // the same fallback as slots the analysis never saw.
+            if s.slots.contains_key(&start) || s.slots.size() < MAX_TRACKED_SLOTS {
+              s.slots = s.slots.insert(start, (s.invalid_epoch, stored));
+            }
           }
         }
       } else if s.regs[inst.dst] != RegKind::Data {
