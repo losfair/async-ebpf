@@ -413,7 +413,7 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
         }
       }
 
-      Op::Call => check_call(config, &insn, i, num_insns)?,
+      Op::Call => check_call(config, &insn, insns, i)?,
 
       // Nothing structural to check.
       Op::Exit | Op::Alu { .. } | Op::Load { .. } => {}
@@ -480,7 +480,8 @@ fn check_atomic_selector(insn: &Insn, pc: usize) -> Result<(), String> {
 /// Checks one `call` instruction.
 ///
 /// The source field is the call *kind*, not a register.
-fn check_call(config: &Config, insn: &Insn, pc: usize, num_insns: usize) -> Result<(), String> {
+fn check_call(config: &Config, insn: &Insn, insns: &[Insn], pc: usize) -> Result<(), String> {
+  let num_insns = insns.len();
   match insn.src {
     // Helper call: the immediate is an index the embedder must recognise.
     0 => {
@@ -528,6 +529,14 @@ fn check_call(config: &Config, insn: &Insn, pc: usize, num_insns: usize) -> Resu
         return Err(format!(
           "call to local function (at PC {pc}) is out of bounds (target: {target})"
         ));
+      }
+      // Opcode zero at the target means the high half of an `lddw` — or a
+      // stray zero word, which this reports the same way. The jump arm
+      // rejects those targets outright (see `validate`); a call must too, or
+      // the callee would be compiled from the bare zero word at lazy-compile
+      // time, after the load-time boundary has already let it through.
+      if insns[target as usize].opcode == 0 {
+        return Err(format!("call to middle of lddw at PC {pc}"));
       }
       // Stack usage is then computed for the
       // target; see the note in `validate` for why that cannot fail here.
@@ -696,6 +705,27 @@ mod tests {
       insn(opcode::JA, 0, 0, -2, 0), // closed loop in the callee
     ];
     assert_eq!(validate(&config, &program), Ok(()));
+  }
+
+  #[test]
+  fn a_local_call_cannot_target_the_high_half_of_an_lddw() {
+    // A sub-program may end with an unconditional jump in its second-to-last
+    // slot, so the boundary slot can be an `lddw` whose high half is a call
+    // target. The jump arm rejects opcode-0 targets; the call arm must too,
+    // or the callee is compiled from the bare zero word at lazy-compile time
+    // instead of being refused at load.
+    let config = Config::default();
+    let program = [
+      insn(opcode::CALL, 0, 1, 0, 2), // pc 0: call pc 3
+      insn(opcode::JA, 0, 0, 0, 0),   // pc 1: ends the caller's sub-program
+      insn(opcode::LDDW, 2, 0, 0, 0), // pc 2: lddw, high half at pc 3
+      insn(0, 0, 0, 0, 0),            // pc 3: the zero word
+      exit(),                         // pc 4
+    ];
+    assert_eq!(
+      validate(&config, &program).unwrap_err(),
+      "call to middle of lddw at PC 0"
+    );
   }
 
   #[test]

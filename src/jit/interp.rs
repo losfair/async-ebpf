@@ -349,9 +349,16 @@ impl<'a> Interpreter<'a> {
             Source::Imm => insn.imm as i64 as u64,
             Source::Reg => regs[src],
           };
-          // `div`/`mod` carry their signedness in the offset field rather than
-          // in a distinct opcode; every other operation ignores it.
-          regs[dst] = alu_signed(width, op, regs[dst], operand, is_signed_divmod(&insn));
+          // `mov` and its sign-extending forms share an opcode, so `movsx`
+          // carries its source width in the offset field (see `movsx_value`).
+          // `div`/`mod` carry their signedness there the same way; every
+          // other operation ignores it.
+          regs[dst] = if op == AluOp::Mov && source == Source::Reg {
+            movsx_value(width, regs[src], insn.offset)
+              .unwrap_or_else(|| alu_signed(width, op, regs[dst], operand, false))
+          } else {
+            alu_signed(width, op, regs[dst], operand, is_signed_divmod(&insn))
+          };
         }
 
         Op::End(kind) => match end(kind, regs[dst], insn.imm) {
@@ -628,6 +635,26 @@ fn sign_extend(value: u64, width: Width) -> u64 {
 /// signed.
 pub fn is_signed_divmod(insn: &Insn) -> bool {
   insn.offset == 1
+}
+
+/// The RFC 9669 `movsx32`/`movsx64` result, or `None` for a plain `mov`.
+///
+/// `mov` and its sign-extending forms share an opcode; the source width rides
+/// in the *offset field* (8, 16, or, at 64 bits, 32), the same way `div`/`mod`
+/// carry their signedness there. The `Op` decoder cannot express it, so both
+/// JIT backends read the offset in their `Mov`/`Reg` arms — and this
+/// interpreter must match them: the 32-bit forms sign-extend into a 32-bit
+/// result that zero-extends on the register write, and an offset the ISA does
+/// not define falls back to a plain move in both backends.
+fn movsx_value(width: AluWidth, src: u64, source_bits: i16) -> Option<u64> {
+  match (width, source_bits) {
+    (AluWidth::W64, 8) => Some(src as u8 as i8 as i64 as u64),
+    (AluWidth::W64, 16) => Some(src as u16 as i16 as i64 as u64),
+    (AluWidth::W64, 32) => Some(src as u32 as i32 as i64 as u64),
+    (AluWidth::W32, 8) => Some(src as u8 as i8 as i32 as u32 as u64),
+    (AluWidth::W32, 16) => Some(src as u16 as i16 as i32 as u32 as u64),
+    _ => None,
+  }
 }
 
 fn alu_signed(width: AluWidth, op: AluOp, dst: u64, operand: u64, signed: bool) -> u64 {
@@ -929,6 +956,66 @@ mod tests {
       exit(),
     ];
     assert_eq!(r0(&p), 0);
+  }
+
+  // ---- movsx -------------------------------------------------------------
+
+  /// `r0 = movsx64 r1` with the given source width (the offset field).
+  fn movsx64_eval(offset: i16, b: u64) -> u64 {
+    let mut p = Vec::new();
+    p.extend(lddw(1, b));
+    p.push(i(cls::ALU64 | srcbit::REG | alu::MOV, 0, 1, offset, 0));
+    p.push(exit());
+    r0(&p)
+  }
+
+  /// `r0 = movsx32 r1` with the given source width (the offset field).
+  fn movsx32_eval(offset: i16, b: u64) -> u64 {
+    let mut p = Vec::new();
+    p.extend(lddw(1, b));
+    p.push(i(cls::ALU | srcbit::REG | alu::MOV, 0, 1, offset, 0));
+    p.push(exit());
+    r0(&p)
+  }
+
+  #[test]
+  fn movsx64_sign_extends_from_the_offset_field() {
+    // RFC 9669: the offset field of `mov64 dst, src` names the source width
+    // being sign-extended from. offset 0 is the plain move.
+    let b = 0x0123_4567_89ab_cdefu64;
+    assert_eq!(movsx64_eval(0, b), b);
+    assert_eq!(movsx64_eval(8, b), 0xffff_ffff_ffff_ffef); // 0xef sign-extends
+    assert_eq!(movsx64_eval(16, b), 0xffff_ffff_ffff_cdef); // 0xcdef sign-extends
+    assert_eq!(movsx64_eval(32, b), 0xffff_ffff_89ab_cdef); // 0x89ab_cdef sign-extends
+                                                            // A positive source keeps the sign bits clear.
+    assert_eq!(movsx64_eval(8, 0x7f), 0x7f);
+    assert_eq!(movsx64_eval(16, 0x7fff), 0x7fff);
+    assert_eq!(movsx64_eval(32, 0x7fff_ffff), 0x7fff_ffff);
+  }
+
+  #[test]
+  fn movsx32_sign_extends_into_a_zero_extended_result() {
+    // The 32-bit form sign-extends into 32 bits, and the register write
+    // zero-extends: the upper half is cleared even when the source has high
+    // bits set, which is the corner a backend gets wrong by extending to 64.
+    let b = 0x0123_4567_89ab_cdefu64;
+    assert_eq!(movsx32_eval(0, b), 0x89ab_cdef); // plain 32-bit move
+    assert_eq!(movsx32_eval(8, b), 0xffff_ffef); // 0xef sign-extends to 32
+    assert_eq!(movsx32_eval(16, b), 0xffff_cdef); // 0xcdef sign-extends to 32
+    assert_eq!(movsx32_eval(8, 0x7f), 0x7f);
+    assert_eq!(movsx32_eval(16, 0x7fff), 0x7fff);
+  }
+
+  #[test]
+  fn movsx_with_an_undefined_source_width_is_a_plain_move() {
+    // Only offsets {0, 8, 16} (32-bit) and {0, 8, 16, 32} (64-bit) are
+    // defined. An unvalidated program can still carry another value, and both
+    // backends fall back to a plain move; the oracle must match them.
+    assert_eq!(
+      movsx64_eval(24, 0x0123_4567_89ab_cdef),
+      0x0123_4567_89ab_cdef
+    );
+    assert_eq!(movsx32_eval(32, 0x0123_4567_89ab_cdef), 0x89ab_cdef);
   }
 
   // ---- shifts ------------------------------------------------------------
