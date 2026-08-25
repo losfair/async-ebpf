@@ -28,7 +28,7 @@ const HELPER_SYM: &str = "h";
 /// [`DATA_SYM`].
 #[derive(Clone, Copy)]
 pub(crate) struct Insn {
-  value: u64,
+  pub(crate) value: u64,
   data_reloc: bool,
   helper_reloc: bool,
 }
@@ -397,7 +397,7 @@ fn align(out: &mut Vec<u8>, alignment: usize) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_section_header(
+pub(crate) fn write_section_header(
   out: &mut Vec<u8>,
   name: u32,
   ty: u32,
@@ -421,7 +421,7 @@ fn write_section_header(
   out.extend_from_slice(&entsize.to_le_bytes());
 }
 
-fn write_elf_header(header: &mut [u8], shoff: u64, shnum: u16, shstrndx: u16) {
+pub(crate) fn write_elf_header(header: &mut [u8], shoff: u64, shnum: u16, shstrndx: u16) {
   const ET_REL: u16 = 1;
   const EM_BPF: u16 = 247;
 

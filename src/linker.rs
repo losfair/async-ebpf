@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use elf::{endian::LittleEndian, ElfBytes};
+use elf::{endian::LittleEndian, relocation::Rel, ElfBytes};
 
 use crate::error::LinkerError;
 
@@ -48,6 +48,36 @@ impl WritableDataPlan {
       .find(|section| section.index == section_index)
       .map(|section| section.backing_offset)
   }
+}
+
+/// Guest base address for the section a relocated symbol points into: the
+/// packed writable suffix for an allocated writable section, the immutable
+/// ELF image otherwise.
+///
+/// The section's file offset is a raw `u64` from the input, validated only as
+/// far as the header table that carried it - nothing else reads the section's
+/// bytes. The add is checked because a wild offset is a malformed image, not
+/// a host panic: `immutable_vbase` is always positive, so `sh_offset` values
+/// close to `u64::MAX` overflow a plain `+` in overflow-checked builds.
+fn symbol_section_base(
+  writable_plan: &WritableDataPlan,
+  writable_vbase: usize,
+  immutable_vbase: usize,
+  section_index: usize,
+  section_file_offset: u64,
+  reloc: &Rel,
+) -> Result<u64, LinkerError> {
+  if let Some(offset) = writable_plan.backing_offset(section_index) {
+    return Ok(writable_vbase as u64 + offset as u64);
+  }
+  (immutable_vbase as u64)
+    .checked_add(section_file_offset)
+    .ok_or_else(|| {
+      LinkerError::Reloc(
+        "relocation: symbol's section file offset overflows the guest address space".to_string(),
+        reloc.clone(),
+      )
+    })
 }
 
 pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, LinkerError> {
@@ -112,6 +142,13 @@ pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, Linke
       size: section_size,
       backing_offset,
     });
+    // Capped per header, like code sections: the overlap scan above is
+    // quadratic in the header count, and nothing else bounds it.
+    if sections.len() > MAX_WRITABLE_SECTIONS {
+      return Err(LinkerError::InvalidElf(
+        "too many writable sections in one object",
+      ));
+    }
   }
 
   Ok(WritableDataPlan { sections, size })
@@ -128,10 +165,16 @@ pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, Linke
 /// them to describe disjoint bytes, so N headers pointing at one code blob
 /// multiply the analysis by N for ~67 bytes apiece.
 ///
+/// The section counts are capped per *header*, not per unique section name.
+/// Entrypoints are deduplicated by name downstream, but the overlap scans here
+/// are quadratic in the number of headers, so a flood of same-named sections
+/// has to trip the same ceiling as distinct ones.
+///
 /// The numbers are far above anything a compiler emits - LLVM produces one code
 /// section per function at most - and are about refusing absurd inputs, not
 /// about being tight.
 const MAX_CODE_SECTIONS: usize = 1024;
+const MAX_WRITABLE_SECTIONS: usize = 1024;
 const MAX_TOTAL_CODE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RELOCATIONS: usize = 1024 * 1024;
 #[cfg(test)]
@@ -241,7 +284,10 @@ pub fn link_elf(
       (immutable_vbase + cs.sh_offset as usize, cs.sh_size as usize),
     );
     code_section_indexes.insert(cs_index);
-    if code_sections.len() > MAX_CODE_SECTIONS {
+    // The ceiling counts headers, not unique names: `code_sections` dedupes
+    // by name, but the overlap scan above is quadratic in the number of
+    // headers, so same-named sections must trip the same limit.
+    if code_section_indexes.len() > MAX_CODE_SECTIONS {
       return Err(LinkerError::InvalidElf(
         "too many code sections in one object",
       ));
@@ -314,10 +360,14 @@ pub fn link_elf(
             .try_into()
             .unwrap(),
         );
-        let section_base = writable_plan
-          .backing_offset(sym.st_shndx as usize)
-          .map(|offset| writable_vbase as u64 + offset as u64)
-          .unwrap_or_else(|| immutable_vbase as u64 + data_section.sh_offset);
+        let section_base = symbol_section_base(
+          writable_plan,
+          writable_vbase,
+          immutable_vbase,
+          sym.st_shndx as usize,
+          data_section.sh_offset,
+          &reloc,
+        )?;
         let value = section_base.wrapping_add(sym.st_value).wrapping_add(addend);
         data_rewrites.push((
           target_section.sh_offset as usize + reloc.r_offset as usize,
@@ -409,10 +459,14 @@ pub fn link_elf(
           ) as u64)
             << 32);
 
-        let section_base = writable_plan
-          .backing_offset(sym.st_shndx as usize)
-          .map(|offset| writable_vbase as u64 + offset as u64)
-          .unwrap_or_else(|| immutable_vbase as u64 + data_section.sh_offset);
+        let section_base = symbol_section_base(
+          writable_plan,
+          writable_vbase,
+          immutable_vbase,
+          sym.st_shndx as usize,
+          data_section.sh_offset,
+          &reloc,
+        )?;
         let imm = section_base.wrapping_add(sym.st_value).wrapping_add(oldimm);
 
         insn.imm = imm as u32 as i32;
