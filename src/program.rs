@@ -360,6 +360,67 @@ extern "C" {
   ) -> u64;
 }
 
+// Darwin records SS_ONSTACK in kernel thread state until sigreturn. An owned
+// guest fault suspends out of the signal handler and deliberately never runs
+// sigreturn, so the runtime dispatcher itself cannot use SA_ONSTACK there.
+// Foreign faults still owe the saved handler its requested stack; these tiny
+// trampolines make that switch explicitly without changing Darwin's state.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+std::arch::global_asm!(
+  r#"
+    .p2align 4
+    .globl _async_ebpf_call_on_altstack
+    .private_extern _async_ebpf_call_on_altstack
+_async_ebpf_call_on_altstack:
+    push r15
+    mov r15, rsp
+    mov rax, rsi
+    mov rsp, rdi
+    and rsp, -16
+    mov edi, edx
+    mov rsi, rcx
+    mov rdx, r8
+    call rax
+    mov rsp, r15
+    pop r15
+    ret
+"#,
+);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+std::arch::global_asm!(
+  r#"
+    .p2align 2
+    .globl _async_ebpf_call_on_altstack
+    .private_extern _async_ebpf_call_on_altstack
+_async_ebpf_call_on_altstack:
+    bti c
+    stp x19, x30, [sp, #-16]!
+    mov x19, sp
+    mov x16, x1
+    and x9, x0, #0xfffffffffffffff0
+    mov sp, x9
+    mov w0, w2
+    mov x1, x3
+    mov x2, x4
+    blr x16
+    mov sp, x19
+    ldp x19, x30, [sp], #16
+    ret
+"#,
+);
+
+#[cfg(target_os = "macos")]
+extern "C" {
+  fn async_ebpf_call_on_altstack(
+    stack_top: usize,
+    handler: usize,
+    signum: i32,
+    siginfo: *mut libc::siginfo_t,
+    uctx: *mut libc::ucontext_t,
+  );
+}
+
 /// Per-invocation storage for helper state during a program run.
 pub struct InvokeScope {
   data: HashMap<TypeId, Box<dyn Any + Send>>,
@@ -1481,8 +1542,14 @@ impl GlobalEnv {
           // converted into an abort. See `chain_to_previous_fault_handler`.
           // If that handler requested an alternate signal stack, enter this
           // dispatcher on it too: the saved handler is invoked directly and
-          // cannot ask the kernel to switch stacks a second time.
-          act.sa_flags |= prev.sa_flags & libc::SA_ONSTACK;
+          // cannot ask the kernel to switch stacks a second time. Darwin is
+          // the exception: it keeps SS_ONSTACK set until sigreturn, but an
+          // owned guest fault suspends out of this handler and never returns.
+          // `invoke_previous_fault_handler` switches stacks explicitly there.
+          #[cfg(not(target_os = "macos"))]
+          {
+            act.sa_flags |= prev.sa_flags & libc::SA_ONSTACK;
+          }
           if sig == libc::SIGSEGV {
             let _ = PREV_SIGSEGV.set(prev);
           } else {
@@ -3388,6 +3455,73 @@ static PREV_SIGBUS: OnceLock<libc::sigaction> = OnceLock::new();
 static PREV_SIGSEGV_CONSUMED: AtomicBool = AtomicBool::new(false);
 static PREV_SIGBUS_CONSUMED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+unsafe fn current_stack_pointer() -> usize {
+  let stack_pointer;
+  std::arch::asm!(
+    "mov {}, rsp",
+    out(reg) stack_pointer,
+    options(nomem, nostack, preserves_flags)
+  );
+  stack_pointer
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn current_stack_pointer() -> usize {
+  let stack_pointer;
+  std::arch::asm!(
+    "mov {}, sp",
+    out(reg) stack_pointer,
+    options(nomem, nostack, preserves_flags)
+  );
+  stack_pointer
+}
+
+/// Invokes a saved fault disposition with its C signature and, on Darwin, its
+/// requested alternate stack.
+///
+/// Darwin's `sigaltstack` state uses a persistent kernel flag rather than the
+/// current stack pointer. The runtime cannot install its dispatcher with
+/// `SA_ONSTACK`: an owned guest fault suspends back to the host and abandons
+/// the signal frame, so no sigreturn would clear that flag. Instead, foreign
+/// handlers are switched to the configured stack explicitly. A nested fault
+/// already within that range stays at its current stack pointer, matching the
+/// kernel's normal nested-delivery behavior.
+unsafe fn invoke_previous_fault_handler(
+  prev: &libc::sigaction,
+  signum: i32,
+  siginfo: *mut libc::siginfo_t,
+  uctx: *mut libc::ucontext_t,
+) {
+  #[cfg(target_os = "macos")]
+  if prev.sa_flags & libc::SA_ONSTACK != 0 {
+    let mut altstack: libc::stack_t = std::mem::zeroed();
+    if libc::sigaltstack(std::ptr::null(), &mut altstack) != 0 {
+      libc::abort();
+    }
+    if altstack.ss_flags & libc::SS_DISABLE == 0 {
+      let bottom = altstack.ss_sp as usize;
+      let Some(top) = bottom.checked_add(altstack.ss_size) else {
+        libc::abort();
+      };
+      let stack_pointer = current_stack_pointer();
+      if stack_pointer < bottom || stack_pointer >= top {
+        async_ebpf_call_on_altstack(top, prev.sa_sigaction, signum, siginfo, uctx);
+        return;
+      }
+    }
+  }
+
+  if prev.sa_flags & libc::SA_SIGINFO != 0 {
+    let handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) =
+      std::mem::transmute(prev.sa_sigaction);
+    handler(signum, siginfo, uctx as *mut libc::c_void);
+  } else {
+    let handler: extern "C" fn(i32) = std::mem::transmute(prev.sa_sigaction);
+    handler(signum);
+  }
+}
+
 /// Hands a fault the runtime does not own to whoever had the disposition
 /// before this crate installed its own, then returns so the faulting
 /// instruction re-executes — under the previous handler, which is still
@@ -3403,8 +3537,9 @@ static PREV_SIGBUS_CONSUMED: AtomicBool = AtomicBool::new(false);
 /// — through this one first, which is exactly the containment the runtime
 /// promises. Before the call, its saved `sa_mask` and `SA_NODEFER` policy are
 /// applied exactly as the kernel would have applied them. `GlobalEnv::new`
-/// also propagates `SA_ONSTACK` onto this dispatcher, so the direct call is
-/// already running on the previous handler's alternate stack.
+/// also preserves `SA_ONSTACK`: the dispatcher inherits it on Linux/OpenBSD,
+/// while Darwin uses an explicit stack switch so an abandoned guest-fault
+/// signal frame cannot leave the thread permanently marked `SS_ONSTACK`.
 ///
 /// A default disposition is not a function to call: it is restored and the
 /// faulting instruction re-executes under it. An ignored user-generated signal
@@ -3460,14 +3595,7 @@ unsafe fn chain_to_previous_fault_handler(
     }
   }
 
-  if prev.sa_flags & libc::SA_SIGINFO != 0 {
-    let handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) =
-      std::mem::transmute(prev.sa_sigaction);
-    handler(signum, siginfo, uctx as *mut libc::c_void);
-  } else {
-    let handler: extern "C" fn(i32) = std::mem::transmute(prev.sa_sigaction);
-    handler(signum);
-  }
+  invoke_previous_fault_handler(prev, signum, siginfo, uctx);
   if libc::pthread_sigmask(libc::SIG_SETMASK, &dispatcher_mask, std::ptr::null_mut()) != 0 {
     libc::abort();
   }
