@@ -16,5 +16,6 @@ mod preemption;
 mod raw_elf;
 mod region_analysis_complexity;
 mod runtime_state;
+mod signal_safety;
 mod spill_tracking_cap;
 mod stores;

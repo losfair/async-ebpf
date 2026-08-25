@@ -8,6 +8,7 @@ const ET_REL: u16 = 1;
 const EM_BPF: u16 = 247;
 
 const SHT_PROGBITS: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
 const SHT_REL: u32 = 9;
 const SHF_ALLOC: u64 = 1 << 1;
 const SHF_WRITE: u64 = 1;
@@ -175,8 +176,81 @@ pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, Linke
 /// about being tight.
 const MAX_CODE_SECTIONS: usize = 1024;
 const MAX_WRITABLE_SECTIONS: usize = 1024;
+const MAX_REL_SECTIONS: usize = 1024;
 const MAX_TOTAL_CODE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RELOCATIONS: usize = 1024 * 1024;
+
+/// Ceilings on the string-table index built by [`StrTabIndex`].
+///
+/// The NUL ceiling bounds the memory the index may claim (a hostile table of
+/// single-byte strings would otherwise index at ~8 bytes per byte of input).
+/// The length ceiling bounds what a resolved name costs downstream: section
+/// names become `HashMap` keys and symbol names are hashed against the helper
+/// table, so one giant name replayed against every relocation would multiply
+/// hash cost the same way the scans did. No real toolchain emits either.
+const MAX_STRINGS: usize = 1 << 20;
+const MAX_STRING_LEN: usize = 4096;
+
+/// One-pass index of an ELF string table, replacing the `elf` crate's
+/// `StringTable` lookups for hostile objects.
+///
+/// Every `StringTable::get` is a fresh linear scan to the next NUL, so an
+/// object that replays one giant table against every section header or
+/// relocation costs Θ(lookups · table) — the audit measured days of CPU from
+/// a ~2 GiB ELF (uncapped SHT_REL header count × linear shstrtab scans).
+/// Indexing the NUL positions once turns each lookup into a binary search;
+/// building the index is a single O(table) pass, the same class of work the
+/// loader already does on the input.
+struct StrTabIndex<'data> {
+  raw: &'data [u8],
+  /// Every NUL position, ascending. A lookup for `offset` scans to the next
+  /// NUL in the crate's version; this is a binary search for it. Crucially
+  /// the search must start from *any* offset, not just string starts: ELF
+  /// tools share string suffixes ("test" inside ".reltest"), so names
+  /// routinely point into the middle of another string.
+  nuls: Vec<usize>,
+}
+
+impl<'data> StrTabIndex<'data> {
+  /// Records every NUL position in `raw`, in one pass. An unterminated tail
+  /// is fine to leave unindexed: nothing in it can name anything.
+  fn index(raw: &'data [u8]) -> Result<Self, LinkerError> {
+    let mut nuls = Vec::new();
+    let mut offset = 0usize;
+    while offset < raw.len() {
+      let Some(nul) = raw[offset..].iter().position(|&b| b == 0) else {
+        break;
+      };
+      // Bounds what a resolved name costs downstream: section names become
+      // `HashMap` keys and symbol names are hashed against the helper table,
+      // so one giant name replayed against every relocation would multiply
+      // hash cost the way the scans did. No real toolchain emits these.
+      if nul > MAX_STRING_LEN {
+        return Err(LinkerError::InvalidElf(
+          "string table entry exceeds MAX_STRING_LEN",
+        ));
+      }
+      offset += nul + 1;
+      nuls.push(offset - 1);
+      if nuls.len() > MAX_STRINGS {
+        return Err(LinkerError::InvalidElf("too many strings in one object"));
+      }
+    }
+    Ok(Self { raw, nuls })
+  }
+
+  /// Resolves `offset` the way `StringTable::get` would, in O(log strings).
+  fn get(&self, offset: usize) -> Result<&'data str, LinkerError> {
+    let end = *self
+      .nuls
+      .get(self.nuls.partition_point(|&nul| nul < offset))
+      .ok_or(LinkerError::InvalidElf(
+        "string table offset is not inside a string",
+      ))?;
+    std::str::from_utf8(&self.raw[offset..end])
+      .map_err(|_| LinkerError::InvalidElf("string table entry is not UTF-8"))
+  }
+}
 #[cfg(test)]
 const EBPF_OP_EXIT: u8 = 0x95;
 #[cfg(test)]
@@ -231,13 +305,32 @@ pub fn link_elf(
     return Err(LinkerError::InvalidElf("invalid ELF header"));
   }
 
-  let (Some(sht), Some(sht_strtab)) = elf.section_headers_with_strtab()? else {
+  let (Some(sht), Some(_)) = elf.section_headers_with_strtab()? else {
     return Err(LinkerError::InvalidElf("missing section headers"));
   };
 
-  let Some(symtab) = elf.symbol_table()? else {
+  // The crate's StringTable hides its bytes, so resolve the same index it
+  // does (e_shstrndx, or section 0's sh_link under SHN_XINDEX) and index the
+  // raw section ourselves.
+  let shstrndx = if elf.ehdr.e_shstrndx == elf::abi::SHN_XINDEX {
+    sht.get(0)?.sh_link as usize
+  } else {
+    elf.ehdr.e_shstrndx as usize
+  };
+  let shstrtab_raw = elf.section_data(&sht.get(shstrndx)?)?.0;
+  let shstrtab = StrTabIndex::index(shstrtab_raw)?;
+
+  let Some((symtab, _)) = elf.symbol_table()? else {
     return Err(LinkerError::InvalidElf("missing symbol table"));
   };
+  // The crate resolves the symbol-name table as the symtab section's sh_link
+  // target; index those same bytes so per-relocation name lookups are O(1).
+  let symtab_shdr = sht
+    .iter()
+    .find(|shdr| shdr.sh_type == SHT_SYMTAB)
+    .ok_or(LinkerError::InvalidElf("missing symbol table"))?;
+  let sym_strtab_raw = elf.section_data(&sht.get(symtab_shdr.sh_link as usize)?)?.0;
+  let sym_strtab = StrTabIndex::index(sym_strtab_raw)?;
 
   let mut code_sections: HashMap<String, (usize, usize)> = HashMap::new();
   let mut code_section_indexes: HashSet<usize> = HashSet::new();
@@ -255,7 +348,7 @@ pub fn link_elf(
       continue;
     }
 
-    let Ok(cs_name) = sht_strtab.get(cs.sh_name as usize) else {
+    let Ok(cs_name) = shstrtab.get(cs.sh_name as usize) else {
       continue;
     };
 
@@ -297,6 +390,7 @@ pub fn link_elf(
   let mut insn_rewrites: Vec<(usize, u64)> = vec![];
   let mut data_rewrites: Vec<(usize, u64)> = vec![];
   let mut relocation_count = 0usize;
+  let mut reloc_section_count = 0usize;
   // Relocation sections are not required to describe distinct bytes either, so
   // one valid relocation blob can be replayed against the same target by any
   // number of SHT_REL headers.
@@ -319,8 +413,17 @@ pub fn link_elf(
         "more than one relocation section targets the same section",
       ));
     }
+    // Capped per header like the other section classes: `MAX_RELOCATIONS`
+    // counts individual relocations, so a flood of empty SHT_REL sections
+    // slips past it, and each one costs the loop body below.
+    reloc_section_count += 1;
+    if reloc_section_count > MAX_REL_SECTIONS {
+      return Err(LinkerError::InvalidElf(
+        "too many relocation sections in one object",
+      ));
+    }
 
-    let target_section_name = sht_strtab
+    let target_section_name = shstrtab
       .get(target_section.sh_name as usize)
       .unwrap_or_default();
     let (target_section_data, _) = elf.section_data(&target_section)?;
@@ -341,8 +444,8 @@ pub fn link_elf(
         return Err(LinkerError::InvalidElf("relocation: invalid offset"));
       }
 
-      let sym = symtab.0.get(reloc.r_sym as usize)?;
-      let sym_name = symtab.1.get(sym.st_name as usize)?;
+      let sym = symtab.get(reloc.r_sym as usize)?;
+      let sym_name = sym_strtab.get(sym.st_name as usize)?;
 
       if !target_is_code {
         if reloc.r_type != R_BPF_64_ABS64 {

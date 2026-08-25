@@ -143,3 +143,59 @@ async fn unpinnable_stores_invalidate_in_constant_time() {
      invalidation-epoch fix in region_analysis.rs"
   );
 }
+
+/// The "ladder" CFG from the liveness-fixpoint audit finding: `ja +1; ja +1;
+/// ja -2` repeated — an acyclic chain whose every path crosses ~n/3 backward
+/// edges, ending in a register use (`add64 r0, r6`) and `exit`, so every live
+/// bit has to cross every backward edge to reach the entry.
+///
+/// [`function_live_in`](crate::region_analysis) used to compute backward
+/// liveness with an all-slots fixpoint sweep: one pass per backward edge on a
+/// path, ~n/3 passes over all n slots, Θ(n²) — measured ~17 s (release) at
+/// the maximum program size, inside the non-preemptible load path. The
+/// fixpoint is now worklist-driven (only predecessors of changed slots are
+/// re-evaluated), so the same shape costs O(bits · edges). This test runs the
+/// hostile shape end to end and bounds the wall time; the budget is ~50× the
+/// measured time of the fixed code, while the sweep misses it by ~3×.
+#[tokio::test]
+async fn ladder_cfg_live_in_analysis_is_linear() {
+  let budget = if cfg!(debug_assertions) {
+    Duration::from_secs(15)
+  } else {
+    Duration::from_secs(5)
+  };
+
+  // 65,534 = 3 × 21,844 triples + `add64 r0, r6` + `exit`; 65,536 is refused,
+  // so this is the legal maximum and the shape that maximizes the Θ(n²) cost.
+  let n = 65_534;
+  let triples = (n - 2) / 3;
+  let mut code = Vec::with_capacity(n);
+  for _ in 0..triples {
+    code.push(Insn::raw(0x05, 0, 0, 1, 0)); // ja +1
+    code.push(Insn::raw(0x05, 0, 0, 1, 0)); // ja +1
+    code.push(Insn::raw(0x05, 0, 0, -2, 0)); // ja -2, target pc + 1
+  }
+  // Chain from the last triple into the register use.
+  for _ in code.len()..n - 2 {
+    code.push(Insn::raw(0x05, 0, 0, 1, 0));
+  }
+  code.push(Insn::raw(0x0f, 0, 6, 0, 0)); // add64 r0, r6 — makes R6 live-in
+  code.push(Insn::exit());
+
+  let start = Instant::now();
+  // The load (where the pre-fix code burned ~17 s) and the run of the whole
+  // chain must both succeed — a fast rejection would pass without timing the
+  // analysis.
+  let result = run_raw(&code, &[], &[], false).await;
+  let elapsed = start.elapsed();
+
+  assert!(
+    result.is_ok(),
+    "ladder program must load and run; got {result:?}"
+  );
+  assert!(
+    elapsed < budget,
+    "liveness analysis of the {n}-slot ladder took {elapsed:?} (budget {budget:?}); \
+     the fixpoint must be O(bits · edges), not O(n²) — see function_live_in"
+  );
+}

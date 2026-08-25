@@ -803,34 +803,50 @@ pub(crate) fn function_live_in(
     }
   }
 
-  // Backward liveness to a fixpoint. Reverse instruction order converges in a
-  // couple of passes for the reducible CFGs the loader accepts.
-  let mut live = vec![0 as RegMask; num_slots];
-  loop {
-    let mut changed = false;
-    for pc in (start_pc..end_pc).rev() {
-      if !reachable[pc] {
-        continue;
-      }
-      let inst = decode(&code[pc * 8..pc * 8 + 8]);
-      let mut live_out = 0;
-      for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
-        live_out |= live[succ];
-      }
-      let callee = if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
-        callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize)
-      } else {
-        0
-      };
-      let (uses, defs) = uses_and_defs(&inst, callee);
-      let next = uses | (live_out & !defs);
-      if next != live[pc] {
-        live[pc] = next;
-        changed = true;
-      }
+  // Backward liveness to a fixpoint, worklist-driven. The all-slots sweep
+  // needed one pass per backward edge on a path: a hostile acyclic "ladder"
+  // CFG (`ja +1; ja +1; ja -2` repeated) forces ~n/3 passes over all n slots,
+  // Θ(n²) — measured ~17 s at the 65535-instruction maximum, inside the
+  // non-preemptible load path. Re-processing only predecessors of a changed
+  // slot makes every register bit traverse every edge at most once (a
+  // `RegMask` has ten signature bits, so a slot can change at most ten
+  // times): O(bits · edges), with the same least fixed point the sweep
+  // computed. The unit test `worklist_live_in_is_bit_identical_to_the_sweep`
+  // pins the two to agree.
+  let span = end_pc - start_pc;
+  let mut edges = vec![Vec::new(); span];
+  let mut predecessors = vec![Vec::new(); span];
+  for pc in start_pc..end_pc {
+    if !reachable[pc] {
+      continue;
     }
-    if !changed {
-      break;
+    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+      edges[pc - start_pc].push(succ);
+      predecessors[succ - start_pc].push(pc);
+    }
+  }
+  let mut live = vec![0 as RegMask; num_slots];
+  // Seeded in program order so a LIFO worklist starts at the last slot and
+  // forward edges converge on the first visit, like the old reverse sweep; a
+  // change re-queues only the predecessors it can affect.
+  let mut work: Vec<usize> = (start_pc..end_pc).filter(|&pc| reachable[pc]).collect();
+  while let Some(pc) = work.pop() {
+    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    let mut live_out = 0;
+    for &succ in &edges[pc - start_pc] {
+      live_out |= live[succ];
+    }
+    let callee = if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
+      callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize)
+    } else {
+      0
+    };
+    let (uses, defs) = uses_and_defs(&inst, callee);
+    let next = uses | (live_out & !defs);
+    if next != live[pc] {
+      live[pc] = next;
+      work.extend_from_slice(&predecessors[pc - start_pc]);
     }
   }
 
@@ -2166,6 +2182,126 @@ mod tests {
       slot(EBPF_OP_EXIT, 0, 0, 0, 0), // callee, reported as reading r7
     ]);
     assert_eq!(function_live_in(&code, 0, 2, &|_| 1 << 7), 1 << 7);
+  }
+
+  /// The all-slots fixpoint sweep [`function_live_in`] used before the
+  /// worklist, kept verbatim so the two can be proven to agree bit for bit.
+  fn sweep_live_in(
+    code: &[u8],
+    start_pc: usize,
+    end_pc: usize,
+    callee_live_in: &dyn Fn(usize) -> RegMask,
+  ) -> RegMask {
+    let num_slots = code.len() / 8;
+    if start_pc >= end_pc || end_pc > num_slots {
+      return ALL_SIGNATURE_REGS;
+    }
+    let mut reachable = vec![false; num_slots];
+    let mut pending = vec![start_pc];
+    reachable[start_pc] = true;
+    while let Some(pc) = pending.pop() {
+      let inst = decode(&code[pc * 8..pc * 8 + 8]);
+      for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+        if !reachable[succ] {
+          reachable[succ] = true;
+          pending.push(succ);
+        }
+      }
+    }
+    let mut live = vec![0 as RegMask; num_slots];
+    loop {
+      let mut changed = false;
+      for pc in (start_pc..end_pc).rev() {
+        if !reachable[pc] {
+          continue;
+        }
+        let inst = decode(&code[pc * 8..pc * 8 + 8]);
+        let mut live_out = 0;
+        for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+          live_out |= live[succ];
+        }
+        let callee = if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
+          callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize)
+        } else {
+          0
+        };
+        let (uses, defs) = uses_and_defs(&inst, callee);
+        let next = uses | (live_out & !defs);
+        if next != live[pc] {
+          live[pc] = next;
+          changed = true;
+        }
+      }
+      if !changed {
+        break;
+      }
+    }
+    live[start_pc]
+  }
+
+  #[test]
+  fn worklist_live_in_is_bit_identical_to_the_sweep() {
+    // The masks are precision-only inputs to per-signature specialization, so
+    // a single bit of difference would change which variants the loader
+    // builds. Exercise the hostile ladder shape the sweep was quadratic on,
+    // plus a deterministic spread of random fragments (any bytes are safe:
+    // decode, successors and uses_and_defs are total).
+    fn ladder(n: usize) -> Vec<u8> {
+      let mut code = Vec::with_capacity((n + 2) * 8);
+      let mut pc = 0;
+      while pc + 3 <= n {
+        code.extend_from_slice(&slot(EBPF_OP_JA, 0, 0, 1, 0)); // ja +1
+        code.extend_from_slice(&slot(EBPF_OP_JA, 0, 0, 1, 0)); // ja +1
+        code.extend_from_slice(&slot(EBPF_OP_JA, 0, 0, -2, 0)); // ja -2
+        pc += 3;
+      }
+      while pc < n {
+        code.extend_from_slice(&slot(EBPF_OP_JA, 0, 0, 1, 0));
+        pc += 1;
+      }
+      // A register use after the ladder makes every live bit cross every
+      // backward edge on the way to the entry. Register form (`| EBPF_SRC_REG`),
+      // so the source nibble is the read register.
+      code.extend_from_slice(&slot(
+        EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_ADD,
+        0,
+        6,
+        0,
+        0,
+      ));
+      code.extend_from_slice(&slot(EBPF_OP_EXIT, 0, 0, 0, 0));
+      code
+    }
+
+    for n in [2usize, 3, 7, 64, 1000, 4096] {
+      let code = ladder(n);
+      assert_eq!(
+        function_live_in(&code, 0, code.len() / 8, &|_| 0),
+        sweep_live_in(&code, 0, code.len() / 8, &|_| 0),
+        "worklist diverged from the sweep on the {n}-slot ladder"
+      );
+    }
+
+    // A small deterministic PRNG so the spread is identical on every host.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next_u8 = move || {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      (state >> 32) as u8
+    };
+    for _ in 0..1000 {
+      let n = (next_u8() as usize % 60) + 1;
+      let mut code = Vec::with_capacity(n * 8);
+      for _ in 0..n * 8 {
+        code.push(next_u8());
+      }
+      assert_eq!(
+        function_live_in(&code, 0, n, &|_| 0),
+        sweep_live_in(&code, 0, n, &|_| 0),
+        "worklist diverged from the sweep on a random {n}-slot fragment"
+      );
+    }
   }
 
   #[test]

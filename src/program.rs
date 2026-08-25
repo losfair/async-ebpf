@@ -1137,7 +1137,14 @@ struct PreemptionStateSignal {
 
 thread_local! {
   static RUST_TID: ThreadId = std::thread::current().id();
-  static SIGUSR1_COUNTER: Cell< u64> = Cell::new(0);
+  static SIGUSR1_COUNTER: Cell<u64> = Cell::new(0);
+  /// The signal mask in effect before the signal that suspended the guest, so
+  /// the run loop can restore exactly what the embedder had. The kernel
+  /// blocks the handler's own signals (via `sa_mask`) for the duration of the
+  /// handler, and on the fault path the coroutine is dropped without being
+  /// resumed — so the `rt_sigreturn` that would restore the pre-signal mask
+  /// never runs, and the block would otherwise leak onto the thread forever.
+  static PRE_SIGNAL_MASK: Cell<Option<libc::sigset_t>> = Cell::new(None);
   static ACTIVE_JIT_CODE_ZONE: ActiveJitCodeZone = ActiveJitCodeZone::default();
   static EXEC_CONTEXT_POOL: RefCell<Vec<ExecContext>> = Default::default();
   static PENDING_ASYNC_TASK: RefCell<Option<PendingAsyncTask>> = RefCell::new(None);
@@ -1420,7 +1427,7 @@ impl GlobalEnv {
   /// that includes the SIGSEGV handler Rust's standard library installs to
   /// report thread stack overflow, so a host stack overflow reports as a plain
   /// segmentation fault while this is installed. The previous fault
-  /// dispositions are kept and restored for any fault this crate determines
+  /// dispositions are kept and invoked for any fault this crate determines
   /// is not its own, so another component's handler still sees those - but it
   /// does not see them *first*, and a component that needs to run before this
   /// one cannot be accommodated.
@@ -2250,6 +2257,19 @@ impl Program {
       ));
     }
 
+    // A blocked SIGUSR1 is exactly as unpreemptible as a stopped watcher: the
+    // watcher's signals pend instead of interrupting, and a guest spin then
+    // holds the OS thread with no await point at which the caller could time
+    // it out. Refuse loudly rather than wedging the thread — a run thread
+    // that inherits a blocked SIGUSR1 from the embedder or a library would
+    // otherwise fail silently (the preemption counter never moves, and the
+    // run-budget fast path never trips because `resume` never returns).
+    if !sigusr1_is_unblocked() {
+      return Err(RuntimeError::PlatformError(
+        "SIGUSR1 is blocked on this thread, so a program run here could not be preempted",
+      ));
+    }
+
     let Some(section_index) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));
     };
@@ -2459,12 +2479,39 @@ impl Program {
           return Err(RuntimeError::StackExhausted);
         }
 
-        // restore signal mask of current thread
+        // Restore the signal mask that was in effect before the signal that
+        // suspended the guest. The kernel blocks the handler's signals for
+        // the duration of the handler, and on the fault path the coroutine is
+        // dropped without being resumed, so the `rt_sigreturn` that would
+        // restore it never runs. Restoring the exact pre-signal mask —
+        // instead of unconditionally unblocking SIGUSR1/SIGSEGV/SIGBUS, which
+        // permanently cleared whatever an embedder had deliberately blocked —
+        // keeps the runtime functional without vandalizing the thread's
+        // signal discipline.
         if dispatch.memory_access_error.is_some() || dispatch.async_preemption {
-          unsafe {
-            let unblock = get_blocked_sigset();
-            libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+          match PRE_SIGNAL_MASK.with(|x| x.take()) {
+            Some(mask) => unsafe {
+              libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+            },
+            // No handler captured a mask for this dispatch (defensive — both
+            // handlers capture before suspending): fall back to unblocking
+            // the three signals the kernel would have blocked.
+            None => unsafe {
+              let unblock = get_blocked_sigset();
+              libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+            },
           }
+        }
+
+        // An embedder helper (or the embedder's own signal handling) may have
+        // blocked SIGUSR1 while the guest was suspended. Re-check before the
+        // next resume, the same way the entry check does, so a guest spin
+        // that follows cannot wedge the thread. This runs once per dispatch —
+        // nowhere near the hot path.
+        if !sigusr1_is_unblocked() {
+          return Err(RuntimeError::PlatformError(
+            "SIGUSR1 is blocked on this thread, so a program run here could not be preempted",
+          ));
         }
 
         if let Some(si_addr) = dispatch.memory_access_error {
@@ -3228,7 +3275,7 @@ unsafe extern "C" fn fault_handler(
   siginfo: *mut libc::siginfo_t,
   uctx: *mut libc::ucontext_t,
 ) {
-  let fail = || chain_to_previous_fault_handler(sig);
+  let fail = || chain_to_previous_fault_handler(sig, siginfo, uctx);
 
   let Some((jit_code_zone, pointer_cage, data_range, stack_range, yielder)) = ACTIVE_JIT_CODE_ZONE
     .with(|x| {
@@ -3269,6 +3316,9 @@ unsafe extern "C" fn fault_handler(
     return fail();
   }
 
+  // Save the pre-signal mask while the ucontext still has it, so the run loop
+  // can restore it once the guest is dropped (see the dispatch loop).
+  PRE_SIGNAL_MASK.with(|x| x.set(Some((*uctx).uc_sigmask)));
   let yielder = yielder.expect("no yielder").as_ref();
   yielder.suspend(Dispatch {
     memory_access_error: Some(si_addr),
@@ -3303,6 +3353,8 @@ unsafe extern "C" fn sigusr1_handler(
   let Some(yielder) = yielder else {
     return;
   };
+  // See `fault_handler`: the dispatch loop restores this exact mask.
+  PRE_SIGNAL_MASK.with(|x| x.set(Some((*uctx).uc_sigmask)));
   yielder.as_ref().suspend(Dispatch {
     async_preemption: true,
     ..Default::default()
@@ -3314,15 +3366,31 @@ unsafe extern "C" fn sigusr1_handler(
 static PREV_SIGSEGV: OnceLock<libc::sigaction> = OnceLock::new();
 static PREV_SIGBUS: OnceLock<libc::sigaction> = OnceLock::new();
 
-/// Hands a fault back to whoever had it before this crate took it, then returns
-/// so the faulting instruction re-executes under that disposition.
+/// Hands a fault the runtime does not own to whoever had the disposition
+/// before this crate installed its own, then returns so the faulting
+/// instruction re-executes — under the previous handler, which is still
+/// installed because this crate never uninstalled it.
 ///
-/// Installing `SIG_DFL` here instead - which is what this used to do - turns a
-/// fault another component would have *recovered* from into a process death,
-/// and silently discards Rust's own stack-overflow handler, so a host stack
-/// overflow reports as a bare `Segmentation fault` rather than naming itself.
-/// `sigaction` is async-signal-safe, so this is legal from a handler.
-unsafe fn chain_to_previous_fault_handler(signum: i32) {
+/// The previous disposition is *called* rather than `sigaction`-ed into
+/// place, which is what the code used to do and what made containment
+/// single-shot: the first foreign fault permanently displaced this crate's
+/// handler, so a later guest fault that should have been contained reached
+/// the displaced disposition instead and aborted the process. With a direct
+/// call this handler stays installed, and a recovering previous handler (a
+/// libsigsegv-style probe, another JIT) gets every fault it would have gotten
+/// — through this one first, which is exactly the containment the runtime
+/// promises. The signal is already blocked here, as the kernel would have
+/// blocked it while the previous handler ran.
+///
+/// A default or ignored previous disposition is not a function to call: it is
+/// restored and the faulting instruction re-executes under it. That path
+/// terminates the process, which is also the behavior that disposition
+/// promised, so nothing is lost.
+unsafe fn chain_to_previous_fault_handler(
+  signum: i32,
+  siginfo: *mut libc::siginfo_t,
+  uctx: *mut libc::ucontext_t,
+) {
   let prev = if signum == libc::SIGSEGV {
     PREV_SIGSEGV.get()
   } else if signum == libc::SIGBUS {
@@ -3330,12 +3398,20 @@ unsafe fn chain_to_previous_fault_handler(signum: i32) {
   } else {
     None
   };
-  if let Some(prev) = prev {
-    if libc::sigaction(signum, prev, std::ptr::null_mut()) == 0 {
-      return;
-    }
+  let Some(prev) = prev else {
+    return restore_default_signal_handler(signum);
+  };
+  if prev.sa_sigaction == libc::SIG_DFL || prev.sa_sigaction == libc::SIG_IGN {
+    return restore_default_signal_handler(signum);
   }
-  restore_default_signal_handler(signum);
+  if prev.sa_flags & libc::SA_SIGINFO != 0 {
+    let handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) =
+      std::mem::transmute(prev.sa_sigaction);
+    handler(signum, siginfo, uctx as *mut libc::c_void);
+  } else {
+    let handler: extern "C" fn(i32) = std::mem::transmute(prev.sa_sigaction);
+    handler(signum);
+  }
 }
 
 unsafe fn restore_default_signal_handler(signum: i32) {
@@ -3354,5 +3430,24 @@ fn get_blocked_sigset() -> libc::sigset_t {
     libc::sigaddset(&mut s, libc::SIGSEGV);
     libc::sigaddset(&mut s, libc::SIGBUS);
     s
+  }
+}
+
+/// Whether SIGUSR1 is unblocked on the current thread.
+///
+/// Preemption is signal-only: the watcher's `tgkill` cannot interrupt a
+/// guest whose thread has SIGUSR1 blocked — the signal merely pends while
+/// the guest spins, and nothing in the run loop can observe that (the
+/// preemption-counter checks only run once `resume` has returned, which a
+/// spin never does). The run path checks this before starting (and before
+/// every resume), refusing to wedge the OS thread rather than failing
+/// silently.
+fn sigusr1_is_unblocked() -> bool {
+  unsafe {
+    let mut current: libc::sigset_t = std::mem::zeroed();
+    if libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut current) != 0 {
+      return false;
+    }
+    libc::sigismember(&current, libc::SIGUSR1) == 0
   }
 }
