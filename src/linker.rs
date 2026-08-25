@@ -23,7 +23,6 @@ const EBPF_OP_LDDW: u8 = 0x18;
 
 #[derive(Clone, Debug)]
 pub(crate) struct WritableSection {
-  pub(crate) index: usize,
   pub(crate) file_offset: usize,
   pub(crate) size: usize,
   pub(crate) backing_offset: usize,
@@ -39,15 +38,14 @@ pub(crate) struct WritableSection {
 pub(crate) struct WritableDataPlan {
   pub(crate) sections: Vec<WritableSection>,
   pub(crate) size: usize,
+  // Hash-indexed by ELF section-header index so relocation lookup stays O(1)
+  // without allocating in proportion to every (possibly irrelevant) header.
+  backing_offsets: HashMap<usize, usize>,
 }
 
 impl WritableDataPlan {
   fn backing_offset(&self, section_index: usize) -> Option<usize> {
-    self
-      .sections
-      .iter()
-      .find(|section| section.index == section_index)
-      .map(|section| section.backing_offset)
+    self.backing_offsets.get(&section_index).copied()
   }
 }
 
@@ -88,6 +86,7 @@ pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, Linke
   };
 
   let mut sections = Vec::new();
+  let mut backing_offsets = HashMap::new();
   let mut claimed_ranges = Vec::new();
   let mut size = 0usize;
   for (index, section) in sht.iter().enumerate() {
@@ -138,11 +137,11 @@ pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, Linke
       ));
     }
     sections.push(WritableSection {
-      index,
       file_offset,
       size: section_size,
       backing_offset,
     });
+    backing_offsets.insert(index, backing_offset);
     // Capped per header, like code sections: the overlap scan above is
     // quadratic in the header count, and nothing else bounds it.
     if sections.len() > MAX_WRITABLE_SECTIONS {
@@ -152,7 +151,11 @@ pub(crate) fn plan_writable_data(input: &[u8]) -> Result<WritableDataPlan, Linke
     }
   }
 
-  Ok(WritableDataPlan { sections, size })
+  Ok(WritableDataPlan {
+    sections,
+    size,
+    backing_offsets,
+  })
 }
 
 /// Ceilings on how much work one object may ask the loader to do.
@@ -615,6 +618,37 @@ pub fn link_elf(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn writable_section_lookup_stays_indexed_at_loader_limits() {
+    let sections: Vec<_> = (0..MAX_WRITABLE_SECTIONS)
+      .map(|index| WritableSection {
+        file_offset: index,
+        size: 1,
+        backing_offset: index * 8,
+      })
+      .collect();
+    let backing_offsets = sections
+      .iter()
+      .enumerate()
+      .map(|(index, section)| (index, section.backing_offset))
+      .collect();
+    let plan = WritableDataPlan {
+      sections,
+      size: MAX_WRITABLE_SECTIONS * 8,
+      backing_offsets,
+    };
+
+    let last_section = MAX_WRITABLE_SECTIONS - 1;
+    let expected = last_section * 8;
+    let mut sum = 0usize;
+    for _ in 0..MAX_RELOCATIONS {
+      sum = sum.wrapping_add(plan.backing_offset(last_section).unwrap());
+    }
+
+    assert_eq!(sum, expected * MAX_RELOCATIONS);
+    assert_eq!(plan.backing_offset(MAX_WRITABLE_SECTIONS), None);
+  }
 
   fn validate_local_call_graph(code: &[u8]) -> Result<(), String> {
     crate::function_analysis::analyze_functions(code).map(|_| ())

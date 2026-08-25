@@ -28,6 +28,23 @@ use crate::{
   test::raw_elf::{run_raw, run_raw_with_helpers, Insn},
 };
 
+/// A statically stack-routed store whose derived address is outside every
+/// supported default stack layout.
+///
+/// A direct `R10 - 4097` access faults in the guarded 4 KiB-frame layout, but
+/// it is still inside the contiguous fallback used when the host page is larger
+/// than a frame (notably macOS/aarch64's 16 KiB pages). Deriving the address in
+/// a register gives us the wider immediate needed to get past the entire stack
+/// on every platform while retaining a valid stack-region hint.
+fn guest_fault_program() -> Vec<Insn> {
+  vec![
+    Insn::mov64_reg(1, 10),
+    Insn::add64_imm(1, -1_000_000),
+    Insn::stx_dw(1, 0, 0),
+    Insn::exit(),
+  ]
+}
+
 /// Blocks `signum` on the current thread while alive; unblocks it on drop.
 struct SignalBlockGuard(libc::c_int);
 
@@ -97,7 +114,7 @@ async fn a_run_with_sigusr1_blocked_is_refused() {
 #[tokio::test]
 async fn embedder_signal_blocks_survive_a_guest_fault() {
   let guard = SignalBlockGuard::new(libc::SIGBUS);
-  let code = vec![Insn::stx_dw(10, 0, -4097), Insn::exit()];
+  let code = guest_fault_program();
   let result = run_raw(&code, &[], &[], false).await;
   let still_blocked = guard.is_blocked();
   drop(guard);
@@ -220,9 +237,10 @@ async fn fault_containment_child() {
     );
   }
 
-  // A "recovering" previous handler, libsigsegv style: skip the faulting
-  // instruction in the interrupted context and return. Must be installed
-  // before `GlobalEnv::new` captures the previous disposition.
+  // A recovering previous handler that returns from a user-generated foreign
+  // SIGSEGV. It must be installed before `GlobalEnv::new` captures the previous
+  // disposition. Using `raise` exercises the same chaining path without
+  // hard-coding the length of a faulting instruction in each host ISA.
   let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
   act.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
   act.sa_sigaction = fixup_handler as *const () as usize;
@@ -241,26 +259,17 @@ async fn fault_containment_child() {
   // signal must never trigger lazy TLS initialization).
   let _env = crate::test_util::gt_env();
 
-  // A foreign fault: the faulting PC is outside any JIT code range, so the
-  // runtime hands it to the probe, which skips the faulting instruction.
-  // The runtime's own handler must stay installed.
+  // A foreign signal delivered outside any JIT code range, so the runtime
+  // hands it to the probe and keeps its own handler installed.
   unsafe {
-    #[cfg(target_arch = "x86_64")]
-    core::arch::asm!("mov rax, qword ptr [1]", out("rax") _, options(nostack));
-    #[cfg(target_arch = "aarch64")]
-    core::arch::asm!(
-      "mov x1, 1; ldr x0, [x1]",
-      lateout("x0") _,
-      lateout("x1") _,
-      options(nostack)
-    );
+    assert_eq!(libc::raise(libc::SIGSEGV), 0, "failed to raise SIGSEGV");
   }
 
   // A guest fault must still be contained: the runtime's own handler is still
-  // the SIGSEGV disposition, so the out-of-frame store surfaces as a
-  // `MemoryFault` instead of reaching the probe (which would not recognize
-  // the address and could only mis-skip the JIT instruction).
-  let code = vec![Insn::stx_dw(10, 0, -4097), Insn::exit()];
+  // the SIGSEGV disposition, so the out-of-stack store surfaces as a
+  // `MemoryFault` instead of reaching the returning probe and re-executing the
+  // same fault forever.
+  let code = guest_fault_program();
   let result = run_raw(&code, &[], &[], false).await;
   unsafe {
     assert_eq!(
@@ -287,15 +296,12 @@ async fn fault_containment_child() {
   }
 }
 
-/// Skips the faulting instruction in the interrupted context and returns.
-/// The faulting sequence is `mov rax, qword ptr [1]` (8 bytes) on x86_64 and
-/// `ldr x0, [x1]` (4 bytes, fixed width) on aarch64 — the stride matches the
-/// instruction the child faults on, so the thread continues exactly after it.
+/// Records the execution contract seen by the previous handler and returns.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn fixup_handler(
   _sig: libc::c_int,
   _siginfo: *mut libc::siginfo_t,
-  uctx: *mut libc::ucontext_t,
+  _uctx: *mut libc::ucontext_t,
 ) {
   unsafe {
     let mut current: libc::sigset_t = std::mem::zeroed();
@@ -311,24 +317,6 @@ extern "C" fn fixup_handler(
       && stack_addr < ALTSTACK_TOP.load(Ordering::SeqCst)
     {
       PREVIOUS_USED_ALTSTACK.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    {
-      let rip = &mut (*uctx).uc_mcontext.gregs[libc::REG_RIP as usize];
-      *rip += 8;
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    {
-      (*(*uctx).uc_mcontext).__ss.__rip += 8;
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    {
-      (*uctx).uc_mcontext.pc += 4;
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-      (*(*uctx).uc_mcontext).__ss.__pc += 4;
     }
   }
 }

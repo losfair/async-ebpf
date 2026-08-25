@@ -137,7 +137,7 @@ fn a_storm_of_writable_section_headers_is_refused() {
   let strtab = vec![0u8];
 
   let mut elf = vec![0u8; 64];
-  let mut append = |elf: &mut Vec<u8>, bytes: &[u8], alignment: usize| {
+  let append = |elf: &mut Vec<u8>, bytes: &[u8], alignment: usize| {
     let padding = (alignment - (elf.len() % alignment)) % alignment;
     elf.resize(elf.len() + padding, 0);
     let offset = elf.len() as u64;
@@ -246,7 +246,7 @@ fn rel_section_storm_elf(n: usize, shstrtab_size: usize) -> Vec<u8> {
   let shstrtab = vec![0xFFu8; shstrtab_size];
 
   let mut elf = vec![0u8; 64];
-  let mut append = |elf: &mut Vec<u8>, bytes: &[u8], alignment: usize| {
+  let append = |elf: &mut Vec<u8>, bytes: &[u8], alignment: usize| {
     let padding = (alignment - (elf.len() % alignment)) % alignment;
     elf.resize(elf.len() + padding, 0);
     let offset = elf.len() as u64;
@@ -397,7 +397,7 @@ fn a_giant_symbol_name_is_refused_at_index_time() {
   let name_shstrtab = shname(".shstrtab", &mut shstrtab);
 
   let mut elf = vec![0u8; 64];
-  let mut append = |elf: &mut Vec<u8>, bytes: &[u8], alignment: usize| {
+  let append = |elf: &mut Vec<u8>, bytes: &[u8], alignment: usize| {
     let padding = (alignment - (elf.len() % alignment)) % alignment;
     elf.resize(elf.len() + padding, 0);
     let offset = elf.len() as u64;
@@ -410,7 +410,6 @@ fn a_giant_symbol_name_is_refused_at_index_time() {
   let shstrtab_offset = append(&mut elf, &shstrtab, 1);
   let shoff = append(&mut elf, &[], 8);
 
-  let sec_symtab = 2;
   let sec_names = 3;
   let sec_shstrtab = 4;
 
