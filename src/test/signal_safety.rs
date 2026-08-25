@@ -18,6 +18,9 @@
 //!    start — and to resume — while SIGUSR1 is blocked, and restores the
 //!    exact pre-signal mask instead of unblocking.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Duration;
 
 use crate::{
@@ -125,9 +128,10 @@ async fn a_helper_that_blocks_sigusr1_stops_the_run() {
     }
     Ok(0)
   };
-  // The first call blocks SIGUSR1; the second call's dispatch must refuse the
-  // resume (a plain `exit` breaks out of the loop before the re-check).
-  let code = vec![Insn::call_helper(), Insn::call_helper(), Insn::exit()];
+  // The check has to sit at the resume boundary: after this helper returns,
+  // even a plain `exit` must not receive control with preemption blocked. A
+  // second helper would hide a misplaced post-resume check by yielding again.
+  let code = vec![Insn::call_helper(), Insn::exit()];
   let result = run_raw_with_helpers(&code, &[], &[], false, &[&[("h", helper)]]).await;
 
   assert!(
@@ -142,7 +146,17 @@ async fn a_helper_that_blocks_sigusr1_stops_the_run() {
 /// longer do (the `Once`). The child installs a probe handler that skips the
 /// faulting instruction, then checks that a later guest fault is still
 /// contained.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const CHILD_ENV: &str = "ASYNC_EBPF_FAULT_CONTAINMENT_CHILD";
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static PREVIOUS_MASK_WAS_HONOURED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static PREVIOUS_USED_ALTSTACK: AtomicBool = AtomicBool::new(false);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static ALTSTACK_BOTTOM: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static ALTSTACK_TOP: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
@@ -152,7 +166,7 @@ async fn fault_containment_survives_a_foreign_fault() {
     return;
   }
 
-  let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+  let child = tokio::process::Command::new(std::env::current_exe().unwrap())
     .args([
       "--exact",
       "test::signal_safety::fault_containment_survives_a_foreign_fault",
@@ -183,13 +197,38 @@ async fn fault_containment_survives_a_foreign_fault() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn fault_containment_child() {
+  // The saved disposition asks the kernel for a custom mask, SA_NODEFER, and
+  // an alternate stack. Direct chaining must preserve those parts of
+  // sigaction's contract even though this runtime's dispatcher stays installed.
+  let mut altstack = vec![0u8; libc::SIGSTKSZ as usize * 2];
+  ALTSTACK_BOTTOM.store(altstack.as_mut_ptr() as usize, Ordering::SeqCst);
+  ALTSTACK_TOP.store(
+    altstack.as_mut_ptr() as usize + altstack.len(),
+    Ordering::SeqCst,
+  );
+  let stack = libc::stack_t {
+    ss_sp: altstack.as_mut_ptr().cast(),
+    ss_flags: 0,
+    ss_size: altstack.len(),
+  };
+  let mut old_stack: libc::stack_t = unsafe { std::mem::zeroed() };
+  unsafe {
+    assert_eq!(
+      libc::sigaltstack(&stack, &mut old_stack),
+      0,
+      "failed to install the probe alternate stack"
+    );
+  }
+
   // A "recovering" previous handler, libsigsegv style: skip the faulting
   // instruction in the interrupted context and return. Must be installed
   // before `GlobalEnv::new` captures the previous disposition.
   let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
-  act.sa_flags = libc::SA_SIGINFO;
+  act.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
   act.sa_sigaction = fixup_handler as *const () as usize;
   unsafe {
+    libc::sigemptyset(&mut act.sa_mask);
+    libc::sigaddset(&mut act.sa_mask, libc::SIGUSR2);
     assert_eq!(
       libc::sigaction(libc::SIGSEGV, &act, std::ptr::null_mut()),
       0,
@@ -223,10 +262,26 @@ async fn fault_containment_child() {
   // the address and could only mis-skip the JIT instruction).
   let code = vec![Insn::stx_dw(10, 0, -4097), Insn::exit()];
   let result = run_raw(&code, &[], &[], false).await;
+  unsafe {
+    assert_eq!(
+      libc::sigaltstack(&old_stack, std::ptr::null_mut()),
+      0,
+      "failed to restore the previous alternate stack"
+    );
+  }
   match result {
-    Err(Error(RuntimeError::MemoryFault(_))) => println!("FOREIGN_FAULT_CONTAINED"),
+    Err(Error(RuntimeError::MemoryFault(_)))
+      if PREVIOUS_MASK_WAS_HONOURED.load(Ordering::SeqCst)
+        && PREVIOUS_USED_ALTSTACK.load(Ordering::SeqCst) =>
+    {
+      println!("FOREIGN_FAULT_CONTAINED")
+    }
     other => {
-      eprintln!("unexpected child result: {other:?}");
+      eprintln!(
+        "unexpected child result: {other:?}; mask honoured: {}; used altstack: {}",
+        PREVIOUS_MASK_WAS_HONOURED.load(Ordering::SeqCst),
+        PREVIOUS_USED_ALTSTACK.load(Ordering::SeqCst)
+      );
       std::process::exit(1);
     }
   }
@@ -243,6 +298,21 @@ extern "C" fn fixup_handler(
   uctx: *mut libc::ucontext_t,
 ) {
   unsafe {
+    let mut current: libc::sigset_t = std::mem::zeroed();
+    if libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut current) == 0
+      && libc::sigismember(&current, libc::SIGUSR2) == 1
+      && libc::sigismember(&current, libc::SIGSEGV) == 0
+    {
+      PREVIOUS_MASK_WAS_HONOURED.store(true, Ordering::SeqCst);
+    }
+    let stack_probe = 0u8;
+    let stack_addr = &stack_probe as *const u8 as usize;
+    if stack_addr >= ALTSTACK_BOTTOM.load(Ordering::SeqCst)
+      && stack_addr < ALTSTACK_TOP.load(Ordering::SeqCst)
+    {
+      PREVIOUS_USED_ALTSTACK.store(true, Ordering::SeqCst);
+    }
+
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
       let rip = &mut (*uctx).uc_mcontext.gregs[libc::REG_RIP as usize];

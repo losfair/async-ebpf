@@ -1471,19 +1471,26 @@ impl GlobalEnv {
         act.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
         act.sa_mask = sa_mask;
         let mut prev: libc::sigaction = std::mem::zeroed();
-        if libc::sigaction(sig, &act, &mut prev) != 0 {
-          panic!("failed to setup handler for signal {}", sig);
+        if libc::sigaction(sig, std::ptr::null(), &mut prev) != 0 {
+          panic!("failed to read handler for signal {}", sig);
         }
         if sig == libc::SIGSEGV || sig == libc::SIGBUS {
           // Kept so a fault this crate does not own can go back to whoever was
           // handling the signal before - Rust's own stack-overflow reporter, a
           // crash reporter, another runtime's guard pages - instead of being
           // converted into an abort. See `chain_to_previous_fault_handler`.
+          // If that handler requested an alternate signal stack, enter this
+          // dispatcher on it too: the saved handler is invoked directly and
+          // cannot ask the kernel to switch stacks a second time.
+          act.sa_flags |= prev.sa_flags & libc::SA_ONSTACK;
           if sig == libc::SIGSEGV {
             let _ = PREV_SIGSEGV.set(prev);
           } else {
             let _ = PREV_SIGBUS.set(prev);
           }
+        }
+        if libc::sigaction(sig, &act, std::ptr::null_mut()) != 0 {
+          panic!("failed to setup handler for signal {}", sig);
         }
       }
     });
@@ -1499,6 +1506,7 @@ impl GlobalEnv {
     // the watcher can send its first signal.
     RUST_TID.with(|_| {});
     SIGUSR1_COUNTER.with(|_| {});
+    PRE_SIGNAL_MASK.with(|_| {});
     ACTIVE_JIT_CODE_ZONE.with(|_| {});
 
     struct DeferDrop(Arc<PreemptionStateSignal>);
@@ -2445,6 +2453,16 @@ impl Program {
           .map_err(|_| RuntimeError::AsyncHelperError(helper_name))?;
         }
 
+        // Host callbacks run while the guest is suspended and may change the
+        // thread's signal mask. Check at the actual resume boundary so a
+        // helper, async completion, or event listener cannot block SIGUSR1 and
+        // hand control directly to a guest spin.
+        if !sigusr1_is_unblocked() {
+          return Err(RuntimeError::PlatformError(
+            "SIGUSR1 is blocked on this thread, so a program run here could not be preempted",
+          ));
+        }
+
         let ret = co.0.resume(resume_input);
         // The coroutine is suspended here, which is exactly the state a
         // cancellation abandons without running destructors. Checked on the
@@ -2501,17 +2519,6 @@ impl Program {
               libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
             },
           }
-        }
-
-        // An embedder helper (or the embedder's own signal handling) may have
-        // blocked SIGUSR1 while the guest was suspended. Re-check before the
-        // next resume, the same way the entry check does, so a guest spin
-        // that follows cannot wedge the thread. This runs once per dispatch —
-        // nowhere near the hot path.
-        if !sigusr1_is_unblocked() {
-          return Err(RuntimeError::PlatformError(
-            "SIGUSR1 is blocked on this thread, so a program run here could not be preempted",
-          ));
         }
 
         if let Some(si_addr) = dispatch.memory_access_error {
@@ -3270,6 +3277,19 @@ unsafe fn program_counter(uctx: *mut libc::ucontext_t) -> usize {
   (*(*uctx).uc_mcontext).__ss.__pc as usize
 }
 
+/// The signal mask that was active before the kernel entered the handler.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe fn pre_signal_mask(uctx: *mut libc::ucontext_t) -> libc::sigset_t {
+  (*uctx).uc_sigmask
+}
+
+/// OpenBSD exposes the handler context as `sigcontext`, not the POSIX-shaped
+/// `ucontext_t` used by Linux and macOS.
+#[cfg(target_os = "openbsd")]
+unsafe fn pre_signal_mask(uctx: *mut libc::ucontext_t) -> libc::sigset_t {
+  (*uctx).sc_mask as libc::sigset_t
+}
+
 unsafe extern "C" fn fault_handler(
   sig: i32,
   siginfo: *mut libc::siginfo_t,
@@ -3318,7 +3338,7 @@ unsafe extern "C" fn fault_handler(
 
   // Save the pre-signal mask while the ucontext still has it, so the run loop
   // can restore it once the guest is dropped (see the dispatch loop).
-  PRE_SIGNAL_MASK.with(|x| x.set(Some((*uctx).uc_sigmask)));
+  PRE_SIGNAL_MASK.with(|x| x.set(Some(pre_signal_mask(uctx))));
   let yielder = yielder.expect("no yielder").as_ref();
   yielder.suspend(Dispatch {
     memory_access_error: Some(si_addr),
@@ -3354,7 +3374,7 @@ unsafe extern "C" fn sigusr1_handler(
     return;
   };
   // See `fault_handler`: the dispatch loop restores this exact mask.
-  PRE_SIGNAL_MASK.with(|x| x.set(Some((*uctx).uc_sigmask)));
+  PRE_SIGNAL_MASK.with(|x| x.set(Some(pre_signal_mask(uctx))));
   yielder.as_ref().suspend(Dispatch {
     async_preemption: true,
     ..Default::default()
@@ -3365,6 +3385,8 @@ unsafe extern "C" fn sigusr1_handler(
 /// replaced them, captured once under `INIT` and only ever read afterwards.
 static PREV_SIGSEGV: OnceLock<libc::sigaction> = OnceLock::new();
 static PREV_SIGBUS: OnceLock<libc::sigaction> = OnceLock::new();
+static PREV_SIGSEGV_CONSUMED: AtomicBool = AtomicBool::new(false);
+static PREV_SIGBUS_CONSUMED: AtomicBool = AtomicBool::new(false);
 
 /// Hands a fault the runtime does not own to whoever had the disposition
 /// before this crate installed its own, then returns so the faulting
@@ -3379,31 +3401,65 @@ static PREV_SIGBUS: OnceLock<libc::sigaction> = OnceLock::new();
 /// call this handler stays installed, and a recovering previous handler (a
 /// libsigsegv-style probe, another JIT) gets every fault it would have gotten
 /// — through this one first, which is exactly the containment the runtime
-/// promises. The signal is already blocked here, as the kernel would have
-/// blocked it while the previous handler ran.
+/// promises. Before the call, its saved `sa_mask` and `SA_NODEFER` policy are
+/// applied exactly as the kernel would have applied them. `GlobalEnv::new`
+/// also propagates `SA_ONSTACK` onto this dispatcher, so the direct call is
+/// already running on the previous handler's alternate stack.
 ///
-/// A default or ignored previous disposition is not a function to call: it is
-/// restored and the faulting instruction re-executes under it. That path
-/// terminates the process, which is also the behavior that disposition
-/// promised, so nothing is lost.
+/// A default disposition is not a function to call: it is restored and the
+/// faulting instruction re-executes under it. An ignored user-generated signal
+/// remains ignored; ignoring a synchronous hardware fault is undefined by
+/// POSIX, so returning is the closest faithful behavior available.
 unsafe fn chain_to_previous_fault_handler(
   signum: i32,
   siginfo: *mut libc::siginfo_t,
   uctx: *mut libc::ucontext_t,
 ) {
-  let prev = if signum == libc::SIGSEGV {
-    PREV_SIGSEGV.get()
+  let (prev, consumed) = if signum == libc::SIGSEGV {
+    (PREV_SIGSEGV.get(), &PREV_SIGSEGV_CONSUMED)
   } else if signum == libc::SIGBUS {
-    PREV_SIGBUS.get()
+    (PREV_SIGBUS.get(), &PREV_SIGBUS_CONSUMED)
   } else {
-    None
+    (None, &PREV_SIGBUS_CONSUMED)
   };
   let Some(prev) = prev else {
     return restore_default_signal_handler(signum);
   };
-  if prev.sa_sigaction == libc::SIG_DFL || prev.sa_sigaction == libc::SIG_IGN {
+  if prev.sa_sigaction == libc::SIG_DFL {
     return restore_default_signal_handler(signum);
   }
+  if prev.sa_sigaction == libc::SIG_IGN {
+    return;
+  }
+
+  // SA_RESETHAND changes the disposition to default before the handler starts.
+  // Keep this runtime's dispatcher installed, but make every later foreign
+  // fault take the saved action's promised default path.
+  if prev.sa_flags & libc::SA_RESETHAND != 0 && consumed.swap(true, Ordering::SeqCst) {
+    return restore_default_signal_handler(signum);
+  }
+
+  // Recreate the mask the kernel would have installed for `prev`: start from
+  // the pre-signal mask in the ucontext, add the saved action's mask, and block
+  // the delivered signal unless SA_NODEFER requested otherwise. Save the
+  // dispatcher's current mask so code after the callback still runs under the
+  // runtime handler's protection until sigreturn restores the original mask.
+  let mut dispatcher_mask: libc::sigset_t = std::mem::zeroed();
+  let pre_signal = pre_signal_mask(uctx);
+  if libc::pthread_sigmask(libc::SIG_SETMASK, &pre_signal, &mut dispatcher_mask) != 0
+    || libc::pthread_sigmask(libc::SIG_BLOCK, &prev.sa_mask, std::ptr::null_mut()) != 0
+  {
+    libc::abort();
+  }
+  if prev.sa_flags & libc::SA_NODEFER == 0 {
+    let mut delivered: libc::sigset_t = std::mem::zeroed();
+    libc::sigemptyset(&mut delivered);
+    libc::sigaddset(&mut delivered, signum);
+    if libc::pthread_sigmask(libc::SIG_BLOCK, &delivered, std::ptr::null_mut()) != 0 {
+      libc::abort();
+    }
+  }
+
   if prev.sa_flags & libc::SA_SIGINFO != 0 {
     let handler: extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) =
       std::mem::transmute(prev.sa_sigaction);
@@ -3411,6 +3467,9 @@ unsafe fn chain_to_previous_fault_handler(
   } else {
     let handler: extern "C" fn(i32) = std::mem::transmute(prev.sa_sigaction);
     handler(signum);
+  }
+  if libc::pthread_sigmask(libc::SIG_SETMASK, &dispatcher_mask, std::ptr::null_mut()) != 0 {
+    libc::abort();
   }
 }
 
