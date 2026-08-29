@@ -1331,9 +1331,15 @@ pub struct UnboundProgram {
   sections: RefCell<Vec<Section>>,
   resolvers: RefCell<HashMap<u32, ResolverInfo>>,
   /// Atomic because [`LazyCompileJob`]s allocate resolver ids on the worker
-  /// thread, where the emitted call sites need them as immediates. Ids taken
-  /// by a compilation that then fails are abandoned rather than reused; each
-  /// `(function, signature)` pair caches its failure, so the loss is bounded.
+  /// thread, where the emitted call sites need them as immediates. Ids drawn
+  /// by a job are abandoned rather than reused unless its commit registers
+  /// them. A compilation that fails caches the failure, so it burns its ids at
+  /// most once per `(function, signature)` pair - but a run cancelled while
+  /// its job is away caches nothing, so every cancelled attempt burns the call
+  /// sites' ids again. Each burned batch costs a full compilation, which keeps
+  /// exhaustion of the 32-bit id space out of practical reach; running out
+  /// surfaces as a cached per-variant "too many local call resolvers" error,
+  /// never as id reuse.
   next_resolver_id: Arc<AtomicU32>,
   /// One entry per `(section, function, signature)` variant currently away on
   /// a [`Timeslicer::run_blocking`] worker. Later runs of the same variant
