@@ -728,11 +728,11 @@ async fn lazy_compilation_runs_on_the_blocking_executor() {
   );
 }
 
-/// The trait's default `run_blocking` runs the job inline on the current
-/// thread - the behavior every embedder had before the hook existed - and the
-/// lazy pipeline works identically through it.
+/// An embedder without a blocking pool can implement `run_blocking` inline on
+/// the current thread - the behavior every embedder had before the hook
+/// existed - and the lazy pipeline works identically through it.
 #[tokio::test]
-async fn the_default_run_blocking_compiles_inline() {
+async fn an_inline_run_blocking_compiles_on_the_current_thread() {
   struct InlineTimeslicer;
   impl Timeslicer for InlineTimeslicer {
     fn sleep(&self, duration: Duration) -> impl std::future::Future<Output = ()> {
@@ -740,6 +740,12 @@ async fn the_default_run_blocking_compiles_inline() {
     }
     fn yield_now(&self) -> impl std::future::Future<Output = ()> {
       tokio::task::yield_now()
+    }
+    fn run_blocking<T: Send + 'static>(
+      &self,
+      f: impl FnOnce() -> T + Send + 'static,
+    ) -> impl std::future::Future<Output = T> {
+      std::future::ready(f())
     }
   }
 

@@ -1499,12 +1499,13 @@ pub trait Timeslicer {
   /// Runs guest-triggered, CPU-bound work - today, one lazy JIT compilation -
   /// and resolves with its result.
   ///
-  /// The default runs `f` inline, blocking the calling thread exactly as the
-  /// runtime always has. An executor integration should move `f` onto a
-  /// blocking-work pool (e.g. `tokio::task::spawn_blocking`) so that a large
-  /// guest-chosen compilation does not stall every other task on the event
-  /// loop; the caller merely awaits the result, and still charges the elapsed
-  /// wall time to the guest's run budget either way.
+  /// An executor integration should move `f` onto a blocking-work pool (e.g.
+  /// `tokio::task::spawn_blocking`) so that a large guest-chosen compilation
+  /// does not stall every other task on the event loop; the caller merely
+  /// awaits the result, and still charges the elapsed wall time to the guest's
+  /// run budget either way. An embedder without a blocking pool can run `f`
+  /// inline - `std::future::ready(f())` - which blocks the calling thread for
+  /// the duration, exactly as the runtime always had before this hook existed.
   ///
   /// `f` must run to completion exactly once, on any thread. Dropping the
   /// returned future without polling it to completion may leave `f` running
@@ -1512,9 +1513,7 @@ pub trait Timeslicer {
   fn run_blocking<T: Send + 'static>(
     &self,
     f: impl FnOnce() -> T + Send + 'static,
-  ) -> impl Future<Output = T> {
-    std::future::ready(f())
-  }
+  ) -> impl Future<Output = T>;
 }
 
 /// Global runtime environment for signal handlers.

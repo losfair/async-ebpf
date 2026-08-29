@@ -193,10 +193,10 @@ The generated local-call sequence calls through a resolver slot:
    by external helpers.
 5. Rust compiles the callee variant selected by the call-site pointer
    signature. The analysis and emission run under `Timeslicer::run_blocking` —
-   inline by default, or on a blocking-work pool (e.g. Tokio's) if the
-   embedder's timeslicer provides one, so a large guest-chosen compilation does
-   not stall the event loop while the run awaits it. The elapsed time is still
-   charged to the guest's run budget.
+   on a blocking-work pool (e.g. Tokio's) so a large guest-chosen compilation
+   does not stall the event loop while the run awaits it, or inline for an
+   embedder without one. The elapsed time is still charged to the guest's run
+   budget.
 6. Rust commits the finished code on the program's thread and stores the
    compiled callee in the per-program function-variant cache.
 7. The stub resumes, transfers control to the compiled callee, and returns
@@ -339,8 +339,8 @@ exercised in `src/test/lazy_local_call.rs`:
   specializations, and observed ones do;
 - lazy compilation is charged to the caller's timeslice, and a compilation storm
   does not starve the async runtime;
-- compilation runs on the timeslicer's blocking executor when it provides one,
-  and inline through the trait's default `run_blocking` when it does not;
+- compilation runs on the timeslicer's blocking executor, and an inline
+  `run_blocking` implementation behaves identically;
 - interleaved runs that hit the same cold variant share one in-flight
   compilation;
 - code-budget exhaustion names the budget, and is terminal for the program.
