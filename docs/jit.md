@@ -103,10 +103,10 @@ An entrypoint is a lazy handle rather than a raw native pointer. Per section:
 
 ```rust
 struct Section {
-  translator: jit::Translator,
+  translator: Arc<jit::Translator>,
   code_vaddr: usize,
   code_len: usize,
-  layout: FunctionLayout,
+  layout: Arc<FunctionLayout>,
   functions: Vec<FunctionState>,
 }
 
@@ -127,7 +127,12 @@ not retried on every call.
 register. `R10` is always stack.
 
 Because `Program::run` takes `&self`, compilation needs interior mutability.
-Programs are pinned to one thread, so `RefCell` is enough.
+Programs are pinned to one thread, so `RefCell` is enough for the shared
+bookkeeping. The translator and layout are `Arc`-shared because the heavy
+compilation phases run under `Timeslicer::run_blocking`, possibly on a worker
+thread (see below); a separate per-program map tracks variants whose
+compilation is currently in flight, so interleaved runs of the same program
+await one shared compilation instead of duplicating it.
 
 ## Region analysis
 
@@ -186,8 +191,14 @@ The generated local-call sequence calls through a resolver slot:
    invariants.
 4. The stub yields out to Rust using the same coroutine/yielder mechanism used
    by external helpers.
-5. Rust compiles the callee variant selected by the call-site pointer signature.
-6. Rust stores the compiled callee in the per-program function-variant cache.
+5. Rust compiles the callee variant selected by the call-site pointer
+   signature. The analysis and emission run under `Timeslicer::run_blocking` —
+   inline by default, or on a blocking-work pool (e.g. Tokio's) if the
+   embedder's timeslicer provides one, so a large guest-chosen compilation does
+   not stall the event loop while the run awaits it. The elapsed time is still
+   charged to the guest's run budget.
+6. Rust commits the finished code on the program's thread and stores the
+   compiled callee in the per-program function-variant cache.
 7. The stub resumes, transfers control to the compiled callee, and returns
    normally to the original caller.
 8. Later calls enter the same resolver host function, which returns the cached
@@ -264,14 +275,22 @@ The native code arena tracks:
 
 Emitting a function variant:
 
-1. Reserve aligned space from the append pointer.
-2. `mprotect` the affected pages to `PROT_READ | PROT_WRITE`.
-3. Translate the function's range into the reserved space.
-4. Flush the instruction cache where required — `jit::clear_instruction_cache`,
+1. Translate the function's range into a scratch buffer, sized to the space the
+   arena has left. This is the phase that runs under
+   `Timeslicer::run_blocking`; the output is position-independent (the backend
+   never sees the buffer's address, and local calls are indirect through
+   resolver slots), so it can land wherever the append pointer sits at commit.
+2. Back on the program's thread, `mprotect` the arena to
+   `PROT_READ | PROT_WRITE` and copy the scratch buffer to the append pointer.
+3. Flush the instruction cache where required — `jit::clear_instruction_cache`,
    which is a real sequence on aarch64 and a no-op on x86_64.
-5. `mprotect` the emitted pages to `PROT_READ | PROT_EXEC`, and the rest of the
+4. `mprotect` the emitted pages to `PROT_READ | PROT_EXEC`, and the rest of the
    arena back to `PROT_NONE`.
-6. Advance the executable high-water mark.
+5. Advance the executable high-water mark.
+
+Steps 2-5 are one synchronous commit with no suspension point, so the arena is
+never writable while anything on the thread could enter generated code — the
+same W^X discipline as when translation wrote into the arena directly.
 
 Generated call slots are not patched after the first call. Repeated compilation
 is avoided by consulting the per-program function cache in the resolver host
@@ -320,6 +339,10 @@ exercised in `src/test/lazy_local_call.rs`:
   specializations, and observed ones do;
 - lazy compilation is charged to the caller's timeslice, and a compilation storm
   does not starve the async runtime;
+- compilation runs on the timeslicer's blocking executor when it provides one,
+  and inline through the trait's default `run_blocking` when it does not;
+- interleaved runs that hit the same cold variant share one in-flight
+  compilation;
 - code-budget exhaustion names the budget, and is terminal for the program.
 
 `src/test/jit_limits.rs` covers the arena and per-section code-size ceilings;

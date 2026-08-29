@@ -23,6 +23,20 @@ impl Timeslicer for TokioTimeslicer {
   fn yield_now(&self) -> impl Future<Output = ()> {
     tokio::task::yield_now()
   }
+
+  fn run_blocking<T: Send + 'static>(
+    &self,
+    f: impl FnOnce() -> T + Send + 'static,
+  ) -> impl Future<Output = T> {
+    let handle = tokio::task::spawn_blocking(f);
+    async move {
+      match handle.await {
+        Ok(value) => value,
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => panic!("blocking task failed: {err}"),
+      }
+    }
+  }
 }
 
 /// Compiles C source to an eBPF ELF object using LLVM tools.
