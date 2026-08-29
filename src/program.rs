@@ -12,10 +12,10 @@ use std::{
   ptr::NonNull,
   rc::Rc,
   sync::{
-    atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+    atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Once, OnceLock,
   },
-  task::{Context, Poll},
+  task::{Context, Poll, Waker},
   thread::ThreadId,
   time::{Duration, Instant},
 };
@@ -1319,7 +1319,10 @@ pub struct UnboundProgram {
   run_lock: RwLock<()>,
   data_protection_failed: Cell<bool>,
   code_arena: RefCell<CodeArena>,
-  cage: PointerCage,
+  /// Shared with in-flight [`LazyCompileJob`]s, which read the frozen bytecode
+  /// prefix of the data region from a worker thread. The `Arc` keeps the
+  /// mapping alive if a job outlives a cancelled run.
+  cage: Arc<PointerCage>,
   helper_id_xor: u16,
   helpers: Arc<Vec<(u16, &'static str, Helper)>>,
   event_listener: Arc<dyn ProgramEventListener>,
@@ -1327,7 +1330,17 @@ pub struct UnboundProgram {
   entrypoints: HashMap<String, usize>,
   sections: RefCell<Vec<Section>>,
   resolvers: RefCell<HashMap<u32, ResolverInfo>>,
-  next_resolver_id: Cell<u32>,
+  /// Atomic because [`LazyCompileJob`]s allocate resolver ids on the worker
+  /// thread, where the emitted call sites need them as immediates. Ids taken
+  /// by a compilation that then fails are abandoned rather than reused; each
+  /// `(function, signature)` pair caches its failure, so the loss is bounded.
+  next_resolver_id: Arc<AtomicU32>,
+  /// One entry per `(section, function, signature)` variant currently away on
+  /// a [`Timeslicer::run_blocking`] worker. Later runs of the same variant
+  /// await the entry instead of compiling it twice; the entry is removed - and
+  /// its waiters woken - when the owning run commits the result or is
+  /// cancelled while the job is away.
+  in_flight_compiles: RefCell<HashMap<CompileKey, Arc<InFlightCompile>>>,
   /// Set when the code arena becomes unusable. Unlike a per-variant compilation
   /// failure, this is terminal for the whole program: a full arena cannot grow,
   /// and a page-protection failure leaves code permissions indeterminate.
@@ -1378,10 +1391,12 @@ struct CodeArena {
 }
 
 struct Section {
-  translator: crate::jit::Translator,
+  /// `Arc` so a [`LazyCompileJob`] can carry them to a worker thread; both are
+  /// immutable after load.
+  translator: Arc<crate::jit::Translator>,
   code_vaddr: usize,
   code_len: usize,
-  layout: FunctionLayout,
+  layout: Arc<FunctionLayout>,
   functions: Vec<FunctionState>,
 }
 
@@ -1421,6 +1436,49 @@ struct ResolverInfo {
   signature: PointerSignature,
 }
 
+/// Identifies one compilation variant: `(section, function, signature)`.
+type CompileKey = (usize, usize, PointerSignature);
+
+/// A claim on one compilation variant whose job is away on a worker.
+///
+/// Runs of one program interleave on a single thread, so this is only ever
+/// touched from that thread; it still uses `Arc`/atomics rather than
+/// `Rc`/`Cell` so [`UnboundProgram`] stays movable across threads.
+#[derive(Default)]
+struct InFlightCompile {
+  done: AtomicBool,
+  wakers: Mutex<Vec<Waker>>,
+}
+
+impl InFlightCompile {
+  /// Resolves once the claim is released - because the result was committed,
+  /// or because the owning run was cancelled. Either way the caller re-checks
+  /// the variant cache rather than trusting this for an outcome.
+  fn wait(&self) -> impl Future<Output = ()> + '_ {
+    std::future::poll_fn(move |cx| {
+      if self.done.load(Ordering::Acquire) {
+        return Poll::Ready(());
+      }
+      let mut wakers = self.wakers.lock();
+      // Re-check under the lock so a `finish` between the load above and the
+      // push below cannot strand this waker.
+      if self.done.load(Ordering::Acquire) {
+        return Poll::Ready(());
+      }
+      wakers.push(cx.waker().clone());
+      Poll::Pending
+    })
+  }
+
+  fn finish(&self) {
+    self.done.store(true, Ordering::Release);
+    let wakers = std::mem::take(&mut *self.wakers.lock());
+    for waker in wakers {
+      waker.wake();
+    }
+  }
+}
+
 /// Time limits used to yield or throttle execution.
 #[derive(Clone, Debug)]
 pub struct TimesliceConfig {
@@ -1438,6 +1496,24 @@ pub trait Timeslicer {
   fn sleep(&self, duration: Duration) -> impl Future<Output = ()>;
   /// Yield to the async scheduler.
   fn yield_now(&self) -> impl Future<Output = ()>;
+  /// Runs guest-triggered, CPU-bound work - today, one lazy JIT compilation -
+  /// and resolves with its result.
+  ///
+  /// An executor integration should move `f` onto a blocking-work pool (e.g.
+  /// `tokio::task::spawn_blocking`) so that a large guest-chosen compilation
+  /// does not stall every other task on the event loop; the caller merely
+  /// awaits the result, and still charges the elapsed wall time to the guest's
+  /// run budget either way. An embedder without a blocking pool can run `f`
+  /// inline - `std::future::ready(f())` - which blocks the calling thread for
+  /// the duration, exactly as the runtime always had before this hook existed.
+  ///
+  /// `f` must run to completion exactly once, on any thread. Dropping the
+  /// returned future without polling it to completion may leave `f` running
+  /// detached; its result is then discarded by the caller.
+  fn run_blocking<T: Send + 'static>(
+    &self,
+    f: impl FnOnce() -> T + Send + 'static,
+  ) -> impl Future<Output = T>;
 }
 
 /// Global runtime environment for signal handlers.
@@ -1940,17 +2016,34 @@ impl Program {
       .collect()
   }
 
-  fn compile_entrypoint(&self, section_index: usize) -> Result<Entrypoint, RuntimeError> {
-    self.compile_function(section_index, 0, PointerSignature::entry())
+  async fn compile_entrypoint(
+    &self,
+    timeslicer: &impl Timeslicer,
+    section_index: usize,
+  ) -> Result<Entrypoint, RuntimeError> {
+    self
+      .compile_function(timeslicer, section_index, 0, PointerSignature::entry())
+      .await
   }
 
-  fn compile_resolver(&self, resolver_id: u32) -> Result<Entrypoint, RuntimeError> {
+  async fn compile_resolver(
+    &self,
+    timeslicer: &impl Timeslicer,
+    resolver_id: u32,
+  ) -> Result<Entrypoint, RuntimeError> {
     let Some(info) = self.unbound.resolvers.borrow().get(&resolver_id).copied() else {
       return Err(RuntimeError::InvalidArgument(
         "local call resolver not found",
       ));
     };
-    self.compile_function(info.section_index, info.function_index, info.signature)
+    self
+      .compile_function(
+        timeslicer,
+        info.section_index,
+        info.function_index,
+        info.signature,
+      )
+      .await
   }
 
   fn cached_resolver_target(&self, resolver_id: u32) -> Option<usize> {
@@ -1996,6 +2089,11 @@ impl Program {
       "a `sections` borrow is live across a suspension; a cancelled run would \
        abandon it without dropping it"
     );
+    debug_assert!(
+      self.unbound.in_flight_compiles.try_borrow_mut().is_ok(),
+      "an `in_flight_compiles` borrow is live across a suspension; a cancelled \
+       run would abandon it without dropping it"
+    );
   }
 
   fn protect_code_pages(&self, executable_len: usize) -> Result<(), RuntimeError> {
@@ -2040,102 +2138,204 @@ impl Program {
     }
   }
 
-  fn compile_function(
+  /// Compiles one `(function, signature)` variant, running the heavy phases -
+  /// region analysis and code emission - under [`Timeslicer::run_blocking`] so
+  /// an executor integration can take them off the event-loop thread.
+  ///
+  /// The work is split around the await so that everything touching shared
+  /// program state stays on this thread with no borrow held across a
+  /// suspension: [`Self::claim_compile`] snapshots the job's inputs and
+  /// registers an in-flight claim, the job runs on data that is immutable
+  /// after load (the frozen bytecode, the translator, the layout) plus
+  /// job-owned scratch, and [`Self::commit_compile`] copies the finished code
+  /// into the arena and publishes the result. The W^X flip over the code arena
+  /// happens entirely inside the synchronous commit, so - exactly as when
+  /// compilation was inline - nothing can enter arena code while it is
+  /// writable.
+  async fn compile_function(
     &self,
+    timeslicer: &impl Timeslicer,
     section_index: usize,
     function_index: usize,
     signature: PointerSignature,
   ) -> Result<Entrypoint, RuntimeError> {
-    {
-      let sections = self.unbound.sections.borrow();
-      let Some(section) = sections.get(section_index) else {
-        return Err(RuntimeError::InvalidArgument("section not found"));
-      };
-      let Some(function) = section.functions.get(function_index) else {
-        return Err(RuntimeError::InvalidArgument("function not found"));
-      };
-      if let Some(compilation) = function.compiled.get(&signature) {
-        return compilation.result();
+    let job = loop {
+      match self.claim_compile(section_index, function_index, signature)? {
+        CompileClaim::Compiled(result) => return result,
+        CompileClaim::InFlight(in_flight) => {
+          // Another interleaved run of this program owns the claim. Wait for
+          // it to release and re-check the cache: it either committed a
+          // result, or was cancelled and left the claim open to take over.
+          in_flight.wait().await;
+        }
+        CompileClaim::Claimed(job) => break job,
       }
-    }
+    };
 
+    let key = (section_index, function_index, signature);
+    // Releasing the claim on drop covers every exit at once: a committed
+    // result (waiters then read it from the cache), a panic in the commit, and
+    // a cancellation of this run while the job is away - the claim reopens, a
+    // waiter re-claims and compiles again, and the detached job's output is
+    // dropped with the `run_blocking` future. Duplicate work at worst, never a
+    // wrong result: nothing is reserved in the arena until commit.
+    let _release = scopeguard::guard((), |()| {
+      if let Some(in_flight) = self.unbound.in_flight_compiles.borrow_mut().remove(&key) {
+        in_flight.finish();
+      }
+    });
+    let outcome = timeslicer.run_blocking(move || job.run()).await;
+    self.commit_compile(section_index, function_index, signature, outcome)
+  }
+
+  /// Resolves one variant to a cached result, an in-flight claim owned by
+  /// another run, or a fresh claim paired with the job that will fill it.
+  fn claim_compile(
+    &self,
+    section_index: usize,
+    function_index: usize,
+    signature: PointerSignature,
+  ) -> Result<CompileClaim, RuntimeError> {
     let mut sections = self.unbound.sections.borrow_mut();
-    let section = sections
-      .get_mut(section_index)
-      .ok_or(RuntimeError::InvalidArgument("section not found"))?;
-    if function_index >= section.functions.len() {
+    let Some(section) = sections.get_mut(section_index) else {
+      return Err(RuntimeError::InvalidArgument("section not found"));
+    };
+    let Some(function_state) = section.functions.get(function_index) else {
       return Err(RuntimeError::InvalidArgument("function not found"));
+    };
+    if let Some(compilation) = function_state.compiled.get(&signature) {
+      return Ok(CompileClaim::Compiled(compilation.result()));
     }
-    if let Some(compilation) = section.functions[function_index].compiled.get(&signature) {
-      return compilation.result();
+    let mut in_flight = self.unbound.in_flight_compiles.borrow_mut();
+    if let Some(state) = in_flight.get(&(section_index, function_index, signature)) {
+      return Ok(CompileClaim::InFlight(state.clone()));
     }
+    in_flight.insert(
+      (section_index, function_index, signature),
+      Arc::new(InFlightCompile::default()),
+    );
     #[cfg(test)]
     {
       section.functions[function_index].compile_attempts += 1;
     }
-    let function = section.layout.functions[function_index].clone();
-    let code = self
-      .unbound
-      .cage
-      .data_slice(section.code_vaddr, section.code_len)
-      .unwrap();
-    let code_bytes = unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
-    let region_analysis = crate::region_analysis::analyze_function(
-      code_bytes,
-      function.start_pc,
-      function.end_pc,
+    let function = &section.layout.functions[function_index];
+    Ok(CompileClaim::Claimed(Box::new(LazyCompileJob {
+      cage: self.unbound.cage.clone(),
+      translator: section.translator.clone(),
+      layout: section.layout.clone(),
+      code_vaddr: section.code_vaddr,
+      code_len: section.code_len,
+      section_index,
+      start_pc: function.start_pc,
+      end_pc: function.end_pc,
       signature,
-      self.unbound.cage.data_bottom() as u64,
-      self.unbound.cage.data_top() as u64,
-      &section.layout,
-      self.unbound.stack_frame_size,
-    );
-    if self.unbound.require_static_regions && !region_analysis.unresolved.is_empty() {
-      let err = RuntimeError::InvalidArgumentOwned(format!(
-        "static region analysis failed in function [{}, {}): {} memory access(es) could not be \
-         routed to a single region (instruction slots {:?})",
-        function.start_pc,
-        function.end_pc,
-        region_analysis.unresolved.len(),
-        region_analysis.unresolved,
-      ));
-      section.functions[function_index]
-        .compiled
-        .insert(signature, FunctionCompilation::Failed(err.clone()));
-      return Err(err);
-    }
+      stack_frame_size: self.unbound.stack_frame_size,
+      require_static_regions: self.unbound.require_static_regions,
+      next_resolver_id: self.unbound.next_resolver_id.clone(),
+      // Scratch sized to what the arena can still take, so a function that
+      // could never fit reports the same budget exhaustion it always has. The
+      // commit re-checks against the arena's state at commit time.
+      scratch_capacity: self.unbound.code_size - self.unbound.code_arena.borrow().used,
+    })))
+  }
 
-    // Allocate resolver ids and build their metadata locally. Nothing is
-    // committed to `next_resolver_id` or the shared `resolvers` map until the
-    // function has been fully compiled and protected, so a failed compilation
-    // does not leak resolver ids or orphan map entries.
-    let mut resolver_ids = vec![0u32; code_bytes.len() / 8];
-    let mut pending_resolvers: Vec<(u32, ResolverInfo)> = Vec::new();
-    let mut next_resolver_id = self.unbound.next_resolver_id.get();
-    for (&call_pc, &callee_signature) in &region_analysis.call_signatures {
-      let target_pc = local_call_target(code_bytes, call_pc);
-      let callee_index = section.layout.pc_to_func[target_pc];
-      let resolver_id = next_resolver_id;
-      let Some(advanced) = resolver_id.checked_add(1) else {
-        let err = RuntimeError::InvalidArgument("too many local call resolvers");
+  /// Publishes a finished job on the program's thread: copies the emitted code
+  /// into the arena under the W^X flip, registers the job's resolvers, and
+  /// caches the outcome for the variant. Synchronous on purpose - nothing may
+  /// suspend while the arena is writable or `sections` is borrowed.
+  fn commit_compile(
+    &self,
+    section_index: usize,
+    function_index: usize,
+    signature: PointerSignature,
+    outcome: Result<LazyCompiledCode, LazyCompileError>,
+  ) -> Result<Entrypoint, RuntimeError> {
+    let mut sections = self.unbound.sections.borrow_mut();
+    let section = sections
+      .get_mut(section_index)
+      .expect("claimed section disappeared");
+    let function = &section.layout.functions[function_index];
+    let (start_pc, end_pc) = (function.start_pc, function.end_pc);
+    let result = self.commit_compile_inner(outcome, start_pc, end_pc);
+    match &result {
+      Ok((entrypoint, written_len)) => {
+        section.functions[function_index]
+          .compiled
+          .insert(signature, FunctionCompilation::Succeeded(*entrypoint));
+        tracing::debug!(
+          section_index,
+          function_index,
+          start_pc,
+          end_pc,
+          native_code_addr = ?(entrypoint.code_ptr as *const u8),
+          native_code_size = written_len,
+          "jit compiled function"
+        );
+      }
+      Err(err) => {
         section.functions[function_index]
           .compiled
           .insert(signature, FunctionCompilation::Failed(err.clone()));
-        return Err(err);
-      };
-      next_resolver_id = advanced;
-      resolver_ids[call_pc] = resolver_id;
-      pending_resolvers.push((
-        resolver_id,
-        ResolverInfo {
-          section_index,
-          function_index: callee_index,
-          signature: callee_signature,
-        },
-      ));
+      }
     }
+    result.map(|(entrypoint, _)| entrypoint)
+  }
 
+  fn commit_compile_inner(
+    &self,
+    outcome: Result<LazyCompiledCode, LazyCompileError>,
+    start_pc: usize,
+    end_pc: usize,
+  ) -> Result<(Entrypoint, usize), RuntimeError> {
     let mut arena = self.unbound.code_arena.borrow_mut();
+    // The function translates; there is just no room left for it. That is
+    // terminal for the whole program, not for this variant: the arena never
+    // shrinks, so nothing can be compiled from here on.
+    let out_of_space = |arena: &CodeArena| {
+      let err = RuntimeError::InvalidArgumentOwned(format!(
+        "jit code budget exhausted: function [{start_pc}, {end_pc}) did not fit in the {} bytes \
+         left of the {} byte code budget ({} already in use). Raise \
+         ProgramLoader::with_code_size_limit if the program needs more.",
+        self.unbound.code_size - arena.used,
+        self.unbound.code_size,
+        arena.used,
+      ));
+      *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
+      err
+    };
+
+    let compiled = match outcome {
+      Ok(compiled) => compiled,
+      Err(LazyCompileError::StaticRegions { unresolved }) => {
+        return Err(RuntimeError::InvalidArgumentOwned(format!(
+          "static region analysis failed in function [{start_pc}, {end_pc}): {} memory \
+           access(es) could not be routed to a single region (instruction slots {unresolved:?})",
+          unresolved.len(),
+        )));
+      }
+      Err(LazyCompileError::TooManyResolvers) => {
+        return Err(RuntimeError::InvalidArgument(
+          "too many local call resolvers",
+        ));
+      }
+      Err(LazyCompileError::Translate(TranslateError::OutOfSpace)) => {
+        // The job's scratch was sized to the space the arena had left at
+        // claim time.
+        return Err(out_of_space(&arena));
+      }
+      Err(LazyCompileError::Translate(TranslateError::Failed(errmsg))) => {
+        return Err(RuntimeError::InvalidArgumentOwned(format!(
+          "jit: code translation failed for function [{start_pc}, {end_pc}): {errmsg}"
+        )));
+      }
+    };
+
+    // Another variant may have claimed arena space while this job was away;
+    // what fit at claim time has to fit now.
+    let written_len = compiled.code.len();
+    if written_len > self.unbound.code_size - arena.used {
+      return Err(out_of_space(&arena));
+    }
 
     unsafe {
       if libc::mprotect(
@@ -2144,74 +2344,17 @@ impl Program {
         libc::PROT_READ | libc::PROT_WRITE,
       ) != 0
       {
-        let err = RuntimeError::PlatformError("failed to make code writable");
-        section.functions[function_index]
-          .compiled
-          .insert(signature, FunctionCompilation::Failed(err.clone()));
-        return Err(err);
+        return Err(RuntimeError::PlatformError("failed to make code writable"));
       }
     }
 
     let code_ptr = self.unbound.code_base + arena.used;
-    let remaining = self.unbound.code_size - arena.used;
-    let outcome = unsafe {
-      translate_function_into(
-        &section.translator,
-        &TranslationInputs {
-          hints: &region_analysis.hints,
-          plan: &region_analysis.plan,
-          resolver_ids: &resolver_ids,
-          start_pc: function.start_pc,
-          end_pc: function.end_pc,
-        },
-        code_ptr as *mut u8,
-        remaining,
-      )
-    };
-
-    let written_len = match outcome {
-      Ok(written_len) => written_len,
-      Err(reason) => {
-        if let Err(err) = self.protect_code_pages(arena.used) {
-          self.quarantine_code_pages();
-          *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
-          section.functions[function_index]
-            .compiled
-            .insert(signature, FunctionCompilation::Failed(err.clone()));
-          return Err(err);
-        }
-
-        let err = match reason {
-          // The function translates; there was just no room left for it. That is
-          // terminal for the whole program, not for this variant: the arena never
-          // shrinks, so nothing can be compiled from here on.
-          TranslateError::OutOfSpace => {
-            let err = RuntimeError::InvalidArgumentOwned(format!(
-              "jit code budget exhausted: function [{}, {}) did not fit in the {remaining} bytes \
-               left of the {} byte code budget ({} already in use). Raise \
-               ProgramLoader::with_code_size_limit if the program needs more.",
-              function.start_pc, function.end_pc, self.unbound.code_size, arena.used,
-            ));
-            *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
-            err
-          }
-          TranslateError::Failed(errmsg) => RuntimeError::InvalidArgumentOwned(format!(
-            "jit: code translation failed for function [{}, {}): {errmsg}",
-            function.start_pc, function.end_pc,
-          )),
-        };
-        section.functions[function_index]
-          .compiled
-          .insert(signature, FunctionCompilation::Failed(err.clone()));
-        return Err(err);
-      }
-    };
-
     unsafe {
+      std::ptr::copy_nonoverlapping(compiled.code.as_ptr(), code_ptr as *mut u8, written_len);
       crate::jit::clear_instruction_cache(code_ptr as *mut u8, written_len);
     }
 
-    // Restore W^X protection covering the newly emitted function before
+    // Restore W^X protection covering the newly copied function before
     // advancing the arena. If protection cannot be restored the function is not
     // executable, so leave `arena.used` unchanged (reclaiming the space, which
     // the next compilation overwrites after making the region writable again)
@@ -2220,36 +2363,19 @@ impl Program {
     if let Err(err) = self.protect_code_pages(new_used) {
       self.quarantine_code_pages();
       *self.unbound.code_exhausted.borrow_mut() = Some(err.clone());
-      section.functions[function_index]
-        .compiled
-        .insert(signature, FunctionCompilation::Failed(err.clone()));
       return Err(err);
     }
     arena.used = new_used;
 
-    // Compilation succeeded: commit the resolver ids and metadata.
-    self.unbound.next_resolver_id.set(next_resolver_id);
+    // The code is live: commit the job's resolver metadata.
     {
       let mut resolvers = self.unbound.resolvers.borrow_mut();
-      for (resolver_id, info) in pending_resolvers {
+      for (resolver_id, info) in compiled.pending_resolvers {
         resolvers.insert(resolver_id, info);
       }
     }
 
-    let entrypoint = Entrypoint { code_ptr };
-    section.functions[function_index]
-      .compiled
-      .insert(signature, FunctionCompilation::Succeeded(entrypoint));
-    tracing::debug!(
-      section_index,
-      function_index,
-      start_pc = function.start_pc,
-      end_pc = function.end_pc,
-      native_code_addr = ?(code_ptr as *const u8),
-      native_code_size = written_len,
-      "jit compiled function"
-    );
-    Ok(entrypoint)
+    Ok((Entrypoint { code_ptr }, written_len))
   }
 
   /// Runs the program entrypoint with immutable access to shared ELF data.
@@ -2348,7 +2474,7 @@ impl Program {
     let Some(section_index) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));
     };
-    let entrypoint = self.compile_entrypoint(section_index)?;
+    let entrypoint = self.compile_entrypoint(timeslicer, section_index).await?;
     struct CoDropper<'a, Input, Yield, Return, DefaultStack: Stack>(
       ScopedCoroutine<'a, Input, Yield, Return, DefaultStack>,
     );
@@ -2619,15 +2745,22 @@ impl Program {
           writable_data,
         };
 
-        // A lazy local call JIT-compiles a function on this thread before the
-        // guest can continue - guest-triggered work whose size the program
-        // chooses, since every (function, pointer signature) pair is a separate
-        // compilation. So it has to reach the run-budget check below like any
-        // other dispatch. Async preemption cannot substitute: the SIGUSR1
-        // handler only acts on a PC inside the JIT code range, and during
-        // compilation the PC is in the compiler.
+        // A lazy local call JIT-compiles a function before the guest can
+        // continue - guest-triggered work whose size the program chooses,
+        // since every (function, pointer signature) pair is a separate
+        // compilation. The heavy phases run under `Timeslicer::run_blocking`,
+        // so an executor integration keeps its event loop responsive while
+        // this run awaits the result; the elapsed wall time still has to reach
+        // the run-budget check below like any other dispatch (awaiting is not
+        // credited back the way async helper time is). Async preemption cannot
+        // substitute for that check: the SIGUSR1 handler only acts on a PC
+        // inside the JIT code range, and during compilation the PC is in the
+        // compiler.
         let compiled_lazily = if let Some(resolver_id) = dispatch.lazy_local_call {
-          resume_input = self.compile_resolver(resolver_id)?.code_ptr as u64;
+          resume_input = self
+            .compile_resolver(timeslicer, resolver_id)
+            .await?
+            .code_ptr as u64;
           true
         } else if dispatch.async_preemption {
           self
@@ -2799,39 +2932,128 @@ impl Drop for LoaderValidationScope {
 
 use crate::jit::TranslateError;
 
-/// What the analysis tells the JIT about one function, beyond the bytecode
-/// itself. All of it is borrowed for the duration of a single translation and
-/// cleared again afterwards.
-struct TranslationInputs<'a> {
-  hints: &'a [u8],
-  plan: &'a [crate::jit::PlanEntry],
-  resolver_ids: &'a [u32],
-  start_pc: usize,
-  end_pc: usize,
+/// How one compilation variant resolves at claim time.
+enum CompileClaim {
+  /// The variant is already cached - compiled, or failed for good.
+  Compiled(Result<Entrypoint, RuntimeError>),
+  /// Another run holds the claim; wait for it and re-check the cache.
+  InFlight(Arc<InFlightCompile>),
+  /// This run now holds the claim, and this job fills it.
+  Claimed(Box<LazyCompileJob>),
 }
 
-/// Translates `[start_pc, end_pc)` into `buffer`, returning the number of bytes
-/// emitted.
+/// Everything one lazy compilation needs away from the program's thread.
 ///
-/// # Safety
-/// `buffer` must be writable for `capacity` bytes.
-unsafe fn translate_function_into(
-  translator: &crate::jit::Translator,
-  inputs: &TranslationInputs<'_>,
-  buffer: *mut u8,
-  capacity: usize,
-) -> Result<usize, TranslateError> {
-  // The analysis inputs describe this one range under this one specialization,
-  // and are borrowed for exactly this call.
-  let jit_inputs = crate::jit::TranslationInputs {
-    hints: inputs.hints,
-    plan: inputs.plan,
-    resolver_ids: inputs.resolver_ids,
-    start_pc: inputs.start_pc,
-    end_pc: inputs.end_pc,
-  };
-  let out = std::slice::from_raw_parts_mut(buffer, capacity);
-  translator.translate_range(&jit_inputs, out)
+/// Built under the claim in `claim_compile` and executed via
+/// [`Timeslicer::run_blocking`] - possibly on a worker thread, possibly
+/// outliving a cancelled run - hence owned or `Arc`-shared data only. The
+/// bytecode is read out of the cage's data region, whose code-bearing prefix
+/// is frozen read-only at load ([`PointerCage::freeze_data`]) and never made
+/// writable again (`run_mut` reopens only the writable-data suffix above it),
+/// so the job reads immutable memory; the `cage` Arc keeps that mapping alive
+/// for the life of the job.
+struct LazyCompileJob {
+  cage: Arc<PointerCage>,
+  translator: Arc<crate::jit::Translator>,
+  layout: Arc<FunctionLayout>,
+  code_vaddr: usize,
+  code_len: usize,
+  section_index: usize,
+  start_pc: usize,
+  end_pc: usize,
+  signature: PointerSignature,
+  stack_frame_size: u16,
+  require_static_regions: bool,
+  next_resolver_id: Arc<AtomicU32>,
+  scratch_capacity: usize,
+}
+
+struct LazyCompiledCode {
+  /// The emitted native code. Position-independent: `translate_range` is
+  /// handed a buffer but never its address, and lazy local calls are emitted
+  /// as indirect calls, so the commit can land these bytes wherever the arena
+  /// cursor sits.
+  code: Vec<u8>,
+  /// Resolver metadata for the call sites baked into `code`, registered by the
+  /// commit only once the code is live.
+  pending_resolvers: Vec<(u32, ResolverInfo)>,
+}
+
+enum LazyCompileError {
+  StaticRegions { unresolved: Vec<usize> },
+  TooManyResolvers,
+  Translate(TranslateError),
+}
+
+impl LazyCompileJob {
+  fn run(&self) -> Result<LazyCompiledCode, LazyCompileError> {
+    let code = self
+      .cage
+      .data_slice(self.code_vaddr, self.code_len)
+      .expect("section code range was validated at load");
+    // SAFETY: the range is mapped for the life of `self.cage` and frozen
+    // read-only (see the struct docs), so no writer exists to alias with.
+    let code_bytes = unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
+    let region_analysis = crate::region_analysis::analyze_function(
+      code_bytes,
+      self.start_pc,
+      self.end_pc,
+      self.signature,
+      self.cage.data_bottom() as u64,
+      self.cage.data_top() as u64,
+      &self.layout,
+      self.stack_frame_size,
+    );
+    if self.require_static_regions && !region_analysis.unresolved.is_empty() {
+      return Err(LazyCompileError::StaticRegions {
+        unresolved: region_analysis.unresolved,
+      });
+    }
+
+    // Resolver ids are allocated here because the emitted call sites carry
+    // them as immediates. Their metadata still reaches the shared `resolvers`
+    // map only through the commit, so a failed or abandoned job orphans no map
+    // entries - it merely retires the ids it drew.
+    let mut resolver_ids = vec![0u32; code_bytes.len() / 8];
+    let mut pending_resolvers: Vec<(u32, ResolverInfo)> = Vec::new();
+    for (&call_pc, &callee_signature) in &region_analysis.call_signatures {
+      let target_pc = local_call_target(code_bytes, call_pc);
+      let callee_index = self.layout.pc_to_func[target_pc];
+      let resolver_id = self
+        .next_resolver_id
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| LazyCompileError::TooManyResolvers)?;
+      resolver_ids[call_pc] = resolver_id;
+      pending_resolvers.push((
+        resolver_id,
+        ResolverInfo {
+          section_index: self.section_index,
+          function_index: callee_index,
+          signature: callee_signature,
+        },
+      ));
+    }
+
+    let mut code = vec![0u8; self.scratch_capacity];
+    let written_len = self
+      .translator
+      .translate_range(
+        &crate::jit::TranslationInputs {
+          hints: &region_analysis.hints,
+          plan: &region_analysis.plan,
+          resolver_ids: &resolver_ids,
+          start_pc: self.start_pc,
+          end_pc: self.end_pc,
+        },
+        &mut code,
+      )
+      .map_err(LazyCompileError::Translate)?;
+    code.truncate(written_len);
+    Ok(LazyCompiledCode {
+      code,
+      pending_resolvers,
+    })
+  }
 }
 
 fn local_call_target(code: &[u8], pc: usize) -> usize {
@@ -3180,10 +3402,10 @@ impl ProgramLoader {
         .map(|_| FunctionState::default())
         .collect();
       sections.push(Section {
-        translator,
+        translator: Arc::new(translator),
         code_vaddr: code_vaddr_size.0,
         code_len: code_vaddr_size.1,
-        layout,
+        layout: Arc::new(layout),
         functions,
       });
     }
@@ -3211,7 +3433,7 @@ impl ProgramLoader {
       run_lock: RwLock::new(()),
       data_protection_failed: Cell::new(false),
       code_arena: RefCell::new(CodeArena { used: 0 }),
-      cage,
+      cage: Arc::new(cage),
       helper_id_xor: self.helper_id_xor,
       helpers: self.helpers.clone(),
       event_listener: self.event_listener.clone(),
@@ -3219,7 +3441,8 @@ impl ProgramLoader {
       entrypoints,
       sections: RefCell::new(sections),
       resolvers: RefCell::new(resolvers),
-      next_resolver_id: Cell::new(next_resolver_id),
+      next_resolver_id: Arc::new(AtomicU32::new(next_resolver_id)),
+      in_flight_compiles: RefCell::new(HashMap::new()),
       code_exhausted: RefCell::new(None),
     })
   }

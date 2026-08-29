@@ -22,7 +22,7 @@ use crate::{
   helpers::Helper,
   program::{
     DummyProgramEventListener, HelperScope, PreemptionEnabled, Program, ProgramEventListener,
-    ProgramLoader, TimesliceConfig, MAX_CALLDATA_SIZE,
+    ProgramLoader, TimesliceConfig, Timeslicer, MAX_CALLDATA_SIZE,
   },
   test::raw_elf::{build_elf, Insn},
   test_util::{compile_ebpf, gt_env, timeslice_config, TokioTimeslicer},
@@ -665,4 +665,169 @@ async fn a_compilation_storm_does_not_starve_the_async_runtime() {
     during > 0,
     "the heartbeat task was starved for the whole run"
   );
+}
+
+/// The compilations themselves run wherever `Timeslicer::run_blocking` puts
+/// them - here, on Tokio's blocking pool - never on the thread driving the run
+/// loop.
+#[tokio::test]
+async fn lazy_compilation_runs_on_the_blocking_executor() {
+  struct RecordingTimeslicer {
+    compile_threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+  }
+  impl Timeslicer for RecordingTimeslicer {
+    fn sleep(&self, duration: Duration) -> impl std::future::Future<Output = ()> {
+      tokio::time::sleep(duration)
+    }
+    fn yield_now(&self) -> impl std::future::Future<Output = ()> {
+      tokio::task::yield_now()
+    }
+    fn run_blocking<T: Send + 'static>(
+      &self,
+      f: impl FnOnce() -> T + Send + 'static,
+    ) -> impl std::future::Future<Output = T> {
+      let threads = self.compile_threads.clone();
+      let handle = tokio::task::spawn_blocking(move || {
+        threads.lock().unwrap().push(std::thread::current().id());
+        f()
+      });
+      async move { handle.await.unwrap() }
+    }
+  }
+
+  let timeslicer = RecordingTimeslicer {
+    compile_threads: Arc::new(std::sync::Mutex::new(Vec::new())),
+  };
+  let program = load_raw(&signature_fanout(2, 2, Carriers::Observed), &[0u8; 8]);
+  let (_, t_env) = gt_env();
+  let mut resources: [&mut dyn Any; 0] = [];
+  let ret = program
+    .run(
+      &timeslice_config(),
+      &timeslicer,
+      "test",
+      &mut resources,
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 0);
+  assert_eq!(program.compiled_function_count_for_tests(), 7);
+
+  let threads = timeslicer.compile_threads.lock().unwrap();
+  assert_eq!(
+    threads.len(),
+    7,
+    "expected one run_blocking invocation per compiled variant"
+  );
+  let loop_thread = std::thread::current().id();
+  assert!(
+    threads.iter().all(|id| *id != loop_thread),
+    "a compilation ran on the run-loop thread"
+  );
+}
+
+/// An embedder without a blocking pool can implement `run_blocking` inline on
+/// the current thread - the behavior every embedder had before the hook
+/// existed - and the lazy pipeline works identically through it.
+#[tokio::test]
+async fn an_inline_run_blocking_compiles_on_the_current_thread() {
+  struct InlineTimeslicer;
+  impl Timeslicer for InlineTimeslicer {
+    fn sleep(&self, duration: Duration) -> impl std::future::Future<Output = ()> {
+      tokio::time::sleep(duration)
+    }
+    fn yield_now(&self) -> impl std::future::Future<Output = ()> {
+      tokio::task::yield_now()
+    }
+    fn run_blocking<T: Send + 'static>(
+      &self,
+      f: impl FnOnce() -> T + Send + 'static,
+    ) -> impl std::future::Future<Output = T> {
+      std::future::ready(f())
+    }
+  }
+
+  let program = load_raw(&signature_fanout(2, 2, Carriers::Observed), &[0u8; 8]);
+  let (_, t_env) = gt_env();
+  let mut resources: [&mut dyn Any; 0] = [];
+  let ret = program
+    .run(
+      &timeslice_config(),
+      &InlineTimeslicer,
+      "test",
+      &mut resources,
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 0);
+  assert_eq!(program.compiled_function_count_for_tests(), 7);
+}
+
+/// Two interleaved runs hitting the same cold function share one compilation:
+/// the second finds the first's claim in flight and awaits it instead of
+/// compiling the variant again.
+#[tokio::test]
+async fn interleaved_runs_share_one_in_flight_compilation() {
+  struct SlowCompileTimeslicer;
+  impl Timeslicer for SlowCompileTimeslicer {
+    fn sleep(&self, duration: Duration) -> impl std::future::Future<Output = ()> {
+      tokio::time::sleep(duration)
+    }
+    fn yield_now(&self) -> impl std::future::Future<Output = ()> {
+      tokio::task::yield_now()
+    }
+    fn run_blocking<T: Send + 'static>(
+      &self,
+      f: impl FnOnce() -> T + Send + 'static,
+    ) -> impl std::future::Future<Output = T> {
+      let handle = tokio::task::spawn_blocking(move || {
+        // Hold the claim open long enough for the other run to reach the same
+        // call site and find it in flight.
+        std::thread::sleep(Duration::from_millis(20));
+        f()
+      });
+      async move { handle.await.unwrap() }
+    }
+  }
+
+  let code = [
+    Insn::call_local(1),
+    Insn::exit(),
+    Insn::mov64_imm(0, 7),
+    Insn::exit(),
+  ];
+  let program = load_raw(&code, &[]);
+  let (_, t_env) = gt_env();
+  let preemption = PreemptionEnabled::new(t_env);
+  let timeslice = timeslice_config();
+  let mut resources_a: [&mut dyn Any; 0] = [];
+  let mut resources_b: [&mut dyn Any; 0] = [];
+  let run_a = program.run(
+    &timeslice,
+    &SlowCompileTimeslicer,
+    "test",
+    &mut resources_a,
+    &[],
+    &preemption,
+  );
+  let run_b = program.run(
+    &timeslice,
+    &SlowCompileTimeslicer,
+    "test",
+    &mut resources_b,
+    &[],
+    &preemption,
+  );
+  let (ret_a, ret_b) = tokio::join!(run_a, run_b);
+  assert_eq!(ret_a.unwrap(), 7);
+  assert_eq!(ret_b.unwrap(), 7);
+
+  // The entry point and the callee, compiled once each even though both runs
+  // needed both while the claims were still open.
+  assert_eq!(program.function_compile_attempt_count_for_tests(), 2);
+  assert_eq!(program.compiled_function_count_for_tests(), 2);
 }
