@@ -730,10 +730,14 @@ async fn lazy_compilation_runs_on_the_blocking_executor() {
 
 /// An embedder without a blocking pool can implement `run_blocking` inline on
 /// the current thread - the behavior every embedder had before the hook
-/// existed - and the lazy pipeline works identically through it.
+/// existed - and the lazy pipeline works identically through it. The recorded
+/// thread ids are what pins "inline": every job must have run on the thread
+/// driving the run loop, unlike the blocking-executor test above.
 #[tokio::test]
 async fn an_inline_run_blocking_compiles_on_the_current_thread() {
-  struct InlineTimeslicer;
+  struct InlineTimeslicer {
+    compile_threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+  }
   impl Timeslicer for InlineTimeslicer {
     fn sleep(&self, duration: Duration) -> impl std::future::Future<Output = ()> {
       tokio::time::sleep(duration)
@@ -745,17 +749,27 @@ async fn an_inline_run_blocking_compiles_on_the_current_thread() {
       &self,
       f: impl FnOnce() -> T + Send + 'static,
     ) -> impl std::future::Future<Output = T> {
-      std::future::ready(f())
+      std::future::ready({
+        self
+          .compile_threads
+          .lock()
+          .unwrap()
+          .push(std::thread::current().id());
+        f()
+      })
     }
   }
 
+  let timeslicer = InlineTimeslicer {
+    compile_threads: Arc::new(std::sync::Mutex::new(Vec::new())),
+  };
   let program = load_raw(&signature_fanout(2, 2, Carriers::Observed), &[0u8; 8]);
   let (_, t_env) = gt_env();
   let mut resources: [&mut dyn Any; 0] = [];
   let ret = program
     .run(
       &timeslice_config(),
-      &InlineTimeslicer,
+      &timeslicer,
       "test",
       &mut resources,
       &[],
@@ -765,6 +779,18 @@ async fn an_inline_run_blocking_compiles_on_the_current_thread() {
     .unwrap();
   assert_eq!(ret, 0);
   assert_eq!(program.compiled_function_count_for_tests(), 7);
+
+  let threads = timeslicer.compile_threads.lock().unwrap();
+  assert_eq!(
+    threads.len(),
+    7,
+    "expected one run_blocking invocation per compiled variant"
+  );
+  let loop_thread = std::thread::current().id();
+  assert!(
+    threads.iter().all(|id| *id == loop_thread),
+    "an inline compilation ran off the run-loop thread"
+  );
 }
 
 /// Two interleaved runs hitting the same cold function share one compilation:
