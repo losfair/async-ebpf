@@ -3553,7 +3553,7 @@ impl ProgramLoader {
         let target_section_index = elf_to_runtime_section[&call.target_section_index];
         let target_layout = &sections[target_section_index].layout;
         // Neither arm below can fire, and neither is what admits a target: this
-        // very `target_pc` was handed to `analyze_functions_with_entries` above
+        // very `target_pc` was handed to `analyze_program` above
         // as one of the target section's entries, so it is in range (that call
         // refuses an out-of-range entry) and it opens a function (an entry is
         // inserted into `starts`). What actually rejects a bad target is the

@@ -1,6 +1,8 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 
-use crate::region_analysis::{function_live_in, CallSite, RegMask, ALL_SIGNATURE_REGS};
+use crate::region_analysis::{
+  program_live_in, CrossSectionCallSite, LiveInSection, RegMask, ALL_SIGNATURE_REGS,
+};
 
 const EBPF_OP_CALL: u8 = 0x05u8 | 0x80u8;
 const EBPF_OP_LDDW: u8 = 0x18;
@@ -17,7 +19,7 @@ pub(crate) struct FunctionLayout {
   /// Per function, the registers whose incoming kind it can observe. Used to
   /// mask the pointer signature a call site hands its callee, so specialization
   /// keys off what the callee actually reads rather than the caller's whole
-  /// register file. See [`function_live_in`].
+  /// register file. See [`program_live_in`].
   pub(crate) arg_masks: Vec<RegMask>,
   /// Per cross-section call site in this section, keyed by the call's pc, the
   /// argument mask of the callee that lives in another section.
@@ -228,125 +230,77 @@ fn insn_src(code: &[u8], pc: usize) -> u8 {
   code[pc * 8 + 1] >> 4
 }
 
-/// Computes the least fixed point of the per-function live-in equations, over
-/// the whole program's call graph rather than one section's.
+/// Fills in every layout's argument masks from one whole-program solve.
 ///
-/// Starting at the empty masks is important: these masks control lazy JIT
-/// specialization, so an all-register over-approximation can multiply native
-/// variants at every call around a recursive component. `function_live_in` is
-/// monotone in its callee summaries. Each successful update therefore only
-/// adds bits, and a changed callee needs to wake only its direct callers. With
-/// a finite `RegMask`, every function can change at most once per register bit.
+/// Starting the masks at empty is important: they control lazy JIT
+/// specialization, so an all-register over-approximation multiplies native
+/// variants at every call around a recursive component. [`program_live_in`]
+/// computes the least fixed point and explains why it solves all the sections
+/// together rather than one function at a time.
 ///
 /// Cross-section edges are part of that graph and not a special case. Cutting
-/// them — summarising an external callee as "reads everything" — would be sound
+/// them - summarising an external callee as "reads everything" - would be sound
 /// but expensive twice over: the call site stops masking, *and* the caller's own
-/// mask saturates, which propagates to every function transitively above it. A
-/// cycle that spans sections is no different from one inside a section; the
-/// worklist already handles those, and the bit-count bound still applies.
+/// mask saturates, which propagates to every function transitively above it.
 fn live_in_fixed_point(
   sections: &[SectionInput<'_>],
   layouts: &mut [FunctionLayout],
   cross_section_calls: &[CrossSectionEdge],
 ) {
-  // Global function ids number the sections' functions consecutively, so one
-  // worklist covers the whole program.
-  let mut section_base = Vec::with_capacity(layouts.len());
-  let mut total = 0usize;
-  for layout in layouts.iter() {
-    section_base.push(total);
-    total += layout.functions.len();
-  }
-  let global = |section: usize, function: usize| section_base[section] + function;
+  // Resolve each cross-section call's callee to a function index. Every
+  // `callee_pc` reached here was also supplied as one of the callee section's
+  // entries, so it opens a function; a caller that passes the two out of step
+  // drops the edge and gets the conservative mask rather than a panic.
+  let call_sites = cross_section_calls
+    .iter()
+    .filter_map(|edge| {
+      let callee_function = *layouts
+        .get(edge.callee_section)?
+        .pc_to_func
+        .get(edge.callee_pc)?;
+      Some(CrossSectionCallSite {
+        caller_section: edge.caller_section,
+        call_pc: edge.call_pc,
+        callee_section: edge.callee_section,
+        callee_function,
+      })
+    })
+    .collect::<Vec<_>>();
 
-  // Cross-section callees, keyed the way `function_live_in` reports them: by
-  // the pc of the call site, which is all the caller's own buffer knows.
-  let mut cross_callee: HashMap<(usize, usize), usize> = HashMap::new();
-  let mut callers: Vec<Vec<usize>> = vec![Vec::new(); total];
-  for (section_index, layout) in layouts.iter().enumerate() {
-    for (function_index, function) in layout.functions.iter().enumerate() {
-      for &callee in &function.callees {
-        callers[global(section_index, callee)].push(global(section_index, function_index));
-      }
-    }
-  }
-  for edge in cross_section_calls {
-    let callee_layout = &layouts[edge.callee_section];
-    // Every `callee_pc` reached here was also supplied as one of the callee
-    // section's entries, so it opens a function. A caller that passes the two
-    // out of step gets the conservative mask rather than a panic.
-    let Some(&callee_function) = callee_layout.pc_to_func.get(edge.callee_pc) else {
-      continue;
-    };
-    let caller_layout = &layouts[edge.caller_section];
-    let Some(&caller_function) = caller_layout.pc_to_func.get(edge.call_pc) else {
-      continue;
-    };
-    cross_callee.insert(
-      (edge.caller_section, edge.call_pc),
-      global(edge.callee_section, callee_function),
-    );
-    callers[global(edge.callee_section, callee_function)]
-      .push(global(edge.caller_section, caller_function));
-  }
+  let masks = {
+    let starts = layouts
+      .iter()
+      .map(|layout| {
+        layout
+          .functions
+          .iter()
+          .map(|function| function.start_pc)
+          .collect::<Vec<_>>()
+      })
+      .collect::<Vec<_>>();
+    let inputs = sections
+      .iter()
+      .zip(layouts.iter())
+      .zip(&starts)
+      .map(|((section, layout), starts)| LiveInSection {
+        code: section.code,
+        starts,
+        pc_to_func: &layout.pc_to_func,
+      })
+      .collect::<Vec<_>>();
+    program_live_in(&inputs, &call_sites)
+  };
 
-  let mut arg_masks = vec![0 as RegMask; total];
-  let mut pending = (0..total).collect::<VecDeque<_>>();
-  let mut queued = vec![true; total];
-
-  while let Some(id) = pending.pop_front() {
-    queued[id] = false;
-    // `section_base` is sorted, so the owning section is the last base at or
-    // below this id.
-    let section_index = section_base.partition_point(|&base| base <= id) - 1;
-    let function_index = id - section_base[section_index];
-    let code = sections[section_index].code;
-    let layout = &layouts[section_index];
-    let function = &layout.functions[function_index];
-    let computed = function_live_in(
-      code,
-      function.start_pc,
-      function.end_pc,
-      &|site| match site {
-        CallSite::Local { target_pc } => layout
-          .pc_to_func
-          .get(target_pc)
-          .and_then(|&callee| arg_masks.get(global(section_index, callee)).copied())
-          .unwrap_or(ALL_SIGNATURE_REGS),
-        CallSite::CrossSection { call_pc } => cross_callee
-          .get(&(section_index, call_pc))
-          .map(|&callee| arg_masks[callee])
-          .unwrap_or(ALL_SIGNATURE_REGS),
-      },
-    );
-
-    // The transfer function is monotone, so a recomputation after callee masks
-    // grow cannot lose bits. Keep the union in release builds as a safe
-    // backstop if that invariant is accidentally broken by a future change.
-    debug_assert_eq!(arg_masks[id] & !computed, 0);
-    let next = arg_masks[id] | computed;
-    if next == arg_masks[id] {
-      continue;
-    }
-    arg_masks[id] = next;
-    for &caller in &callers[id] {
-      if !queued[caller] {
-        queued[caller] = true;
-        pending.push_back(caller);
-      }
-    }
-  }
-
-  for (section_index, layout) in layouts.iter_mut().enumerate() {
-    let base = section_base[section_index];
-    layout.arg_masks = arg_masks[base..base + layout.functions.len()].to_vec();
+  for (layout, masks) in layouts.iter_mut().zip(masks) {
+    layout.arg_masks = masks;
   }
   // Project each callee's mask back onto its call site, so per-function region
   // analysis can mask a cross-section call without holding the whole program.
-  for ((section_index, call_pc), callee) in cross_callee {
-    layouts[section_index]
+  for site in &call_sites {
+    let mask = layouts[site.callee_section].arg_masks[site.callee_function];
+    layouts[site.caller_section]
       .cross_section_arg_masks
-      .insert(call_pc, arg_masks[callee]);
+      .insert(site.call_pc, mask);
   }
 }
 
