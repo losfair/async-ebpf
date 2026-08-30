@@ -298,15 +298,16 @@ impl std::fmt::Display for LoadError {
 /// A validated eBPF program, ready to translate.
 ///
 /// Holds only what code generation needs: the decoded instructions, where the
-/// local functions start, and their stack usage. One of these is built per
-/// section at load time and then translated from repeatedly, once per function
-/// variant.
+/// functions start, and their stack usage. The runtime builds one per ELF code
+/// section and then translates from it repeatedly, once per function variant.
 pub struct Translator {
   config: Arc<Config>,
   insns: Box<[Insn]>,
-  /// Slots that are the entry point of a local function, i.e. the target of some
-  /// `call` with `src == 1`.
+  /// Slots that are function entry points: local-call targets plus roots
+  /// supplied by the object container.
   local_func_entries: Box<[bool]>,
+  /// Calls whose local-function target lives in another object section.
+  external_local_calls: Box<[bool]>,
   /// Memoised per-local-function stack usage, indexed by entry pc.
   stack_usage: stack::StackUsage,
 }
@@ -318,6 +319,19 @@ impl Translator {
   /// verbatim by callers and matched on by tests, so their wording is part of
   /// the interface rather than a diagnostic detail.
   pub fn load(config: Arc<Config>, code: &[u8]) -> Result<Translator, LoadError> {
+    Self::load_with_entries(config, code, &[], &[])
+  }
+
+  /// Validates `code` with additional function roots supplied by its container.
+  ///
+  /// The ELF loader uses this for independently invocable code sections whose
+  /// first instruction may not be the target of a local call.
+  pub(crate) fn load_with_entries(
+    config: Arc<Config>,
+    code: &[u8],
+    entries: &[usize],
+    external_calls: &[usize],
+  ) -> Result<Translator, LoadError> {
     if code.len() % 8 != 0 {
       return Err(LoadError("code_len must be a multiple of 8".to_string()));
     }
@@ -351,7 +365,18 @@ impl Translator {
       )));
     }
 
-    validate::validate(&config, &insns).map_err(LoadError)?;
+    let mut external_local_calls = vec![false; insns.len()].into_boxed_slice();
+    for &pc in external_calls {
+      if pc >= external_local_calls.len() {
+        return Err(LoadError(format!(
+          "cross-section call pc {pc} is outside the program"
+        )));
+      }
+      external_local_calls[pc] = true;
+    }
+
+    validate::validate_with_external_calls(&config, &insns, &external_local_calls)
+      .map_err(LoadError)?;
 
     // Mark the targets of local call instructions: they begin local functions,
     // and the backend needs to know where those start.
@@ -371,6 +396,19 @@ impl Translator {
         local_func_entries[target as usize] = true;
       }
     }
+    for &entry in entries {
+      if entry >= local_func_entries.len() {
+        return Err(LoadError(format!(
+          "function entry pc {entry} is outside the program"
+        )));
+      }
+      if insns[entry].opcode == 0 {
+        return Err(LoadError(format!(
+          "function entry pc {entry} targets the middle of lddw"
+        )));
+      }
+      local_func_entries[entry] = true;
+    }
 
     let insns = insns.into_boxed_slice();
     let stack_usage = stack::StackUsage::new(insns.len(), config.stack_frame_size);
@@ -379,6 +417,7 @@ impl Translator {
       config,
       insns,
       local_func_entries,
+      external_local_calls,
       stack_usage,
     })
   }
@@ -391,6 +430,12 @@ impl Translator {
   /// Whether the slot at `pc` begins a local function.
   pub fn is_local_func_entry(&self, pc: usize) -> bool {
     self.local_func_entries.get(pc).copied().unwrap_or(false)
+  }
+
+  /// Whether `pc` is an intra- or cross-section local call.
+  pub fn is_local_call(&self, pc: usize) -> bool {
+    self.insns.get(pc).copied().is_some_and(Insn::is_local_call)
+      || self.external_local_calls.get(pc).copied().unwrap_or(false)
   }
 
   /// This program's configuration.

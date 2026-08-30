@@ -26,7 +26,10 @@
 
 use std::time::{Duration, Instant};
 
+use elf::{abi::SHT_SYMTAB, endian::LittleEndian, ElfBytes};
+
 use super::raw_elf::{build_elf, load_raw_elf, write_elf_header, write_section_header, Insn};
+use crate::test_util::compile_ebpf;
 
 /// Patches the `sh_offset` field of one section header in an ELF built by
 /// [`build_elf`]. Section headers are last; `rodata` is index 5 there.
@@ -34,6 +37,54 @@ fn set_section_file_offset(elf: &mut [u8], section_index: usize, sh_offset: u64)
   let shoff = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
   let field = shoff + section_index * 64 + 24;
   elf[field..field + 8].copy_from_slice(&sh_offset.to_le_bytes());
+}
+
+fn cross_section_call_symbol_value_field_and_section_size(
+  elf: &[u8],
+  caller_section: &str,
+) -> (usize, u64) {
+  let parsed = ElfBytes::<LittleEndian>::minimal_parse(elf).unwrap();
+  let (symtab, _) = parsed.symbol_table().unwrap().unwrap();
+  let sections = parsed.section_headers().unwrap();
+  let (_, section_names) = parsed.section_headers_with_strtab().unwrap();
+  let section_names = section_names.unwrap();
+  let symbol_index = sections
+    .iter()
+    .filter(|section| section.sh_type == elf::abi::SHT_REL)
+    .find_map(|relocation_section| {
+      let target = sections.get(relocation_section.sh_info as usize).ok()?;
+      if section_names.get(target.sh_name as usize).ok()? != caller_section {
+        return None;
+      }
+      parsed
+        .section_data_as_rels(&relocation_section)
+        .ok()?
+        .find(|relocation| relocation.r_type == 10)
+        .map(|relocation| relocation.r_sym as usize)
+    })
+    .expect("cross-section call relocation not found");
+  let symbol = symtab.get(symbol_index).unwrap();
+  let symtab_section = sections
+    .iter()
+    .find(|section| section.sh_type == SHT_SYMTAB)
+    .unwrap();
+  let symbol_section = sections.get(symbol.st_shndx as usize).unwrap();
+  (
+    symtab_section.sh_offset as usize + symbol_index * symtab_section.sh_entsize as usize + 8,
+    symbol_section.sh_size,
+  )
+}
+
+fn section_file_range(elf: &[u8], name: &str) -> std::ops::Range<usize> {
+  let parsed = ElfBytes::<LittleEndian>::minimal_parse(elf).unwrap();
+  let (Some(sections), Some(strtab)) = parsed.section_headers_with_strtab().unwrap() else {
+    panic!("section table missing");
+  };
+  let section = sections
+    .iter()
+    .find(|section| strtab.get(section.sh_name as usize).ok() == Some(name))
+    .expect("section not found");
+  section.sh_offset as usize..(section.sh_offset + section.sh_size) as usize
 }
 
 const SEC_RODATA: usize = 5;
@@ -58,6 +109,66 @@ fn reloc_against_wild_sh_offset_is_a_link_error_not_a_panic() {
     err.contains("overflows the guest address space"),
     "unexpected load error: {err}"
   );
+}
+
+#[tokio::test]
+async fn cross_section_call_symbol_must_be_aligned_and_inside_its_section() {
+  let elf = compile_ebpf(
+    br#"
+      static int __attribute__((noinline, section("callee"))) target(int x) {
+        return x + 1;
+      }
+      int __attribute__((section("test"))) entry(void) {
+        return target(41);
+      }
+    "#
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let (value_field, section_size) =
+    cross_section_call_symbol_value_field_and_section_size(&elf, "test");
+
+  for bad_value in [1, section_size] {
+    let mut malformed = elf.clone();
+    malformed[value_field..value_field + 8].copy_from_slice(&bad_value.to_le_bytes());
+    let err = load_raw_elf(&malformed).expect_err("malformed function symbol must not load");
+    let err = format!("{err:?}");
+    assert!(
+      err.contains("unaligned or outside its code section"),
+      "unexpected load error for symbol value {bad_value}: {err}"
+    );
+  }
+}
+
+#[tokio::test]
+async fn local_calls_in_one_section_do_not_change_another_sections_validation() {
+  let mut elf = compile_ebpf(
+    br#"
+      static int __attribute__((noinline, section("calls"))) callee(int x) {
+        return x + 1;
+      }
+      int __attribute__((section("calls"))) calls_entry(void) {
+        return callee(41);
+      }
+      int __attribute__((section("padding"))) padded_entry(void) {
+        return 7;
+      }
+    "#
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let padding = section_file_range(&elf, "padding");
+  assert!(padding.len() >= 16, "padding section is unexpectedly short");
+  // `exit; mov r0, 7` is accepted as a section with dead trailing padding: the
+  // second slot is unreachable. A local call in `calls` must not make the JIT
+  // validate these independent bytes as one combined sub-program.
+  elf[padding.start..padding.start + 8].copy_from_slice(&Insn::exit().value.to_le_bytes());
+  elf[padding.start + 8..padding.start + 16]
+    .copy_from_slice(&Insn::mov64_imm(0, 7).value.to_le_bytes());
+
+  load_raw_elf(&elf).expect("independent sections must retain independent validation");
 }
 
 /// N code sections sharing one name must trip the same ceiling as N

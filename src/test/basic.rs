@@ -517,6 +517,65 @@ async fn test_noinline_local_function_calls() {
 
 #[tokio::test]
 #[tracing_test::traced_test]
+async fn test_local_function_calls_across_elf_sections() {
+  let (_, t_env) = gt_env();
+  let binary = compile_ebpf(
+    r#"
+  static int add_eight(int x) __attribute__((noinline, section("late_leaf")));
+
+  static int __attribute__((noinline, section("leaf"))) add_six(int x) {
+    return x + 6;
+  }
+
+  static int __attribute__((noinline, section("leaf"))) add_seven(int x) {
+    return add_six(x) + 1;
+  }
+
+  static int __attribute__((noinline, section("middle"))) twice_after_add(int x) {
+    return add_seven(x) + add_eight(x);
+  }
+
+  int __attribute__((section("test"))) entry(void) {
+    return twice_after_add(4);
+  }
+
+  static int add_eight(int x) {
+    return x + 8;
+  }
+  "#
+    .as_bytes()
+    .to_vec(),
+  )
+  .await
+  .unwrap();
+  let program = ProgramLoader::new(
+    &mut rand::thread_rng(),
+    Arc::new(DummyProgramEventListener),
+    &[],
+  )
+  .require_static_region_analysis(true)
+  .load(&mut rand::thread_rng(), &binary)
+  .unwrap()
+  .pin_to_current_thread(t_env);
+  let section_counts = program.section_instruction_counts_for_tests();
+  assert_eq!(section_counts.len(), 4);
+  assert!(section_counts.iter().sum::<usize>() > *section_counts.iter().max().unwrap());
+  let ret = program
+    .run(
+      &timeslice_config(),
+      &TokioTimeslicer,
+      "test",
+      &mut [],
+      &[],
+      &PreemptionEnabled::new(t_env),
+    )
+    .await
+    .unwrap();
+  assert_eq!(ret, 23);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
 async fn test_lazy_jit_compiles_entry_on_first_run() {
   let (_, t_env) = gt_env();
   let binary = compile_ebpf(

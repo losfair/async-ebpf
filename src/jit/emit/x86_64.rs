@@ -2085,7 +2085,7 @@ impl Emit<'_, '_, '_> {
             self.emit_cmp_imm32(map_register(0), 0);
             self.emit_jcc(0x84, PatchTarget::Special(SpecialTarget::Exit));
           }
-        } else if inst.src == 1 {
+        } else if self.t.is_local_call(pc) {
           // This entry point always compiles local calls lazily; the eager
           // `emit_local_call` is unreachable and is not ported.
           self.emit_lazy_local_call(pc);

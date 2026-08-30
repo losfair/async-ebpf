@@ -606,13 +606,20 @@ pub(crate) fn analyze_function(
   while let Some(pc) = worklist.pop() {
     on_list[pc] = false;
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
-      let target = (pc as i64 + 1 + inst.imm as i64) as usize;
-      let mask = layout
-        .pc_to_func
-        .get(target)
-        .and_then(|&callee| layout.arg_masks.get(callee).copied())
-        .unwrap_or(ALL_SIGNATURE_REGS);
+    if inst.opcode == EBPF_OP_CALL && (inst.src == 1 || inst.src == 2) {
+      let mask = if inst.src == 1 {
+        let target = (pc as i64 + 1 + inst.imm as i64) as usize;
+        layout
+          .pc_to_func
+          .get(target)
+          .and_then(|&callee| layout.arg_masks.get(callee).copied())
+          .unwrap_or(ALL_SIGNATURE_REGS)
+      } else {
+        // Cross-section callees have a separate FunctionLayout. Conservatively
+        // preserve every signature register rather than coupling the sections'
+        // fixed-point analyses.
+        ALL_SIGNATURE_REGS
+      };
       call_signatures.insert(pc, PointerSignature::from_state(&states[pc]).masked(mask));
     }
     let lddw_addr = lddw_full_imm(code, pc, &inst);
@@ -743,7 +750,7 @@ fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
           // A local callee sees the caller's whole register file: R1-R5 are
           // passed, R6-R9 are preserved across the call by the caller's stub,
           // and R0 survives it. So the call reads whatever the callee reads.
-          1 => (callee_live_in, CALL_CLOBBERED_REGS),
+          1 | 2 => (callee_live_in, CALL_CLOBBERED_REGS),
           _ => (0, 0),
         }
       } else if inst.opcode == EBPF_OP_JA || inst.opcode == EBPF_OP_JA32 {
@@ -837,8 +844,15 @@ pub(crate) fn function_live_in(
     for &succ in &edges[pc - start_pc] {
       live_out |= live[succ];
     }
-    let callee = if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
-      callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize)
+    let callee = if inst.opcode == EBPF_OP_CALL {
+      match inst.src {
+        1 => callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize),
+        // Cross-section summaries are intentionally not coupled here. Reading
+        // every signature register is conservative and keeps transitive callers
+        // from dropping state the external callee may observe.
+        2 => ALL_SIGNATURE_REGS,
+        _ => 0,
+      }
     } else {
       0
     };
@@ -895,6 +909,9 @@ fn successors(pc: usize, inst: &Inst, num_slots: usize) -> Vec<usize> {
           push(fallthrough);
           push((pc as i64 + 1 + inst.imm as i64) as usize);
         }
+        // A linker-tagged cross-section local call returns here but its callee
+        // is represented outside this section's CFG.
+        2 => push(fallthrough),
         // Other forms branch to exit; no fallthrough.
         _ => {}
       }
@@ -2184,6 +2201,18 @@ mod tests {
     assert_eq!(function_live_in(&code, 0, 2, &|_| 1 << 7), 1 << 7);
   }
 
+  #[test]
+  fn a_cross_section_call_conservatively_reads_signature_registers() {
+    let code = flatten(&[
+      slot(EBPF_OP_CALL, 0, 2, 0, 0),
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    assert_eq!(
+      function_live_in(&code, 0, 2, &|_| ALL_SIGNATURE_REGS),
+      ALL_SIGNATURE_REGS
+    );
+  }
+
   /// The all-slots fixpoint sweep [`function_live_in`] used before the
   /// worklist, kept verbatim so the two can be proven to agree bit for bit.
   fn sweep_live_in(
@@ -2220,8 +2249,12 @@ mod tests {
         for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
           live_out |= live[succ];
         }
-        let callee = if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
-          callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize)
+        let callee = if inst.opcode == EBPF_OP_CALL {
+          match inst.src {
+            1 => callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize),
+            2 => ALL_SIGNATURE_REGS,
+            _ => 0,
+          }
         } else {
           0
         };

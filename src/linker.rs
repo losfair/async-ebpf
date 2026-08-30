@@ -288,16 +288,40 @@ impl EbpfInsn {
   }
 }
 
-/// Relocates an eBPF ELF image in place and returns entrypoint ranges.
+/// One local call whose target is in another executable ELF section.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CrossSectionCall {
+  pub(crate) call_pc: usize,
+  pub(crate) target_section_index: usize,
+  pub(crate) target_pc: usize,
+}
+
+/// One executable ELF section after relocation.
+pub(crate) struct LinkedCodeSection {
+  pub(crate) elf_index: usize,
+  pub(crate) name: String,
+  pub(crate) code_vaddr: usize,
+  pub(crate) len: usize,
+  pub(crate) cross_section_calls: Vec<CrossSectionCall>,
+}
+
+/// The executable sections and the cross-section calls between them.
+pub(crate) struct LinkedCode {
+  pub(crate) sections: Vec<LinkedCodeSection>,
+}
+
+/// Relocates an eBPF ELF image in place and returns its code layout.
 ///
-/// Returns: section_name -> (code_vaddr, code_size).
+/// Calls within one section retain ordinary PC-relative immediates. Calls to a
+/// different section are tagged for the runtime and returned as explicit
+/// metadata; no synthetic whole-program instruction address space is created.
 pub fn link_elf(
   input: &mut [u8],
   immutable_vbase: usize,
   writable_vbase: usize,
   writable_plan: &WritableDataPlan,
   ext_func_table: &HashMap<&str, i32>,
-) -> Result<HashMap<String, (usize, usize)>, LinkerError> {
+) -> Result<LinkedCode, LinkerError> {
   let elf = ElfBytes::<LittleEndian>::minimal_parse(input)?;
   if elf.ehdr.class != elf::file::Class::ELF64
     || elf.ehdr.version != 1
@@ -335,7 +359,7 @@ pub fn link_elf(
   let sym_strtab_raw = elf.section_data(&sht.get(symtab_shdr.sh_link as usize)?)?.0;
   let sym_strtab = StrTabIndex::index(sym_strtab_raw)?;
 
-  let mut code_sections: HashMap<String, (usize, usize)> = HashMap::new();
+  let mut code_sections = Vec::new();
   let mut code_section_indexes: HashSet<usize> = HashSet::new();
   // Byte ranges already claimed by a code section, so two headers cannot
   // describe the same bytes and have them analyzed, translated and retained
@@ -370,19 +394,28 @@ pub fn link_elf(
     }
     claimed_code_ranges.push((start, end));
 
-    total_code_bytes = total_code_bytes.saturating_add(cs.sh_size as usize);
+    let section_size = cs.sh_size as usize;
+    if section_size % 8 != 0 {
+      return Err(LinkerError::InvalidElf(
+        "code section size is not multiple of 8",
+      ));
+    }
+    total_code_bytes = total_code_bytes.saturating_add(section_size);
     if total_code_bytes > MAX_TOTAL_CODE_BYTES {
       return Err(LinkerError::InvalidElf("too many code bytes in one object"));
     }
 
-    code_sections.insert(
-      cs_name.to_string(),
-      (immutable_vbase + cs.sh_offset as usize, cs.sh_size as usize),
-    );
+    code_sections.push(LinkedCodeSection {
+      elf_index: cs_index,
+      name: cs_name.to_string(),
+      code_vaddr: immutable_vbase + cs.sh_offset as usize,
+      len: section_size,
+      cross_section_calls: Vec::new(),
+    });
     code_section_indexes.insert(cs_index);
-    // The ceiling counts headers, not unique names: `code_sections` dedupes
-    // by name, but the overlap scan above is quadratic in the number of
-    // headers, so same-named sections must trip the same limit.
+    // The ceiling counts headers, not unique names: entrypoints are deduplicated
+    // by name downstream, but the overlap scan above is quadratic in the number
+    // of headers, so same-named sections must trip the same limit.
     if code_section_indexes.len() > MAX_CODE_SECTIONS {
       return Err(LinkerError::InvalidElf(
         "too many code sections in one object",
@@ -394,6 +427,7 @@ pub fn link_elf(
   let mut data_rewrites: Vec<(usize, u64)> = vec![];
   let mut relocation_count = 0usize;
   let mut reloc_section_count = 0usize;
+  let mut cross_section_calls: HashMap<usize, Vec<CrossSectionCall>> = HashMap::new();
   // Relocation sections are not required to describe distinct bytes either, so
   // one valid relocation blob can be replayed against the same target by any
   // number of SHT_REL headers.
@@ -500,23 +534,42 @@ pub fn link_elf(
           insn.imm = func_index;
           insn.src = 0;
         } else if code_section_indexes.contains(&(sym.st_shndx as usize)) {
-          let code_section = sht.get(sym.st_shndx as usize)?;
+          let symbol_section_index = sym.st_shndx as usize;
+          let symbol_section = sht.get(symbol_section_index)?;
           let old_imm = insn.imm as i64;
           let symbol_offset = if sym.st_value == 0 && old_imm != -1 {
             ((old_imm + 1) as u64).saturating_mul(8)
           } else {
             sym.st_value
           };
-          let target_addr = code_section.sh_offset.wrapping_add(symbol_offset);
-          let call_addr = target_section.sh_offset.wrapping_add(reloc.r_offset);
-          let delta = (target_addr as i128 - call_addr as i128 - 8) / 8;
-          if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+          if symbol_offset % 8 != 0 || symbol_offset >= symbol_section.sh_size {
             return Err(LinkerError::Reloc(
-              "R_BPF_64_32: local call target out of range".to_string(),
+              "R_BPF_64_32: local call target is unaligned or outside its code section".to_string(),
               reloc,
             ));
           }
-          insn.imm = delta as i32;
+          if symbol_section_index == target_section_index {
+            let delta = (symbol_offset as i128 - reloc.r_offset as i128 - 8) / 8;
+            if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+              return Err(LinkerError::Reloc(
+                "R_BPF_64_32: local call target out of range".to_string(),
+                reloc,
+              ));
+            }
+            insn.src = 1;
+            insn.imm = delta as i32;
+          } else {
+            insn.src = 2;
+            insn.imm = 0;
+            cross_section_calls
+              .entry(target_section_index)
+              .or_default()
+              .push(CrossSectionCall {
+                call_pc: reloc.r_offset as usize / 8,
+                target_section_index: symbol_section_index,
+                target_pc: symbol_offset as usize / 8,
+              });
+          }
         } else {
           return Err(LinkerError::Reloc(
             format!(
@@ -600,19 +653,15 @@ pub fn link_elf(
     input[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
   }
 
-  // Each code section must be a whole number of 8-byte instruction slots.
-  // Per-instruction validation (control flow, local-call graph, region routing)
-  // is performed later by `function_analysis`/`region_analysis` once the section
-  // bytes are resolved.
-  for &(_, len) in code_sections.values() {
-    if len % 8 != 0 {
-      return Err(LinkerError::InvalidElf(
-        "code section size is not multiple of 8",
-      ));
-    }
+  for section in &mut code_sections {
+    section.cross_section_calls = cross_section_calls
+      .remove(&section.elf_index)
+      .unwrap_or_default();
   }
 
-  Ok(code_sections)
+  Ok(LinkedCode {
+    sections: code_sections,
+  })
 }
 
 #[cfg(test)]

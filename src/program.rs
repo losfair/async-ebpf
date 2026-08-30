@@ -31,7 +31,7 @@ use crate::{
     Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
   },
   error::{Error, RuntimeError},
-  function_analysis::{analyze_functions, FunctionLayout},
+  function_analysis::{analyze_functions_with_entries, FunctionLayout},
   helpers::Helper,
   linker::{link_elf, plan_writable_data},
   pointer_cage::PointerCage,
@@ -1403,7 +1403,14 @@ struct Section {
   code_vaddr: usize,
   code_len: usize,
   layout: Arc<FunctionLayout>,
+  cross_section_calls: Arc<HashMap<usize, ExternalCallTarget>>,
   functions: Vec<FunctionState>,
+}
+
+#[derive(Clone, Copy)]
+struct ExternalCallTarget {
+  section_index: usize,
+  function_index: usize,
 }
 
 #[derive(Default)]
@@ -2000,6 +2007,17 @@ impl Program {
     self.unbound.code_arena.borrow().used
   }
 
+  #[cfg(test)]
+  pub(crate) fn section_instruction_counts_for_tests(&self) -> Vec<usize> {
+    self
+      .unbound
+      .sections
+      .borrow()
+      .iter()
+      .map(|section| section.translator.insns().len())
+      .collect()
+  }
+
   /// Number of successfully compiled variants per source function, flattened
   /// across sections. One entry per function in the layout; a value > 1 means
   /// that callee was specialized for multiple incoming pointer signatures.
@@ -2231,6 +2249,7 @@ impl Program {
       layout: section.layout.clone(),
       code_vaddr: section.code_vaddr,
       code_len: section.code_len,
+      cross_section_calls: section.cross_section_calls.clone(),
       section_index,
       start_pc: function.start_pc,
       end_pc: function.end_pc,
@@ -2964,6 +2983,7 @@ struct LazyCompileJob {
   layout: Arc<FunctionLayout>,
   code_vaddr: usize,
   code_len: usize,
+  cross_section_calls: Arc<HashMap<usize, ExternalCallTarget>>,
   section_index: usize,
   start_pc: usize,
   end_pc: usize,
@@ -3023,8 +3043,21 @@ impl LazyCompileJob {
     let mut resolver_ids = vec![0u32; code_bytes.len() / 8];
     let mut pending_resolvers: Vec<(u32, ResolverInfo)> = Vec::new();
     for (&call_pc, &callee_signature) in &region_analysis.call_signatures {
-      let target_pc = local_call_target(code_bytes, call_pc);
-      let callee_index = self.layout.pc_to_func[target_pc];
+      let call_src = code_bytes[call_pc * 8 + 1] >> 4;
+      let target = if call_src == 2 {
+        self
+          .cross_section_calls
+          .get(&call_pc)
+          .copied()
+          .expect("validated cross-section call lost its target metadata")
+      } else {
+        debug_assert_eq!(call_src, 1);
+        let target_pc = local_call_target(code_bytes, call_pc);
+        ExternalCallTarget {
+          section_index: self.section_index,
+          function_index: self.layout.pc_to_func[target_pc],
+        }
+      };
       let resolver_id = self
         .next_resolver_id
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -3033,8 +3066,8 @@ impl LazyCompileJob {
       pending_resolvers.push((
         resolver_id,
         ResolverInfo {
-          section_index: self.section_index,
-          function_index: callee_index,
+          section_index: target.section_index,
+          function_index: target.function_index,
           signature: callee_signature,
         },
       ));
@@ -3286,7 +3319,7 @@ impl ProgramLoader {
       writable_plan.size,
     )?;
 
-    let code_sections = {
+    let linked_code = {
       let mut data = cage.data_slice(cage.data_bottom(), elf.len()).unwrap();
       let data = unsafe { data.as_mut() };
       data.copy_from_slice(elf);
@@ -3356,45 +3389,65 @@ impl ProgramLoader {
     let mut sections = Vec::new();
     let resolvers = HashMap::new();
     let next_resolver_id = 1u32;
-
     let config = std::sync::Arc::new(jit_config(
       &cage,
       self.instruction_limit,
       self.stack_frame_size,
       u32::try_from(stack_layout.frame_stride).expect("stack stride validated above"),
     ));
+    let mut incoming_entries: HashMap<usize, Vec<usize>> = HashMap::new();
+    for code_section in &linked_code.sections {
+      for call in &code_section.cross_section_calls {
+        incoming_entries
+          .entry(call.target_section_index)
+          .or_default()
+          .push(call.target_pc);
+      }
+    }
+    let mut elf_to_runtime_section = HashMap::new();
 
-    for (section_name, code_vaddr_size) in code_sections {
+    for code_section in &linked_code.sections {
       let code = cage
-        .data_slice(code_vaddr_size.0, code_vaddr_size.1)
+        .data_slice(code_section.code_vaddr, code_section.len)
         .unwrap();
       let code_bytes =
         unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
-      // `Translator::load` enforces this, but it runs last: without the check
-      // here an oversized section is walked twice and given per-instruction
-      // tables by the two analyses below, only to be refused afterwards for a
-      // reason that was knowable from its length.
-      if code_bytes.len() / 8 > self.instruction_limit as usize {
+      if code_bytes.len() / 8 >= self.instruction_limit {
         return Err(RuntimeError::InvalidArgumentOwned(format!(
-          "too many instructions in {section_name} (max {})",
-          self.instruction_limit
+          "too many instructions in {} (max {})",
+          code_section.name, self.instruction_limit
         )));
       }
-      let layout = analyze_functions(code_bytes).map_err(|err| {
+      let function_entries = incoming_entries
+        .get(&code_section.elf_index)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+      let layout = analyze_functions_with_entries(code_bytes, function_entries).map_err(|err| {
         RuntimeError::InvalidArgumentOwned(format!(
-          "local function analysis failed in {section_name}: {err}"
+          "local function analysis failed in {}: {err}",
+          code_section.name
         ))
       })?;
+      let external_call_pcs = code_section
+        .cross_section_calls
+        .iter()
+        .map(|call| call.call_pc)
+        .collect::<Vec<_>>();
       // The validator calls back into the loader to check helper indices, so
       // the scope has to be live across the call.
       let translator = {
         let _validation_scope = LoaderValidationScope::new(self);
-        crate::jit::Translator::load(config.clone(), code_bytes)
+        crate::jit::Translator::load_with_entries(
+          config.clone(),
+          code_bytes,
+          function_entries,
+          &external_call_pcs,
+        )
       };
       let translator = match translator {
         Ok(translator) => translator,
         Err(err) => {
-          tracing::error!(section_name, error = %err, "failed to load code");
+          tracing::error!(section_name = code_section.name, error = %err, "failed to load code");
           return Err(RuntimeError::InvalidArgumentOwned(format!(
             "jit: code load failed: {err}"
           )));
@@ -3402,18 +3455,58 @@ impl ProgramLoader {
       };
 
       let section_index = sections.len();
-
-      entrypoints.insert(section_name, section_index);
+      entrypoints.insert(code_section.name.clone(), section_index);
+      elf_to_runtime_section.insert(code_section.elf_index, section_index);
       let functions = (0..layout.functions.len())
         .map(|_| FunctionState::default())
         .collect();
       sections.push(Section {
         translator: Arc::new(translator),
-        code_vaddr: code_vaddr_size.0,
-        code_len: code_vaddr_size.1,
+        code_vaddr: code_section.code_vaddr,
+        code_len: code_section.len,
         layout: Arc::new(layout),
+        cross_section_calls: Arc::new(HashMap::new()),
         functions,
       });
+    }
+
+    let mut resolved_cross_section_calls = vec![HashMap::new(); sections.len()];
+    for code_section in &linked_code.sections {
+      let source_section_index = elf_to_runtime_section[&code_section.elf_index];
+      for call in &code_section.cross_section_calls {
+        let target_section_index = elf_to_runtime_section[&call.target_section_index];
+        let target_layout = &sections[target_section_index].layout;
+        let Some(&function_index) = target_layout.pc_to_func.get(call.target_pc) else {
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "cross-section local call at PC {} targets PC {} outside section {}",
+            call.call_pc, call.target_pc, target_section_index
+          )));
+        };
+        if target_layout.functions[function_index].start_pc != call.target_pc {
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "cross-section local call at PC {} targets non-function PC {}",
+            call.call_pc, call.target_pc
+          )));
+        }
+        if resolved_cross_section_calls[source_section_index]
+          .insert(
+            call.call_pc,
+            ExternalCallTarget {
+              section_index: target_section_index,
+              function_index,
+            },
+          )
+          .is_some()
+        {
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "more than one cross-section relocation targets call PC {}",
+            call.call_pc
+          )));
+        }
+      }
+    }
+    for (section, calls) in sections.iter_mut().zip(resolved_cross_section_calls) {
+      section.cross_section_calls = Arc::new(calls);
     }
 
     tracing::info!(
