@@ -930,9 +930,11 @@ pub(crate) struct CrossSectionCallSite {
 /// every time any callee's mask grows, and each restart costs the whole
 /// function, so a function with `m` callees whose masks settle one at a time is
 /// re-analyzed `m` times at O(span) each. A caller of a chain of `m` functions
-/// is then Θ(m · span), and no property of the call graph bounds that below the
-/// size of the program — condensing the graph into strongly connected
-/// components would fix the chain but not a cycle spanning the same functions.
+/// is Theta(m . span). Condensing the call graph into strongly connected
+/// components and solving in reverse topological order would fix a chain -
+/// including the shape the budget tests use, which is a DAG - but not a cycle
+/// spanning those same functions, where an SCC still re-runs the inner solve
+/// once per member. Flattening needs no such case split.
 ///
 /// Flattened, nothing restarts because nothing is discarded between visits.
 /// Every slot's liveness only grows, and it is capped at ten signature bits, so
@@ -940,14 +942,20 @@ pub(crate) struct CrossSectionCallSite {
 /// program.
 ///
 /// The space is linear in the program too, which the per-function solve was
-/// not: the predecessor index spans every slot at once, where that one held
-/// one function's worth. Measured on the largest object `link_elf` admits (128
-/// sections × 65,535 slots = 64 MiB of code), this function costs 6.4 s and
-/// 416 MiB, and the whole of `analyze_program` around it 6.7 s and 968 MiB —
-/// on the non-preemptible load path, for an object that already occupies 64
-/// MiB twice over. Both are far below what the per-function solve cost on far
-/// smaller objects, but the memory is a real change in kind and is why the
-/// indices are `u32` rather than `usize`.
+/// not: the predecessor index and the callee array span every slot at once,
+/// where that one held a function's worth. That is why the indices here are
+/// `u32` and why the callee lookup is an array rather than a map.
+///
+/// Linear is not the same as cheap at the ceiling. On the largest object
+/// `link_elf` admits — 128 sections of 65,534 slots, 64 MiB of code, needing
+/// no relocations at all — a shape built to make every mask bit propagate
+/// separately costs this function 2.1 s and 219 MB, and `analyze_program`
+/// around it 4.0 s and 868 MB. That is on the non-preemptible load path, and
+/// the analysis is most of what loading such an object costs. It is far below
+/// what the per-function solve charged (11.7 s and 301 MB for this function on
+/// the same input, and superlinearly worse as the object grows), but it is not
+/// nothing, and a caller that admits objects this large should know the shape
+/// of the bill.
 pub(crate) fn program_live_in(
   sections: &[LiveInSection<'_>],
   cross_section_calls: &[CrossSectionCallSite],
@@ -979,7 +987,7 @@ pub(crate) fn program_live_in(
   // a caller that ignores that cap gets the conservative summary, not a wrong
   // one. Same for a `starts` array that does not partition its section: every
   // walk below assumes `starts[i] < starts[i + 1] <= num_slots`.
-  if total_slots > u32::MAX as usize {
+  if total_slots >= (u32::MAX - 1) as usize {
     return conservative();
   }
   for section in sections {
@@ -1019,8 +1027,11 @@ pub(crate) fn program_live_in(
     (section.starts[fi], end)
   };
 
-  // Only reachable slots can read anything; walking dead code would invent
-  // uses no execution can perform.
+  // Reachable slots only. This is a speedup, not a correctness requirement:
+  // liveness runs backward, and every successor of a reachable slot is itself
+  // reachable, so an unreachable slot's liveness can only ever flow to other
+  // unreachable slots and never reaches a function entry. Skipping them also
+  // keeps this identical to `function_live_in`, which filters the same way.
   let mut reachable = vec![false; total_slots];
   let mut stack: Vec<usize> = Vec::new();
   for (si, section) in sections.iter().enumerate() {
@@ -1044,10 +1055,20 @@ pub(crate) fn program_live_in(
     }
   }
 
-  // Each call site's callee, by global slot id. `None` is the conservative
-  // summary, for a target this analysis cannot resolve; the loader's own
-  // validation refuses those long before here, so it is a backstop.
-  let mut callee_of: HashMap<u32, Option<u32>> = HashMap::new();
+  // Each call site's callee, indexed by global slot id. Dense rather than a
+  // map: this is read on every worklist pop, and at the linker's ceiling a
+  // hash table over 4M call sites costs both more memory (~106 MB against 34)
+  // and a lookup per pop, which is what makes the per-pop cost degrade as the
+  // working set leaves cache.
+  //
+  // `NOT_A_CALL` is a slot that contributes no callee summary; `UNRESOLVED` is
+  // a call whose target this analysis cannot name, which reads everything. The
+  // loader's own validation refuses the latter long before here, so it is a
+  // backstop. Both sentinels are outside the id space: the bail above keeps
+  // `total_funcs <= total_slots < u32::MAX - 1`.
+  const NOT_A_CALL: u32 = u32::MAX;
+  const UNRESOLVED: u32 = u32::MAX - 1;
+  let mut callee_of = vec![NOT_A_CALL; total_slots];
   let mut cross_callee: HashMap<u32, u32> = HashMap::new();
   for call in cross_section_calls {
     if call.caller_section >= sections.len() || call.callee_section >= sections.len() {
@@ -1087,12 +1108,15 @@ pub(crate) fn program_live_in(
           section
             .pc_to_func
             .get(target)
-            .map(|&callee| (func_base[si] + callee) as u32)
+            .map_or(UNRESOLVED, |&callee| (func_base[si] + callee) as u32)
         }
-        2 => cross_callee.get(&((base + pc) as u32)).copied(),
+        2 => cross_callee
+          .get(&((base + pc) as u32))
+          .copied()
+          .unwrap_or(UNRESOLVED),
         _ => continue,
       };
-      callee_of.insert((base + pc) as u32, callee);
+      callee_of[base + pc] = callee;
     }
   }
 
@@ -1127,7 +1151,8 @@ pub(crate) fn program_live_in(
         for &succ in &succs[..written] {
           on_pred(base + succ, base + pc);
         }
-        if let Some(&Some(callee)) = callee_of.get(&((base + pc) as u32)) {
+        let callee = callee_of[base + pc];
+        if callee != NOT_A_CALL && callee != UNRESOLVED {
           on_caller(callee as usize, base + pc);
         }
       }
@@ -1163,7 +1188,10 @@ pub(crate) fn program_live_in(
   let mut live = vec![0 as RegMask; total_slots];
   let mut queued = vec![false; total_slots];
   // Seeded in ascending program order so a LIFO worklist starts at the last
-  // slot and backward edges converge on the first visit.
+  // slot and forward edges converge on the first visit. This is a constant
+  // factor either way, and not always the right one - descending seeding is
+  // about twice as fast on a call-heavy program at the size ceiling and about
+  // 20% slower on the call-chain shape the budget tests use.
   let mut work: Vec<u32> = (0..total_slots as u32)
     .filter(|&slot| reachable[slot as usize])
     .collect();
@@ -1191,19 +1219,24 @@ pub(crate) fn program_live_in(
     for &succ in &succs[..written] {
       live_out |= live[slot_base[si] + succ];
     }
-    let callee = match callee_of.get(&(slot as u32)) {
-      Some(Some(callee)) => live[func_start_slot[*callee as usize] as usize],
-      Some(None) => ALL_SIGNATURE_REGS,
-      None => 0,
+    let callee = match callee_of[slot] {
+      NOT_A_CALL => 0,
+      UNRESOLVED => ALL_SIGNATURE_REGS,
+      callee => live[func_start_slot[callee as usize] as usize],
     };
     let (uses, defs) = uses_and_defs(&inst, callee);
-    let next = uses | (live_out & !defs);
+    // Monotone: `uses` grows with the callee summary and `live_out` with the
+    // successors, both of which only ever gain bits. The union with the
+    // previous value is therefore a no-op today, and is kept because it is
+    // what makes termination independent of that property: without it, a
+    // future non-monotone change loops forever here, on the load path, rather
+    // than returning a slightly imprecise mask.
+    let computed = uses | (live_out & !defs);
+    debug_assert_eq!(live[slot] & !computed, 0);
+    let next = live[slot] | computed;
     if next == live[slot] {
       continue;
     }
-    // Monotone: `uses` grows with the callee summary and `live_out` with the
-    // successors, both of which only ever gain bits.
-    debug_assert_eq!(live[slot] & !next, 0);
     live[slot] = next;
 
     let mut wake = |target: usize| {
@@ -2922,6 +2955,93 @@ mod tests {
       with_cross_calls > 1000,
       "only {with_cross_calls} generated programs had a cross-section call"
     );
+  }
+
+  /// `function_successors_into` must agree with composing the whole-program
+  /// `successors` the way the per-function walk used to: override a local
+  /// call's edges with its fallthrough, then keep only what lands in
+  /// `[start_pc, end_pc)`.
+  ///
+  /// The randomized differential above cannot see this. Its reference,
+  /// `sweep_program_live_in`, reaches `function_successors` — the same
+  /// `function_successors_into` the solver uses — so a successor bug appears
+  /// identically on both sides and cancels. That blindness is real: a mutation
+  /// giving `call` with `src == 3` a fallthrough edge passes the whole suite
+  /// without this test.
+  #[test]
+  fn function_successors_into_agrees_with_composing_the_whole_program_walk() {
+    fn expected(
+      pc: usize,
+      inst: &Inst,
+      num_slots: usize,
+      start_pc: usize,
+      end_pc: usize,
+    ) -> Vec<usize> {
+      let mut succs = successors(pc, inst, num_slots);
+      // A local callee is a separate function, so the call contributes only
+      // its return edge.
+      if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
+        succs.clear();
+        if pc + 1 < num_slots {
+          succs.push(pc + 1);
+        }
+      }
+      succs.retain(|&succ| succ >= start_pc && succ < end_pc);
+      succs
+    }
+
+    let offsets = [i16::MIN, -3, -1, 0, 1, 2, i16::MAX];
+    let imms = [i32::MIN, -4, -1, 0, 1, 3, i32::MAX];
+    let ranges = [(1, 0, 1), (4, 0, 4), (6, 2, 5), (8, 3, 4), (9, 0, 9)];
+    let mut cases = 0usize;
+    for opcode in 0..=255u8 {
+      for src in 0..16u8 {
+        for &offset in &offsets {
+          for &imm in &imms {
+            for &(num_slots, start_pc, end_pc) in &ranges {
+              for pc in start_pc..end_pc {
+                let inst = decode(&slot(opcode, 0, src, offset, imm));
+                let mut out = [0usize; 2];
+                let written =
+                  function_successors_into(pc, &inst, num_slots, start_pc, end_pc, &mut out);
+                assert_eq!(
+                  &out[..written],
+                  expected(pc, &inst, num_slots, start_pc, end_pc).as_slice(),
+                  "opcode {opcode:#04x} src {src} offset {offset} imm {imm} \
+                   pc {pc} in [{start_pc}, {end_pc}) of {num_slots}"
+                );
+                cases += 1;
+              }
+            }
+          }
+        }
+      }
+    }
+    assert!(cases > 1_000_000, "only {cases} cases");
+  }
+
+  /// A `starts` array that does not partition its section takes the
+  /// conservative bail rather than being walked.
+  #[test]
+  fn a_starts_array_that_does_not_partition_takes_the_conservative_bail() {
+    let code = flatten(&[
+      slot(EBPF_CLS_LDX | 0x18, 0, 6, 0, 0), // r0 = *(u64*)(r6)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    // Not ascending, does not begin at 0, and out of range: each on its own
+    // must be refused.
+    for starts in [&[1usize, 0][..], &[1][..], &[0, 2][..]] {
+      let sections = [LiveInSection {
+        code: &code,
+        starts,
+        pc_to_func: &[0, 0],
+      }];
+      assert_eq!(
+        program_live_in(&sections, &[]),
+        vec![vec![ALL_SIGNATURE_REGS; starts.len()]],
+        "starts {starts:?} was not refused"
+      );
+    }
   }
 
   /// A cross-section call site outside the section it is attributed to must be
