@@ -31,7 +31,7 @@ use crate::{
     Coroutine, CoroutineResult, ScopedCoroutine, Yielder,
   },
   error::{Error, RuntimeError},
-  function_analysis::{analyze_functions_with_entries, FunctionLayout},
+  function_analysis::{analyze_program, CrossSectionEdge, FunctionLayout, SectionInput},
   helpers::Helper,
   linker::{link_elf, plan_writable_data},
   pointer_cage::PointerCage,
@@ -2018,6 +2018,23 @@ impl Program {
       .collect()
   }
 
+  /// Every cross-section call site's callee argument mask, flattened across
+  /// sections and sorted. A mask narrower than `ALL_SIGNATURE_REGS` is the
+  /// whole-program live-in analysis paying off: the call site hands its
+  /// external callee only the register kinds that callee can observe.
+  #[cfg(test)]
+  pub(crate) fn cross_section_arg_masks_for_tests(&self) -> Vec<crate::region_analysis::RegMask> {
+    let mut masks = self
+      .unbound
+      .sections
+      .borrow()
+      .iter()
+      .flat_map(|section| section.layout.cross_section_arg_masks.values().copied())
+      .collect::<Vec<_>>();
+    masks.sort_unstable();
+    masks
+  }
+
   /// Number of successfully compiled variants per source function, flattened
   /// across sections. One entry per function in the layout; a value > 1 means
   /// that callee was specialized for multiple incoming pointer signatures.
@@ -3395,6 +3412,14 @@ impl ProgramLoader {
       self.stack_frame_size,
       u32::try_from(stack_layout.frame_stride).expect("stack stride validated above"),
     ));
+    // Runtime section indices are positions in `linked_code.sections`: the loop
+    // below pushes one `Section` per entry, in order and without skipping.
+    let elf_to_runtime_section: HashMap<usize, usize> = linked_code
+      .sections
+      .iter()
+      .enumerate()
+      .map(|(index, code_section)| (code_section.elf_index, index))
+      .collect();
     let mut incoming_entries: HashMap<usize, Vec<usize>> = HashMap::new();
     for code_section in &linked_code.sections {
       for call in &code_section.cross_section_calls {
@@ -3404,30 +3429,78 @@ impl ProgramLoader {
           .push(call.target_pc);
       }
     }
-    let mut elf_to_runtime_section = HashMap::new();
 
+    let mut section_code = Vec::with_capacity(linked_code.sections.len());
     for code_section in &linked_code.sections {
       let code = cage
         .data_slice(code_section.code_vaddr, code_section.len)
         .unwrap();
       let code_bytes =
         unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len()) };
+      // `Translator::load_with_entries` enforces this too, but it runs after
+      // the analysis below: without the check here an oversized section is
+      // walked and given per-instruction tables first, only to be refused
+      // afterwards for a reason that was knowable from its length.
       if code_bytes.len() / 8 >= self.instruction_limit {
         return Err(RuntimeError::InvalidArgumentOwned(format!(
           "too many instructions in {} (max {})",
           code_section.name, self.instruction_limit
         )));
       }
+      section_code.push(code_bytes);
+    }
+
+    // One analysis over every section at once. A cross-section callee's
+    // argument mask decides how finely its call sites specialize it, so the
+    // sections' live-in fixed points have to be solved together rather than
+    // each cutting the edges that leave it.
+    let section_inputs = linked_code
+      .sections
+      .iter()
+      .zip(&section_code)
+      .map(|(code_section, &code)| SectionInput {
+        code,
+        entries: incoming_entries
+          .get(&code_section.elf_index)
+          .map(Vec::as_slice)
+          .unwrap_or_default(),
+      })
+      .collect::<Vec<_>>();
+    let cross_section_edges = linked_code
+      .sections
+      .iter()
+      .enumerate()
+      .flat_map(|(caller_section, code_section)| {
+        let elf_to_runtime_section = &elf_to_runtime_section;
+        code_section
+          .cross_section_calls
+          .iter()
+          .map(move |call| CrossSectionEdge {
+            caller_section,
+            call_pc: call.call_pc,
+            callee_section: elf_to_runtime_section[&call.target_section_index],
+            callee_pc: call.target_pc,
+          })
+      })
+      .collect::<Vec<_>>();
+    let layouts =
+      analyze_program(&section_inputs, &cross_section_edges).map_err(|(section_index, err)| {
+        RuntimeError::InvalidArgumentOwned(format!(
+          "local function analysis failed in {}: {err}",
+          linked_code.sections[section_index].name
+        ))
+      })?;
+
+    for ((code_section, &code_bytes), layout) in linked_code
+      .sections
+      .iter()
+      .zip(&section_code)
+      .zip(layouts.into_iter())
+    {
       let function_entries = incoming_entries
         .get(&code_section.elf_index)
         .map(Vec::as_slice)
         .unwrap_or_default();
-      let layout = analyze_functions_with_entries(code_bytes, function_entries).map_err(|err| {
-        RuntimeError::InvalidArgumentOwned(format!(
-          "local function analysis failed in {}: {err}",
-          code_section.name
-        ))
-      })?;
       let external_call_pcs = code_section
         .cross_section_calls
         .iter()
@@ -3455,8 +3528,11 @@ impl ProgramLoader {
       };
 
       let section_index = sections.len();
+      debug_assert_eq!(
+        elf_to_runtime_section[&code_section.elf_index],
+        section_index
+      );
       entrypoints.insert(code_section.name.clone(), section_index);
-      elf_to_runtime_section.insert(code_section.elf_index, section_index);
       let functions = (0..layout.functions.len())
         .map(|_| FunctionState::default())
         .collect();
@@ -3476,6 +3552,16 @@ impl ProgramLoader {
       for call in &code_section.cross_section_calls {
         let target_section_index = elf_to_runtime_section[&call.target_section_index];
         let target_layout = &sections[target_section_index].layout;
+        // Neither arm below can fire, and neither is what admits a target: this
+        // very `target_pc` was handed to `analyze_functions_with_entries` above
+        // as one of the target section's entries, so it is in range (that call
+        // refuses an out-of-range entry) and it opens a function (an entry is
+        // inserted into `starts`). What actually rejects a bad target is the
+        // reachability walk in `scan_local_function_ranges`, which refuses a
+        // section whose control flow crosses the boundary an entry introduces,
+        // and the mid-`lddw` check in `Translator::load_with_entries`. These
+        // two stay as a cheap backstop against the entry set and the call list
+        // drifting apart, since everything downstream indexes on the answer.
         let Some(&function_index) = target_layout.pc_to_func.get(call.target_pc) else {
           return Err(RuntimeError::InvalidArgumentOwned(format!(
             "cross-section local call at PC {} targets PC {} outside section {}",

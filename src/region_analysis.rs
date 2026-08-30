@@ -615,10 +615,15 @@ pub(crate) fn analyze_function(
           .and_then(|&callee| layout.arg_masks.get(callee).copied())
           .unwrap_or(ALL_SIGNATURE_REGS)
       } else {
-        // Cross-section callees have a separate FunctionLayout. Conservatively
-        // preserve every signature register rather than coupling the sections'
-        // fixed-point analyses.
-        ALL_SIGNATURE_REGS
+        // A cross-section callee lives in another section's layout, so its
+        // mask is carried here per call site by the whole-program fixed point.
+        // The fallback is only reached by a fragment analyzed outside the
+        // loader, which has no cross-section call graph to consult.
+        layout
+          .cross_section_arg_masks
+          .get(&pc)
+          .copied()
+          .unwrap_or(ALL_SIGNATURE_REGS)
       };
       call_signatures.insert(pc, PointerSignature::from_state(&states[pc]).masked(mask));
     }
@@ -784,11 +789,26 @@ fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
 /// `callee_live_in` maps a local call's target PC to that callee's current
 /// summary. Callers iterate this monotone transfer function to a least fixed
 /// point over the call graph.
+/// Where a local call sends control, as seen from inside one code section.
+///
+/// A section-local call names its callee by a displacement this buffer can
+/// resolve. A cross-section call cannot: its immediate was zeroed by the
+/// linker and its callee lives in another section, so the call *site* is the
+/// only handle on it from here, and the caller of [`function_live_in`] is the
+/// one holding the map from site to callee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallSite {
+  /// A `src == 1` call entering `target_pc` in this same buffer.
+  Local { target_pc: usize },
+  /// A linker-tagged `src == 2` call at `call_pc`, whose callee is elsewhere.
+  CrossSection { call_pc: usize },
+}
+
 pub(crate) fn function_live_in(
   code: &[u8],
   start_pc: usize,
   end_pc: usize,
-  callee_live_in: &dyn Fn(usize) -> RegMask,
+  callee_live_in: &dyn Fn(CallSite) -> RegMask,
 ) -> RegMask {
   let num_slots = code.len() / 8;
   if start_pc >= end_pc || end_pc > num_slots {
@@ -846,11 +866,10 @@ pub(crate) fn function_live_in(
     }
     let callee = if inst.opcode == EBPF_OP_CALL {
       match inst.src {
-        1 => callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize),
-        // Cross-section summaries are intentionally not coupled here. Reading
-        // every signature register is conservative and keeps transitive callers
-        // from dropping state the external callee may observe.
-        2 => ALL_SIGNATURE_REGS,
+        1 => callee_live_in(CallSite::Local {
+          target_pc: (pc as i64 + 1 + inst.imm as i64) as usize,
+        }),
+        2 => callee_live_in(CallSite::CrossSection { call_pc: pc }),
         _ => 0,
       }
     } else {
@@ -2219,7 +2238,7 @@ mod tests {
     code: &[u8],
     start_pc: usize,
     end_pc: usize,
-    callee_live_in: &dyn Fn(usize) -> RegMask,
+    callee_live_in: &dyn Fn(CallSite) -> RegMask,
   ) -> RegMask {
     let num_slots = code.len() / 8;
     if start_pc >= end_pc || end_pc > num_slots {
@@ -2251,8 +2270,10 @@ mod tests {
         }
         let callee = if inst.opcode == EBPF_OP_CALL {
           match inst.src {
-            1 => callee_live_in((pc as i64 + 1 + inst.imm as i64) as usize),
-            2 => ALL_SIGNATURE_REGS,
+            1 => callee_live_in(CallSite::Local {
+              target_pc: (pc as i64 + 1 + inst.imm as i64) as usize,
+            }),
+            2 => callee_live_in(CallSite::CrossSection { call_pc: pc }),
             _ => 0,
           }
         } else {

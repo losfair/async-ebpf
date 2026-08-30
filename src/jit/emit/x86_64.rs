@@ -2090,8 +2090,14 @@ impl Emit<'_, '_, '_> {
           // `emit_local_call` is unreachable and is not ported.
           self.emit_lazy_local_call(pc);
         }
-        // A source field other than 0 or 1 emits nothing at all. Unreachable:
-        // the operand filter bounds `call`'s source to 0..=1.
+        // A call that is neither a helper nor a local call emits nothing at
+        // all, so control would fall into the next instruction. (The aarch64
+        // backend branches to exit in the same position; the two disagree, and
+        // only unreachability makes that harmless.) Unreachable: the operand
+        // filter bounds `call`'s source to 0..=2, source 1 is a local call by
+        // definition, and `check_call` refuses a source-2 call unless the
+        // loader tagged it as a cross-section local call — which is exactly
+        // what makes `is_local_call` true for it.
       }
 
       Op::Exit => {
