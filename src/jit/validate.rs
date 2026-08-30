@@ -162,10 +162,10 @@ const JA32: Filter = filter((0, 0), (0, 0), NO_OFF, ANY_IMM);
 const JMP_IMM: Filter = filter((0, 0), (0, 9), ANY_OFF, ANY_IMM);
 /// Conditional jump against a register.
 const JMP_REG: Filter = filter((0, 10), (0, 9), ANY_OFF, NO_IMM);
-/// `call`: source 0 is a helper, 1 is a local function. 2 (call by BTF id) is
-/// refused by [`validate`] with its own message before reaching here, so this
-/// bound never speaks.
-const CALL: Filter = filter((0, 1), (0, 0), NO_OFF, ANY_IMM);
+/// `call`: source 0 is a helper, 1 is a section-local function, and 2 is
+/// admitted only for a linker-tagged cross-section local call. An untagged BTF
+/// call is refused by [`validate`] before reaching this filter.
+const CALL: Filter = filter((0, 2), (0, 0), NO_OFF, ANY_IMM);
 /// `exit` takes no operands at all.
 const EXIT: Filter = filter((0, 0), (0, 0), NO_OFF, NO_IMM);
 /// 32-bit atomic RMW. The source is bounded at R9, not R10: a fetching atomic
@@ -314,6 +314,16 @@ fn check_operand_filter(insn: &Insn) -> Result<(), String> {
 /// The caller has already established that
 /// the byte length was a multiple of eight.
 pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
+  validate_with_external_calls(config, insns, &[])
+}
+
+/// Validates a decoded program, accepting linker-tagged cross-section calls at
+/// the slots marked in `external_calls`.
+pub(crate) fn validate_with_external_calls(
+  config: &Config,
+  insns: &[Insn],
+  external_calls: &[bool],
+) -> Result<(), String> {
   // The bound is `>=`, not `>`: a program of exactly `MAX_INSTS`
   // instructions is refused. `Translator::load` checks `>` before calling here,
   // so the two together reproduce `>=` — but this must not depend on that, and
@@ -413,7 +423,13 @@ pub fn validate(config: &Config, insns: &[Insn]) -> Result<(), String> {
         }
       }
 
-      Op::Call => check_call(config, &insn, insns, i)?,
+      Op::Call => check_call(
+        config,
+        &insn,
+        insns,
+        i,
+        external_calls.get(i).copied().unwrap_or(false),
+      )?,
 
       // Nothing structural to check.
       Op::Exit | Op::Alu { .. } | Op::Load { .. } => {}
@@ -480,8 +496,19 @@ fn check_atomic_selector(insn: &Insn, pc: usize) -> Result<(), String> {
 /// Checks one `call` instruction.
 ///
 /// The source field is the call *kind*, not a register.
-fn check_call(config: &Config, insn: &Insn, insns: &[Insn], pc: usize) -> Result<(), String> {
+fn check_call(
+  config: &Config,
+  insn: &Insn,
+  insns: &[Insn],
+  pc: usize,
+  cross_section: bool,
+) -> Result<(), String> {
   let num_insns = insns.len();
+  if cross_section && insn.src != 2 {
+    return Err(format!(
+      "cross-section call metadata at PC {pc} does not describe a tagged call"
+    ));
+  }
   match insn.src {
     // Helper call: the immediate is an index the embedder must recognise.
     0 => {
@@ -541,6 +568,8 @@ fn check_call(config: &Config, insn: &Insn, insns: &[Insn], pc: usize) -> Result
       // Stack usage is then computed for the
       // target; see the note in `validate` for why that cannot fail here.
     }
+
+    2 if cross_section => {}
 
     2 => {
       return Err(format!(

@@ -1860,7 +1860,7 @@ pub fn translate_range(
             emit_addsub_immediate(&mut st, true, addsub::SUBS, RZ, map_register(0), 0);
             emit_conditionalbranch_immediate(&mut st, cond::EQ, exit_tgt);
           }
-        } else if insn.src == 1 {
+        } else if t.is_local_call(i) {
           // Always lazy from this entry point.
           emit_lazy_local_call(cfg, inputs, &mut st, i);
         } else {

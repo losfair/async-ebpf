@@ -250,6 +250,18 @@ fn live_in_fixed_point(
 }
 
 pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
+  analyze_functions_with_entries(code, &[])
+}
+
+/// Analyzes local functions in one code section.
+///
+/// `entries` contains additional roots supplied by the container format, such
+/// as targets of calls from other ELF sections. They delimit functions just
+/// like ordinary section-local call targets do.
+pub(crate) fn analyze_functions_with_entries(
+  code: &[u8],
+  entries: &[usize],
+) -> Result<FunctionLayout, String> {
   if code.len() % 8 != 0 {
     return Err("code length is not a multiple of 8".to_string());
   }
@@ -264,6 +276,14 @@ pub(crate) fn analyze_functions(code: &[u8]) -> Result<FunctionLayout, String> {
   }
 
   let mut starts = BTreeSet::from([0usize]);
+  for &entry in entries {
+    if entry >= num_insns {
+      return Err(format!(
+        "function entry PC {entry} is outside a program of {num_insns} instructions"
+      ));
+    }
+    starts.insert(entry);
+  }
   for pc in 0..num_insns {
     let insn = insn_at(code, pc);
     if insn.opcode == EBPF_OP_CALL && insn_src(code, pc) == 1 {
