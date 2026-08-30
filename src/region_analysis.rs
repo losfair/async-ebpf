@@ -937,10 +937,17 @@ pub(crate) struct CrossSectionCallSite {
 /// Flattened, nothing restarts because nothing is discarded between visits.
 /// Every slot's liveness only grows, and it is capped at ten signature bits, so
 /// each bit crosses each edge at most once: O(bits · edges), linear in the
-/// program. Note the space is linear in the program too — the predecessor index
-/// spans every slot at once, where the per-function solve held one function's
-/// worth. At the linker's 64 MiB code ceiling that is a few hundred megabytes,
-/// paid once, on a path that already holds the object twice over.
+/// program.
+///
+/// The space is linear in the program too, which the per-function solve was
+/// not: the predecessor index spans every slot at once, where that one held
+/// one function's worth. Measured on the largest object `link_elf` admits (128
+/// sections × 65,535 slots = 64 MiB of code), this function costs 6.4 s and
+/// 416 MiB, and the whole of `analyze_program` around it 6.7 s and 968 MiB —
+/// on the non-preemptible load path, for an object that already occupies 64
+/// MiB twice over. Both are far below what the per-function solve cost on far
+/// smaller objects, but the memory is a real change in kind and is why the
+/// indices are `u32` rather than `usize`.
 pub(crate) fn program_live_in(
   sections: &[LiveInSection<'_>],
   cross_section_calls: &[CrossSectionCallSite],
@@ -984,6 +991,17 @@ pub(crate) fn program_live_in(
       && section.starts.last().is_none_or(|&last| last < num_slots)
       && section.starts.first().is_none_or(|&first| first == 0);
     if !partitions {
+      return conservative();
+    }
+    // `bounds` indexes `starts` by a `pc_to_func` entry, and the whole-program
+    // ids below are derived from it, so an entry naming no function of this
+    // section is refused here rather than panicking or silently naming a
+    // function in the next one.
+    if section
+      .pc_to_func
+      .iter()
+      .any(|&function| function >= section.starts.len())
+    {
       return conservative();
     }
   }
@@ -1036,6 +1054,13 @@ pub(crate) fn program_live_in(
       continue;
     }
     if call.callee_function >= sections[call.callee_section].starts.len() {
+      continue;
+    }
+    // A call site outside its own section would alias a slot in a later one:
+    // global slot ids are only injective while every `call_pc` is inside the
+    // section it is attributed to, and the aliased slot's callee would be
+    // silently rebound - narrowing a mask rather than widening it.
+    if call.call_pc >= sections[call.caller_section].code.len() / 8 {
       continue;
     }
     cross_callee.insert(
@@ -2725,6 +2750,27 @@ mod tests {
         "worklist diverged from the sweep on the {n}-slot ladder"
       );
     }
+
+    // A small deterministic PRNG so the spread is identical on every host.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next_u8 = move || {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      (state >> 32) as u8
+    };
+    for _ in 0..1000 {
+      let n = (next_u8() as usize % 60) + 1;
+      let mut code = Vec::with_capacity(n * 8);
+      for _ in 0..n * 8 {
+        code.push(next_u8());
+      }
+      assert_eq!(
+        function_live_in(&code, 0, n, &|_| 0),
+        sweep_live_in(&code, 0, n, &|_| 0),
+        "worklist diverged from the sweep on a random {n}-slot fragment"
+      );
+    }
   }
 
   /// Naive whole-program Kleene iteration over the same equations
@@ -2876,27 +2922,70 @@ mod tests {
       with_cross_calls > 1000,
       "only {with_cross_calls} generated programs had a cross-section call"
     );
+  }
 
-    // A small deterministic PRNG so the spread is identical on every host.
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next_u8 = move || {
-      state ^= state << 13;
-      state ^= state >> 7;
-      state ^= state << 17;
-      (state >> 32) as u8
-    };
-    for _ in 0..1000 {
-      let n = (next_u8() as usize % 60) + 1;
-      let mut code = Vec::with_capacity(n * 8);
-      for _ in 0..n * 8 {
-        code.push(next_u8());
-      }
-      assert_eq!(
-        function_live_in(&code, 0, n, &|_| 0),
-        sweep_live_in(&code, 0, n, &|_| 0),
-        "worklist diverged from the sweep on a random {n}-slot fragment"
-      );
-    }
+  /// A cross-section call site outside the section it is attributed to must be
+  /// dropped, not folded into whichever section its global slot id lands in.
+  ///
+  /// Slot ids are assigned per section and concatenated, so they are injective
+  /// only while every `call_pc` is inside its own section. An out-of-range one
+  /// aliases a real slot in a later section and rebinds *that* slot's callee,
+  /// which narrows a mask - the unsafe direction, since a callee would then be
+  /// specialized on fewer registers than it can observe.
+  #[test]
+  fn a_cross_section_call_outside_its_own_section_is_dropped() {
+    let first = flatten(&[slot(EBPF_OP_EXIT, 0, 0, 0, 0)]);
+    let second = flatten(&[
+      slot(EBPF_OP_CALL, 0, 2, 0, 0), // no edge names this one
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let sections = [
+      LiveInSection {
+        code: &first,
+        starts: &[0],
+        pc_to_func: &[0],
+      },
+      LiveInSection {
+        code: &second,
+        starts: &[0],
+        pc_to_func: &[0, 0],
+      },
+    ];
+    // `call_pc: 1` does not exist in section 0, which has one slot. Its global
+    // id is section 1's slot 0 - the untagged call above.
+    let stray = [CrossSectionCallSite {
+      caller_section: 0,
+      call_pc: 1,
+      callee_section: 0,
+      callee_function: 0,
+    }];
+
+    assert_eq!(
+      program_live_in(&sections, &stray),
+      vec![vec![0], vec![ALL_SIGNATURE_REGS]],
+      "a stray call site rebound an unrelated section's call"
+    );
+  }
+
+  /// A `pc_to_func` entry naming no function of its section takes the
+  /// conservative bail the guard block promises, rather than panicking in
+  /// `bounds` or silently naming a function in the next section.
+  #[test]
+  fn a_pc_to_func_entry_outside_its_section_takes_the_conservative_bail() {
+    let code = flatten(&[
+      slot(EBPF_CLS_LDX | 0x18, 0, 6, 0, 0), // r0 = *(u64*)(r6)
+      slot(EBPF_OP_EXIT, 0, 0, 0, 0),
+    ]);
+    let sections = [LiveInSection {
+      code: &code,
+      starts: &[0],
+      pc_to_func: &[0, 7],
+    }];
+
+    assert_eq!(
+      program_live_in(&sections, &[]),
+      vec![vec![ALL_SIGNATURE_REGS]]
+    );
   }
 
   #[test]
