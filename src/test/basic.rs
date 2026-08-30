@@ -560,6 +560,18 @@ async fn test_local_function_calls_across_elf_sections() {
   let section_counts = program.section_instruction_counts_for_tests();
   assert_eq!(section_counts.len(), 4);
   assert!(section_counts.iter().sum::<usize>() > *section_counts.iter().max().unwrap());
+  // The whole-program live-in analysis must narrow every cross-section call
+  // site to what its callee actually reads. `add_seven` and `add_eight` each
+  // read their one `int` argument, so R1; `twice_after_add` is called with a
+  // constant the optimizer sank into its own body, so it reads nothing at all.
+  // Summarising an external callee as "reads everything" instead would leave
+  // all three at `ALL_SIGNATURE_REGS` (0x3ff) and specialize each callee once
+  // per caller-side register file.
+  assert_eq!(
+    program.cross_section_arg_masks_for_tests(),
+    vec![0, 1 << 1, 1 << 1],
+    "cross-section call sites must mask down to what the callee reads"
+  );
   let ret = program
     .run(
       &timeslice_config(),

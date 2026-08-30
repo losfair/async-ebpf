@@ -199,3 +199,149 @@ async fn ladder_cfg_live_in_analysis_is_linear() {
      the fixpoint must be O(bits · edges), not O(n²) — see function_live_in"
   );
 }
+
+/// Links in the chain the two tests below build. `3 · CHAIN + 1` slots stays
+/// inside the 65,535-instruction ceiling, and it is large enough that the two
+/// solvers are not close: the fixed one takes ~13 ms release, the per-function
+/// one 48.5 s.
+const CHAIN: usize = 16_000;
+
+/// One caller that calls all `links` links of a chain, laid out so the live bit
+/// has to walk the chain from its tail one worklist step at a time.
+///
+/// This is the shape that made the previous two-level solve quadratic: every
+/// link that settled woke the caller, and re-analyzing the caller cost its
+/// whole span each time. Nothing about the call graph bounded that. Condensing
+/// into strongly connected components would not have helped either — the graph
+/// is a DAG, and the cost is in one function's fan-out, not in a cycle.
+fn call_chain_section(links: usize) -> Vec<u8> {
+  let mut code: Vec<Insn> = Vec::with_capacity(3 * links + 1);
+  // The caller: one call per link, then `exit`. Function `[0, links + 1)`.
+  for pc in 0..links {
+    let target = links + 1 + 2 * pc;
+    code.push(Insn::call_local((target - pc - 1) as i32));
+  }
+  code.push(Insn::exit());
+  // The chain: two slots each, every link calling the next. Only the last
+  // reads R6, so the bit has to travel the whole way back to the caller.
+  for i in 0..links {
+    let pc = links + 1 + 2 * i;
+    if i + 1 < links {
+      let target = links + 1 + 2 * (i + 1);
+      code.push(Insn::call_local((target - pc - 1) as i32));
+    } else {
+      // `mov`, not `add`: it reads R6 without also reading R0, so the expected
+      // mask is exactly one bit.
+      code.push(Insn::raw(0xbf, 0, 6, 0, 0)); // mov64 r0, r6
+    }
+    code.push(Insn::exit());
+  }
+  code
+    .iter()
+    .flat_map(|insn| insn.value.to_le_bytes())
+    .collect()
+}
+
+/// ~370× headroom on the fixed solver, and the per-function solve this replaced
+/// misses it by ~10× (48.5 s, measured at `CHAIN`).
+fn live_in_budget() -> Duration {
+  if cfg!(debug_assertions) {
+    Duration::from_secs(15)
+  } else {
+    Duration::from_secs(5)
+  }
+}
+
+#[test]
+fn a_call_chain_in_one_section_analyzes_in_linear_time() {
+  let code = call_chain_section(CHAIN);
+
+  let start = Instant::now();
+  let layout = crate::function_analysis::analyze_functions(&code).unwrap();
+  let elapsed = start.elapsed();
+
+  // Every function must end up reading R6, or the bit never travelled the
+  // chain and the timing measured nothing.
+  assert_eq!(
+    layout.arg_masks,
+    vec![1 << 6; CHAIN + 1],
+    "the live bit must reach every link, or this timed the wrong thing"
+  );
+  assert!(
+    elapsed < live_in_budget(),
+    "live-in analysis of a {CHAIN}-link call chain took {elapsed:?} (budget {:?}); \
+     the solve must be O(bits · edges) over the whole program, not a per-function \
+     fixed point that restarts a caller once per callee — see program_live_in",
+    live_in_budget()
+  );
+}
+
+#[test]
+fn a_call_chain_across_sections_analyzes_in_linear_time() {
+  use crate::function_analysis::{analyze_program, CrossSectionEdge, SectionInput};
+
+  // The same shape with the caller and the chain in different sections.
+  // Solving the sections separately used to cut every one of these edges,
+  // which hid the cost behind a summary; solving them together, which is what
+  // buys the specialization precision, must not reintroduce it.
+  let mut caller: Vec<Insn> = (0..CHAIN).map(|_| Insn::raw(0x85, 0, 2, 0, 0)).collect();
+  caller.push(Insn::exit());
+  let caller = caller
+    .iter()
+    .flat_map(|insn| insn.value.to_le_bytes())
+    .collect::<Vec<u8>>();
+
+  let mut callee: Vec<Insn> = Vec::with_capacity(2 * CHAIN);
+  for i in 0..CHAIN {
+    if i + 1 < CHAIN {
+      callee.push(Insn::call_local(1)); // the next link, two slots along
+    } else {
+      callee.push(Insn::raw(0xbf, 0, 6, 0, 0)); // mov64 r0, r6
+    }
+    callee.push(Insn::exit());
+  }
+  let callee = callee
+    .iter()
+    .flat_map(|insn| insn.value.to_le_bytes())
+    .collect::<Vec<u8>>();
+
+  let entries = (0..CHAIN).map(|i| i * 2).collect::<Vec<_>>();
+  let edges = (0..CHAIN)
+    .map(|i| CrossSectionEdge {
+      caller_section: 0,
+      call_pc: i,
+      callee_section: 1,
+      callee_pc: i * 2,
+    })
+    .collect::<Vec<_>>();
+
+  let start = Instant::now();
+  let layouts = analyze_program(
+    &[
+      SectionInput {
+        code: &caller,
+        entries: &[],
+      },
+      SectionInput {
+        code: &callee,
+        entries: &entries,
+      },
+    ],
+    &edges,
+  )
+  .unwrap();
+  let elapsed = start.elapsed();
+
+  assert_eq!(
+    layouts[0].arg_masks,
+    vec![1 << 6],
+    "the caller's mask must come from the chain's tail, through every link"
+  );
+  assert!(
+    elapsed < live_in_budget(),
+    "live-in analysis of a {CHAIN}-link cross-section call chain took {elapsed:?} \
+     (budget {:?}); coupling the sections must not cost more than solving them \
+     apart — see program_live_in",
+    live_in_budget()
+  );
+}
