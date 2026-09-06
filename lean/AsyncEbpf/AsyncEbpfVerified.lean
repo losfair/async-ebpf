@@ -18,7 +18,7 @@ set_option maxRecDepth 2048
 namespace async_ebpf_verified
 
 /-- [async_ebpf_verified::region::StackKind]
-    Source: '../../src/verified/region.rs', lines 92:0-95:1
+    Source: '../../src/verified/region.rs', lines 91:0-94:1
     Visibility: public -/
 @[discriminant isize]
 inductive region.StackKind where
@@ -26,7 +26,7 @@ inductive region.StackKind where
 | Foreign : region.StackKind
 
 /-- [async_ebpf_verified::region::RegKind]
-    Source: '../../src/verified/region.rs', lines 82:0-88:1
+    Source: '../../src/verified/region.rs', lines 81:0-87:1
     Visibility: public -/
 @[discriminant isize]
 inductive region.RegKind where
@@ -37,7 +37,7 @@ inductive region.RegKind where
 | Unknown : region.RegKind
 
 /-- [async_ebpf_verified::region::Slot]
-    Source: '../../src/verified/region.rs', lines 186:0-190:1
+    Source: '../../src/verified/region.rs', lines 185:0-189:1
     Visibility: public -/
 structure region.Slot where
   off : Std.I32
@@ -45,7 +45,7 @@ structure region.Slot where
   kind : region.RegKind
 
 /-- [async_ebpf_verified::region::Spills]
-    Source: '../../src/verified/region.rs', lines 200:0-207:1
+    Source: '../../src/verified/region.rs', lines 199:0-206:1
     Visibility: public -/
 structure region.Spills where
   slots : Array region.Slot 32#usize
@@ -53,14 +53,14 @@ structure region.Spills where
   invalid_epoch : Std.U64
 
 /-- [async_ebpf_verified::region::State]
-    Source: '../../src/verified/region.rs', lines 213:0-216:1
+    Source: '../../src/verified/region.rs', lines 212:0-215:1
     Visibility: public -/
 structure region.State where
   regs : Array region.RegKind 11#usize
   spills : region.Spills
 
 /-- [async_ebpf_verified::fixpoint::Solution]
-    Source: '../../src/verified/fixpoint.rs', lines 28:0-32:1
+    Source: '../../src/verified/fixpoint.rs', lines 29:0-33:1
     Visibility: public -/
 structure fixpoint.Solution where
   states : alloc.vec.Vec region.State
@@ -118,7 +118,7 @@ structure isa.Insn where
   imm : Std.I32
 
 /-- [async_ebpf_verified::fixpoint::raw_successors]:
-    Source: '../../src/verified/fixpoint.rs', lines 38:0-66:1 -/
+    Source: '../../src/verified/fixpoint.rs', lines 39:0-67:1 -/
 def fixpoint.raw_successors
   (insn : isa.Insn) (pc : Std.Usize) :
   Result (Std.Usize × Std.I64 × Std.I64)
@@ -196,7 +196,7 @@ def fixpoint.raw_successors
       else ok (1#usize, next, 0#i64)
 
 /-- [async_ebpf_verified::fixpoint::in_function]:
-    Source: '../../src/verified/fixpoint.rs', lines 68:0-70:1 -/
+    Source: '../../src/verified/fixpoint.rs', lines 69:0-71:1 -/
 def fixpoint.in_function
   (target : Std.I64) (start : Std.Usize) («end» : Std.Usize) :
   Result Bool
@@ -208,7 +208,7 @@ def fixpoint.in_function
   else ok false
 
 /-- [async_ebpf_verified::fixpoint::function_successors]:
-    Source: '../../src/verified/fixpoint.rs', lines 77:0-98:1
+    Source: '../../src/verified/fixpoint.rs', lines 78:0-99:1
     Visibility: public -/
 def fixpoint.function_successors
   (insns : Slice isa.Insn) (pc : Std.Usize) (start : Std.Usize)
@@ -241,7 +241,7 @@ def fixpoint.function_successors
     else ok (0#usize, 0#usize, 0#usize)
 
 /-- [async_ebpf_verified::fixpoint::lddw_full_imm]:
-    Source: '../../src/verified/fixpoint.rs', lines 103:0-112:1
+    Source: '../../src/verified/fixpoint.rs', lines 104:0-113:1
     Visibility: public -/
 def fixpoint.lddw_full_imm
   (insns : Slice isa.Insn) (pc : Std.Usize) : Result Std.U64 := do
@@ -263,7 +263,7 @@ def fixpoint.lddw_full_imm
   else ok 0#u64
 
 /-- [async_ebpf_verified::region::set_kind]:
-    Source: '../../src/verified/region.rs', lines 484:0-486:1 -/
+    Source: '../../src/verified/region.rs', lines 483:0-485:1 -/
 def region.set_kind
   (regs : Array region.RegKind 11#usize) (reg : Std.Usize)
   (kind : region.RegKind) :
@@ -272,17 +272,17 @@ def region.set_kind
   Array.update regs reg kind
 
 /-- [async_ebpf_verified::region::R10]
-    Source: '../../src/verified/region.rs', lines 62:0-62:26
+    Source: '../../src/verified/region.rs', lines 61:0-61:26
     Visibility: public -/
 @[global_simps, irreducible] def region.R10 : Std.Usize := 10#usize
 
 /-- [async_ebpf_verified::region::NUM_REGS]
-    Source: '../../src/verified/region.rs', lines 59:0-59:31
+    Source: '../../src/verified/region.rs', lines 58:0-58:31
     Visibility: public -/
 @[global_simps, irreducible] def region.NUM_REGS : Std.Usize := 11#usize
 
 /-- [async_ebpf_verified::region::project_regs]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 453:2-458:3
+    Source: '../../src/verified/region.rs', lines 452:2-457:3
     Visibility: public -/
 @[rust_loop_body]
 def region.project_regs_loop.body
@@ -307,7 +307,7 @@ def region.project_regs_loop.body
   else ok (done regs)
 
 /-- [async_ebpf_verified::region::project_regs]: loop 0:
-    Source: '../../src/verified/region.rs', lines 453:2-458:3
+    Source: '../../src/verified/region.rs', lines 452:2-457:3
     Visibility: public -/
 @[rust_loop]
 def region.project_regs_loop
@@ -319,7 +319,7 @@ def region.project_regs_loop
     (regs, reg)
 
 /-- [async_ebpf_verified::region::project_regs]:
-    Source: '../../src/verified/region.rs', lines 451:0-459:1
+    Source: '../../src/verified/region.rs', lines 450:0-458:1
     Visibility: public -/
 @[reducible]
 def region.project_regs
@@ -329,7 +329,7 @@ def region.project_regs
   region.project_regs_loop regs mask 0#usize
 
 /-- [async_ebpf_verified::region::project]:
-    Source: '../../src/verified/region.rs', lines 462:0-464:1
+    Source: '../../src/verified/region.rs', lines 461:0-463:1
     Visibility: public -/
 def region.project
   (state : region.State) (live : Std.U16) : Result region.State := do
@@ -337,7 +337,7 @@ def region.project
   ok { state with regs := a }
 
 /-- [async_ebpf_verified::region::find_slot]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 248:2-255:1 -/
+    Source: '../../src/verified/region.rs', lines 247:2-254:1 -/
 @[rust_loop_body]
 def region.find_slot_loop.body
   (spills : region.Spills) (off : Std.I32) (i : Std.Usize) :
@@ -353,7 +353,7 @@ def region.find_slot_loop.body
   else ok (done none)
 
 /-- [async_ebpf_verified::region::find_slot]: loop 0:
-    Source: '../../src/verified/region.rs', lines 248:2-255:1 -/
+    Source: '../../src/verified/region.rs', lines 247:2-254:1 -/
 @[rust_loop]
 def region.find_slot_loop
   (spills : region.Spills) (off : Std.I32) (i : Std.Usize) :
@@ -364,20 +364,20 @@ def region.find_slot_loop
     i
 
 /-- [async_ebpf_verified::region::find_slot]:
-    Source: '../../src/verified/region.rs', lines 246:0-255:1 -/
+    Source: '../../src/verified/region.rs', lines 245:0-254:1 -/
 @[reducible]
 def region.find_slot
   (spills : region.Spills) (off : Std.I32) : Result (Option Std.Usize) := do
   region.find_slot_loop spills off 0#usize
 
 /-- [async_ebpf_verified::region::MAX_TRACKED_SLOTS]
-    Source: '../../src/verified/region.rs', lines 69:0-69:40
+    Source: '../../src/verified/region.rs', lines 68:0-68:40
     Visibility: public -/
 @[global_simps, irreducible]
 def region.MAX_TRACKED_SLOTS : Std.Usize := 32#usize
 
 /-- [async_ebpf_verified::region::insert_slot]:
-    Source: '../../src/verified/region.rs', lines 268:0-284:1
+    Source: '../../src/verified/region.rs', lines 267:0-283:1
     Visibility: public -/
 def region.insert_slot
   (spills : region.Spills) (off : Std.I32) (epoch : Std.U64)
@@ -400,7 +400,7 @@ def region.insert_slot
     ok (true, { spills with slots := a })
 
 /-- [async_ebpf_verified::region::effective_kind]:
-    Source: '../../src/verified/region.rs', lines 237:0-243:1 -/
+    Source: '../../src/verified/region.rs', lines 236:0-242:1 -/
 def region.effective_kind
   (spills : region.Spills) (epoch : Std.U64) (kind : region.RegKind) :
   Result region.RegKind
@@ -410,7 +410,7 @@ def region.effective_kind
   else ok region.RegKind.Unknown
 
 /-- [async_ebpf_verified::region::slot_kind]:
-    Source: '../../src/verified/region.rs', lines 259:0-264:1
+    Source: '../../src/verified/region.rs', lines 258:0-263:1
     Visibility: public -/
 def region.slot_kind
   (spills : region.Spills) (off : Std.I32) : Result region.RegKind := do
@@ -422,7 +422,7 @@ def region.slot_kind
     region.effective_kind spills s.epoch s.kind
 
 /-- [async_ebpf_verified::region::kind_eq]:
-    Source: '../../src/verified/region.rs', lines 99:0-112:1
+    Source: '../../src/verified/region.rs', lines 98:0-111:1
     Visibility: public -/
 def region.kind_eq
   (a : region.RegKind) (b : region.RegKind) : Result Bool := do
@@ -480,7 +480,7 @@ def region.kind_eq
     | region.RegKind.Unknown => ok true
 
 /-- [async_ebpf_verified::region::meet]:
-    Source: '../../src/verified/region.rs', lines 115:0-135:1
+    Source: '../../src/verified/region.rs', lines 114:0-134:1
     Visibility: public -/
 def region.meet
   (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
@@ -541,7 +541,7 @@ def region.meet
       | region.RegKind.Unknown => ok region.RegKind.Unknown
 
 /-- [async_ebpf_verified::region::meet_spills]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 363:4-380:5 -/
+    Source: '../../src/verified/region.rs', lines 362:4-379:5 -/
 @[rust_loop_body]
 def region.meet_spills_loop.body
   (other : region.Spills) (spills : region.Spills) (changed : Bool)
@@ -572,7 +572,7 @@ def region.meet_spills_loop.body
   else ok (done (spills, changed, refused))
 
 /-- [async_ebpf_verified::region::meet_spills]: loop 0:
-    Source: '../../src/verified/region.rs', lines 363:4-380:5 -/
+    Source: '../../src/verified/region.rs', lines 362:4-379:5 -/
 @[rust_loop]
 def region.meet_spills_loop
   (spills : region.Spills) (other : region.Spills) (changed : Bool)
@@ -585,7 +585,7 @@ def region.meet_spills_loop
     (spills, changed, refused, i)
 
 /-- [async_ebpf_verified::region::meet_spills]:
-    Source: '../../src/verified/region.rs', lines 351:0-383:1 -/
+    Source: '../../src/verified/region.rs', lines 350:0-382:1 -/
 def region.meet_spills
   (spills : region.Spills) (other : region.Spills) :
   Result ((Bool × Bool) × region.Spills)
@@ -601,7 +601,7 @@ def region.meet_spills
     ok ((changed, refused), spills1)
 
 /-- [async_ebpf_verified::region::meet_regs]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 338:2-345:3 -/
+    Source: '../../src/verified/region.rs', lines 337:2-344:3 -/
 @[rust_loop_body]
 def region.meet_regs_loop.body
   (other : Array region.RegKind 11#usize)
@@ -625,7 +625,7 @@ def region.meet_regs_loop.body
   else ok (done (changed, regs))
 
 /-- [async_ebpf_verified::region::meet_regs]: loop 0:
-    Source: '../../src/verified/region.rs', lines 338:2-345:3 -/
+    Source: '../../src/verified/region.rs', lines 337:2-344:3 -/
 @[rust_loop]
 def region.meet_regs_loop
   (regs : Array region.RegKind 11#usize)
@@ -638,7 +638,7 @@ def region.meet_regs_loop
     (regs, changed, r)
 
 /-- [async_ebpf_verified::region::meet_regs]:
-    Source: '../../src/verified/region.rs', lines 335:0-347:1 -/
+    Source: '../../src/verified/region.rs', lines 334:0-346:1 -/
 @[reducible]
 def region.meet_regs
   (regs : Array region.RegKind 11#usize)
@@ -648,7 +648,7 @@ def region.meet_regs
   region.meet_regs_loop regs other false 0#usize
 
 /-- [async_ebpf_verified::region::meet_from]:
-    Source: '../../src/verified/region.rs', lines 387:0-391:1
+    Source: '../../src/verified/region.rs', lines 386:0-390:1
     Visibility: public -/
 def region.meet_from
   (state : region.State) (other : region.State) :
@@ -662,7 +662,7 @@ def region.meet_from
   else ok ((spills_changed, refused), { regs := a, spills := s })
 
 /-- [async_ebpf_verified::fixpoint::propagate]:
-    Source: '../../src/verified/fixpoint.rs', lines 117:0-139:1 -/
+    Source: '../../src/verified/fixpoint.rs', lines 118:0-140:1 -/
 def fixpoint.propagate
   (states : alloc.vec.Vec region.State) (reached : alloc.vec.Vec Bool)
   (on_list : alloc.vec.Vec Bool) (stack : alloc.vec.Vec Std.Usize)
@@ -734,7 +734,7 @@ def fixpoint.propagate
       ok ((top, refused), states1, reached1, on_list1, stack1)
 
 /-- [async_ebpf_verified::region::checked_add_i32]:
-    Source: '../../src/verified/region.rs', lines 512:0-521:1 -/
+    Source: '../../src/verified/region.rs', lines 511:0-520:1 -/
 def region.checked_add_i32
   (a : Std.I32) (b : Std.I32) : Result (Option Std.I32) := do
   if b >= 0#i32
@@ -752,7 +752,7 @@ def region.checked_add_i32
          ok (some i1)
 
 /-- [async_ebpf_verified::region::add_imm_kind]:
-    Source: '../../src/verified/region.rs', lines 617:0-628:1
+    Source: '../../src/verified/region.rs', lines 616:0-627:1
     Visibility: public -/
 def region.add_imm_kind
   (a : region.RegKind) (imm : Std.I32) : Result region.RegKind := do
@@ -772,7 +772,7 @@ def region.add_imm_kind
   | region.RegKind.Unknown => ok region.RegKind.Unknown
 
 /-- [async_ebpf_verified::region::sub_kinds]:
-    Source: '../../src/verified/region.rs', lines 603:0-613:1
+    Source: '../../src/verified/region.rs', lines 602:0-612:1
     Visibility: public -/
 def region.sub_kinds
   (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
@@ -806,7 +806,7 @@ def region.sub_kinds
   | region.RegKind.Unknown => ok region.RegKind.Unknown
 
 /-- [async_ebpf_verified::region::add_kinds]:
-    Source: '../../src/verified/region.rs', lines 589:0-600:1
+    Source: '../../src/verified/region.rs', lines 588:0-599:1
     Visibility: public -/
 def region.add_kinds
   (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
@@ -844,22 +844,22 @@ def region.add_kinds
   | region.RegKind.Unknown => ok region.RegKind.Unknown
 
 /-- [async_ebpf_verified::region::wrapping_neg_i32]:
-    Source: '../../src/verified/region.rs', lines 524:0-530:1 -/
+    Source: '../../src/verified/region.rs', lines 523:0-529:1 -/
 def region.wrapping_neg_i32 (imm : Std.I32) : Result Std.I32 := do
   if imm = core.num.I32.MIN
   then ok core.num.I32.MIN
   else -. imm
 
 /-- [async_ebpf_verified::region::ALU_OP_MOV]
-    Source: '../../src/verified/region.rs', lines 73:0-73:28 -/
+    Source: '../../src/verified/region.rs', lines 72:0-72:28 -/
 @[global_simps, irreducible] def region.ALU_OP_MOV : Std.U8 := 176#u8
 
 /-- [async_ebpf_verified::region::ALU_OP_SUB]
-    Source: '../../src/verified/region.rs', lines 72:0-72:28 -/
+    Source: '../../src/verified/region.rs', lines 71:0-71:28 -/
 @[global_simps, irreducible] def region.ALU_OP_SUB : Std.U8 := 16#u8
 
 /-- [async_ebpf_verified::region::ALU_OP_ADD]
-    Source: '../../src/verified/region.rs', lines 71:0-71:28 -/
+    Source: '../../src/verified/region.rs', lines 70:0-70:28 -/
 @[global_simps, irreducible] def region.ALU_OP_ADD : Std.U8 := 0#u8
 
 /-- [async_ebpf_verified::isa::ALU_MASK]
@@ -873,7 +873,7 @@ def region.wrapping_neg_i32 (imm : Std.I32) : Result Std.I32 := do
 @[global_simps, irreducible] def isa.SRC_REG : Std.U8 := 8#u8
 
 /-- [async_ebpf_verified::region::transfer_alu64]:
-    Source: '../../src/verified/region.rs', lines 712:0-743:1 -/
+    Source: '../../src/verified/region.rs', lines 711:0-742:1 -/
 def region.transfer_alu64
   (s : region.State) (inst : isa.Insn) : Result region.State := do
   let op ← lift (inst.opcode &&& isa.ALU_MASK)
@@ -936,7 +936,7 @@ def region.transfer_alu64
         ok { s with regs := a }
 
 /-- [async_ebpf_verified::region::stack_access_start]:
-    Source: '../../src/verified/region.rs', lines 505:0-510:1
+    Source: '../../src/verified/region.rs', lines 504:0-509:1
     Visibility: public -/
 def region.stack_access_start
   (base : region.RegKind) (offset : Std.I16) : Result (Option Std.I32) := do
@@ -961,7 +961,7 @@ def region.stack_access_start
 @[global_simps, irreducible] def isa.CLS_STX : Std.U8 := 3#u8
 
 /-- [async_ebpf_verified::region::is_atomic]:
-    Source: '../../src/verified/region.rs', lines 499:0-501:1
+    Source: '../../src/verified/region.rs', lines 498:0-500:1
     Visibility: public -/
 def region.is_atomic (opcode : Std.U8) : Result Bool := do
   let i ← lift (opcode &&& isa.CLS_MASK)
@@ -971,7 +971,7 @@ def region.is_atomic (opcode : Std.U8) : Result Bool := do
   else ok false
 
 /-- [async_ebpf_verified::region::access_width]:
-    Source: '../../src/verified/region.rs', lines 489:0-496:1
+    Source: '../../src/verified/region.rs', lines 488:0-495:1
     Visibility: public -/
 def region.access_width (opcode : Std.U8) : Result Std.U8 := do
   let i ← lift (opcode &&& 24#u8)
@@ -982,7 +982,7 @@ def region.access_width (opcode : Std.U8) : Result Std.U8 := do
   | _ => ok 8#u8
 
 /-- [async_ebpf_verified::region::slot_overlaps]:
-    Source: '../../src/verified/region.rs', lines 294:0-302:1 -/
+    Source: '../../src/verified/region.rs', lines 293:0-301:1 -/
 def region.slot_overlaps
   (slot_off : Std.I32) (start : Std.I32) («end» : Std.I32) :
   Result Bool
@@ -997,7 +997,7 @@ def region.slot_overlaps
     else ok false
 
 /-- [async_ebpf_verified::region::invalidate_slots]:
-    Source: '../../src/verified/region.rs', lines 289:0-291:1
+    Source: '../../src/verified/region.rs', lines 288:0-290:1
     Visibility: public -/
 def region.invalidate_slots
   (spills : region.Spills) : Result region.Spills := do
@@ -1005,7 +1005,7 @@ def region.invalidate_slots
   ok { spills with invalid_epoch := i }
 
 /-- [async_ebpf_verified::region::invalidate_stack_write]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 322:2-331:3
+    Source: '../../src/verified/region.rs', lines 321:2-330:3
     Visibility: public -/
 @[rust_loop_body]
 def region.invalidate_stack_write_loop.body
@@ -1034,7 +1034,7 @@ def region.invalidate_stack_write_loop.body
   else ok (done (spills.slots, spills.num_slots, spills.invalid_epoch))
 
 /-- [async_ebpf_verified::region::invalidate_stack_write]: loop 0:
-    Source: '../../src/verified/region.rs', lines 322:2-331:3
+    Source: '../../src/verified/region.rs', lines 321:2-330:3
     Visibility: public -/
 @[rust_loop]
 def region.invalidate_stack_write_loop
@@ -1048,7 +1048,7 @@ def region.invalidate_stack_write_loop
     (spills, i)
 
 /-- [async_ebpf_verified::region::invalidate_stack_write]:
-    Source: '../../src/verified/region.rs', lines 307:0-332:1
+    Source: '../../src/verified/region.rs', lines 306:0-331:1
     Visibility: public -/
 def region.invalidate_stack_write
   (spills : region.Spills) (start : Option Std.I32) (width : Std.U8) :
@@ -1068,13 +1068,13 @@ def region.invalidate_stack_write
       ok { slots := a, num_slots := i1, invalid_epoch := i2 }
 
 /-- [async_ebpf_verified::region::frame_pointer_kind]:
-    Source: '../../src/verified/region.rs', lines 178:0-180:1
+    Source: '../../src/verified/region.rs', lines 177:0-179:1
     Visibility: public -/
 def region.frame_pointer_kind : Result region.RegKind := do
   ok (region.RegKind.Stack (region.StackKind.Current (some 0#i32)))
 
 /-- [async_ebpf_verified::region::aliases_current_stack]:
-    Source: '../../src/verified/region.rs', lines 170:0-175:1
+    Source: '../../src/verified/region.rs', lines 169:0-174:1
     Visibility: public -/
 def region.aliases_current_stack (kind : region.RegKind) : Result Bool := do
   match kind with
@@ -1088,7 +1088,7 @@ def region.aliases_current_stack (kind : region.RegKind) : Result Bool := do
   | region.RegKind.Unknown => ok true
 
 /-- [async_ebpf_verified::region::is_stack]:
-    Source: '../../src/verified/region.rs', lines 154:0-159:1
+    Source: '../../src/verified/region.rs', lines 153:0-158:1
     Visibility: public -/
 def region.is_stack (kind : region.RegKind) : Result Bool := do
   match kind with
@@ -1099,11 +1099,11 @@ def region.is_stack (kind : region.RegKind) : Result Bool := do
   | region.RegKind.Unknown => ok false
 
 /-- [async_ebpf_verified::region::ATOMIC_OP_CMPXCHG]
-    Source: '../../src/verified/region.rs', lines 75:0-75:36 -/
+    Source: '../../src/verified/region.rs', lines 74:0-74:36 -/
 @[global_simps, irreducible] def region.ATOMIC_OP_CMPXCHG : Std.I32 := 240#i32
 
 /-- [async_ebpf_verified::region::ATOMIC_OP_MASK]
-    Source: '../../src/verified/region.rs', lines 74:0-74:33 -/
+    Source: '../../src/verified/region.rs', lines 73:0-73:33 -/
 @[global_simps, irreducible] def region.ATOMIC_OP_MASK : Std.I32 := 240#i32
 
 /-- [async_ebpf_verified::isa::CLS_ST]
@@ -1112,7 +1112,7 @@ def region.is_stack (kind : region.RegKind) : Result Bool := do
 @[global_simps, irreducible] def isa.CLS_ST : Std.U8 := 2#u8
 
 /-- [async_ebpf_verified::region::transfer_store]:
-    Source: '../../src/verified/region.rs', lines 654:0-709:1 -/
+    Source: '../../src/verified/region.rs', lines 653:0-708:1 -/
 def region.transfer_store
   (s : region.State) (inst : isa.Insn) (cls : Std.U8) :
   Result (Bool × region.State)
@@ -1210,7 +1210,7 @@ def region.transfer_store
   else ok (refused, s3)
 
 /-- [async_ebpf_verified::region::set_reg]:
-    Source: '../../src/verified/region.rs', lines 648:0-650:1 -/
+    Source: '../../src/verified/region.rs', lines 647:0-649:1 -/
 def region.set_reg
   (state : region.State) (reg : Std.Usize) (kind : region.RegKind) :
   Result region.State
@@ -1219,7 +1219,7 @@ def region.set_reg
   ok { state with regs := a }
 
 /-- [async_ebpf_verified::region::is_pointer]:
-    Source: '../../src/verified/region.rs', lines 146:0-152:1
+    Source: '../../src/verified/region.rs', lines 145:0-151:1
     Visibility: public -/
 def region.is_pointer (kind : region.RegKind) : Result Bool := do
   match kind with
@@ -1230,7 +1230,7 @@ def region.is_pointer (kind : region.RegKind) : Result Bool := do
   | region.RegKind.Unknown => ok false
 
 /-- [async_ebpf_verified::region::load_kind]:
-    Source: '../../src/verified/region.rs', lines 632:0-643:1 -/
+    Source: '../../src/verified/region.rs', lines 631:0-642:1 -/
 def region.load_kind
   (spills : region.Spills) (inst : isa.Insn) : Result region.RegKind := do
   let i ← lift (UScalar.cast .Usize inst.src)
@@ -1265,7 +1265,7 @@ def region.load_kind
 @[global_simps, irreducible] def isa.CLS_LD : Std.U8 := 0#u8
 
 /-- [async_ebpf_verified::region::transfer]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 789:4-792:5
+    Source: '../../src/verified/region.rs', lines 788:4-791:5
     Visibility: public -/
 @[rust_loop_body]
 def region.transfer_loop.body
@@ -1280,7 +1280,7 @@ def region.transfer_loop.body
   else ok (done s)
 
 /-- [async_ebpf_verified::region::transfer]: loop 0:
-    Source: '../../src/verified/region.rs', lines 789:4-792:5
+    Source: '../../src/verified/region.rs', lines 788:4-791:5
     Visibility: public -/
 @[rust_loop]
 def region.transfer_loop
@@ -1290,7 +1290,7 @@ def region.transfer_loop
     (s, r)
 
 /-- [async_ebpf_verified::region::transfer]:
-    Source: '../../src/verified/region.rs', lines 749:0-796:1
+    Source: '../../src/verified/region.rs', lines 748:0-795:1
     Visibility: public -/
 def region.transfer
   (in_state : region.State) (inst : isa.Insn) (lddw_addr : Std.U64)
@@ -1351,13 +1351,13 @@ def region.transfer
               else ok (in_state, false)
 
 /-- [async_ebpf_verified::region::EMPTY_SLOT]
-    Source: '../../src/verified/region.rs', lines 218:0-222:2 -/
+    Source: '../../src/verified/region.rs', lines 217:0-221:2 -/
 @[global_simps, irreducible]
 def region.EMPTY_SLOT : region.Slot :=
   { off := 0#i32, epoch := 0#u64, kind := region.RegKind.Uninit }
 
 /-- [async_ebpf_verified::region::top]:
-    Source: '../../src/verified/region.rs', lines 225:0-234:1
+    Source: '../../src/verified/region.rs', lines 224:0-233:1
     Visibility: public -/
 def region.top : Result region.State := do
   let a := Array.repeat 11#usize region.RegKind.Uninit
@@ -1369,29 +1369,28 @@ def region.top : Result region.State := do
     }
 
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::State}::clone]:
-    Source: '../../src/verified/region.rs', lines 211:9-211:14
+    Source: '../../src/verified/region.rs', lines 210:9-210:14
     Visibility: public -/
 def region.State.Insts.CoreCloneClone.clone
   (self : region.State) : Result region.State := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::State}]
-    Source: '../../src/verified/region.rs', lines 211:9-211:14 -/
+    Source: '../../src/verified/region.rs', lines 210:9-210:14 -/
 @[reducible]
 def region.State.Insts.CoreCloneClone : core.clone.Clone region.State := {
   clone := region.State.Insts.CoreCloneClone.clone
 }
 
 /-- [async_ebpf_verified::fixpoint::solve_from]: loop body 0:
-    Source: '../../src/verified/fixpoint.rs', lines 169:2-212:3
+    Source: '../../src/verified/fixpoint.rs', lines 172:2-215:3
     Visibility: public -/
 @[rust_loop_body]
 def fixpoint.solve_from_loop.body
-  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
-  (live : Slice Std.U16) (data_lo : Std.U64) (data_hi : Std.U64)
-  (states : alloc.vec.Vec region.State) (reached : alloc.vec.Vec Bool)
-  (on_list : alloc.vec.Vec Bool) (stack : alloc.vec.Vec Std.Usize)
-  (sp : Std.Usize) (refused : Bool) :
+  (insns : Slice isa.Insn) (live : Slice Std.U16) (data_lo : Std.U64)
+  (data_hi : Std.U64) (num : Std.Usize) (states : alloc.vec.Vec region.State)
+  (reached : alloc.vec.Vec Bool) (on_list : alloc.vec.Vec Bool)
+  (stack : alloc.vec.Vec Std.Usize) (sp : Std.Usize) (refused : Bool) :
   Result (ControlFlow ((alloc.vec.Vec region.State) × (alloc.vec.Vec Bool) ×
     (alloc.vec.Vec Bool) × (alloc.vec.Vec Std.Usize) × Std.Usize × Bool)
     ((alloc.vec.Vec region.State) × (alloc.vec.Vec Bool) × Bool))
@@ -1418,7 +1417,7 @@ def fixpoint.solve_from_loop.body
       else let on_list2 := index_mut_back false
            ok (on_list2, refused)
     let (count, first, second) ←
-      fixpoint.function_successors insns pc start «end»
+      fixpoint.function_successors insns pc 0#usize num
     let (states1, reached1, on_list2, stack1, sp2, refused2) ←
       if count >= 1#usize
       then
@@ -1443,30 +1442,28 @@ def fixpoint.solve_from_loop.body
   else ok (done (states, reached, refused))
 
 /-- [async_ebpf_verified::fixpoint::solve_from]: loop 0:
-    Source: '../../src/verified/fixpoint.rs', lines 169:2-212:3
+    Source: '../../src/verified/fixpoint.rs', lines 172:2-215:3
     Visibility: public -/
 @[rust_loop]
 def fixpoint.solve_from_loop
-  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
-  (live : Slice Std.U16) (data_lo : Std.U64) (data_hi : Std.U64)
-  (states : alloc.vec.Vec region.State) (reached : alloc.vec.Vec Bool)
-  (on_list : alloc.vec.Vec Bool) (stack : alloc.vec.Vec Std.Usize)
-  (sp : Std.Usize) (refused : Bool) :
+  (insns : Slice isa.Insn) (live : Slice Std.U16) (data_lo : Std.U64)
+  (data_hi : Std.U64) (num : Std.Usize) (states : alloc.vec.Vec region.State)
+  (reached : alloc.vec.Vec Bool) (on_list : alloc.vec.Vec Bool)
+  (stack : alloc.vec.Vec Std.Usize) (sp : Std.Usize) (refused : Bool) :
   Result ((alloc.vec.Vec region.State) × (alloc.vec.Vec Bool) × Bool)
   := do
   loop
     (fun (states1, reached1, on_list1, stack1, sp1, refused1) =>
-      fixpoint.solve_from_loop.body insns start «end» live data_lo data_hi
-      states1 reached1 on_list1 stack1 sp1 refused1)
+      fixpoint.solve_from_loop.body insns live data_lo data_hi num states1
+      reached1 on_list1 stack1 sp1 refused1)
     (states, reached, on_list, stack, sp, refused)
 
 /-- [async_ebpf_verified::fixpoint::solve_from]:
-    Source: '../../src/verified/fixpoint.rs', lines 148:0-219:1
+    Source: '../../src/verified/fixpoint.rs', lines 153:0-222:1
     Visibility: public -/
 def fixpoint.solve_from
-  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
-  (entry : region.State) (live : Slice Std.U16) (data_lo : Std.U64)
-  (data_hi : Std.U64) :
+  (insns : Slice isa.Insn) (entry : region.State) (live : Slice Std.U16)
+  (data_lo : Std.U64) (data_hi : Std.U64) :
   Result fixpoint.Solution
   := do
   let num := Slice.len insns
@@ -1476,33 +1473,33 @@ def fixpoint.solve_from
   let stack ← alloc.vec.from_elem core.clone.CloneUsize 0#usize num
   let (_, index_mut_back) ←
     alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
-      region.State) states start
+      region.State) states 0#usize
   let (_, index_mut_back1) ←
     alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
-      reached start
+      reached 0#usize
   let (_, index_mut_back2) ←
     alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
-      reached start
+      reached 0#usize
   let (_, index_mut_back3) ←
     alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.Usize)
       stack 0#usize
-  let stack1 := index_mut_back3 start
+  let stack1 := index_mut_back3 0#usize
   let on_list := index_mut_back2 true
   let reached1 := index_mut_back1 true
   let states1 := index_mut_back entry
   let (states2, reached2, refused) ←
-    fixpoint.solve_from_loop insns start «end» live data_lo data_hi states1
-      reached1 on_list stack1 1#usize false
+    fixpoint.solve_from_loop insns live data_lo data_hi num states1 reached1
+      on_list stack1 1#usize false
   ok { states := states2, reached := reached2, refused }
 
 /-- [async_ebpf_verified::region::PointerSignature]
-    Source: '../../src/verified/region.rs', lines 396:0-398:1
+    Source: '../../src/verified/region.rs', lines 395:0-397:1
     Visibility: public -/
 structure region.PointerSignature where
   regs : Array region.RegKind 11#usize
 
 /-- [async_ebpf_verified::region::apply_signature]:
-    Source: '../../src/verified/region.rs', lines 423:0-426:1
+    Source: '../../src/verified/region.rs', lines 422:0-425:1
     Visibility: public -/
 def region.apply_signature
   (sig : region.PointerSignature) (state : region.State) :
@@ -1513,7 +1510,7 @@ def region.apply_signature
   ok { state with regs := a }
 
 /-- [async_ebpf_verified::region::entry_state]:
-    Source: '../../src/verified/region.rs', lines 476:0-481:1
+    Source: '../../src/verified/region.rs', lines 475:0-480:1
     Visibility: public -/
 def region.entry_state
   (sig : region.PointerSignature) (live : Std.U16) : Result region.State := do
@@ -1522,17 +1519,16 @@ def region.entry_state
   region.project state1 live
 
 /-- [async_ebpf_verified::fixpoint::solve]:
-    Source: '../../src/verified/fixpoint.rs', lines 223:0-234:1
+    Source: '../../src/verified/fixpoint.rs', lines 226:0-235:1
     Visibility: public -/
 def fixpoint.solve
-  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
-  (sig : region.PointerSignature) (live : Slice Std.U16) (data_lo : Std.U64)
-  (data_hi : Std.U64) :
+  (insns : Slice isa.Insn) (sig : region.PointerSignature)
+  (live : Slice Std.U16) (data_lo : Std.U64) (data_hi : Std.U64) :
   Result fixpoint.Solution
   := do
-  let i ← Slice.index_usize live start
+  let i ← Slice.index_usize live 0#usize
   let entry ← region.entry_state sig i
-  fixpoint.solve_from insns start «end» entry live data_lo data_hi
+  fixpoint.solve_from insns entry live data_lo data_hi
 
 /-- [async_ebpf_verified::isa::{impl core::clone::Clone for async_ebpf_verified::isa::Insn}::clone]:
     Source: '../../src/verified/isa.rs', lines 12:15-12:20
@@ -3129,55 +3125,55 @@ def layout.partition
       layout.Layout (core.convert.FromSame layout.LayoutReject) residual
 
 /-- [async_ebpf_verified::region::REGION_UNKNOWN]
-    Source: '../../src/verified/region.rs', lines 51:0-51:33
+    Source: '../../src/verified/region.rs', lines 50:0-50:33
     Visibility: public -/
 @[global_simps, irreducible] def region.REGION_UNKNOWN : Std.U8 := 0#u8
 
 /-- [async_ebpf_verified::region::REGION_STACK]
-    Source: '../../src/verified/region.rs', lines 52:0-52:31
+    Source: '../../src/verified/region.rs', lines 51:0-51:31
     Visibility: public -/
 @[global_simps, irreducible] def region.REGION_STACK : Std.U8 := 1#u8
 
 /-- [async_ebpf_verified::region::REGION_DATA]
-    Source: '../../src/verified/region.rs', lines 53:0-53:30
+    Source: '../../src/verified/region.rs', lines 52:0-52:30
     Visibility: public -/
 @[global_simps, irreducible] def region.REGION_DATA : Std.U8 := 2#u8
 
 /-- [async_ebpf_verified::region::REGION_FRAME]
-    Source: '../../src/verified/region.rs', lines 56:0-56:31
+    Source: '../../src/verified/region.rs', lines 55:0-55:31
     Visibility: public -/
 @[global_simps, irreducible] def region.REGION_FRAME : Std.U8 := 3#u8
 
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::RegKind}::clone]:
-    Source: '../../src/verified/region.rs', lines 80:9-80:14
+    Source: '../../src/verified/region.rs', lines 79:9-79:14
     Visibility: public -/
 def region.RegKind.Insts.CoreCloneClone.clone
   (self : region.RegKind) : Result region.RegKind := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::RegKind}]
-    Source: '../../src/verified/region.rs', lines 80:9-80:14 -/
+    Source: '../../src/verified/region.rs', lines 79:9-79:14 -/
 @[reducible]
 def region.RegKind.Insts.CoreCloneClone : core.clone.Clone region.RegKind := {
   clone := region.RegKind.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::marker::Copy for async_ebpf_verified::region::RegKind}]
-    Source: '../../src/verified/region.rs', lines 80:16-80:20 -/
+    Source: '../../src/verified/region.rs', lines 79:16-79:20 -/
 @[reducible]
 def region.RegKind.Insts.CoreMarkerCopy : core.marker.Copy region.RegKind := {
   cloneInst := region.RegKind.Insts.CoreCloneClone
 }
 
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::StackKind}::clone]:
-    Source: '../../src/verified/region.rs', lines 90:9-90:14
+    Source: '../../src/verified/region.rs', lines 89:9-89:14
     Visibility: public -/
 def region.StackKind.Insts.CoreCloneClone.clone
   (self : region.StackKind) : Result region.StackKind := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::StackKind}]
-    Source: '../../src/verified/region.rs', lines 90:9-90:14 -/
+    Source: '../../src/verified/region.rs', lines 89:9-89:14 -/
 @[reducible]
 def region.StackKind.Insts.CoreCloneClone : core.clone.Clone region.StackKind
   := {
@@ -3185,7 +3181,7 @@ def region.StackKind.Insts.CoreCloneClone : core.clone.Clone region.StackKind
 }
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::marker::Copy for async_ebpf_verified::region::StackKind}]
-    Source: '../../src/verified/region.rs', lines 90:16-90:20 -/
+    Source: '../../src/verified/region.rs', lines 89:16-89:20 -/
 @[reducible]
 def region.StackKind.Insts.CoreMarkerCopy : core.marker.Copy region.StackKind
   := {
@@ -3193,7 +3189,7 @@ def region.StackKind.Insts.CoreMarkerCopy : core.marker.Copy region.StackKind
 }
 
 /-- [async_ebpf_verified::region::region_of]:
-    Source: '../../src/verified/region.rs', lines 138:0-144:1
+    Source: '../../src/verified/region.rs', lines 137:0-143:1
     Visibility: public -/
 def region.region_of (kind : region.RegKind) : Result Std.U8 := do
   match kind with
@@ -3204,7 +3200,7 @@ def region.region_of (kind : region.RegKind) : Result Std.U8 := do
   | region.RegKind.Unknown => ok region.REGION_UNKNOWN
 
 /-- [async_ebpf_verified::region::foreign_for_call]:
-    Source: '../../src/verified/region.rs', lines 162:0-167:1
+    Source: '../../src/verified/region.rs', lines 161:0-166:1
     Visibility: public -/
 def region.foreign_for_call
   (kind : region.RegKind) : Result region.RegKind := do
@@ -3217,63 +3213,63 @@ def region.foreign_for_call
   | region.RegKind.Unknown => ok region.RegKind.Unknown
 
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::Slot}::clone]:
-    Source: '../../src/verified/region.rs', lines 184:9-184:14
+    Source: '../../src/verified/region.rs', lines 183:9-183:14
     Visibility: public -/
 def region.Slot.Insts.CoreCloneClone.clone
   (self : region.Slot) : Result region.Slot := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::Slot}]
-    Source: '../../src/verified/region.rs', lines 184:9-184:14 -/
+    Source: '../../src/verified/region.rs', lines 183:9-183:14 -/
 @[reducible]
 def region.Slot.Insts.CoreCloneClone : core.clone.Clone region.Slot := {
   clone := region.Slot.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::marker::Copy for async_ebpf_verified::region::Slot}]
-    Source: '../../src/verified/region.rs', lines 184:16-184:20 -/
+    Source: '../../src/verified/region.rs', lines 183:16-183:20 -/
 @[reducible]
 def region.Slot.Insts.CoreMarkerCopy : core.marker.Copy region.Slot := {
   cloneInst := region.Slot.Insts.CoreCloneClone
 }
 
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::Spills}::clone]:
-    Source: '../../src/verified/region.rs', lines 198:9-198:14
+    Source: '../../src/verified/region.rs', lines 197:9-197:14
     Visibility: public -/
 def region.Spills.Insts.CoreCloneClone.clone
   (self : region.Spills) : Result region.Spills := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::Spills}]
-    Source: '../../src/verified/region.rs', lines 198:9-198:14 -/
+    Source: '../../src/verified/region.rs', lines 197:9-197:14 -/
 @[reducible]
 def region.Spills.Insts.CoreCloneClone : core.clone.Clone region.Spills := {
   clone := region.Spills.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::marker::Copy for async_ebpf_verified::region::Spills}]
-    Source: '../../src/verified/region.rs', lines 198:16-198:20 -/
+    Source: '../../src/verified/region.rs', lines 197:16-197:20 -/
 @[reducible]
 def region.Spills.Insts.CoreMarkerCopy : core.marker.Copy region.Spills := {
   cloneInst := region.Spills.Insts.CoreCloneClone
 }
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::marker::Copy for async_ebpf_verified::region::State}]
-    Source: '../../src/verified/region.rs', lines 211:16-211:20 -/
+    Source: '../../src/verified/region.rs', lines 210:16-210:20 -/
 @[reducible]
 def region.State.Insts.CoreMarkerCopy : core.marker.Copy region.State := {
   cloneInst := region.State.Insts.CoreCloneClone
 }
 
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::PointerSignature}::clone]:
-    Source: '../../src/verified/region.rs', lines 394:9-394:14
+    Source: '../../src/verified/region.rs', lines 393:9-393:14
     Visibility: public -/
 def region.PointerSignature.Insts.CoreCloneClone.clone
   (self : region.PointerSignature) : Result region.PointerSignature := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::PointerSignature}]
-    Source: '../../src/verified/region.rs', lines 394:9-394:14 -/
+    Source: '../../src/verified/region.rs', lines 393:9-393:14 -/
 @[reducible]
 def region.PointerSignature.Insts.CoreCloneClone : core.clone.Clone
   region.PointerSignature := {
@@ -3281,7 +3277,7 @@ def region.PointerSignature.Insts.CoreCloneClone : core.clone.Clone
 }
 
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::marker::Copy for async_ebpf_verified::region::PointerSignature}]
-    Source: '../../src/verified/region.rs', lines 394:16-394:20 -/
+    Source: '../../src/verified/region.rs', lines 393:16-393:20 -/
 @[reducible]
 def region.PointerSignature.Insts.CoreMarkerCopy : core.marker.Copy
   region.PointerSignature := {
@@ -3289,23 +3285,23 @@ def region.PointerSignature.Insts.CoreMarkerCopy : core.marker.Copy
 }
 
 /-- [async_ebpf_verified::region::ALL_SIGNATURE_REGS]
-    Source: '../../src/verified/region.rs', lines 406:0-406:47
+    Source: '../../src/verified/region.rs', lines 405:0-405:47
     Visibility: public -/
 @[global_simps, irreducible]
 def region.ALL_SIGNATURE_REGS : Std.U16 := 1023#u16
 
 /-- [async_ebpf_verified::region::HELPER_ARG_REGS]
-    Source: '../../src/verified/region.rs', lines 410:0-410:48
+    Source: '../../src/verified/region.rs', lines 409:0-409:48
     Visibility: public -/
 @[global_simps, irreducible] def region.HELPER_ARG_REGS : Std.U16 := 62#u16
 
 /-- [async_ebpf_verified::region::CALL_CLOBBERED_REGS]
-    Source: '../../src/verified/region.rs', lines 411:0-411:52
+    Source: '../../src/verified/region.rs', lines 410:0-410:52
     Visibility: public -/
 @[global_simps, irreducible] def region.CALL_CLOBBERED_REGS : Std.U16 := 63#u16
 
 /-- [async_ebpf_verified::region::entry_signature]:
-    Source: '../../src/verified/region.rs', lines 415:0-420:1
+    Source: '../../src/verified/region.rs', lines 414:0-419:1
     Visibility: public -/
 def region.entry_signature : Result region.PointerSignature := do
   let regs := Array.repeat 11#usize region.RegKind.Scalar
@@ -3317,7 +3313,7 @@ def region.entry_signature : Result region.PointerSignature := do
   ok { regs := regs2 }
 
 /-- [async_ebpf_verified::region::signature_from_state]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 433:2-438:3
+    Source: '../../src/verified/region.rs', lines 432:2-437:3
     Visibility: public -/
 @[rust_loop_body]
 def region.signature_from_state_loop.body
@@ -3340,7 +3336,7 @@ def region.signature_from_state_loop.body
   else ok (done regs)
 
 /-- [async_ebpf_verified::region::signature_from_state]: loop 0:
-    Source: '../../src/verified/region.rs', lines 433:2-438:3
+    Source: '../../src/verified/region.rs', lines 432:2-437:3
     Visibility: public -/
 @[rust_loop]
 def region.signature_from_state_loop
@@ -3352,7 +3348,7 @@ def region.signature_from_state_loop
     (regs, reg)
 
 /-- [async_ebpf_verified::region::signature_from_state]:
-    Source: '../../src/verified/region.rs', lines 430:0-441:1
+    Source: '../../src/verified/region.rs', lines 429:0-440:1
     Visibility: public -/
 def region.signature_from_state
   (state : region.State) : Result region.PointerSignature := do
@@ -3362,7 +3358,7 @@ def region.signature_from_state
   ok { regs := regs1 }
 
 /-- [async_ebpf_verified::region::mask_signature]:
-    Source: '../../src/verified/region.rs', lines 468:0-472:1
+    Source: '../../src/verified/region.rs', lines 467:0-471:1
     Visibility: public -/
 def region.mask_signature
   (sig : region.PointerSignature) (mask : Std.U16) :
@@ -3388,7 +3384,7 @@ def stack.in_frame_window
   else ok false
 
 /-- [async_ebpf_verified::region::frame_access]:
-    Source: '../../src/verified/region.rs', lines 552:0-563:1
+    Source: '../../src/verified/region.rs', lines 551:0-562:1
     Visibility: public -/
 def region.frame_access
   (state : region.State) (inst : isa.Insn) (base : Std.Usize)
@@ -3412,7 +3408,7 @@ def region.frame_access
     else ok false
 
 /-- [async_ebpf_verified::region::classify]:
-    Source: '../../src/verified/region.rs', lines 569:0-586:1
+    Source: '../../src/verified/region.rs', lines 568:0-585:1
     Visibility: public -/
 def region.classify
   (state : region.State) (inst : isa.Insn) (frame_size : Std.U16) :
@@ -3451,7 +3447,7 @@ def region.classify
       else ok (false, region.REGION_UNKNOWN, region.REGION_UNKNOWN)
 
 /-- [async_ebpf_verified::region::reg_bit]:
-    Source: '../../src/verified/region.rs', lines 799:0-805:1
+    Source: '../../src/verified/region.rs', lines 798:0-804:1
     Visibility: public -/
 def region.reg_bit (reg : Std.Usize) : Result Std.U16 := do
   if reg < region.R10
@@ -3459,7 +3455,7 @@ def region.reg_bit (reg : Std.Usize) : Result Std.U16 := do
   else ok 0#u16
 
 /-- [async_ebpf_verified::region::uses_and_defs]:
-    Source: '../../src/verified/region.rs', lines 815:0-872:1
+    Source: '../../src/verified/region.rs', lines 814:0-871:1
     Visibility: public -/
 def region.uses_and_defs
   (inst : isa.Insn) (callee_live_in : Std.U16) :

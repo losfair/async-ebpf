@@ -229,13 +229,16 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
 /// Analyzes the function `[start_pc, end_pc)` of a section from the
 /// signature `incoming`.
 ///
-/// The fixed point is `verified::fixpoint::solve`, over the section decoded
-/// as the verified core reads it and the per-slot live-in table of
-/// `layout`; this decodes, warns once if the spill-slot cap bit, classifies
-/// every reached access from its settled state, computes the masked
-/// signature each local call hands its callee, and groups accesses into the
-/// plan. A layout whose live-in table does not cover the section (a
-/// fragment analyzed outside the loader) projects nothing.
+/// The fixed point is `verified::fixpoint::solve`, over the function's slots
+/// decoded as the verified core reads them and the function's rows of the
+/// per-slot live-in table of `layout`; this decodes, warns once if the
+/// spill-slot cap bit, classifies every reached access from its settled
+/// state, computes the masked signature each local call hands its callee,
+/// and groups accesses into the plan. Only `hints` and `plan` are the
+/// section's size, because the JIT indexes them by absolute slot; the
+/// analysis itself costs the function's size. A layout whose live-in table
+/// does not cover the section (a fragment analyzed outside the loader)
+/// projects nothing.
 pub(crate) fn analyze_function(
   code: &[u8],
   start_pc: usize,
@@ -250,7 +253,6 @@ pub(crate) fn analyze_function(
   let mut hints = vec![REGION_UNKNOWN; num_slots];
   let mut unresolved = Vec::new();
   let mut call_signatures = std::collections::HashMap::new();
-  let insns = decode_section(code);
   if start_pc >= end_pc || end_pc > num_slots {
     return FunctionRegionAnalysis {
       hints,
@@ -259,28 +261,31 @@ pub(crate) fn analyze_function(
       call_signatures,
     };
   }
+  let span = end_pc - start_pc;
+  let insns = Insn::decode_all(&code[start_pc * 8..end_pc * 8]).expect("whole slots decode");
 
   let everything;
   let live: &[RegMask] = if layout.slot_live_in.len() == num_slots {
-    &layout.slot_live_in
+    &layout.slot_live_in[start_pc..end_pc]
   } else {
-    everything = vec![ALL_SIGNATURE_REGS; num_slots];
+    everything = vec![ALL_SIGNATURE_REGS; span];
     &everything
   };
   let fixpoint::Solution {
     states,
     reached,
     refused,
-  } = fixpoint::solve(&insns, start_pc, end_pc, &incoming, live, data_lo, data_hi);
+  } = fixpoint::solve(&insns, &incoming, live, data_lo, data_hi);
   if refused {
     warn_cap_reached(&mut false);
   }
 
   for pc in start_pc..end_pc {
-    if !reached[pc] {
+    let i = pc - start_pc;
+    if !reached[i] {
       continue;
     }
-    let insn = insns[pc];
+    let insn = insns[i];
     if insn.opcode == EBPF_OP_CALL && (insn.src == 1 || insn.src == 2) {
       let mask = if insn.src == 1 {
         let target = (pc as i64 + 1 + insn.imm as i64) as usize;
@@ -300,9 +305,9 @@ pub(crate) fn analyze_function(
           .copied()
           .unwrap_or(ALL_SIGNATURE_REGS)
       };
-      call_signatures.insert(pc, mask_signature(&signature_from_state(&states[pc]), mask));
+      call_signatures.insert(pc, mask_signature(&signature_from_state(&states[i]), mask));
     }
-    let (is_access, hint, region) = core::classify(&states[pc], &insn, frame_size);
+    let (is_access, hint, region) = core::classify(&states[i], &insn, frame_size);
     if !is_access {
       continue;
     }
@@ -948,21 +953,24 @@ fn build_access_plan(
   hints: &[u8],
   reached: &[bool],
 ) -> Vec<PlanEntry> {
+  // `insns` and `reached` are the function's own, indexed from `start_pc`;
+  // `hints` and the plan are the section's, indexed by absolute slot.
+  let span = end_pc - start_pc;
   let mut plan = vec![PlanEntry::default(); num_slots];
 
   // Anything a branch can land on ends the previous group: the base would not
   // have been established on the path that jumped in. Calls end it too - a
   // local callee runs in the same host frame and would overwrite the parked
   // base, and a helper call can suspend the guest entirely.
-  let mut is_target = vec![false; num_slots];
-  for pc in start_pc..end_pc {
-    if !reached[pc] {
+  let mut is_target = vec![false; span];
+  for i in 0..span {
+    if !reached[i] {
       continue;
     }
-    let inst = insns[pc];
+    let inst = insns[i];
     let cls = inst.opcode & EBPF_CLS_MASK;
     if (cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32) && inst.opcode != EBPF_OP_EXIT {
-      for succ in successors_of(insns, pc, start_pc, end_pc) {
+      for succ in successors_of(insns, i, 0, span) {
         is_target[succ] = true;
       }
     }
@@ -972,12 +980,12 @@ fn build_access_plan(
   let mut written: u16 = 0;
 
   for pc in start_pc..end_pc {
-    if !reached[pc] {
+    if !reached[pc - start_pc] {
       close_group(&mut open, &mut plan);
       written = 0;
       continue;
     }
-    if is_target[pc] {
+    if is_target[pc - start_pc] {
       close_group(&mut open, &mut plan);
       written = 0;
     }

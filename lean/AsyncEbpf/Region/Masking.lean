@@ -915,16 +915,16 @@ theorem entry_state_eq {σ σ' : region.PointerSignature} {m live : U16}
 
 /-! ## The statement -/
 
-/-- Live-in masking is invisible to the analysis: `solve` from a signature
-and from its masked form return the same solution, whenever the mask
-covers the entry slot's live-in. -/
+/-- Live-in masking is invisible to the analysis: `solve` over a function's
+slots from a signature and from its masked form return the same solution,
+whenever the mask covers the live-in of the function's first slot. -/
 theorem solve_masked_eq {σ σ' : region.PointerSignature} {m : U16}
-    {insns : Slice isa.Insn} {start «end» : Usize} {live : Slice U16} {lo hi : U64}
-    {L : U16} (hL : Slice.index_usize live start = ok L)
+    {insns : Slice isa.Insn} {live : Slice U16} {lo hi : U64}
+    {L : U16} (hL : Slice.index_usize live 0#usize = ok L)
     (hcover : ∀ (r : Nat), L.val.testBit r → m.val.testBit r)
     (hmask : region.mask_signature σ m = ok σ') {S₁ S₂ : fixpoint.Solution}
-    (h₁ : fixpoint.solve insns start «end» σ live lo hi = ok S₁)
-    (h₂ : fixpoint.solve insns start «end» σ' live lo hi = ok S₂) : S₁ = S₂ := by
+    (h₁ : fixpoint.solve insns σ live lo hi = ok S₁)
+    (h₂ : fixpoint.solve insns σ' live lo hi = ok S₂) : S₁ = S₂ := by
   unfold fixpoint.solve at h₁ h₂
   rw [hL] at h₁ h₂
   simp only [bind_tc_ok] at h₁ h₂

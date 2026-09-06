@@ -22,9 +22,10 @@
 use super::isa::*;
 use super::region::{meet_from, project, top, transfer, PointerSignature, RegMask, State};
 
-/// The result of [`solve`]: the state at every slot of the section (`top`
-/// where the walk never arrived), which slots it reached, and whether the
-/// spill-slot cap refused an entry anywhere.
+/// The result of [`solve`]: the state at every slot of the function (`top`
+/// where the walk never arrived), which slots it reached, both indexed from
+/// the function's start, and whether the spill-slot cap refused an entry
+/// anywhere.
 pub struct Solution {
   pub states: Vec<State>,
   pub reached: Vec<bool>,
@@ -138,17 +139,19 @@ fn propagate(
   (top, refused)
 }
 
-/// The fixed point of the function `[start, end)` from `entry` at `start`.
+/// The fixed point of one function from `entry` at its first slot. `insns`
+/// are the function's own slots, so every pc here is relative to its start;
 /// `live[pc]` is the live-in mask of slot `pc`; `[data_lo, data_hi)` is the
-/// guest data region. Requires `start < end <= insns.len()` and
-/// `live.len() >= insns.len()`.
+/// guest data region. Requires `0 < insns.len() <= live.len()`.
+///
+/// Everything allocated here is the function's size, not the section's:
+/// the loader runs this once per function and signature it compiles, and a
+/// section can hold thousands of functions.
 ///
 /// The worklist is a stack: a slot is on it at most once (`on_list`), so it
 /// never holds more than `insns.len()` entries.
 pub fn solve_from(
   insns: &[Insn],
-  start: usize,
-  end: usize,
   entry: State,
   live: &[RegMask],
   data_lo: u64,
@@ -159,10 +162,10 @@ pub fn solve_from(
   let mut reached: Vec<bool> = vec![false; num];
   let mut on_list: Vec<bool> = vec![false; num];
   let mut stack: Vec<usize> = vec![0; num];
-  states[start] = entry;
-  reached[start] = true;
-  on_list[start] = true;
-  stack[0] = start;
+  states[0] = entry;
+  reached[0] = true;
+  on_list[0] = true;
+  stack[0] = 0;
   let mut sp = 1;
   let mut refused = false;
 
@@ -176,7 +179,7 @@ pub fn solve_from(
     if r {
       refused = true;
     }
-    let (count, first, second) = function_successors(insns, pc, start, end);
+    let (count, first, second) = function_successors(insns, pc, 0, num);
     if count >= 1 {
       let (top, r1) = propagate(
         &mut states,
@@ -218,17 +221,15 @@ pub fn solve_from(
   }
 }
 
-/// [`solve_from`] the entry state `sig` gives, projected onto the entry
+/// [`solve_from`] the entry state `sig` gives, projected onto the first
 /// slot's live-in registers.
 pub fn solve(
   insns: &[Insn],
-  start: usize,
-  end: usize,
   sig: &PointerSignature,
   live: &[RegMask],
   data_lo: u64,
   data_hi: u64,
 ) -> Solution {
-  let entry = super::region::entry_state(sig, live[start]);
-  solve_from(insns, start, end, entry, live, data_lo, data_hi)
+  let entry = super::region::entry_state(sig, live[0]);
+  solve_from(insns, entry, live, data_lo, data_hi)
 }
