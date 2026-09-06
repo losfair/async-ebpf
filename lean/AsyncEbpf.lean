@@ -8,6 +8,7 @@ import AsyncEbpf.Layout.Spec
 import AsyncEbpf.Layout.Proofs
 import AsyncEbpf.Layout.Decoder
 import AsyncEbpf.Stack.Proofs
+import AsyncEbpf.Region.Proofs
 import AsyncEbpf.Semantics.Machine
 import AsyncEbpf.Semantics.Soundness
 import AsyncEbpf.Semantics.Functions

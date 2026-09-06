@@ -27,14 +27,18 @@
 //!
 //! The analysis is a precision optimization behind a bounds check the JIT
 //! always keeps for `STACK` and `DATA` hints, so those two hints may be
-//! wrong without breaking memory safety: the check faults spuriously. Two
+//! wrong without breaking memory safety: the check faults spuriously. Four
 //! of the rules below are deliberately optimistic in that sense — a value
-//! loaded from memory is a scalar, and spills survive a call — and
-//! `lean/AsyncEbpf/Region` states the soundness of the transfer function
-//! relative to exactly those two idealizations. The `FRAME` hint removes a
-//! check; its safety rests on the frame pointer never being assigned
-//! (`Semantics/Soundness.lean`) and on the frame-window arithmetic
-//! (`Semantics/Frames.lean`), not on anything here.
+//! loaded from memory is a scalar, a helper's result is a scalar, spills
+//! survive a call, and a slot the cap refuses reads back as a scalar — so
+//! no natural provenance semantics makes the kinds an over-approximation,
+//! and `lean/AsyncEbpf/Region` does not claim one. What it proves is what
+//! the runtime relies on: the `FRAME` hint, the one that removes a check,
+//! goes only to an access off `R10` itself inside the frame window
+//! (`classify_frame`, carried to executions by `Semantics/Frames.lean`);
+//! `R10`'s kind survives every transfer and meet of an accepted
+//! instruction; and `transfer` reads only the registers `uses_and_defs`
+//! names, which is what the live-in masking of call signatures rests on.
 
 use super::isa::*;
 use super::stack::in_frame_window;

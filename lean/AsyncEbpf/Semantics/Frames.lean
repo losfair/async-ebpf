@@ -1,5 +1,6 @@
 import AsyncEbpf.Semantics.Soundness
 import AsyncEbpf.Stack.Proofs
+import AsyncEbpf.Region.Proofs
 
 /-!
 # Unchecked frame accesses stay in mapped memory
@@ -21,7 +22,9 @@ call, and the guest stack admits `frame_count - 1` calls.
   state satisfies `island_access`, the test the runtime's checked path
   applies;
 * `floor_iff_depth`: the JIT's floor test (`R10 ≥ base + local_call_floor`)
-  passes exactly when the semantics allows another call.
+  passes exactly when the semantics allows another call;
+* `frame_hint_mapped`: the same for the hint itself: an access the region
+  analysis classifies `FRAME` is off `R10` and lands in a mapped island.
 -/
 open Aeneas Aeneas.Std Result
 
@@ -144,5 +147,33 @@ theorem floor_iff_depth (config : validate.Config) (kh : Slice U32) (insns : Sli
     have h1 : L.frame_size.val + L.frame_stride.val ≤ (s.regs R10).toNat - base :=
       hiff.mpr (by omega)
     omega
+
+theorem access_width_pos {x : U8} {w : U8} (h : region.access_width x = ok w) : 0 < w.val := by
+  unfold region.access_width at h
+  obtain_bind ⟨i, _, h⟩ := h
+  split at h <;> simp only [ok.injEq] at h <;> subst h <;> simp
+
+/-- An access the region analysis marks `FRAME` has `R10` for its base
+(`FrameBase`) and, in every execution of an accepted program, lies in a
+mapped island: `island_access` accepts it. -/
+theorem frame_hint_mapped (config : validate.Config) (kh : Slice U32) (insns : Slice isa.Insn)
+    (ext : Slice Bool) (hlen : insns.length < 2 ^ 63)
+    (hv : validate.validate config kh insns ext = ok (.Ok ()))
+    {L : stack.FrameLayout} (hstride : 0 < L.frame_stride.val)
+    (hsize : L.frame_size.val ≤ L.frame_stride.val)
+    {base : Nat} {P : Params} {ctx top : Word} (hSP : StackParams L base P top)
+    {s : State} (hr : Reachable P insns.val (initial ctx top) s)
+    {S : region.State} {F : U16} (hF : F.val = L.frame_size.val) {inst : isa.Insn} {r : U8}
+    (hc : region.classify S inst F = ok (true, region.REGION_FRAME, r))
+    {w : U8} (hw : region.access_width inst.opcode = ok w)
+    {a size : Usize} (ha : (a.val : Int) = ((s.regs R10).toNat - base : Nat) + inst.offset.val)
+    (hsz : size.val = w.val) :
+    FrameBase inst ∧ stack.island_access L a size = ok true := by
+  obtain ⟨hbase, _, w', hw', hwin⟩ := classify_frame hc
+  rw [hw] at hw'
+  simp only [ok.injEq] at hw'
+  subst hw'
+  exact ⟨hbase, frame_access_mapped config kh insns ext hlen hv hstride hsize hSP hr hF
+    (access_width_pos hw) hwin ha hsz⟩
 
 end async_ebpf_verified
