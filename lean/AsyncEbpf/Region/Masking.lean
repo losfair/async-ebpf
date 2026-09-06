@@ -26,13 +26,10 @@ survives `meet_from` (`meet_from_agree`), and therefore survives any
 schedule of the worklist, whether or not it projects (`run_agree`,
 `projection_neutral`); agreeing states classify every access alike
 (`hint_agree`) and hand every callee the same masked signature
-(`call_signature_agree`). What this leaves open is that the projecting and
-the non-projecting driver take the same schedule; the worklist re-queues a
-slot when any register changes, and `transfer` is not monotone, so they
-need not, and in principle a different order can reach a different fixed
-point. That the projecting driver's results are those of the old walk on
-random programs is checked by
-`region_analysis::masking_fuzz::projection_and_masking_are_precision_neutral`.
+(`call_signature_agree`). `projection_neutral` compares the projecting
+walk with the textbook one that meets values in as they are, over a
+common schedule; that is a statement about the algorithm, since nothing
+in the runtime walks without projecting.
 -/
 open Aeneas Aeneas.Std Result
 

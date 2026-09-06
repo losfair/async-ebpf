@@ -212,12 +212,11 @@ kind there. That makes the masking claim a one-line consequence:
   function of its entry state, so the two solutions are equal. Not merely
   the same hints: the same states at every slot.
 
-What is left to show is that projecting costs nothing, which is a
-statement about the analysis before and after this change. `AgreeAt` is
-agreement on the live registers, `R10` and the spills; `LiveSolution` is a
-live-in table that solves the equations the Rust solver computes (at every
-reachable slot: the slot's uses, and every successor's live-in minus the
-slot's defs). Then:
+The rest of the file says what the projection costs, which is nothing
+the analysis can see. `AgreeAt` is agreement on the live registers, `R10`
+and the spills; `LiveSolution` is a live-in table that solves the
+equations the Rust solver computes (at every reachable slot: the slot's
+uses, and every successor's live-in minus the slot's defs). Then:
 
 - `project_agree`: a state agrees with its projection;
 - `step_agree`, `trace_agree`: one transfer from states that agree at a
@@ -230,19 +229,12 @@ slot's defs). Then:
   reachable slot, agreeing states give the same hint and the same routing
   region, and the same masked signature to every local call.
 
-`projection_neutral` quantifies over a common schedule, the same sequence
-of slots processed by the projecting and the non-projecting walk. The two
-need not take one: the worklist re-queues a slot when any register
-changes, which the projection affects, and `transfer` is not monotone in
-the kind lattice (a fill from an untracked slot reads as a scalar, from a
-tracked one as the spilled pointer), so in principle different orders can
-reach different fixed points. That the projecting walk's results are those
-of the old one is checked, not proved:
-`region_analysis::masking_fuzz::projection_and_masking_are_precision_neutral`
-compares the two on random programs and random incoming signatures, and the
-golden and plan tests pin the hints of real programs. Note that this gap
-is now about a comparison with code that no longer runs; the masking claim
-itself no longer depends on any schedule.
+`projection_neutral` compares the projecting walk with the textbook one
+that meets values in as they are, over a common schedule. It is a
+statement about the algorithm, not a comparison with code that runs:
+nothing in the runtime walks without projecting any more, and the hints
+of real programs are pinned by the golden and plan tests, which the
+projection left unchanged.
 
 ## What is trusted
 

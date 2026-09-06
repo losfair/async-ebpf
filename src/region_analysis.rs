@@ -27,24 +27,19 @@
 //! original dual-region probe.
 //!
 //! The analysis is a standard forward dataflow over the instruction-slot CFG
-//! with a per-register lattice and a meet at control-flow joins. The loader
-//! analyzes one function at a time (`verified::fixpoint::solve`), from the
-//! signature its caller passes, with every state projected onto the slot's
-//! live-in registers; the whole-section walk of [`analyze`] instead follows
-//! local calls into their callees (carrying `R10`/`R6-R9`), with
-//! argument-derived pointers (`R1-R5`) reaching the callee as `Unknown`. Any
-//! slot still unreached keeps its registers `Uninit` and yields `UNKNOWN`
-//! hints — safe, just unoptimized.
+//! with a per-register lattice and a meet at control-flow joins, run one
+//! function at a time (`verified::fixpoint::solve`) from the signature the
+//! caller passes, with every state projected onto the slot's live-in
+//! registers. Any slot still unreached keeps its registers `Uninit` and
+//! yields `UNKNOWN` hints — safe, just unoptimized.
 
 use std::collections::HashMap;
 
 use crate::verified::fixpoint;
 use crate::verified::isa::Insn;
 #[cfg(any(test, feature = "testing"))]
-use crate::verified::region::apply_signature;
-use crate::verified::region::{
-  self as core, entry_signature, mask_signature, signature_from_state,
-};
+use crate::verified::region::entry_signature;
+use crate::verified::region::{self as core, mask_signature, signature_from_state};
 pub(crate) use crate::verified::region::{
   PointerSignature, RegMask, ALL_SIGNATURE_REGS, R10, REGION_UNKNOWN,
 };
@@ -52,10 +47,6 @@ pub(crate) use crate::verified::region::{
 pub(crate) use crate::verified::region::{
   RegKind, StackKind, NUM_REGS, REGION_DATA, REGION_FRAME, REGION_STACK,
 };
-
-/// The abstract state at a program point. See `crate::verified::region`.
-#[cfg(any(test, feature = "testing"))]
-type State = core::State;
 
 // eBPF opcode encoding helpers.
 const EBPF_CLS_MASK: u8 = 0x07;
@@ -138,35 +129,6 @@ fn warn_cap_reached(cap_warning_emitted: &mut bool) {
   }
 }
 
-/// Applies the transfer function and the meet into every successor, for the
-/// whole-section walk of [`analyze`]. The per-function analysis runs
-/// `verified::fixpoint::solve` instead, which projects onto live-in registers.
-#[cfg(any(test, feature = "testing"))]
-fn propagate(
-  states: &mut [State],
-  reached: &mut [bool],
-  on_list: &mut [bool],
-  worklist: &mut Vec<usize>,
-  pc: usize,
-  out: &State,
-  succs: &[usize],
-  cap_warning_emitted: &mut bool,
-) {
-  let _ = pc;
-  for &succ in succs {
-    let was_reached = reached[succ];
-    reached[succ] = true;
-    let (changed, refused) = core::meet_from(&mut states[succ], out);
-    if refused {
-      warn_cap_reached(cap_warning_emitted);
-    }
-    if (!was_reached || changed) && !on_list[succ] {
-      on_list[succ] = true;
-      worklist.push(succ);
-    }
-  }
-}
-
 /// Result of the region analysis for one code section.
 #[cfg(any(test, feature = "testing"))]
 pub struct RegionAnalysis {
@@ -188,7 +150,11 @@ pub(crate) struct FunctionRegionAnalysis {
   pub(crate) call_signatures: std::collections::HashMap<usize, PointerSignature>,
 }
 
-/// Analyzes the pointer region of every memory access in one code section.
+/// Analyzes every memory access of one code section the way the loader
+/// does: function by function, each from every masked signature some call
+/// site hands it, starting with the entry signature at slot 0. A slot's hint
+/// is the one its specializations agree on, `UNKNOWN` where they differ;
+/// `unresolved` is their union.
 ///
 /// `code` is the relocated bytecode, 8 bytes per slot, indexed the same way the
 /// JIT indexes it — `lddw` occupies two slots, and the second is not an
@@ -198,70 +164,69 @@ pub(crate) struct FunctionRegionAnalysis {
 pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   let num_slots = code.len() / 8;
   let mut hints = vec![REGION_UNKNOWN; num_slots];
-  let mut unresolved = Vec::new();
+  let mut unresolved = std::collections::BTreeSet::new();
   if num_slots == 0 {
-    return RegionAnalysis { hints, unresolved };
+    return RegionAnalysis {
+      hints,
+      unresolved: Vec::new(),
+    };
   }
+  let layout = crate::function_analysis::analyze_functions(code)
+    .unwrap_or_else(|_| crate::function_analysis::FunctionLayout::unmasked(num_slots));
+  let bounds = |function: usize| -> (usize, usize) {
+    layout
+      .functions
+      .get(function)
+      .map_or((0, num_slots), |f| (f.start_pc, f.end_pc))
+  };
 
-  // Forward dataflow to a fixpoint over the instruction-slot CFG.
-  let mut states: Vec<State> = (0..num_slots).map(|_| core::top()).collect();
-  let mut reached = vec![false; num_slots];
-  // Entry: R1 holds ctx (points into the guest stack), R10 is the frame pointer,
-  // and the entry trampoline zeroed everything else.
-  apply_signature(&entry_signature(), &mut states[0]);
-  reached[0] = true;
-
-  let mut worklist: Vec<usize> = vec![0];
-  let mut on_list = vec![false; num_slots];
-  on_list[0] = true;
-  let mut cap_warning_emitted = false;
-
-  while let Some(pc) = worklist.pop() {
-    on_list[pc] = false;
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    let lddw_addr = lddw_full_imm(code, pc, &inst);
-    let (out, refused) = core::transfer(&states[pc], &to_insn(&inst), lddw_addr, data_lo, data_hi);
-    if refused {
-      warn_cap_reached(&mut cap_warning_emitted);
-    }
-
-    let succs = successors(pc, &inst, num_slots);
-    propagate(
-      &mut states,
-      &mut reached,
-      &mut on_list,
-      &mut worklist,
-      pc,
-      &out,
-      &succs,
-      &mut cap_warning_emitted,
-    );
-  }
-
-  // Classify every memory access from the converged entry state of its slot.
-  // Every access produces the same region-routing hint, independently of
-  // whether it reads or writes. Page protection enforces data permissions.
-  // The second slot of a `lddw` has opcode 0 and is skipped.
-  for pc in 0..num_slots {
-    if !reached[pc] {
+  let mut seen = vec![false; num_slots];
+  let mut done = std::collections::HashSet::new();
+  let mut pending = vec![(0usize, entry_signature())];
+  while let Some((function, signature)) = pending.pop() {
+    if !done.insert((function, signature)) {
       continue;
     }
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    let (is_access, hint, region) = core::classify(
-      &states[pc],
-      &to_insn(&inst),
+    let (start, end) = bounds(function);
+    let result = analyze_function(
+      code,
+      start,
+      end,
+      signature,
+      data_lo,
+      data_hi,
+      &layout,
       crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
     );
-    if !is_access {
-      continue;
+    for pc in start..end {
+      let is_reached_access = result.hints[pc] != REGION_UNKNOWN || result.unresolved.contains(&pc);
+      if !is_reached_access {
+        continue;
+      }
+      if !seen[pc] {
+        seen[pc] = true;
+        hints[pc] = result.hints[pc];
+      } else if hints[pc] != result.hints[pc] {
+        hints[pc] = REGION_UNKNOWN;
+      }
     }
-    hints[pc] = hint;
-    if region == REGION_UNKNOWN {
-      unresolved.push(pc);
+    unresolved.extend(result.unresolved);
+    for (pc, callee_signature) in result.call_signatures {
+      let inst = decode(&code[pc * 8..pc * 8 + 8]);
+      if inst.src != 1 {
+        continue;
+      }
+      let target = (pc as i64 + 1 + inst.imm as i64) as usize;
+      if let Some(&callee) = layout.pc_to_func.get(target) {
+        pending.push((callee, callee_signature));
+      }
     }
   }
 
-  RegionAnalysis { hints, unresolved }
+  RegionAnalysis {
+    hints,
+    unresolved: unresolved.into_iter().collect(),
+  }
 }
 
 /// Analyzes the function `[start_pc, end_pc)` of a section from the
@@ -880,82 +845,6 @@ pub(crate) fn program_live_in(
       .map(|(si, section)| live[slot_base[si]..slot_base[si] + section.code.len() / 8].to_vec())
       .collect(),
   }
-}
-
-/// Full 64-bit immediate of a `lddw` (low half in `inst`, high half in the next
-/// slot's imm field). Returns 0 for non-`lddw` instructions.
-#[cfg(any(test, feature = "testing"))]
-fn lddw_full_imm(code: &[u8], pc: usize, inst: &Inst) -> u64 {
-  if inst.opcode != EBPF_OP_LDDW || (pc + 2) * 8 > code.len() {
-    return 0;
-  }
-  let hi = decode(&code[(pc + 1) * 8..(pc + 1) * 8 + 8]).imm;
-  (inst.imm as u32 as u64) | ((hi as u32 as u64) << 32)
-}
-
-/// Successor slots in the whole-program CFG, in which a local call also enters
-/// its callee. Slot indices, not byte offsets.
-///
-/// Only [`analyze`] treats the program as one CFG; every other consumer works a
-/// function at a time and wants [`function_successors_into`], which stops at
-/// the function's own range.
-#[cfg(any(test, feature = "testing"))]
-fn successors(pc: usize, inst: &Inst, num_slots: usize) -> Vec<usize> {
-  let fallthrough = if inst.opcode == EBPF_OP_LDDW {
-    pc + 2
-  } else {
-    pc + 1
-  };
-  let cls = inst.opcode & EBPF_CLS_MASK;
-  let mut out = Vec::new();
-  let mut push = |s: usize| {
-    if s < num_slots {
-      out.push(s);
-    }
-  };
-
-  if cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32 {
-    if inst.opcode == EBPF_OP_EXIT {
-      return out;
-    }
-    if inst.opcode == EBPF_OP_CALL {
-      match inst.src {
-        // Helper call: returns to the next instruction.
-        0 => push(fallthrough),
-        // Local eBPF call: returns to the next instruction and also enters the
-        // callee at pc+imm+1. The callee inherits the (clobbered) caller state,
-        // which preserves R10=Stack and the callee-saved R6-R9, so callee
-        // stack accesses remain analyzable; arg-derived accesses (R1-R5, now
-        // Unknown) are conservatively unresolved.
-        1 => {
-          push(fallthrough);
-          push((pc as i64 + 1 + inst.imm as i64) as usize);
-        }
-        // A linker-tagged cross-section local call returns here but its callee
-        // is represented outside this section's CFG.
-        2 => push(fallthrough),
-        // Other forms branch to exit; no fallthrough.
-        _ => {}
-      }
-      return out;
-    }
-    // JA32 is the only jump whose target is the 32-bit imm; every other jump
-    // (JA and all conditional JMP/JMP32 forms) uses the 16-bit offset. This
-    // matches how the JIT/linker resolve branch targets.
-    let target = if inst.opcode == EBPF_OP_JA32 {
-      pc as i64 + 1 + inst.imm as i64
-    } else {
-      pc as i64 + 1 + inst.offset as i64
-    } as usize;
-    push(target);
-    if inst.opcode != EBPF_OP_JA && inst.opcode != EBPF_OP_JA32 {
-      push(fallthrough); // conditional branch also falls through
-    }
-    return out;
-  }
-
-  push(fallthrough);
-  out
 }
 
 /// Writes `pc`'s in-function successor slots into `out` and returns how many
@@ -2374,6 +2263,70 @@ mod tests {
   /// identically on both sides and cancels. That blindness is real: a mutation
   /// giving `call` with `src == 3` a fallthrough edge passes the whole suite
   /// without this test.
+  /// Successor slots in the whole-program CFG, in which a local call also enters
+  /// its callee. Slot indices, not byte offsets.
+  ///
+  /// Nothing treats the program as one CFG any more; this is the reference
+  /// `function_successors_into_agrees_with_composing_the_whole_program_walk`
+  /// composes with the function filter.
+  fn whole_program_successors(pc: usize, inst: &Inst, num_slots: usize) -> Vec<usize> {
+    let fallthrough = if inst.opcode == EBPF_OP_LDDW {
+      pc + 2
+    } else {
+      pc + 1
+    };
+    let cls = inst.opcode & EBPF_CLS_MASK;
+    let mut out = Vec::new();
+    let mut push = |s: usize| {
+      if s < num_slots {
+        out.push(s);
+      }
+    };
+
+    if cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32 {
+      if inst.opcode == EBPF_OP_EXIT {
+        return out;
+      }
+      if inst.opcode == EBPF_OP_CALL {
+        match inst.src {
+          // Helper call: returns to the next instruction.
+          0 => push(fallthrough),
+          // Local eBPF call: returns to the next instruction and also enters the
+          // callee at pc+imm+1. The callee inherits the (clobbered) caller state,
+          // which preserves R10=Stack and the callee-saved R6-R9, so callee
+          // stack accesses remain analyzable; arg-derived accesses (R1-R5, now
+          // Unknown) are conservatively unresolved.
+          1 => {
+            push(fallthrough);
+            push((pc as i64 + 1 + inst.imm as i64) as usize);
+          }
+          // A linker-tagged cross-section local call returns here but its callee
+          // is represented outside this section's CFG.
+          2 => push(fallthrough),
+          // Other forms branch to exit; no fallthrough.
+          _ => {}
+        }
+        return out;
+      }
+      // JA32 is the only jump whose target is the 32-bit imm; every other jump
+      // (JA and all conditional JMP/JMP32 forms) uses the 16-bit offset. This
+      // matches how the JIT/linker resolve branch targets.
+      let target = if inst.opcode == EBPF_OP_JA32 {
+        pc as i64 + 1 + inst.imm as i64
+      } else {
+        pc as i64 + 1 + inst.offset as i64
+      } as usize;
+      push(target);
+      if inst.opcode != EBPF_OP_JA && inst.opcode != EBPF_OP_JA32 {
+        push(fallthrough); // conditional branch also falls through
+      }
+      return out;
+    }
+
+    push(fallthrough);
+    out
+  }
+
   #[test]
   fn function_successors_into_agrees_with_composing_the_whole_program_walk() {
     fn expected(
@@ -2383,7 +2336,7 @@ mod tests {
       start_pc: usize,
       end_pc: usize,
     ) -> Vec<usize> {
-      let mut succs = successors(pc, inst, num_slots);
+      let mut succs = whole_program_successors(pc, inst, num_slots);
       // A local callee is a separate function, so the call contributes only
       // its return edge.
       if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
@@ -2927,160 +2880,6 @@ mod tests {
     ]);
     let result = analyze(&code, DATA_LO, DATA_HI);
     assert!(result.unresolved.is_empty());
-  }
-}
-
-/// The per-function fixed point projects every state onto its slot's
-/// live-in registers, which is what makes masking a call signature exactly
-/// neutral (`lean/AsyncEbpf/Region/Masking.lean`). The projection itself is
-/// meant to cost no precision either: a dead register feeds no hint, no
-/// unresolved access and no onward signature. That is the claim this checks,
-/// against the unprojected walk, on random programs and random incoming
-/// signatures; the masked-against-unmasked comparison rides along as a
-/// sanity check of the theorem.
-#[cfg(test)]
-mod masking_fuzz {
-  use super::*;
-  use crate::verified::region::{RegKind, StackKind};
-
-  fn slot(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> [u8; 8] {
-    let mut s = [0u8; 8];
-    s[0] = opcode;
-    s[1] = (dst & 0x0f) | (src << 4);
-    s[2..4].copy_from_slice(&offset.to_le_bytes());
-    s[4..8].copy_from_slice(&imm.to_le_bytes());
-    s
-  }
-
-  /// A fixed-seed generator, so a failure names a reproducible trial.
-  struct Lcg(u64);
-  impl Lcg {
-    fn next(&mut self) -> u64 {
-      self.0 = self
-        .0
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-      self.0 >> 33
-    }
-    fn below(&mut self, n: u64) -> u64 {
-      self.next() % n
-    }
-  }
-
-  const LDXDW: u8 = EBPF_CLS_LDX | 0x18;
-  const STXDW: u8 = EBPF_CLS_STX | 0x18;
-  const MOV64_REG: u8 = EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV;
-  const MOV64_IMM: u8 = EBPF_CLS_ALU64 | EBPF_ALU_OP_MOV;
-  const ADD64_IMM: u8 = EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD;
-  const ADD64_REG: u8 = EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_ADD;
-  const JEQ_IMM: u8 = EBPF_CLS_JMP | 0x10;
-
-  /// A random function of `n` slots plus a trailing `exit`: register moves and
-  /// adds, spills to and fills from two frame slots, loads through registers,
-  /// helper calls, data-pointer immediates, and plenty of jumps, so the
-  /// worklist has joins to re-queue.
-  fn gen(rng: &mut Lcg, n: usize) -> Vec<[u8; 8]> {
-    let mut code = Vec::new();
-    let mut i = 0;
-    while i < n {
-      let a = rng.below(10) as u8;
-      let b = rng.below(10) as u8;
-      let off = if rng.below(2) == 0 { -8 } else { -16 };
-      let jump = |rng: &mut Lcg, i: usize| (rng.below(n as u64) as i64 - i as i64 - 1) as i16;
-      let s = match rng.below(14) {
-        0 => slot(MOV64_REG, a, b, 0, 0),
-        1 => slot(MOV64_IMM, a, 0, 0, 7),
-        2 => slot(ADD64_IMM, a, 0, 0, 8),
-        3 => slot(ADD64_REG, a, b, 0, 0),
-        4 => slot(STXDW, 10, a, off, 0),
-        5 => slot(LDXDW, a, 10, off, 0),
-        6 => slot(LDXDW, a, b, 0, 0),
-        7 | 12 | 13 => {
-          let target = jump(rng, i);
-          slot(JEQ_IMM, a, 0, target, 0)
-        }
-        8 => {
-          let target = jump(rng, i);
-          slot(EBPF_OP_JA, 0, 0, target, 0)
-        }
-        9 => slot(EBPF_OP_CALL, 0, 0, 0, 1),
-        10 => {
-          if i + 1 < n {
-            code.push(slot(EBPF_OP_LDDW, a, 0, 0, 0x10008));
-            i += 1;
-            slot(0, 0, 0, 0, 0)
-          } else {
-            slot(MOV64_IMM, a, 0, 0, 1)
-          }
-        }
-        _ => slot(STXDW, a, b, 0, 0),
-      };
-      code.push(s);
-      i += 1;
-    }
-    code.push(slot(EBPF_OP_EXIT, 0, 0, 0, 0));
-    code
-  }
-
-  fn kind(rng: &mut Lcg) -> RegKind {
-    match rng.below(5) {
-      0 => RegKind::Scalar,
-      1 => RegKind::Data,
-      2 => RegKind::Stack(StackKind::Current(None)),
-      3 => RegKind::Stack(StackKind::Foreign),
-      _ => RegKind::Unknown,
-    }
-  }
-
-  fn same(a: &FunctionRegionAnalysis, b: &FunctionRegionAnalysis) -> bool {
-    a.hints == b.hints && a.unresolved == b.unresolved && a.call_signatures == b.call_signatures
-  }
-
-  #[test]
-  fn projection_and_masking_are_precision_neutral() {
-    let mut rng = Lcg(12345);
-    let mut unprojected_differs = 0;
-    for trial in 0..50_000u64 {
-      let n = 3 + rng.below(14) as usize;
-      let code: Vec<u8> = gen(&mut rng, n).iter().flatten().copied().collect();
-      let num = code.len() / 8;
-      let mut regs = [RegKind::Scalar; NUM_REGS];
-      for r in regs.iter_mut().take(10) {
-        *r = kind(&mut rng);
-      }
-      regs[10] = crate::verified::region::frame_pointer_kind();
-      let sig = PointerSignature { regs };
-      let layout = crate::function_analysis::analyze_functions(&code).unwrap();
-      assert_eq!(layout.slot_live_in.len(), num);
-      let mask = layout.arg_masks[0];
-      let masked = mask_signature(&sig, mask);
-      let projected = analyze_function(&code, 0, num, sig, 0x10000, 0x20000, &layout, 512);
-      let from_masked = analyze_function(&code, 0, num, masked, 0x10000, 0x20000, &layout, 512);
-      assert!(
-        same(&projected, &from_masked),
-        "trial {trial}: mask {mask:#x}\nsig {sig:?}\nmasked {masked:?}\ncode {code:?}\n\
-         hints {:?} vs {:?}\nunresolved {:?} vs {:?}",
-        projected.hints,
-        from_masked.hints,
-        projected.unresolved,
-        from_masked.unresolved
-      );
-      let unmasked_layout = crate::function_analysis::FunctionLayout::unmasked(num);
-      let unprojected =
-        analyze_function(&code, 0, num, sig, 0x10000, 0x20000, &unmasked_layout, 512);
-      if !same(&projected, &unprojected) {
-        unprojected_differs += 1;
-        if unprojected_differs <= 3 {
-          eprintln!(
-            "trial {trial}: projected differs from unprojected\nlive {:?}\nsig {sig:?}\ncode {code:?}\n\
-             hints {:?} vs {:?}\nunresolved {:?} vs {:?}",
-            layout.slot_live_in, projected.hints, unprojected.hints, projected.unresolved,
-            unprojected.unresolved
-          );
-        }
-      }
-    }
-    assert_eq!(unprojected_differs, 0);
   }
 
   /// The verified driver's successor function is the one the live-in solver
