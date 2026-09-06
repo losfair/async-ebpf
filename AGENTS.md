@@ -7,7 +7,7 @@
 - `src/jit/` is the JIT: `isa.rs` (one instruction decode), `abi.rs` (the frame contract shared with the entry trampolines), `validate.rs`, `patch.rs`, and `emit/{x86_64,aarch64}.rs`.
 - `src/jit/goldens/` holds the machine code each backend is expected to emit. A diff there means code generation changed; regenerate with `ASYNC_EBPF_UPDATE_GOLDENS=1` and make the diff part of the change under review.
 - `src/jit/interp.rs` is a reference interpreter written from the instruction set rather than from the JIT, so it can be used to check the JIT's semantics independently.
-- `lean/` holds machine-checked proofs about the analysis passes (see `lean/README.md`). `lean/ebpf_validate` restates `src/jit/validate.rs` in the Rust subset Aeneas translates to Lean; the validator's decision sweeps assert the two agree, and `lean/AsyncEbpf/Validate/Proofs.lean` proves an accepted program never writes R10 outside the store forms. A change to what `validate` accepts must be mirrored in the kernel, or the sweeps fail.
+- `src/verified/` is the verified core: the instruction set and the load-time validator, which `jit::isa` re-exports and `jit::validate` calls. The same directory is the library of the `lean/verified` crate that Charon and Aeneas translate to Lean, so the proofs under `lean/` (see `lean/README.md`) are about the code that runs. Keep it in the Aeneas-friendly subset described there, and after changing it run `make extract` in `lean/` and rebuild the proofs.
 
 ## Build, Test, and Development Commands
 - `cargo build` — build the library.

@@ -11,7 +11,7 @@ the one two-slot instruction.
 -/
 open Aeneas Aeneas.Std Result
 
-namespace ebpf_validate
+namespace async_ebpf_verified
 
 /-- `st`, `stx`, and the two atomics: `src/jit/validate.rs`'s `ST`, `STX`,
 `ATOMIC32` and `ATOMIC64` filter rows. -/
@@ -31,9 +31,9 @@ theorem eq_byte (x : U8) : x = byte x.val (by scalar_tac) := by
 
 /-- One byte's worth of the store-form claim, as a `Bool` the kernel can run. -/
 def storeFormCheck (n : Nat) (h : n < 256) : Bool :=
-  match decode (byte n h) with
+  match isa.decode (byte n h) with
   | ok (some op) =>
-    match is_store_form op with
+    match validate.is_store_form op with
     | ok true => storeFormBytes.contains n
     | _ => true
   | _ => true
@@ -53,9 +53,9 @@ theorem StoreForm_imp_mem (x : U8) (h : StoreForm x) : x.val ∈ storeFormBytes 
 
 /-- One byte's worth of the `lddw` claim. -/
 def lddwCheck (n : Nat) (h : n < 256) : Bool :=
-  match decode (byte n h) with
+  match isa.decode (byte n h) with
   | ok (some op) =>
-    match is_load_imm64 op with
+    match validate.is_load_imm64 op with
     | ok true => n == 0x18
     | _ => true
   | _ => true
@@ -73,4 +73,4 @@ theorem IsLddw_imp_eq (x : U8) (h : IsLddw x) : x.val = 0x18 := by
   simp only [hli] at hc
   simpa using hc
 
-end ebpf_validate
+end async_ebpf_verified

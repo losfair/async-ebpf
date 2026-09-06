@@ -1,55 +1,42 @@
-//! The load-time validator, restated in the subset of Rust that Aeneas can
-//! translate to Lean.
+//! What the loader accepts.
 //!
-//! This crate is the *proof kernel* of `crate::jit::validate` in the runtime.
-//! It reproduces the same decisions in the same order — the opcode match, the
-//! `src > 10` bound, the `dst > 9` bound with its store-form exception, the
-//! per-opcode operand filter, and the sub-program self-containment check — but
-//! with everything Aeneas cannot model removed:
+//! Load-time checking is split in two layers, deliberately overlapping:
 //!
-//! * rejection *messages* become variants of [`Reject`] carrying the slot;
-//! * the embedder's helper-index callback becomes [`Config::accept_every_helper`]
-//!   plus an explicit list of known indices;
-//! * the `const` filter table becomes the function [`filter_for`], and the
-//!   enumerated offset/immediate sets become [`offset_ok`] and [`imm_ok`];
-//! * the local-call target is computed in exact `i64` arithmetic rather than
-//!   wrapping `i32`. Both refuse exactly the same programs: the wrapped and the
-//!   exact target are equal whenever no wrap occurs, and a wrap can only produce
-//!   a target that is out of range either way. Only the number quoted in the
-//!   message differs, and this crate quotes no numbers.
-//! * `sort_unstable` + `dedup` over the sub-program start list becomes a
-//!   boolean array indexed by slot, which is the same set.
+//! * [`check_operand_filter`] is per-opcode data: register bounds, offset
+//!   bounds and immediate bounds, with a handful of enumerated sets. It knows
+//!   nothing about the program around the instruction.
+//! * [`validate`] is the whole-program layer — jump targets, `lddw` pairing,
+//!   call targets, helper indices, sub-program self-containment — plus a
+//!   second, coarser pass over registers.
 //!
-//! What ties it to the runtime is `src/jit/validate.rs`'s
-//! `assert_kernel_agrees` check inside every decision sweep, which runs both over the
-//! recorded decision sweeps and asserts they accept and refuse the same
-//! programs. What ties it to Lean is `lean/AsyncEbpf/EbpfValidate.lean`, which
-//! Aeneas generates from this file, and the theorems proved about that output.
+//! R10 is the frame pointer, frame-relative addressing emits `[r10 + k]` with no
+//! runtime bounds check, and "the guest never assigned R10" is the one premise
+//! the backend cannot re-derive for itself. So both layers refuse a write to
+//! R10, by different routes, and `lean/AsyncEbpf/Validate/Proofs.lean` proves
+//! that an accepted program has none.
 //!
-//! Style constraints, all of them for the translator's sake: no closures, no
-//! iterator chains, no `String`, no wrapping arithmetic, no `==` on enums, one
-//! loop per function, and every early return in the function that owns the
-//! loop. See `lean/README.md` for why each matters.
-#![allow(
-  clippy::question_mark,
-  clippy::ptr_arg,
-  clippy::match_like_matches_macro
-)]
+//! For one instruction the checks run strictly in this order: the opcode
+//! match and the per-opcode structural rules ([`check_structure`]); `src > 10`;
+//! `dst > 9`, unless the instruction is a store form and `dst == 10`; the
+//! operand filter. Any reordering changes which [`Reject`] a doubly-invalid
+//! instruction produces, and `jit::validate` renders those as messages that
+//! embedders match on, so the recorded decision sweeps there fold every
+//! rejection into a digest and a reordering shows up as a changed golden.
+//!
+//! The rejection carries a slot, not a message: rendering is `jit::validate`'s.
+//! The embedder's helper-index callback is folded by the runtime into
+//! [`Config::accept_every_helper`] plus the list of known indices handed to
+//! [`validate`]. The local-call target is computed exactly in `i64` where the
+//! runtime once used wrapping `i32`: the two agree whenever no wrap occurs, and
+//! a wrap can only produce a target that is out of range either way, so both
+//! refuse exactly the same programs, and the runtime recomputes the number it
+//! quotes.
 
-/// A single eBPF instruction, unpacked exactly as `jit::isa::Insn` unpacks it.
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
-pub struct Insn {
-  pub opcode: u8,
-  pub dst: u8,
-  pub src: u8,
-  pub offset: i16,
-  pub imm: i32,
-}
+use super::isa::*;
 
 /// The two facts about a `jit::Config` that the validator consults.
 #[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
+#[cfg_attr(not(feature = "extract"), derive(PartialEq, Eq, Debug))]
 pub struct Config {
   /// Exclusive upper bound on instruction slots; a program of exactly this
   /// many is refused.
@@ -65,7 +52,7 @@ pub struct Config {
 /// Why a program was refused, and at which slot. One variant per distinct
 /// rejection message of the runtime validator.
 #[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
+#[cfg_attr(not(feature = "extract"), derive(PartialEq, Eq, Debug, Hash))]
 pub enum Reject {
   TooManyInstructions,
   UnknownOpcode(usize),
@@ -98,389 +85,13 @@ pub enum Reject {
 }
 
 // ---------------------------------------------------------------------------
-// The instruction set, as `jit::isa` decodes it
-// ---------------------------------------------------------------------------
-
-pub const CLS_MASK: u8 = 0x07;
-pub const CLS_LD: u8 = 0x00;
-pub const CLS_LDX: u8 = 0x01;
-pub const CLS_ST: u8 = 0x02;
-pub const CLS_STX: u8 = 0x03;
-pub const CLS_ALU: u8 = 0x04;
-pub const CLS_JMP: u8 = 0x05;
-pub const CLS_JMP32: u8 = 0x06;
-pub const CLS_ALU64: u8 = 0x07;
-
-pub const SRC_REG: u8 = 0x08;
-
-pub const SIZE_MASK: u8 = 0x18;
-pub const SIZE_W: u8 = 0x00;
-pub const SIZE_H: u8 = 0x08;
-pub const SIZE_B: u8 = 0x10;
-pub const SIZE_DW: u8 = 0x18;
-
-pub const MODE_MASK: u8 = 0xe0;
-pub const MODE_IMM: u8 = 0x00;
-pub const MODE_MEM: u8 = 0x60;
-pub const MODE_MEMSX: u8 = 0x80;
-pub const MODE_ATOMIC: u8 = 0xc0;
-
-pub const ALU_MASK: u8 = 0xf0;
-pub const ALU_ADD: u8 = 0x00;
-pub const ALU_SUB: u8 = 0x10;
-pub const ALU_MUL: u8 = 0x20;
-pub const ALU_DIV: u8 = 0x30;
-pub const ALU_OR: u8 = 0x40;
-pub const ALU_AND: u8 = 0x50;
-pub const ALU_LSH: u8 = 0x60;
-pub const ALU_RSH: u8 = 0x70;
-pub const ALU_NEG: u8 = 0x80;
-pub const ALU_MOD: u8 = 0x90;
-pub const ALU_XOR: u8 = 0xa0;
-pub const ALU_MOV: u8 = 0xb0;
-pub const ALU_ARSH: u8 = 0xc0;
-pub const ALU_END: u8 = 0xd0;
-
-pub const JMP_MASK: u8 = 0xf0;
-pub const JMP_JA: u8 = 0x00;
-pub const JMP_JEQ: u8 = 0x10;
-pub const JMP_JGT: u8 = 0x20;
-pub const JMP_JGE: u8 = 0x30;
-pub const JMP_JSET: u8 = 0x40;
-pub const JMP_JNE: u8 = 0x50;
-pub const JMP_JSGT: u8 = 0x60;
-pub const JMP_JSGE: u8 = 0x70;
-pub const JMP_CALL: u8 = 0x80;
-pub const JMP_EXIT: u8 = 0x90;
-pub const JMP_JLT: u8 = 0xa0;
-pub const JMP_JLE: u8 = 0xb0;
-pub const JMP_JSLT: u8 = 0xc0;
-pub const JMP_JSLE: u8 = 0xd0;
-
-pub const ATOMIC_OP_FETCH: i32 = 0x01;
-pub const ATOMIC_OP_XCHG: i32 = 0xe0 | ATOMIC_OP_FETCH;
-pub const ATOMIC_OP_CMPXCHG: i32 = 0xf0 | ATOMIC_OP_FETCH;
-
-pub const OP_LDDW: u8 = 0x18;
-pub const OP_CALL: u8 = 0x85;
-pub const OP_EXIT: u8 = 0x95;
-pub const OP_JA: u8 = 0x05;
-pub const OP_JA32: u8 = 0x06;
-
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
-pub enum Width {
-  B,
-  H,
-  W,
-  DW,
-}
-
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
-pub enum AluWidth {
-  W32,
-  W64,
-}
-
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
-pub enum Source {
-  Imm,
-  Reg,
-}
-
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
-pub enum AluOp {
-  Add,
-  Sub,
-  Mul,
-  Div,
-  Or,
-  And,
-  Lsh,
-  Rsh,
-  Neg,
-  Mod,
-  Xor,
-  Mov,
-  Arsh,
-}
-
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
-pub enum JmpOp {
-  Eq,
-  Gt,
-  Ge,
-  Set,
-  Ne,
-  Sgt,
-  Sge,
-  Lt,
-  Le,
-  Slt,
-  Sle,
-}
-
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
-pub enum EndKind {
-  Le,
-  Be,
-  Bswap,
-}
-
-/// Every defined instruction, decoded from its opcode byte alone. Mirrors
-/// `jit::isa::Op` variant for variant, minus the atomic operation selector,
-/// which lives in the immediate and is checked by [`check_atomic_selector`].
-#[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
-pub enum Op {
-  Alu(AluWidth, AluOp, Source),
-  End(EndKind),
-  Load(Width, bool),
-  StoreImm(Width),
-  StoreReg(Width),
-  LoadImm64,
-  Atomic(Width),
-  Ja(AluWidth),
-  Jmp(AluWidth, JmpOp, Source),
-  Call,
-  Exit,
-}
-
-pub fn width_from_size_bits(bits: u8) -> Option<Width> {
-  if bits == SIZE_B {
-    Some(Width::B)
-  } else if bits == SIZE_H {
-    Some(Width::H)
-  } else if bits == SIZE_W {
-    Some(Width::W)
-  } else if bits == SIZE_DW {
-    Some(Width::DW)
-  } else {
-    None
-  }
-}
-
-fn alu_op_from_nibble(nibble: u8) -> Option<AluOp> {
-  if nibble == ALU_ADD {
-    Some(AluOp::Add)
-  } else if nibble == ALU_SUB {
-    Some(AluOp::Sub)
-  } else if nibble == ALU_MUL {
-    Some(AluOp::Mul)
-  } else if nibble == ALU_DIV {
-    Some(AluOp::Div)
-  } else if nibble == ALU_OR {
-    Some(AluOp::Or)
-  } else if nibble == ALU_AND {
-    Some(AluOp::And)
-  } else if nibble == ALU_LSH {
-    Some(AluOp::Lsh)
-  } else if nibble == ALU_RSH {
-    Some(AluOp::Rsh)
-  } else if nibble == ALU_NEG {
-    Some(AluOp::Neg)
-  } else if nibble == ALU_MOD {
-    Some(AluOp::Mod)
-  } else if nibble == ALU_XOR {
-    Some(AluOp::Xor)
-  } else if nibble == ALU_MOV {
-    Some(AluOp::Mov)
-  } else if nibble == ALU_ARSH {
-    Some(AluOp::Arsh)
-  } else {
-    None
-  }
-}
-
-fn jmp_op_from_nibble(nibble: u8) -> Option<JmpOp> {
-  if nibble == JMP_JEQ {
-    Some(JmpOp::Eq)
-  } else if nibble == JMP_JGT {
-    Some(JmpOp::Gt)
-  } else if nibble == JMP_JGE {
-    Some(JmpOp::Ge)
-  } else if nibble == JMP_JSET {
-    Some(JmpOp::Set)
-  } else if nibble == JMP_JNE {
-    Some(JmpOp::Ne)
-  } else if nibble == JMP_JSGT {
-    Some(JmpOp::Sgt)
-  } else if nibble == JMP_JSGE {
-    Some(JmpOp::Sge)
-  } else if nibble == JMP_JLT {
-    Some(JmpOp::Lt)
-  } else if nibble == JMP_JLE {
-    Some(JmpOp::Le)
-  } else if nibble == JMP_JSLT {
-    Some(JmpOp::Slt)
-  } else if nibble == JMP_JSLE {
-    Some(JmpOp::Sle)
-  } else {
-    None
-  }
-}
-
-fn is_neg(op: AluOp) -> bool {
-  match op {
-    AluOp::Neg => true,
-    _ => false,
-  }
-}
-
-fn is_reg(source: Source) -> bool {
-  match source {
-    Source::Reg => true,
-    Source::Imm => false,
-  }
-}
-
-fn is_w64(width: AluWidth) -> bool {
-  match width {
-    AluWidth::W64 => true,
-    AluWidth::W32 => false,
-  }
-}
-
-fn is_w(width: Width) -> bool {
-  match width {
-    Width::W => true,
-    _ => false,
-  }
-}
-
-fn is_dw(width: Width) -> bool {
-  match width {
-    Width::DW => true,
-    _ => false,
-  }
-}
-
-/// Decodes an opcode byte. `None` for an undefined encoding. Same decisions as
-/// `jit::isa::Op::from_opcode`, arm for arm.
-pub fn decode(opcode: u8) -> Option<Op> {
-  let source = if opcode & SRC_REG != 0 {
-    Source::Reg
-  } else {
-    Source::Imm
-  };
-  let cls = opcode & CLS_MASK;
-
-  if cls == CLS_ALU || cls == CLS_ALU64 {
-    let width = if cls == CLS_ALU64 {
-      AluWidth::W64
-    } else {
-      AluWidth::W32
-    };
-    if opcode & ALU_MASK == ALU_END {
-      return match (width, source) {
-        (AluWidth::W32, Source::Imm) => Some(Op::End(EndKind::Le)),
-        (AluWidth::W32, Source::Reg) => Some(Op::End(EndKind::Be)),
-        (AluWidth::W64, Source::Imm) => Some(Op::End(EndKind::Bswap)),
-        (AluWidth::W64, Source::Reg) => None,
-      };
-    }
-    let Some(op) = alu_op_from_nibble(opcode & ALU_MASK) else {
-      return None;
-    };
-    // `neg` has no source operand and is only defined with the source bit
-    // clear. Enum comparisons are spelled as matches: a derived `PartialEq`
-    // extracts through `read_discriminant`, which Lean cannot evaluate.
-    if is_neg(op) && is_reg(source) {
-      return None;
-    }
-    return Some(Op::Alu(width, op, source));
-  }
-
-  if cls == CLS_LD {
-    if opcode == OP_LDDW {
-      return Some(Op::LoadImm64);
-    }
-    return None;
-  }
-
-  if cls == CLS_LDX {
-    let Some(width) = width_from_size_bits(opcode & SIZE_MASK) else {
-      return None;
-    };
-    let mode = opcode & MODE_MASK;
-    if mode == MODE_MEM {
-      return Some(Op::Load(width, false));
-    }
-    if mode == MODE_MEMSX && !is_dw(width) {
-      return Some(Op::Load(width, true));
-    }
-    return None;
-  }
-
-  if cls == CLS_ST {
-    let Some(width) = width_from_size_bits(opcode & SIZE_MASK) else {
-      return None;
-    };
-    if opcode & MODE_MASK == MODE_MEM {
-      return Some(Op::StoreImm(width));
-    }
-    return None;
-  }
-
-  if cls == CLS_STX {
-    let Some(width) = width_from_size_bits(opcode & SIZE_MASK) else {
-      return None;
-    };
-    let mode = opcode & MODE_MASK;
-    if mode == MODE_MEM {
-      return Some(Op::StoreReg(width));
-    }
-    if mode == MODE_ATOMIC && (is_w(width) || is_dw(width)) {
-      return Some(Op::Atomic(width));
-    }
-    return None;
-  }
-
-  // cls is JMP or JMP32: the class is three bits and every other value is
-  // handled above.
-  let width = if cls == CLS_JMP32 {
-    AluWidth::W32
-  } else {
-    AluWidth::W64
-  };
-  let nibble = opcode & JMP_MASK;
-  if nibble == JMP_JA {
-    if is_reg(source) {
-      return None;
-    }
-    return Some(Op::Ja(width));
-  }
-  if nibble == JMP_CALL {
-    if is_w64(width) && !is_reg(source) {
-      return Some(Op::Call);
-    }
-    return None;
-  }
-  if nibble == JMP_EXIT {
-    if is_w64(width) && !is_reg(source) {
-      return Some(Op::Exit);
-    }
-    return None;
-  }
-  let Some(op) = jmp_op_from_nibble(nibble) else {
-    return None;
-  };
-  Some(Op::Jmp(width, op, source))
-}
-
-// ---------------------------------------------------------------------------
 // Layer 1: the per-opcode operand filter
 // ---------------------------------------------------------------------------
 
 /// Inclusive register, offset and immediate bounds for one opcode. The
 /// enumerated sets some opcodes carry are in [`offset_ok`] and [`imm_ok`].
 #[derive(Copy, Clone)]
-#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
+#[cfg_attr(not(feature = "extract"), derive(PartialEq, Eq, Debug))]
 pub struct Filter {
   pub src_lo: u8,
   pub src_hi: u8,
@@ -705,7 +316,7 @@ pub fn check_call(
 /// decoded opcode so that the register check below reads as one statement.
 pub fn is_store_form(op: Op) -> bool {
   match op {
-    Op::StoreImm(_) | Op::StoreReg(_) | Op::Atomic(_) => true,
+    Op::StoreImm { .. } | Op::StoreReg { .. } | Op::Atomic { .. } => true,
     _ => false,
   }
 }
@@ -731,7 +342,7 @@ pub fn check_structure(
 ) -> Result<(), Reject> {
   let num_insns = insns.len();
   match op {
-    Op::Alu(_, AluOp::Neg, _) => {
+    Op::Alu { op: AluOp::Neg, .. } => {
       if insn.src != 0 {
         return Err(Reject::NegSrc(pc));
       }
@@ -756,8 +367,8 @@ pub fn check_structure(
       }
       Ok(())
     }
-    Op::Atomic(_) => check_atomic_selector(insn, pc),
-    Op::Ja(_) | Op::Jmp(_, _, _) => {
+    Op::Atomic { .. } => check_atomic_selector(insn, pc),
+    Op::Ja { .. } | Op::Jmp { .. } => {
       let displacement = if insn.opcode == OP_JA32 {
         insn.imm
       } else {
@@ -783,7 +394,9 @@ pub fn check_structure(
       };
       check_call(config, known_helpers, insn, insns, pc, cross_section)
     }
-    Op::Exit | Op::Alu(_, _, _) | Op::Load(_, _) | Op::StoreImm(_) | Op::StoreReg(_) => Ok(()),
+    Op::Exit | Op::Alu { .. } | Op::Load { .. } | Op::StoreImm { .. } | Op::StoreReg { .. } => {
+      Ok(())
+    }
   }
 }
 

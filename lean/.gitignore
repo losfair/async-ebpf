@@ -1,5 +1,5 @@
 .lake/
 tools/
-ebpf_validate/target/
-ebpf_validate/*.llbc
-ebpf_validate/Cargo.lock
+verified/target/
+verified/*.llbc
+verified/Cargo.lock

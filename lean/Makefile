@@ -1,7 +1,7 @@
-# Regenerates the Lean translation of the validator kernel and checks the proofs.
+# Regenerates the Lean translation of the verified core and checks the proofs.
 #
 #   make setup-tools   clone and build Charon and Aeneas under tools/ (once)
-#   make extract       ebpf_validate/src/lib.rs -> AsyncEbpf/EbpfValidate.lean
+#   make extract       ../src/verified/ -> AsyncEbpf/AsyncEbpfVerified.lean
 #   make build         check every proof (default)
 #
 # The Aeneas commit is pinned in lakefile.toml; Charon is pinned by that commit's
@@ -17,9 +17,9 @@ CHARON     ?= $(CHARON_DIR)/bin/charon
 AENEAS     ?= $(AENEAS_DIR)/bin/aeneas
 LAKE       ?= lake
 
-KERNEL     := ebpf_validate
-LLBC       := $(KERNEL)/$(KERNEL).llbc
-GENERATED  := AsyncEbpf/EbpfValidate.lean
+KERNEL     := verified
+LLBC       := $(KERNEL)/async_ebpf_verified.llbc
+GENERATED  := AsyncEbpf/AsyncEbpfVerified.lean
 
 .PHONY: build
 build:
@@ -30,7 +30,7 @@ extract: $(GENERATED)
 
 # Charon compiles the crate with the nightly its own `rust-toolchain` names;
 # `RUSTUP_TOOLCHAIN` carries that choice into a directory that has no such file.
-$(LLBC): $(KERNEL)/src/lib.rs $(KERNEL)/Cargo.toml
+$(LLBC): $(wildcard ../src/verified/*.rs) $(KERNEL)/Cargo.toml
 	cd $(KERNEL) && RUSTUP_TOOLCHAIN=$$(sed -n 's/^channel = "\(.*\)"/\1/p' $(CHARON_DIR)/rust-toolchain) \
 	  $(CHARON) cargo --preset=aeneas
 

@@ -1,6 +1,7 @@
 [workspace]
 # cargo-fuzz crates carry their own lockfile and nightly-only dependencies.
-# `lean/` holds the Aeneas proof kernel, which Charon builds on its own nightly.
+# `lean/verified` compiles `src/verified/` as its own crate for Aeneas, on
+# Charon's nightly.
 exclude = ["fuzz", "lean"]
 
 [package]
@@ -39,9 +40,12 @@ tracing = "0.1"
 [dev-dependencies]
 async-ebpf = { path = ".", features = ["testing"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
-# The validator's proof kernel (see `lean/README.md`). Test-only: the decision
-# sweeps in `jit::validate` assert it accepts and refuses the same programs.
-ebpf_validate = { path = "lean/ebpf_validate", features = ["test-support"] }
 # Golden-file keys and sweep digests. Test-only: `jit::golden` is `cfg(test)`.
 sha2 = "0.10"
 tracing-test = "0.2"
+
+[lints.rust]
+# `src/verified/` is also the library of `lean/verified`, whose `extract`
+# feature hides the runtime-only conveniences from the Lean extraction. The
+# runtime never sets it, but the `cfg` must be known here.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("extract"))'] }

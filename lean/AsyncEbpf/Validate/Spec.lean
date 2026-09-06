@@ -1,10 +1,10 @@
-import AsyncEbpf.EbpfValidate
+import AsyncEbpf.AsyncEbpfVerified
 
 /-!
 # What an accepted program looks like
 
 The statements here are the *specification* side of the validator proof. They
-are written against the types Aeneas generated from `lean/ebpf_validate`
+are written against the types Aeneas generated from `src/verified`
 (`Insn`, `Op`, the decoder) but say nothing about how `validate` computes:
 they describe the shape of a program the loader may hand to the JIT.
 
@@ -21,20 +21,20 @@ Instruction classes are stated through the decoder (`decode`, `is_store_form`,
 -/
 open Aeneas Aeneas.Std Result
 
-namespace ebpf_validate
+namespace async_ebpf_verified
 
 /-- Slot `i` holds a two-slot `lddw`, as the decoder classifies it. -/
 def IsLddw (opcode : U8) : Prop :=
-  ∃ op, decode opcode = ok (some op) ∧ is_load_imm64 op = ok true
+  ∃ op, isa.decode opcode = ok (some op) ∧ validate.is_load_imm64 op = ok true
 
 /-- Slot `i` holds a one-slot instruction. -/
 def IsSingle (opcode : U8) : Prop :=
-  ∃ op, decode opcode = ok (some op) ∧ is_load_imm64 op = ok false
+  ∃ op, isa.decode opcode = ok (some op) ∧ validate.is_load_imm64 op = ok false
 
 /-- `Walk insns i j`: slot `j` is reached from slot `i` by stepping over
 instructions, two slots at a time across an `lddw` whose second slot is not
 an instruction. -/
-inductive Walk (insns : List Insn) : Nat → Nat → Prop
+inductive Walk (insns : List isa.Insn) : Nat → Nat → Prop
   | refl (i : Nat) : Walk insns i i
   | next {i j : Nat} (hi : i < insns.length) :
       IsSingle insns[i].opcode → Walk insns (i + 1) j → Walk insns i j
@@ -42,29 +42,29 @@ inductive Walk (insns : List Insn) : Nat → Nat → Prop
       IsLddw insns[i].opcode → Walk insns (i + 2) j → Walk insns i j
 
 /-- The instruction slots of a program: the slots reached from slot 0. -/
-def InsnSlot (insns : List Insn) (j : Nat) : Prop := Walk insns 0 j
+def InsnSlot (insns : List isa.Insn) (j : Nat) : Prop := Walk insns 0 j
 
 /-- The instructions whose destination field is a memory base: `st`, `stx`
 and the atomics, as the decoder classifies them. -/
 def StoreForm (opcode : U8) : Prop :=
-  ∃ op, decode opcode = ok (some op) ∧ is_store_form op = ok true
+  ∃ op, isa.decode opcode = ok (some op) ∧ validate.is_store_form op = ok true
 
 /-- A defined instruction: one the decoder accepts. -/
 def Decodes (opcode : U8) : Prop :=
-  ∃ op, decode opcode = ok (some op)
+  ∃ op, isa.decode opcode = ok (some op)
 
 /-- Slot `j` never assigns the frame pointer. -/
-def NoFramePointerWrite (insns : List Insn) (j : Nat) (hj : j < insns.length) : Prop :=
+def NoFramePointerWrite (insns : List isa.Insn) (j : Nat) (hj : j < insns.length) : Prop :=
   insns[j].dst.val ≤ 9 ∨ (insns[j].dst.val = 10 ∧ StoreForm insns[j].opcode)
 
 /-- What the validator establishes for every instruction slot. -/
-structure SlotOk (insns : List Insn) (j : Nat) (hj : j < insns.length) : Prop where
+structure SlotOk (insns : List isa.Insn) (j : Nat) (hj : j < insns.length) : Prop where
   decodes : Decodes insns[j].opcode
   src_bound : insns[j].src.val ≤ 10
   no_fp_write : NoFramePointerWrite insns j hj
 
 /-- An accepted program: every instruction slot satisfies `SlotOk`. -/
-def WellFormed (insns : List Insn) : Prop :=
+def WellFormed (insns : List isa.Insn) : Prop :=
   ∀ j (hj : j < insns.length), InsnSlot insns j → SlotOk insns j hj
 
-end ebpf_validate
+end async_ebpf_verified

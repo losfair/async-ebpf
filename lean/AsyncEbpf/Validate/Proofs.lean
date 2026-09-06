@@ -9,7 +9,7 @@ that matters, and a strong induction on the remaining slots for the loop.
 -/
 open Aeneas Aeneas.Std Result
 
-namespace ebpf_validate
+namespace async_ebpf_verified
 
 /-! ## Monad plumbing -/
 
@@ -55,16 +55,16 @@ theorem usize_add_eq_ok {x y z : Usize} (h : x + y = ok z) : z.val = x.val + y.v
 
 /-! ## One slot -/
 
-theorem check_slot_ok {config : Config} {kh : Slice U32} {insns : Slice Insn}
+theorem check_slot_ok {config : validate.Config} {kh : Slice U32} {insns : Slice isa.Insn}
     {ext : Slice Bool} {pc : Usize} {skip : Bool}
-    (h : check_slot config kh insns ext pc = ok (.Ok skip)) :
-    ∃ (hpc : pc.val < insns.length) (op : Op),
-      decode insns.val[pc.val].opcode = ok (some op) ∧
+    (h : validate.check_slot config kh insns ext pc = ok (.Ok skip)) :
+    ∃ (hpc : pc.val < insns.length) (op : isa.Op),
+      isa.decode insns.val[pc.val].opcode = ok (some op) ∧
       insns.val[pc.val].src.val ≤ 10 ∧
       (insns.val[pc.val].dst.val ≤ 9 ∨
-        (insns.val[pc.val].dst.val = 10 ∧ is_store_form op = ok true)) ∧
-      is_load_imm64 op = ok skip := by
-  unfold check_slot at h
+        (insns.val[pc.val].dst.val = 10 ∧ validate.is_store_form op = ok true)) ∧
+      validate.is_load_imm64 op = ok skip := by
+  unfold validate.check_slot at h
   obtain ⟨insn, hidx, h⟩ := bind_eq_ok h
   obtain ⟨hpc, rfl⟩ := index_usize_eq_ok hidx
   refine ⟨hpc, ?_⟩
@@ -141,12 +141,12 @@ theorem check_slot_ok {config : Config} {kh : Slice U32} {insns : Slice Insn}
             exact ⟨Or.inl (by scalar_tac), hli⟩
 
 /-- The `SlotOk` facts, packaged, plus how the slot after this one is chosen. -/
-theorem check_slot_slotOk {config : Config} {kh : Slice U32} {insns : Slice Insn}
+theorem check_slot_slotOk {config : validate.Config} {kh : Slice U32} {insns : Slice isa.Insn}
     {ext : Slice Bool} {pc : Usize} {skip : Bool}
-    (h : check_slot config kh insns ext pc = ok (.Ok skip)) :
+    (h : validate.check_slot config kh insns ext pc = ok (.Ok skip)) :
     ∃ hpc : pc.val < insns.length,
       SlotOk insns.val pc.val hpc ∧
-      ∃ op, decode insns.val[pc.val].opcode = ok (some op) ∧ is_load_imm64 op = ok skip := by
+      ∃ op, isa.decode insns.val[pc.val].opcode = ok (some op) ∧ validate.is_load_imm64 op = ok skip := by
   obtain ⟨hpc, op, hdec, hsrc, hdst, hli⟩ := check_slot_ok h
   refine ⟨hpc, ⟨⟨op, hdec⟩, hsrc, ?_⟩, op, hdec, hli⟩
   rcases hdst with hle | ⟨h10, hsf⟩
@@ -154,9 +154,9 @@ theorem check_slot_slotOk {config : Config} {kh : Slice U32} {insns : Slice Insn
   · exact Or.inr ⟨h10, op, hdec, hsf⟩
 
 /-- Two classifications of one opcode agree on `is_load_imm64`. -/
-theorem is_load_imm64_det {opcode : U8} {op op' : Op} {b b' : Bool}
-    (h : decode opcode = ok (some op)) (h' : decode opcode = ok (some op'))
-    (hb : is_load_imm64 op = ok b) (hb' : is_load_imm64 op' = ok b') : b = b' := by
+theorem is_load_imm64_det {opcode : U8} {op op' : isa.Op} {b b' : Bool}
+    (h : isa.decode opcode = ok (some op)) (h' : isa.decode opcode = ok (some op'))
+    (hb : validate.is_load_imm64 op = ok b) (hb' : validate.is_load_imm64 op' = ok b') : b = b' := by
   rw [h] at h'
   simp only [ok.injEq, Option.some.injEq] at h'
   subst h'
@@ -166,28 +166,28 @@ theorem is_load_imm64_det {opcode : U8} {op op' : Op} {b b' : Bool}
 
 /-! ## The loop -/
 
-theorem Walk.le {insns : List Insn} {i j : Nat} (h : Walk insns i j) : i ≤ j := by
+theorem Walk.le {insns : List isa.Insn} {i j : Nat} (h : Walk insns i j) : i ≤ j := by
   induction h with
   | refl => exact Nat.le_refl _
   | next _ _ _ ih => omega
   | lddw _ _ _ ih => omega
 
-theorem validate_loop_ok (il : Usize) (b b1 : Bool) (kh : Slice U32) (insns : Slice Insn)
+theorem validate_loop_ok (il : Usize) (b b1 : Bool) (kh : Slice U32) (insns : Slice isa.Insn)
     (ext : Slice Bool) (n : Usize) :
     ∀ (k : Nat) (i1 : Usize), n.val - i1.val = k →
-      validate_loop il b b1 kh insns ext n i1 = ok (.Ok ()) →
+      validate.validate_loop il b b1 kh insns ext n i1 = ok (.Ok ()) →
       ∀ j (hj : j < insns.length), Walk insns.val i1.val j → j < n.val →
         SlotOk insns.val j hj := by
   intro k
   induction k using Nat.strong_induction_on with
   | _ k ih =>
   intro i1 hk h j hj hw hjn
-  unfold validate_loop at h
+  unfold validate.validate_loop at h
   unfold loop at h
   try dsimp only at h
-  rcases hb : validate_loop.body il b b1 kh insns ext n i1 with r | e | _
+  rcases hb : validate.validate_loop.body il b b1 kh insns ext n i1 with r | e | _
     <;> simp [hb] at h
-  unfold validate_loop.body at hb
+  unfold validate.validate_loop.body at hb
   split at hb
   · rename_i hlt
     obtain ⟨r0, hcs, hb⟩ := bind_eq_ok hb
@@ -229,7 +229,7 @@ theorem validate_loop_ok (il : Usize) (b b1 : Bool) (kh : Slice U32) (insns : Sl
           exact ⟨i2, rfl, Or.inr ⟨by simpa using hs, by scalar_tac⟩⟩
       obtain ⟨i2, rfl, hi2⟩ := step
       simp only at h
-      change validate_loop il b b1 kh insns ext n i2 = ok (.Ok ()) at h
+      change validate.validate_loop il b b1 kh insns ext n i2 = ok (.Ok ()) at h
       cases hw with
       | refl => exact hok
       | next _ hsingle hw' =>
@@ -254,10 +254,10 @@ theorem validate_loop_ok (il : Usize) (b b1 : Bool) (kh : Slice U32) (insns : Sl
 
 /-- Every program `validate` accepts is `WellFormed`. In particular no
 instruction slot of it writes R10 except through a store form. -/
-theorem validate_ok_wellFormed (config : Config) (kh : Slice U32) (insns : Slice Insn)
-    (ext : Slice Bool) (h : validate config kh insns ext = ok (.Ok ())) :
+theorem validate_ok_wellFormed (config : validate.Config) (kh : Slice U32) (insns : Slice isa.Insn)
+    (ext : Slice Bool) (h : validate.validate config kh insns ext = ok (.Ok ())) :
     WellFormed insns.val := by
-  unfold validate at h
+  unfold validate.validate at h
   dsimp only at h
   split at h
   · simp at h
@@ -266,12 +266,12 @@ theorem validate_ok_wellFormed (config : Config) (kh : Slice U32) (insns : Slice
 
 /-- The headline, spelled out: an accepted program never assigns the frame
 pointer outside the store forms. -/
-theorem validate_ok_no_frame_pointer_write (config : Config) (kh : Slice U32)
-    (insns : Slice Insn) (ext : Slice Bool) (h : validate config kh insns ext = ok (.Ok ()))
+theorem validate_ok_no_frame_pointer_write (config : validate.Config) (kh : Slice U32)
+    (insns : Slice isa.Insn) (ext : Slice Bool) (h : validate.validate config kh insns ext = ok (.Ok ()))
     (j : Nat) (hj : j < insns.length) (hs : InsnSlot insns.val j) :
     insns.val[j].dst.val ≤ 9 ∨ (insns.val[j].dst.val = 10 ∧ StoreForm insns.val[j].opcode) := by
   have hw := validate_ok_wellFormed config kh insns ext h
   unfold WellFormed at hw
   exact (hw j hj hs).no_fp_write
 
-end ebpf_validate
+end async_ebpf_verified

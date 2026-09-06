@@ -1,0 +1,27 @@
+[package]
+name = "async-ebpf-verified"
+version = "0.1.0"
+edition = "2021"
+description = "The runtime's verified core (src/verified/) as a stand-alone crate, for Aeneas extraction to Lean"
+license = "Apache-2.0"
+publish = false
+
+# Stand-alone: the root crate excludes `lean/` from its workspace so that Charon
+# can build this crate on its own nightly without touching the runtime's
+# lockfile. The library is the runtime's own source directory, not a copy.
+[workspace]
+
+[lib]
+path = "../../src/verified/mod.rs"
+
+[features]
+default = ["extract"]
+# Hides the runtime-only conveniences (the wire codec, `Debug`, `Hash`) from
+# the extraction. Never on when the runtime compiles the directory as a module.
+extract = []
+
+[dependencies]
+
+# Charon reads this section when invoked as `charon cargo` in this directory.
+[package.metadata.charon]
+preset = "aeneas"
