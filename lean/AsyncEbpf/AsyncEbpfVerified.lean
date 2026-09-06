@@ -17,6 +17,96 @@ set_option maxRecDepth 2048
 
 namespace async_ebpf_verified
 
+/-- [async_ebpf_verified::region::StackKind]
+    Source: '../../src/verified/region.rs', lines 92:0-95:1
+    Visibility: public -/
+@[discriminant isize]
+inductive region.StackKind where
+| Current : Option Std.I32 → region.StackKind
+| Foreign : region.StackKind
+
+/-- [async_ebpf_verified::region::RegKind]
+    Source: '../../src/verified/region.rs', lines 82:0-88:1
+    Visibility: public -/
+@[discriminant isize]
+inductive region.RegKind where
+| Uninit : region.RegKind
+| Stack : region.StackKind → region.RegKind
+| Data : region.RegKind
+| Scalar : region.RegKind
+| Unknown : region.RegKind
+
+/-- [async_ebpf_verified::region::Slot]
+    Source: '../../src/verified/region.rs', lines 186:0-190:1
+    Visibility: public -/
+structure region.Slot where
+  off : Std.I32
+  epoch : Std.U64
+  kind : region.RegKind
+
+/-- [async_ebpf_verified::region::Spills]
+    Source: '../../src/verified/region.rs', lines 200:0-207:1
+    Visibility: public -/
+structure region.Spills where
+  slots : Array region.Slot 32#usize
+  num_slots : Std.Usize
+  invalid_epoch : Std.U64
+
+/-- [async_ebpf_verified::region::State]
+    Source: '../../src/verified/region.rs', lines 213:0-216:1
+    Visibility: public -/
+structure region.State where
+  regs : Array region.RegKind 11#usize
+  spills : region.Spills
+
+/-- [async_ebpf_verified::fixpoint::Solution]
+    Source: '../../src/verified/fixpoint.rs', lines 28:0-32:1
+    Visibility: public -/
+structure fixpoint.Solution where
+  states : alloc.vec.Vec region.State
+  reached : alloc.vec.Vec Bool
+  refused : Bool
+
+/-- [async_ebpf_verified::isa::OP_JA32]
+    Source: '../../src/verified/isa.rs', lines 90:0-90:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.OP_JA32 : Std.U8 := 6#u8
+
+/-- [async_ebpf_verified::isa::OP_JA]
+    Source: '../../src/verified/isa.rs', lines 89:0-89:27
+    Visibility: public -/
+@[global_simps, irreducible] def isa.OP_JA : Std.U8 := 5#u8
+
+/-- [async_ebpf_verified::isa::OP_EXIT]
+    Source: '../../src/verified/isa.rs', lines 88:0-88:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.OP_EXIT : Std.U8 := 149#u8
+
+/-- [async_ebpf_verified::isa::OP_CALL]
+    Source: '../../src/verified/isa.rs', lines 87:0-87:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.OP_CALL : Std.U8 := 133#u8
+
+/-- [async_ebpf_verified::isa::OP_LDDW]
+    Source: '../../src/verified/isa.rs', lines 86:0-86:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.OP_LDDW : Std.U8 := 24#u8
+
+/-- [async_ebpf_verified::isa::CLS_JMP32]
+    Source: '../../src/verified/isa.rs', lines 33:0-33:31
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_JMP32 : Std.U8 := 6#u8
+
+/-- [async_ebpf_verified::isa::CLS_JMP]
+    Source: '../../src/verified/isa.rs', lines 32:0-32:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_JMP : Std.U8 := 5#u8
+
+/-- [async_ebpf_verified::isa::CLS_MASK]
+    Source: '../../src/verified/isa.rs', lines 26:0-26:30
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_MASK : Std.U8 := 7#u8
+
 /-- [async_ebpf_verified::isa::Insn]
     Source: '../../src/verified/isa.rs', lines 14:0-20:1
     Visibility: public -/
@@ -26,6 +116,1423 @@ structure isa.Insn where
   src : Std.U8
   offset : Std.I16
   imm : Std.I32
+
+/-- [async_ebpf_verified::fixpoint::raw_successors]:
+    Source: '../../src/verified/fixpoint.rs', lines 38:0-66:1 -/
+def fixpoint.raw_successors
+  (insn : isa.Insn) (pc : Std.Usize) :
+  Result (Std.Usize × Std.I64 × Std.I64)
+  := do
+  let i ← lift (UScalar.hcast .I64 pc)
+  let next ← i + 1#i64
+  let cls ← lift (insn.opcode &&& isa.CLS_MASK)
+  if cls = isa.CLS_JMP
+  then
+    if insn.opcode = isa.OP_EXIT
+    then ok (0#usize, 0#i64, 0#i64)
+    else
+      if insn.opcode = isa.OP_CALL
+      then
+        if insn.src = 0#u8
+        then ok (1#usize, next, 0#i64)
+        else
+          if insn.src = 1#u8
+          then ok (1#usize, next, 0#i64)
+          else
+            if insn.src = 2#u8
+            then ok (1#usize, next, 0#i64)
+            else ok (0#usize, 0#i64, 0#i64)
+      else
+        let target ←
+          if insn.opcode = isa.OP_JA32
+          then do
+               let i1 ← lift (IScalar.cast .I64 insn.imm)
+               next + i1
+          else do
+               let i1 ← lift (IScalar.cast .I64 insn.offset)
+               next + i1
+        if insn.opcode = isa.OP_JA
+        then ok (1#usize, target, 0#i64)
+        else
+          if insn.opcode = isa.OP_JA32
+          then ok (1#usize, target, 0#i64)
+          else ok (2#usize, target, next)
+  else
+    if cls = isa.CLS_JMP32
+    then
+      if insn.opcode = isa.OP_EXIT
+      then ok (0#usize, 0#i64, 0#i64)
+      else
+        if insn.opcode = isa.OP_CALL
+        then
+          if insn.src = 0#u8
+          then ok (1#usize, next, 0#i64)
+          else
+            if insn.src = 1#u8
+            then ok (1#usize, next, 0#i64)
+            else
+              if insn.src = 2#u8
+              then ok (1#usize, next, 0#i64)
+              else ok (0#usize, 0#i64, 0#i64)
+        else
+          let target ←
+            if insn.opcode = isa.OP_JA32
+            then do
+                 let i1 ← lift (IScalar.cast .I64 insn.imm)
+                 next + i1
+            else do
+                 let i1 ← lift (IScalar.cast .I64 insn.offset)
+                 next + i1
+          if insn.opcode = isa.OP_JA
+          then ok (1#usize, target, 0#i64)
+          else
+            if insn.opcode = isa.OP_JA32
+            then ok (1#usize, target, 0#i64)
+            else ok (2#usize, target, next)
+    else
+      if insn.opcode = isa.OP_LDDW
+      then let i1 ← next + 1#i64
+           ok (1#usize, i1, 0#i64)
+      else ok (1#usize, next, 0#i64)
+
+/-- [async_ebpf_verified::fixpoint::in_function]:
+    Source: '../../src/verified/fixpoint.rs', lines 68:0-70:1 -/
+def fixpoint.in_function
+  (target : Std.I64) (start : Std.Usize) («end» : Std.Usize) :
+  Result Bool
+  := do
+  let i ← lift (UScalar.hcast .I64 start)
+  if target >= i
+  then let i1 ← lift (UScalar.hcast .I64 «end»)
+       ok (target < i1)
+  else ok false
+
+/-- [async_ebpf_verified::fixpoint::function_successors]:
+    Source: '../../src/verified/fixpoint.rs', lines 77:0-98:1
+    Visibility: public -/
+def fixpoint.function_successors
+  (insns : Slice isa.Insn) (pc : Std.Usize) (start : Std.Usize)
+  («end» : Std.Usize) :
+  Result (Std.Usize × Std.Usize × Std.Usize)
+  := do
+  let insn ← Slice.index_usize insns pc
+  let (count, first, second) ← fixpoint.raw_successors insn pc
+  let keep_first ←
+    if count >= 1#usize
+    then fixpoint.in_function first start «end»
+    else ok false
+  let keep_second ←
+    if count >= 2#usize
+    then fixpoint.in_function second start «end»
+    else ok false
+  if keep_first
+  then
+    if keep_second
+    then
+      let i ← lift (IScalar.hcast .Usize first)
+      let i1 ← lift (IScalar.hcast .Usize second)
+      ok (2#usize, i, i1)
+    else let i ← lift (IScalar.hcast .Usize first)
+         ok (1#usize, i, 0#usize)
+  else
+    if keep_second
+    then let i ← lift (IScalar.hcast .Usize second)
+         ok (1#usize, i, 0#usize)
+    else ok (0#usize, 0#usize, 0#usize)
+
+/-- [async_ebpf_verified::fixpoint::lddw_full_imm]:
+    Source: '../../src/verified/fixpoint.rs', lines 103:0-112:1
+    Visibility: public -/
+def fixpoint.lddw_full_imm
+  (insns : Slice isa.Insn) (pc : Std.Usize) : Result Std.U64 := do
+  let insn ← Slice.index_usize insns pc
+  if insn.opcode = isa.OP_LDDW
+  then
+    let i ← pc + 1#usize
+    let i1 := Slice.len insns
+    if i < i1
+    then
+      let i2 ← lift (IScalar.hcast .U32 insn.imm)
+      let lo ← lift (UScalar.cast .U64 i2)
+      let i3 ← Slice.index_usize insns i
+      let i4 ← lift (IScalar.hcast .U32 i3.imm)
+      let hi ← lift (UScalar.cast .U64 i4)
+      let i5 ← hi <<< 32#u32
+      ok (lo ||| i5)
+    else ok 0#u64
+  else ok 0#u64
+
+/-- [async_ebpf_verified::region::set_kind]:
+    Source: '../../src/verified/region.rs', lines 484:0-486:1 -/
+def region.set_kind
+  (regs : Array region.RegKind 11#usize) (reg : Std.Usize)
+  (kind : region.RegKind) :
+  Result (Array region.RegKind 11#usize)
+  := do
+  Array.update regs reg kind
+
+/-- [async_ebpf_verified::region::R10]
+    Source: '../../src/verified/region.rs', lines 62:0-62:26
+    Visibility: public -/
+@[global_simps, irreducible] def region.R10 : Std.Usize := 10#usize
+
+/-- [async_ebpf_verified::region::NUM_REGS]
+    Source: '../../src/verified/region.rs', lines 59:0-59:31
+    Visibility: public -/
+@[global_simps, irreducible] def region.NUM_REGS : Std.Usize := 11#usize
+
+/-- [async_ebpf_verified::region::project_regs]: loop body 0:
+    Source: '../../src/verified/region.rs', lines 453:2-458:3
+    Visibility: public -/
+@[rust_loop_body]
+def region.project_regs_loop.body
+  (mask : Std.U16) (regs : Array region.RegKind 11#usize) (reg : Std.Usize) :
+  Result (ControlFlow ((Array region.RegKind 11#usize) × Std.Usize) (Array
+    region.RegKind 11#usize))
+  := do
+  if reg < region.NUM_REGS
+  then
+    let regs1 ←
+      if reg != region.R10
+      then
+        do
+        let i ← 1#u16 <<< reg
+        let i1 ← lift (mask &&& i)
+        if i1 = 0#u16
+        then region.set_kind regs reg region.RegKind.Unknown
+        else ok regs
+      else ok regs
+    let reg1 ← reg + 1#usize
+    ok (cont (regs1, reg1))
+  else ok (done regs)
+
+/-- [async_ebpf_verified::region::project_regs]: loop 0:
+    Source: '../../src/verified/region.rs', lines 453:2-458:3
+    Visibility: public -/
+@[rust_loop]
+def region.project_regs_loop
+  (regs : Array region.RegKind 11#usize) (mask : Std.U16) (reg : Std.Usize) :
+  Result (Array region.RegKind 11#usize)
+  := do
+  loop
+    (fun (regs1, reg1) => region.project_regs_loop.body mask regs1 reg1)
+    (regs, reg)
+
+/-- [async_ebpf_verified::region::project_regs]:
+    Source: '../../src/verified/region.rs', lines 451:0-459:1
+    Visibility: public -/
+@[reducible]
+def region.project_regs
+  (regs : Array region.RegKind 11#usize) (mask : Std.U16) :
+  Result (Array region.RegKind 11#usize)
+  := do
+  region.project_regs_loop regs mask 0#usize
+
+/-- [async_ebpf_verified::region::project]:
+    Source: '../../src/verified/region.rs', lines 462:0-464:1
+    Visibility: public -/
+def region.project
+  (state : region.State) (live : Std.U16) : Result region.State := do
+  let a ← region.project_regs state.regs live
+  ok { state with regs := a }
+
+/-- [async_ebpf_verified::region::find_slot]: loop body 0:
+    Source: '../../src/verified/region.rs', lines 248:2-255:1 -/
+@[rust_loop_body]
+def region.find_slot_loop.body
+  (spills : region.Spills) (off : Std.I32) (i : Std.Usize) :
+  Result (ControlFlow Std.Usize (Option Std.Usize))
+  := do
+  if i < spills.num_slots
+  then
+    let s ← Array.index_usize spills.slots i
+    if s.off = off
+    then ok (done (some i))
+    else let i1 ← i + 1#usize
+         ok (cont i1)
+  else ok (done none)
+
+/-- [async_ebpf_verified::region::find_slot]: loop 0:
+    Source: '../../src/verified/region.rs', lines 248:2-255:1 -/
+@[rust_loop]
+def region.find_slot_loop
+  (spills : region.Spills) (off : Std.I32) (i : Std.Usize) :
+  Result (Option Std.Usize)
+  := do
+  loop
+    (fun i1 => region.find_slot_loop.body spills off i1)
+    i
+
+/-- [async_ebpf_verified::region::find_slot]:
+    Source: '../../src/verified/region.rs', lines 246:0-255:1 -/
+@[reducible]
+def region.find_slot
+  (spills : region.Spills) (off : Std.I32) : Result (Option Std.Usize) := do
+  region.find_slot_loop spills off 0#usize
+
+/-- [async_ebpf_verified::region::MAX_TRACKED_SLOTS]
+    Source: '../../src/verified/region.rs', lines 69:0-69:40
+    Visibility: public -/
+@[global_simps, irreducible]
+def region.MAX_TRACKED_SLOTS : Std.Usize := 32#usize
+
+/-- [async_ebpf_verified::region::insert_slot]:
+    Source: '../../src/verified/region.rs', lines 268:0-284:1
+    Visibility: public -/
+def region.insert_slot
+  (spills : region.Spills) (off : Std.I32) (epoch : Std.U64)
+  (kind : region.RegKind) :
+  Result (Bool × region.Spills)
+  := do
+  let o ← region.find_slot spills off
+  match o with
+  | none =>
+    if spills.num_slots < region.MAX_TRACKED_SLOTS
+    then
+      let a ←
+        Array.update spills.slots spills.num_slots ({ off, epoch, kind } :
+          region.Slot)
+      let i ← spills.num_slots + 1#usize
+      ok (true, { spills with slots := a, num_slots := i })
+    else ok (false, spills)
+  | some i =>
+    let a ← Array.update spills.slots i ({ off, epoch, kind } : region.Slot)
+    ok (true, { spills with slots := a })
+
+/-- [async_ebpf_verified::region::effective_kind]:
+    Source: '../../src/verified/region.rs', lines 237:0-243:1 -/
+def region.effective_kind
+  (spills : region.Spills) (epoch : Std.U64) (kind : region.RegKind) :
+  Result region.RegKind
+  := do
+  if epoch >= spills.invalid_epoch
+  then ok kind
+  else ok region.RegKind.Unknown
+
+/-- [async_ebpf_verified::region::slot_kind]:
+    Source: '../../src/verified/region.rs', lines 259:0-264:1
+    Visibility: public -/
+def region.slot_kind
+  (spills : region.Spills) (off : Std.I32) : Result region.RegKind := do
+  let o ← region.find_slot spills off
+  match o with
+  | none => ok region.RegKind.Uninit
+  | some i =>
+    let s ← Array.index_usize spills.slots i
+    region.effective_kind spills s.epoch s.kind
+
+/-- [async_ebpf_verified::region::kind_eq]:
+    Source: '../../src/verified/region.rs', lines 99:0-112:1
+    Visibility: public -/
+def region.kind_eq
+  (a : region.RegKind) (b : region.RegKind) : Result Bool := do
+  match a with
+  | region.RegKind.Uninit =>
+    match b with
+    | region.RegKind.Uninit => ok true
+    | region.RegKind.Stack _ => ok false
+    | region.RegKind.Data => ok false
+    | region.RegKind.Scalar => ok false
+    | region.RegKind.Unknown => ok false
+  | region.RegKind.Stack sk =>
+    match b with
+    | region.RegKind.Uninit => ok false
+    | region.RegKind.Stack sk1 =>
+      match sk with
+      | region.StackKind.Current o =>
+        match sk1 with
+        | region.StackKind.Current o1 =>
+          match o with
+          | none => match o1 with
+                    | none => ok true
+                    | some _ => ok false
+          | some x => match o1 with
+                      | none => ok false
+                      | some y => ok (x = y)
+        | region.StackKind.Foreign => ok false
+      | region.StackKind.Foreign =>
+        match sk1 with
+        | region.StackKind.Current _ => ok false
+        | region.StackKind.Foreign => ok true
+    | region.RegKind.Data => ok false
+    | region.RegKind.Scalar => ok false
+    | region.RegKind.Unknown => ok false
+  | region.RegKind.Data =>
+    match b with
+    | region.RegKind.Uninit => ok false
+    | region.RegKind.Stack _ => ok false
+    | region.RegKind.Data => ok true
+    | region.RegKind.Scalar => ok false
+    | region.RegKind.Unknown => ok false
+  | region.RegKind.Scalar =>
+    match b with
+    | region.RegKind.Uninit => ok false
+    | region.RegKind.Stack _ => ok false
+    | region.RegKind.Data => ok false
+    | region.RegKind.Scalar => ok true
+    | region.RegKind.Unknown => ok false
+  | region.RegKind.Unknown =>
+    match b with
+    | region.RegKind.Uninit => ok false
+    | region.RegKind.Stack _ => ok false
+    | region.RegKind.Data => ok false
+    | region.RegKind.Scalar => ok false
+    | region.RegKind.Unknown => ok true
+
+/-- [async_ebpf_verified::region::meet]:
+    Source: '../../src/verified/region.rs', lines 115:0-135:1
+    Visibility: public -/
+def region.meet
+  (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
+  let b1 ← region.kind_eq a b
+  if b1
+  then ok a
+  else
+    match a with
+    | region.RegKind.Uninit => ok b
+    | region.RegKind.Stack x =>
+      match b with
+      | region.RegKind.Uninit => ok a
+      | region.RegKind.Stack y =>
+        match x with
+        | region.StackKind.Current o =>
+          match y with
+          | region.StackKind.Current o1 =>
+            match o with
+            | none => ok a
+            | some p =>
+              match o1 with
+              | none => ok b
+              | some q =>
+                if p = q
+                then ok a
+                else ok (region.RegKind.Stack (region.StackKind.Current none))
+          | region.StackKind.Foreign =>
+            ok (region.RegKind.Stack (region.StackKind.Current none))
+        | region.StackKind.Foreign =>
+          match y with
+          | region.StackKind.Current _ =>
+            ok (region.RegKind.Stack (region.StackKind.Current none))
+          | region.StackKind.Foreign =>
+            ok (region.RegKind.Stack region.StackKind.Foreign)
+      | region.RegKind.Data => ok region.RegKind.Unknown
+      | region.RegKind.Scalar => ok region.RegKind.Unknown
+      | region.RegKind.Unknown => ok region.RegKind.Unknown
+    | region.RegKind.Data =>
+      match b with
+      | region.RegKind.Uninit => ok region.RegKind.Data
+      | region.RegKind.Stack _ => ok region.RegKind.Unknown
+      | region.RegKind.Data => ok region.RegKind.Unknown
+      | region.RegKind.Scalar => ok region.RegKind.Unknown
+      | region.RegKind.Unknown => ok region.RegKind.Unknown
+    | region.RegKind.Scalar =>
+      match b with
+      | region.RegKind.Uninit => ok region.RegKind.Scalar
+      | region.RegKind.Stack _ => ok region.RegKind.Unknown
+      | region.RegKind.Data => ok region.RegKind.Unknown
+      | region.RegKind.Scalar => ok region.RegKind.Unknown
+      | region.RegKind.Unknown => ok region.RegKind.Unknown
+    | region.RegKind.Unknown =>
+      match b with
+      | region.RegKind.Uninit => ok region.RegKind.Unknown
+      | region.RegKind.Stack _ => ok region.RegKind.Unknown
+      | region.RegKind.Data => ok region.RegKind.Unknown
+      | region.RegKind.Scalar => ok region.RegKind.Unknown
+      | region.RegKind.Unknown => ok region.RegKind.Unknown
+
+/-- [async_ebpf_verified::region::meet_spills]: loop body 0:
+    Source: '../../src/verified/region.rs', lines 363:4-380:5 -/
+@[rust_loop_body]
+def region.meet_spills_loop.body
+  (other : region.Spills) (spills : region.Spills) (changed : Bool)
+  (refused : Bool) (i : Std.Usize) :
+  Result (ControlFlow (region.Spills × Bool × Bool × Std.Usize)
+    (region.Spills × Bool × Bool))
+  := do
+  if i < other.num_slots
+  then
+    let s ← Array.index_usize other.slots i
+    let cur ← region.slot_kind spills s.off
+    let incoming ← region.effective_kind other s.epoch s.kind
+    let merged ← region.meet cur incoming
+    let b ← region.kind_eq merged cur
+    let (spills1, changed1, refused1) ←
+      if b
+      then ok (spills, changed, refused)
+      else
+        do
+        let (b1, spills2) ←
+          region.insert_slot spills s.off spills.invalid_epoch merged
+        let (b2, b3) ← if b1
+                         then ok (true, refused)
+                         else ok (changed, true)
+        ok (spills2, b2, b3)
+    let i1 ← i + 1#usize
+    ok (cont (spills1, changed1, refused1, i1))
+  else ok (done (spills, changed, refused))
+
+/-- [async_ebpf_verified::region::meet_spills]: loop 0:
+    Source: '../../src/verified/region.rs', lines 363:4-380:5 -/
+@[rust_loop]
+def region.meet_spills_loop
+  (spills : region.Spills) (other : region.Spills) (changed : Bool)
+  (refused : Bool) (i : Std.Usize) :
+  Result (region.Spills × Bool × Bool)
+  := do
+  loop
+    (fun (spills1, changed1, refused1, i1) => region.meet_spills_loop.body
+      other spills1 changed1 refused1 i1)
+    (spills, changed, refused, i)
+
+/-- [async_ebpf_verified::region::meet_spills]:
+    Source: '../../src/verified/region.rs', lines 351:0-383:1 -/
+def region.meet_spills
+  (spills : region.Spills) (other : region.Spills) :
+  Result ((Bool × Bool) × region.Spills)
+  := do
+  if spills.num_slots = 0#usize
+  then
+    if other.num_slots != 0#usize
+    then ok ((true, false), other)
+    else ok ((false, false), spills)
+  else
+    let (spills1, changed, refused) ←
+      region.meet_spills_loop spills other false false 0#usize
+    ok ((changed, refused), spills1)
+
+/-- [async_ebpf_verified::region::meet_regs]: loop body 0:
+    Source: '../../src/verified/region.rs', lines 338:2-345:3 -/
+@[rust_loop_body]
+def region.meet_regs_loop.body
+  (other : Array region.RegKind 11#usize)
+  (regs : Array region.RegKind 11#usize) (changed : Bool) (r : Std.Usize) :
+  Result (ControlFlow ((Array region.RegKind 11#usize) × Bool × Std.Usize)
+    (Bool × (Array region.RegKind 11#usize)))
+  := do
+  if r < region.NUM_REGS
+  then
+    let rk ← Array.index_usize regs r
+    let rk1 ← Array.index_usize other r
+    let merged ← region.meet rk rk1
+    let b ← region.kind_eq merged rk
+    if b
+    then let r1 ← r + 1#usize
+         ok (cont (regs, changed, r1))
+    else
+      let a ← Array.update regs r merged
+      let r1 ← r + 1#usize
+      ok (cont (a, true, r1))
+  else ok (done (changed, regs))
+
+/-- [async_ebpf_verified::region::meet_regs]: loop 0:
+    Source: '../../src/verified/region.rs', lines 338:2-345:3 -/
+@[rust_loop]
+def region.meet_regs_loop
+  (regs : Array region.RegKind 11#usize)
+  (other : Array region.RegKind 11#usize) (changed : Bool) (r : Std.Usize) :
+  Result (Bool × (Array region.RegKind 11#usize))
+  := do
+  loop
+    (fun (regs1, changed1, r1) => region.meet_regs_loop.body other regs1
+      changed1 r1)
+    (regs, changed, r)
+
+/-- [async_ebpf_verified::region::meet_regs]:
+    Source: '../../src/verified/region.rs', lines 335:0-347:1 -/
+@[reducible]
+def region.meet_regs
+  (regs : Array region.RegKind 11#usize)
+  (other : Array region.RegKind 11#usize) :
+  Result (Bool × (Array region.RegKind 11#usize))
+  := do
+  region.meet_regs_loop regs other false 0#usize
+
+/-- [async_ebpf_verified::region::meet_from]:
+    Source: '../../src/verified/region.rs', lines 387:0-391:1
+    Visibility: public -/
+def region.meet_from
+  (state : region.State) (other : region.State) :
+  Result ((Bool × Bool) × region.State)
+  := do
+  let (regs_changed, a) ← region.meet_regs state.regs other.regs
+  let ((spills_changed, refused), s) ←
+    region.meet_spills state.spills other.spills
+  if regs_changed
+  then ok ((true, refused), { regs := a, spills := s })
+  else ok ((spills_changed, refused), { regs := a, spills := s })
+
+/-- [async_ebpf_verified::fixpoint::propagate]:
+    Source: '../../src/verified/fixpoint.rs', lines 117:0-139:1 -/
+def fixpoint.propagate
+  (states : alloc.vec.Vec region.State) (reached : alloc.vec.Vec Bool)
+  (on_list : alloc.vec.Vec Bool) (stack : alloc.vec.Vec Std.Usize)
+  (sp : Std.Usize) (succ : Std.Usize) (out : region.State) (live : Std.U16) :
+  Result ((Std.Usize × Bool) × (alloc.vec.Vec region.State) × (alloc.vec.Vec
+    Bool) × (alloc.vec.Vec Bool) × (alloc.vec.Vec Std.Usize))
+  := do
+  let out1 ← region.project out live
+  let was_reached ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Bool) reached
+      succ
+  let (_, index_mut_back) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+      reached succ
+  let (s, index_mut_back1) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+      region.State) states succ
+  let ((changed, refused), s1) ← region.meet_from s out1
+  if was_reached
+  then
+    if changed
+    then
+      let b ←
+        alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Bool)
+          on_list succ
+      if b
+      then
+        let states1 := index_mut_back1 s1
+        let reached1 := index_mut_back true
+        ok ((sp, refused), states1, reached1, on_list, stack)
+      else
+        let (_, index_mut_back2) ←
+          alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+            on_list succ
+        let (_, index_mut_back3) ←
+          alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+            Std.Usize) stack sp
+        let top ← sp + 1#usize
+        let states1 := index_mut_back1 s1
+        let reached1 := index_mut_back true
+        let on_list1 := index_mut_back2 true
+        let stack1 := index_mut_back3 succ
+        ok ((top, refused), states1, reached1, on_list1, stack1)
+    else
+      let states1 := index_mut_back1 s1
+      let reached1 := index_mut_back true
+      ok ((sp, refused), states1, reached1, on_list, stack)
+  else
+    let b ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Bool) on_list
+        succ
+    if b
+    then
+      let states1 := index_mut_back1 s1
+      let reached1 := index_mut_back true
+      ok ((sp, refused), states1, reached1, on_list, stack)
+    else
+      let (_, index_mut_back2) ←
+        alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+          on_list succ
+      let (_, index_mut_back3) ←
+        alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+          Std.Usize) stack sp
+      let top ← sp + 1#usize
+      let states1 := index_mut_back1 s1
+      let reached1 := index_mut_back true
+      let on_list1 := index_mut_back2 true
+      let stack1 := index_mut_back3 succ
+      ok ((top, refused), states1, reached1, on_list1, stack1)
+
+/-- [async_ebpf_verified::region::checked_add_i32]:
+    Source: '../../src/verified/region.rs', lines 512:0-521:1 -/
+def region.checked_add_i32
+  (a : Std.I32) (b : Std.I32) : Result (Option Std.I32) := do
+  if b >= 0#i32
+  then
+    let i ← core.num.I32.MAX - b
+    if a > i
+    then ok none
+    else let i1 ← a + b
+         ok (some i1)
+  else
+    let i ← core.num.I32.MIN - b
+    if a < i
+    then ok none
+    else let i1 ← a + b
+         ok (some i1)
+
+/-- [async_ebpf_verified::region::add_imm_kind]:
+    Source: '../../src/verified/region.rs', lines 617:0-628:1
+    Visibility: public -/
+def region.add_imm_kind
+  (a : region.RegKind) (imm : Std.I32) : Result region.RegKind := do
+  match a with
+  | region.RegKind.Uninit => ok region.RegKind.Unknown
+  | region.RegKind.Stack sk =>
+    match sk with
+    | region.StackKind.Current o =>
+      match o with
+      | none => ok a
+      | some off =>
+        let o1 ← region.checked_add_i32 off imm
+        ok (region.RegKind.Stack (region.StackKind.Current o1))
+    | region.StackKind.Foreign => ok a
+  | region.RegKind.Data => ok region.RegKind.Data
+  | region.RegKind.Scalar => ok region.RegKind.Scalar
+  | region.RegKind.Unknown => ok region.RegKind.Unknown
+
+/-- [async_ebpf_verified::region::sub_kinds]:
+    Source: '../../src/verified/region.rs', lines 603:0-613:1
+    Visibility: public -/
+def region.sub_kinds
+  (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
+  match a with
+  | region.RegKind.Uninit => ok region.RegKind.Unknown
+  | region.RegKind.Stack sk =>
+    match b with
+    | region.RegKind.Uninit => ok region.RegKind.Unknown
+    | region.RegKind.Stack _ => ok region.RegKind.Scalar
+    | region.RegKind.Data => ok region.RegKind.Unknown
+    | region.RegKind.Scalar =>
+      match sk with
+      | region.StackKind.Current _ =>
+        ok (region.RegKind.Stack (region.StackKind.Current none))
+      | region.StackKind.Foreign => ok a
+    | region.RegKind.Unknown => ok region.RegKind.Unknown
+  | region.RegKind.Data =>
+    match b with
+    | region.RegKind.Uninit => ok region.RegKind.Unknown
+    | region.RegKind.Stack _ => ok region.RegKind.Unknown
+    | region.RegKind.Data => ok region.RegKind.Scalar
+    | region.RegKind.Scalar => ok region.RegKind.Data
+    | region.RegKind.Unknown => ok region.RegKind.Unknown
+  | region.RegKind.Scalar =>
+    match b with
+    | region.RegKind.Uninit => ok region.RegKind.Unknown
+    | region.RegKind.Stack _ => ok region.RegKind.Unknown
+    | region.RegKind.Data => ok region.RegKind.Unknown
+    | region.RegKind.Scalar => ok region.RegKind.Scalar
+    | region.RegKind.Unknown => ok region.RegKind.Unknown
+  | region.RegKind.Unknown => ok region.RegKind.Unknown
+
+/-- [async_ebpf_verified::region::add_kinds]:
+    Source: '../../src/verified/region.rs', lines 589:0-600:1
+    Visibility: public -/
+def region.add_kinds
+  (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
+  match a with
+  | region.RegKind.Uninit => ok region.RegKind.Unknown
+  | region.RegKind.Stack sk =>
+    match b with
+    | region.RegKind.Uninit => ok region.RegKind.Unknown
+    | region.RegKind.Stack _ => ok region.RegKind.Unknown
+    | region.RegKind.Data => ok region.RegKind.Unknown
+    | region.RegKind.Scalar =>
+      match sk with
+      | region.StackKind.Current _ =>
+        ok (region.RegKind.Stack (region.StackKind.Current none))
+      | region.StackKind.Foreign => ok a
+    | region.RegKind.Unknown => ok region.RegKind.Unknown
+  | region.RegKind.Data =>
+    match b with
+    | region.RegKind.Uninit => ok region.RegKind.Unknown
+    | region.RegKind.Stack _ => ok region.RegKind.Unknown
+    | region.RegKind.Data => ok region.RegKind.Unknown
+    | region.RegKind.Scalar => ok region.RegKind.Data
+    | region.RegKind.Unknown => ok region.RegKind.Unknown
+  | region.RegKind.Scalar =>
+    match b with
+    | region.RegKind.Uninit => ok region.RegKind.Unknown
+    | region.RegKind.Stack sk =>
+      match sk with
+      | region.StackKind.Current _ =>
+        ok (region.RegKind.Stack (region.StackKind.Current none))
+      | region.StackKind.Foreign => ok b
+    | region.RegKind.Data => ok region.RegKind.Data
+    | region.RegKind.Scalar => ok region.RegKind.Scalar
+    | region.RegKind.Unknown => ok region.RegKind.Unknown
+  | region.RegKind.Unknown => ok region.RegKind.Unknown
+
+/-- [async_ebpf_verified::region::wrapping_neg_i32]:
+    Source: '../../src/verified/region.rs', lines 524:0-530:1 -/
+def region.wrapping_neg_i32 (imm : Std.I32) : Result Std.I32 := do
+  if imm = core.num.I32.MIN
+  then ok core.num.I32.MIN
+  else -. imm
+
+/-- [async_ebpf_verified::region::ALU_OP_MOV]
+    Source: '../../src/verified/region.rs', lines 73:0-73:28 -/
+@[global_simps, irreducible] def region.ALU_OP_MOV : Std.U8 := 176#u8
+
+/-- [async_ebpf_verified::region::ALU_OP_SUB]
+    Source: '../../src/verified/region.rs', lines 72:0-72:28 -/
+@[global_simps, irreducible] def region.ALU_OP_SUB : Std.U8 := 16#u8
+
+/-- [async_ebpf_verified::region::ALU_OP_ADD]
+    Source: '../../src/verified/region.rs', lines 71:0-71:28 -/
+@[global_simps, irreducible] def region.ALU_OP_ADD : Std.U8 := 0#u8
+
+/-- [async_ebpf_verified::isa::ALU_MASK]
+    Source: '../../src/verified/isa.rs', lines 50:0-50:30
+    Visibility: public -/
+@[global_simps, irreducible] def isa.ALU_MASK : Std.U8 := 240#u8
+
+/-- [async_ebpf_verified::isa::SRC_REG]
+    Source: '../../src/verified/isa.rs', lines 36:0-36:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.SRC_REG : Std.U8 := 8#u8
+
+/-- [async_ebpf_verified::region::transfer_alu64]:
+    Source: '../../src/verified/region.rs', lines 712:0-743:1 -/
+def region.transfer_alu64
+  (s : region.State) (inst : isa.Insn) : Result region.State := do
+  let op ← lift (inst.opcode &&& isa.ALU_MASK)
+  let i ← lift (inst.opcode &&& isa.SRC_REG)
+  let dst ← lift (UScalar.cast .Usize inst.dst)
+  let src ← lift (UScalar.cast .Usize inst.src)
+  if op = region.ALU_OP_MOV
+  then
+    let (s1, k) ←
+      if i != 0#u8
+      then
+        do
+        let rk ← Array.index_usize s.regs src
+        let rk1 ←
+          match rk with
+          | region.RegKind.Uninit => ok region.RegKind.Unknown
+          | region.RegKind.Stack _ => ok rk
+          | region.RegKind.Data => ok rk
+          | region.RegKind.Scalar => ok rk
+          | region.RegKind.Unknown => ok rk
+        ok (s, rk1)
+      else ok (s, region.RegKind.Scalar)
+    let a ← Array.update s1.regs dst k
+    ok { s1 with regs := a }
+  else
+    if op = region.ALU_OP_ADD
+    then
+      let rk ←
+        if i != 0#u8
+        then
+          do
+          let rk1 ← Array.index_usize s.regs dst
+          let rk2 ← Array.index_usize s.regs src
+          region.add_kinds rk1 rk2
+        else
+          do
+          let rk1 ← Array.index_usize s.regs dst
+          region.add_imm_kind rk1 inst.imm
+      let a ← Array.update s.regs dst rk
+      ok { s with regs := a }
+    else
+      if op = region.ALU_OP_SUB
+      then
+        let rk ←
+          if i != 0#u8
+          then
+            do
+            let rk1 ← Array.index_usize s.regs dst
+            let rk2 ← Array.index_usize s.regs src
+            region.sub_kinds rk1 rk2
+          else
+            do
+            let rk1 ← Array.index_usize s.regs dst
+            let i1 ← region.wrapping_neg_i32 inst.imm
+            region.add_imm_kind rk1 i1
+        let a ← Array.update s.regs dst rk
+        ok { s with regs := a }
+      else
+        let a ← Array.update s.regs dst region.RegKind.Scalar
+        ok { s with regs := a }
+
+/-- [async_ebpf_verified::region::stack_access_start]:
+    Source: '../../src/verified/region.rs', lines 505:0-510:1
+    Visibility: public -/
+def region.stack_access_start
+  (base : region.RegKind) (offset : Std.I16) : Result (Option Std.I32) := do
+  match base with
+  | region.RegKind.Uninit => ok none
+  | region.RegKind.Stack sk =>
+    match sk with
+    | region.StackKind.Current o =>
+      match o with
+      | none => ok none
+      | some base_off =>
+        let i ← lift (IScalar.cast .I32 offset)
+        region.checked_add_i32 base_off i
+    | region.StackKind.Foreign => ok none
+  | region.RegKind.Data => ok none
+  | region.RegKind.Scalar => ok none
+  | region.RegKind.Unknown => ok none
+
+/-- [async_ebpf_verified::isa::CLS_STX]
+    Source: '../../src/verified/isa.rs', lines 30:0-30:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_STX : Std.U8 := 3#u8
+
+/-- [async_ebpf_verified::region::is_atomic]:
+    Source: '../../src/verified/region.rs', lines 499:0-501:1
+    Visibility: public -/
+def region.is_atomic (opcode : Std.U8) : Result Bool := do
+  let i ← lift (opcode &&& isa.CLS_MASK)
+  if i = isa.CLS_STX
+  then let i1 ← lift (opcode &&& 224#u8)
+       ok (i1 = 192#u8)
+  else ok false
+
+/-- [async_ebpf_verified::region::access_width]:
+    Source: '../../src/verified/region.rs', lines 489:0-496:1
+    Visibility: public -/
+def region.access_width (opcode : Std.U8) : Result Std.U8 := do
+  let i ← lift (opcode &&& 24#u8)
+  match i with
+  | 0#uscalar => ok 4#u8
+  | 8#uscalar => ok 2#u8
+  | 16#uscalar => ok 1#u8
+  | _ => ok 8#u8
+
+/-- [async_ebpf_verified::region::slot_overlaps]:
+    Source: '../../src/verified/region.rs', lines 294:0-302:1 -/
+def region.slot_overlaps
+  (slot_off : Std.I32) (start : Std.I32) («end» : Std.I32) :
+  Result Bool
+  := do
+  let i ← core.num.I32.MAX - 8#i32
+  if slot_off > i
+  then ok true
+  else
+    let slot_end ← slot_off + 8#i32
+    if start < slot_end
+    then ok (slot_off < «end»)
+    else ok false
+
+/-- [async_ebpf_verified::region::invalidate_slots]:
+    Source: '../../src/verified/region.rs', lines 289:0-291:1
+    Visibility: public -/
+def region.invalidate_slots
+  (spills : region.Spills) : Result region.Spills := do
+  let i ← spills.invalid_epoch + 1#u64
+  ok { spills with invalid_epoch := i }
+
+/-- [async_ebpf_verified::region::invalidate_stack_write]: loop body 0:
+    Source: '../../src/verified/region.rs', lines 322:2-331:3
+    Visibility: public -/
+@[rust_loop_body]
+def region.invalidate_stack_write_loop.body
+  (start : Std.I32) («end» : Std.I32) (spills : region.Spills)
+  (i : Std.Usize) :
+  Result (ControlFlow (region.Spills × Std.Usize) ((Array region.Slot
+    32#usize) × Std.Usize × Std.U64))
+  := do
+  if i < spills.num_slots
+  then
+    let s ← Array.index_usize spills.slots i
+    let b ← region.slot_overlaps s.off start «end»
+    if b
+    then
+      let a ←
+        Array.update spills.slots i
+          {
+            s
+              with
+              epoch := spills.invalid_epoch, kind := region.RegKind.Unknown
+          }
+      let i1 ← i + 1#usize
+      ok (cont ({ spills with slots := a }, i1))
+    else let i1 ← i + 1#usize
+         ok (cont (spills, i1))
+  else ok (done (spills.slots, spills.num_slots, spills.invalid_epoch))
+
+/-- [async_ebpf_verified::region::invalidate_stack_write]: loop 0:
+    Source: '../../src/verified/region.rs', lines 322:2-331:3
+    Visibility: public -/
+@[rust_loop]
+def region.invalidate_stack_write_loop
+  (spills : region.Spills) (start : Std.I32) («end» : Std.I32)
+  (i : Std.Usize) :
+  Result ((Array region.Slot 32#usize) × Std.Usize × Std.U64)
+  := do
+  loop
+    (fun (spills1, i1) => region.invalidate_stack_write_loop.body start «end»
+      spills1 i1)
+    (spills, i)
+
+/-- [async_ebpf_verified::region::invalidate_stack_write]:
+    Source: '../../src/verified/region.rs', lines 307:0-332:1
+    Visibility: public -/
+def region.invalidate_stack_write
+  (spills : region.Spills) (start : Option Std.I32) (width : Std.U8) :
+  Result region.Spills
+  := do
+  match start with
+  | none => region.invalidate_slots spills
+  | some s =>
+    let width1 ← lift (UScalar.hcast .I32 width)
+    let i ← core.num.I32.MAX - width1
+    if s > i
+    then region.invalidate_slots spills
+    else
+      let «end» ← s + width1
+      let (a, i1, i2) ←
+        region.invalidate_stack_write_loop spills s «end» 0#usize
+      ok { slots := a, num_slots := i1, invalid_epoch := i2 }
+
+/-- [async_ebpf_verified::region::frame_pointer_kind]:
+    Source: '../../src/verified/region.rs', lines 178:0-180:1
+    Visibility: public -/
+def region.frame_pointer_kind : Result region.RegKind := do
+  ok (region.RegKind.Stack (region.StackKind.Current (some 0#i32)))
+
+/-- [async_ebpf_verified::region::aliases_current_stack]:
+    Source: '../../src/verified/region.rs', lines 170:0-175:1
+    Visibility: public -/
+def region.aliases_current_stack (kind : region.RegKind) : Result Bool := do
+  match kind with
+  | region.RegKind.Uninit => ok true
+  | region.RegKind.Stack sk =>
+    match sk with
+    | region.StackKind.Current _ => ok true
+    | region.StackKind.Foreign => ok false
+  | region.RegKind.Data => ok true
+  | region.RegKind.Scalar => ok true
+  | region.RegKind.Unknown => ok true
+
+/-- [async_ebpf_verified::region::is_stack]:
+    Source: '../../src/verified/region.rs', lines 154:0-159:1
+    Visibility: public -/
+def region.is_stack (kind : region.RegKind) : Result Bool := do
+  match kind with
+  | region.RegKind.Uninit => ok false
+  | region.RegKind.Stack _ => ok true
+  | region.RegKind.Data => ok false
+  | region.RegKind.Scalar => ok false
+  | region.RegKind.Unknown => ok false
+
+/-- [async_ebpf_verified::region::ATOMIC_OP_CMPXCHG]
+    Source: '../../src/verified/region.rs', lines 75:0-75:36 -/
+@[global_simps, irreducible] def region.ATOMIC_OP_CMPXCHG : Std.I32 := 240#i32
+
+/-- [async_ebpf_verified::region::ATOMIC_OP_MASK]
+    Source: '../../src/verified/region.rs', lines 74:0-74:33 -/
+@[global_simps, irreducible] def region.ATOMIC_OP_MASK : Std.I32 := 240#i32
+
+/-- [async_ebpf_verified::isa::CLS_ST]
+    Source: '../../src/verified/isa.rs', lines 29:0-29:28
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_ST : Std.U8 := 2#u8
+
+/-- [async_ebpf_verified::region::transfer_store]:
+    Source: '../../src/verified/region.rs', lines 654:0-709:1 -/
+def region.transfer_store
+  (s : region.State) (inst : isa.Insn) (cls : Std.U8) :
+  Result (Bool × region.State)
+  := do
+  let atomic ← region.is_atomic inst.opcode
+  let (s1, value) ←
+    if cls = isa.CLS_ST
+    then ok (s, region.RegKind.Scalar)
+    else
+      do
+      let i ← lift (UScalar.cast .Usize inst.src)
+      let value1 ← Array.index_usize s.regs i
+      ok (s, value1)
+  let width ← region.access_width inst.opcode
+  let i ← lift (UScalar.cast .Usize inst.dst)
+  let (s2, stack_base) ←
+    if i = region.R10
+    then do
+         let stack_base1 ← region.frame_pointer_kind
+         ok (s1, stack_base1)
+    else
+      do
+      let i1 ← lift (UScalar.cast .Usize inst.dst)
+      let stack_base1 ← Array.index_usize s1.regs i1
+      ok (s1, stack_base1)
+  let b ← region.is_stack stack_base
+  let (s3, atomic1, refused) ←
+    if b
+    then
+      do
+      let b1 ← region.aliases_current_stack stack_base
+      let s4 ←
+        if b1
+        then
+          do
+          let start ← region.stack_access_start stack_base inst.offset
+          let s5 ← region.invalidate_stack_write s2.spills start width
+          ok { s2 with spills := s5 }
+        else ok s2
+      let stored ←
+        if atomic
+        then ok region.RegKind.Unknown
+        else
+          match value with
+          | region.RegKind.Uninit => ok region.RegKind.Unknown
+          | region.RegKind.Stack _ => ok value
+          | region.RegKind.Data => ok region.RegKind.Data
+          | region.RegKind.Scalar => ok region.RegKind.Scalar
+          | region.RegKind.Unknown => ok region.RegKind.Unknown
+      let (s5, b2) ←
+        if atomic
+        then ok (s4, false)
+        else
+          if width = 8#u8
+          then
+            do
+            let o ← region.stack_access_start stack_base inst.offset
+            match o with
+            | none => ok (s4, false)
+            | some start =>
+              let (b3, s6) ←
+                region.insert_slot s4.spills start s4.spills.invalid_epoch
+                  stored
+              let b4 ← if b3
+                         then ok false
+                         else ok true
+              ok ({ s4 with spills := s6 }, b4)
+          else ok (s4, false)
+      ok (s5, atomic, b2)
+    else
+      do
+      let i1 ← lift (UScalar.cast .Usize inst.dst)
+      let rk ← Array.index_usize s2.regs i1
+      let s4 ←
+        match rk with
+        | region.RegKind.Uninit => region.invalidate_slots s2.spills
+        | region.RegKind.Stack _ => region.invalidate_slots s2.spills
+        | region.RegKind.Data => ok s2.spills
+        | region.RegKind.Scalar => region.invalidate_slots s2.spills
+        | region.RegKind.Unknown => region.invalidate_slots s2.spills
+      ok ({ s2 with spills := s4 }, atomic, false)
+  if atomic1
+  then
+    let i1 ← lift (UScalar.cast .Usize inst.src)
+    let (_, index_mut_back) ← Array.index_mut_usize s3.regs i1
+    let i2 ← lift (inst.imm &&& region.ATOMIC_OP_MASK)
+    if i2 = region.ATOMIC_OP_CMPXCHG
+    then
+      let a := index_mut_back region.RegKind.Unknown
+      let a1 ← Array.update a 0#usize region.RegKind.Unknown
+      ok (refused, { s3 with regs := a1 })
+    else
+      let a := index_mut_back region.RegKind.Unknown
+      ok (refused, { s3 with regs := a })
+  else ok (refused, s3)
+
+/-- [async_ebpf_verified::region::set_reg]:
+    Source: '../../src/verified/region.rs', lines 648:0-650:1 -/
+def region.set_reg
+  (state : region.State) (reg : Std.Usize) (kind : region.RegKind) :
+  Result region.State
+  := do
+  let a ← Array.update state.regs reg kind
+  ok { state with regs := a }
+
+/-- [async_ebpf_verified::region::is_pointer]:
+    Source: '../../src/verified/region.rs', lines 146:0-152:1
+    Visibility: public -/
+def region.is_pointer (kind : region.RegKind) : Result Bool := do
+  match kind with
+  | region.RegKind.Uninit => ok false
+  | region.RegKind.Stack _ => ok true
+  | region.RegKind.Data => ok true
+  | region.RegKind.Scalar => ok false
+  | region.RegKind.Unknown => ok false
+
+/-- [async_ebpf_verified::region::load_kind]:
+    Source: '../../src/verified/region.rs', lines 632:0-643:1 -/
+def region.load_kind
+  (spills : region.Spills) (inst : isa.Insn) : Result region.RegKind := do
+  let i ← lift (UScalar.cast .Usize inst.src)
+  if i = region.R10
+  then
+    let i1 ← lift (IScalar.cast .I32 inst.offset)
+    let k ← region.slot_kind spills i1
+    let b ← region.is_pointer k
+    if b
+    then ok k
+    else ok region.RegKind.Scalar
+  else ok region.RegKind.Scalar
+
+/-- [async_ebpf_verified::isa::CLS_ALU64]
+    Source: '../../src/verified/isa.rs', lines 34:0-34:31
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_ALU64 : Std.U8 := 7#u8
+
+/-- [async_ebpf_verified::isa::CLS_ALU]
+    Source: '../../src/verified/isa.rs', lines 31:0-31:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_ALU : Std.U8 := 4#u8
+
+/-- [async_ebpf_verified::isa::CLS_LDX]
+    Source: '../../src/verified/isa.rs', lines 28:0-28:29
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_LDX : Std.U8 := 1#u8
+
+/-- [async_ebpf_verified::isa::CLS_LD]
+    Source: '../../src/verified/isa.rs', lines 27:0-27:28
+    Visibility: public -/
+@[global_simps, irreducible] def isa.CLS_LD : Std.U8 := 0#u8
+
+/-- [async_ebpf_verified::region::transfer]: loop body 0:
+    Source: '../../src/verified/region.rs', lines 789:4-792:5
+    Visibility: public -/
+@[rust_loop_body]
+def region.transfer_loop.body
+  (s : region.State) (r : Std.Usize) :
+  Result (ControlFlow (region.State × Std.Usize) region.State)
+  := do
+  if r <= 5#usize
+  then
+    let s1 ← region.set_reg s r region.RegKind.Unknown
+    let r1 ← r + 1#usize
+    ok (cont (s1, r1))
+  else ok (done s)
+
+/-- [async_ebpf_verified::region::transfer]: loop 0:
+    Source: '../../src/verified/region.rs', lines 789:4-792:5
+    Visibility: public -/
+@[rust_loop]
+def region.transfer_loop
+  (s : region.State) (r : Std.Usize) : Result region.State := do
+  loop
+    (fun (s1, r1) => region.transfer_loop.body s1 r1)
+    (s, r)
+
+/-- [async_ebpf_verified::region::transfer]:
+    Source: '../../src/verified/region.rs', lines 749:0-796:1
+    Visibility: public -/
+def region.transfer
+  (in_state : region.State) (inst : isa.Insn) (lddw_addr : Std.U64)
+  (data_lo : Std.U64) (data_hi : Std.U64) :
+  Result (region.State × Bool)
+  := do
+  let cls ← lift (inst.opcode &&& isa.CLS_MASK)
+  if cls = isa.CLS_LD
+  then
+    let rk ←
+      if inst.opcode = isa.OP_LDDW
+      then
+        if lddw_addr >= data_lo
+        then
+          if lddw_addr < data_hi
+          then ok region.RegKind.Data
+          else ok region.RegKind.Scalar
+        else ok region.RegKind.Scalar
+      else ok region.RegKind.Unknown
+    let i ← lift (UScalar.cast .Usize inst.dst)
+    let a ← Array.update in_state.regs i rk
+    ok ({ in_state with regs := a }, false)
+  else
+    if cls = isa.CLS_LDX
+    then
+      let rk ← region.load_kind in_state.spills inst
+      let i ← lift (UScalar.cast .Usize inst.dst)
+      let a ← Array.update in_state.regs i rk
+      ok ({ in_state with regs := a }, false)
+    else
+      if cls = isa.CLS_ST
+      then
+        let (refused, in_state1) ← region.transfer_store in_state inst cls
+        ok (in_state1, refused)
+      else
+        if cls = isa.CLS_STX
+        then
+          let (refused, in_state1) ← region.transfer_store in_state inst cls
+          ok (in_state1, refused)
+        else
+          if cls = isa.CLS_ALU
+          then
+            let i ← lift (UScalar.cast .Usize inst.dst)
+            let a ← Array.update in_state.regs i region.RegKind.Scalar
+            ok ({ in_state with regs := a }, false)
+          else
+            if cls = isa.CLS_ALU64
+            then
+              let in_state1 ← region.transfer_alu64 in_state inst
+              ok (in_state1, false)
+            else
+              if inst.opcode = isa.OP_CALL
+              then
+                let in_state1 ←
+                  region.set_reg in_state 0#usize region.RegKind.Scalar
+                let in_state2 ← region.transfer_loop in_state1 1#usize
+                ok (in_state2, false)
+              else ok (in_state, false)
+
+/-- [async_ebpf_verified::region::EMPTY_SLOT]
+    Source: '../../src/verified/region.rs', lines 218:0-222:2 -/
+@[global_simps, irreducible]
+def region.EMPTY_SLOT : region.Slot :=
+  { off := 0#i32, epoch := 0#u64, kind := region.RegKind.Uninit }
+
+/-- [async_ebpf_verified::region::top]:
+    Source: '../../src/verified/region.rs', lines 225:0-234:1
+    Visibility: public -/
+def region.top : Result region.State := do
+  let a := Array.repeat 11#usize region.RegKind.Uninit
+  let a1 := Array.repeat 32#usize region.EMPTY_SLOT
+  ok
+    {
+      regs := a,
+      spills := { slots := a1, num_slots := 0#usize, invalid_epoch := 0#u64 }
+    }
+
+/-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::State}::clone]:
+    Source: '../../src/verified/region.rs', lines 211:9-211:14
+    Visibility: public -/
+def region.State.Insts.CoreCloneClone.clone
+  (self : region.State) : Result region.State := do
+  ok self
+
+/-- Trait implementation: [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::State}]
+    Source: '../../src/verified/region.rs', lines 211:9-211:14 -/
+@[reducible]
+def region.State.Insts.CoreCloneClone : core.clone.Clone region.State := {
+  clone := region.State.Insts.CoreCloneClone.clone
+}
+
+/-- [async_ebpf_verified::fixpoint::solve_from]: loop body 0:
+    Source: '../../src/verified/fixpoint.rs', lines 169:2-212:3
+    Visibility: public -/
+@[rust_loop_body]
+def fixpoint.solve_from_loop.body
+  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
+  (live : Slice Std.U16) (data_lo : Std.U64) (data_hi : Std.U64)
+  (states : alloc.vec.Vec region.State) (reached : alloc.vec.Vec Bool)
+  (on_list : alloc.vec.Vec Bool) (stack : alloc.vec.Vec Std.Usize)
+  (sp : Std.Usize) (refused : Bool) :
+  Result (ControlFlow ((alloc.vec.Vec region.State) × (alloc.vec.Vec Bool) ×
+    (alloc.vec.Vec Bool) × (alloc.vec.Vec Std.Usize) × Std.Usize × Bool)
+    ((alloc.vec.Vec region.State) × (alloc.vec.Vec Bool) × Bool))
+  := do
+  if sp > 0#usize
+  then
+    let sp1 ← sp - 1#usize
+    let pc ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.Usize)
+        stack sp1
+    let (_, index_mut_back) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+        on_list pc
+    let insn ← Slice.index_usize insns pc
+    let lddw_addr ← fixpoint.lddw_full_imm insns pc
+    let s ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice region.State)
+        states pc
+    let (out, r) ← region.transfer s insn lddw_addr data_lo data_hi
+    let (on_list1, refused1) ←
+      if r
+      then let on_list2 := index_mut_back false
+           ok (on_list2, true)
+      else let on_list2 := index_mut_back false
+           ok (on_list2, refused)
+    let (count, first, second) ←
+      fixpoint.function_successors insns pc start «end»
+    let (states1, reached1, on_list2, stack1, sp2, refused2) ←
+      if count >= 1#usize
+      then
+        do
+        let i ← Slice.index_usize live first
+        let ((top, r1), states2, reached2, on_list3, stack2) ←
+          fixpoint.propagate states reached on_list1 stack sp1 first out i
+        let b ← if r1
+                  then ok true
+                  else ok refused1
+        ok (states2, reached2, on_list3, stack2, top, b)
+      else ok (states, reached, on_list1, stack, sp1, refused1)
+    if count >= 2#usize
+    then
+      let i ← Slice.index_usize live second
+      let ((top, r2), states2, reached2, on_list3, stack2) ←
+        fixpoint.propagate states1 reached1 on_list2 stack1 sp2 second out i
+      if r2
+      then ok (cont (states2, reached2, on_list3, stack2, top, true))
+      else ok (cont (states2, reached2, on_list3, stack2, top, refused2))
+    else ok (cont (states1, reached1, on_list2, stack1, sp2, refused2))
+  else ok (done (states, reached, refused))
+
+/-- [async_ebpf_verified::fixpoint::solve_from]: loop 0:
+    Source: '../../src/verified/fixpoint.rs', lines 169:2-212:3
+    Visibility: public -/
+@[rust_loop]
+def fixpoint.solve_from_loop
+  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
+  (live : Slice Std.U16) (data_lo : Std.U64) (data_hi : Std.U64)
+  (states : alloc.vec.Vec region.State) (reached : alloc.vec.Vec Bool)
+  (on_list : alloc.vec.Vec Bool) (stack : alloc.vec.Vec Std.Usize)
+  (sp : Std.Usize) (refused : Bool) :
+  Result ((alloc.vec.Vec region.State) × (alloc.vec.Vec Bool) × Bool)
+  := do
+  loop
+    (fun (states1, reached1, on_list1, stack1, sp1, refused1) =>
+      fixpoint.solve_from_loop.body insns start «end» live data_lo data_hi
+      states1 reached1 on_list1 stack1 sp1 refused1)
+    (states, reached, on_list, stack, sp, refused)
+
+/-- [async_ebpf_verified::fixpoint::solve_from]:
+    Source: '../../src/verified/fixpoint.rs', lines 148:0-219:1
+    Visibility: public -/
+def fixpoint.solve_from
+  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
+  (entry : region.State) (live : Slice Std.U16) (data_lo : Std.U64)
+  (data_hi : Std.U64) :
+  Result fixpoint.Solution
+  := do
+  let num := Slice.len insns
+  let s ← region.top
+  let states ← alloc.vec.from_elem region.State.Insts.CoreCloneClone s num
+  let reached ← alloc.vec.from_elem core.clone.CloneBool false num
+  let stack ← alloc.vec.from_elem core.clone.CloneUsize 0#usize num
+  let (_, index_mut_back) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+      region.State) states start
+  let (_, index_mut_back1) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+      reached start
+  let (_, index_mut_back2) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+      reached start
+  let (_, index_mut_back3) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.Usize)
+      stack 0#usize
+  let stack1 := index_mut_back3 start
+  let on_list := index_mut_back2 true
+  let reached1 := index_mut_back1 true
+  let states1 := index_mut_back entry
+  let (states2, reached2, refused) ←
+    fixpoint.solve_from_loop insns start «end» live data_lo data_hi states1
+      reached1 on_list stack1 1#usize false
+  ok { states := states2, reached := reached2, refused }
+
+/-- [async_ebpf_verified::region::PointerSignature]
+    Source: '../../src/verified/region.rs', lines 396:0-398:1
+    Visibility: public -/
+structure region.PointerSignature where
+  regs : Array region.RegKind 11#usize
+
+/-- [async_ebpf_verified::region::apply_signature]:
+    Source: '../../src/verified/region.rs', lines 423:0-426:1
+    Visibility: public -/
+def region.apply_signature
+  (sig : region.PointerSignature) (state : region.State) :
+  Result region.State
+  := do
+  let rk ← region.frame_pointer_kind
+  let a ← Array.update sig.regs region.R10 rk
+  ok { state with regs := a }
+
+/-- [async_ebpf_verified::region::entry_state]:
+    Source: '../../src/verified/region.rs', lines 476:0-481:1
+    Visibility: public -/
+def region.entry_state
+  (sig : region.PointerSignature) (live : Std.U16) : Result region.State := do
+  let state ← region.top
+  let state1 ← region.apply_signature sig state
+  region.project state1 live
+
+/-- [async_ebpf_verified::fixpoint::solve]:
+    Source: '../../src/verified/fixpoint.rs', lines 223:0-234:1
+    Visibility: public -/
+def fixpoint.solve
+  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
+  (sig : region.PointerSignature) (live : Slice Std.U16) (data_lo : Std.U64)
+  (data_hi : Std.U64) :
+  Result fixpoint.Solution
+  := do
+  let i ← Slice.index_usize live start
+  let entry ← region.entry_state sig i
+  fixpoint.solve_from insns start «end» entry live data_lo data_hi
 
 /-- [async_ebpf_verified::isa::{impl core::clone::Clone for async_ebpf_verified::isa::Insn}::clone]:
     Source: '../../src/verified/isa.rs', lines 12:15-12:20
@@ -47,56 +1554,6 @@ def isa.Insn.Insts.CoreCloneClone : core.clone.Clone isa.Insn := {
 def isa.Insn.Insts.CoreMarkerCopy : core.marker.Copy isa.Insn := {
   cloneInst := isa.Insn.Insts.CoreCloneClone
 }
-
-/-- [async_ebpf_verified::isa::CLS_MASK]
-    Source: '../../src/verified/isa.rs', lines 26:0-26:30
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_MASK : Std.U8 := 7#u8
-
-/-- [async_ebpf_verified::isa::CLS_LD]
-    Source: '../../src/verified/isa.rs', lines 27:0-27:28
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_LD : Std.U8 := 0#u8
-
-/-- [async_ebpf_verified::isa::CLS_LDX]
-    Source: '../../src/verified/isa.rs', lines 28:0-28:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_LDX : Std.U8 := 1#u8
-
-/-- [async_ebpf_verified::isa::CLS_ST]
-    Source: '../../src/verified/isa.rs', lines 29:0-29:28
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_ST : Std.U8 := 2#u8
-
-/-- [async_ebpf_verified::isa::CLS_STX]
-    Source: '../../src/verified/isa.rs', lines 30:0-30:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_STX : Std.U8 := 3#u8
-
-/-- [async_ebpf_verified::isa::CLS_ALU]
-    Source: '../../src/verified/isa.rs', lines 31:0-31:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_ALU : Std.U8 := 4#u8
-
-/-- [async_ebpf_verified::isa::CLS_JMP]
-    Source: '../../src/verified/isa.rs', lines 32:0-32:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_JMP : Std.U8 := 5#u8
-
-/-- [async_ebpf_verified::isa::CLS_JMP32]
-    Source: '../../src/verified/isa.rs', lines 33:0-33:31
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_JMP32 : Std.U8 := 6#u8
-
-/-- [async_ebpf_verified::isa::CLS_ALU64]
-    Source: '../../src/verified/isa.rs', lines 34:0-34:31
-    Visibility: public -/
-@[global_simps, irreducible] def isa.CLS_ALU64 : Std.U8 := 7#u8
-
-/-- [async_ebpf_verified::isa::SRC_REG]
-    Source: '../../src/verified/isa.rs', lines 36:0-36:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.SRC_REG : Std.U8 := 8#u8
 
 /-- [async_ebpf_verified::isa::SIZE_MASK]
     Source: '../../src/verified/isa.rs', lines 38:0-38:31
@@ -147,11 +1604,6 @@ def isa.Insn.Insts.CoreMarkerCopy : core.marker.Copy isa.Insn := {
     Source: '../../src/verified/isa.rs', lines 48:0-48:33
     Visibility: public -/
 @[global_simps, irreducible] def isa.MODE_ATOMIC : Std.U8 := 192#u8
-
-/-- [async_ebpf_verified::isa::ALU_MASK]
-    Source: '../../src/verified/isa.rs', lines 50:0-50:30
-    Visibility: public -/
-@[global_simps, irreducible] def isa.ALU_MASK : Std.U8 := 240#u8
 
 /-- [async_ebpf_verified::isa::ALU_ADD]
     Source: '../../src/verified/isa.rs', lines 51:0-51:29
@@ -314,31 +1766,6 @@ def isa.ATOMIC_OP_XCHG : Std.I32 := 224#i32 ||| isa.ATOMIC_OP_FETCH
     Visibility: public -/
 @[global_simps, irreducible]
 def isa.ATOMIC_OP_CMPXCHG : Std.I32 := 240#i32 ||| isa.ATOMIC_OP_FETCH
-
-/-- [async_ebpf_verified::isa::OP_LDDW]
-    Source: '../../src/verified/isa.rs', lines 86:0-86:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.OP_LDDW : Std.U8 := 24#u8
-
-/-- [async_ebpf_verified::isa::OP_CALL]
-    Source: '../../src/verified/isa.rs', lines 87:0-87:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.OP_CALL : Std.U8 := 133#u8
-
-/-- [async_ebpf_verified::isa::OP_EXIT]
-    Source: '../../src/verified/isa.rs', lines 88:0-88:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.OP_EXIT : Std.U8 := 149#u8
-
-/-- [async_ebpf_verified::isa::OP_JA]
-    Source: '../../src/verified/isa.rs', lines 89:0-89:27
-    Visibility: public -/
-@[global_simps, irreducible] def isa.OP_JA : Std.U8 := 5#u8
-
-/-- [async_ebpf_verified::isa::OP_JA32]
-    Source: '../../src/verified/isa.rs', lines 90:0-90:29
-    Visibility: public -/
-@[global_simps, irreducible] def isa.OP_JA32 : Std.U8 := 6#u8
 
 /-- [async_ebpf_verified::isa::Width]
     Source: '../../src/verified/isa.rs', lines 94:0-99:1
@@ -1721,61 +3148,6 @@ def layout.partition
     Visibility: public -/
 @[global_simps, irreducible] def region.REGION_FRAME : Std.U8 := 3#u8
 
-/-- [async_ebpf_verified::region::NUM_REGS]
-    Source: '../../src/verified/region.rs', lines 59:0-59:31
-    Visibility: public -/
-@[global_simps, irreducible] def region.NUM_REGS : Std.Usize := 11#usize
-
-/-- [async_ebpf_verified::region::R10]
-    Source: '../../src/verified/region.rs', lines 62:0-62:26
-    Visibility: public -/
-@[global_simps, irreducible] def region.R10 : Std.Usize := 10#usize
-
-/-- [async_ebpf_verified::region::MAX_TRACKED_SLOTS]
-    Source: '../../src/verified/region.rs', lines 69:0-69:40
-    Visibility: public -/
-@[global_simps, irreducible]
-def region.MAX_TRACKED_SLOTS : Std.Usize := 32#usize
-
-/-- [async_ebpf_verified::region::ALU_OP_ADD]
-    Source: '../../src/verified/region.rs', lines 71:0-71:28 -/
-@[global_simps, irreducible] def region.ALU_OP_ADD : Std.U8 := 0#u8
-
-/-- [async_ebpf_verified::region::ALU_OP_SUB]
-    Source: '../../src/verified/region.rs', lines 72:0-72:28 -/
-@[global_simps, irreducible] def region.ALU_OP_SUB : Std.U8 := 16#u8
-
-/-- [async_ebpf_verified::region::ALU_OP_MOV]
-    Source: '../../src/verified/region.rs', lines 73:0-73:28 -/
-@[global_simps, irreducible] def region.ALU_OP_MOV : Std.U8 := 176#u8
-
-/-- [async_ebpf_verified::region::ATOMIC_OP_MASK]
-    Source: '../../src/verified/region.rs', lines 74:0-74:33 -/
-@[global_simps, irreducible] def region.ATOMIC_OP_MASK : Std.I32 := 240#i32
-
-/-- [async_ebpf_verified::region::ATOMIC_OP_CMPXCHG]
-    Source: '../../src/verified/region.rs', lines 75:0-75:36 -/
-@[global_simps, irreducible] def region.ATOMIC_OP_CMPXCHG : Std.I32 := 240#i32
-
-/-- [async_ebpf_verified::region::StackKind]
-    Source: '../../src/verified/region.rs', lines 92:0-95:1
-    Visibility: public -/
-@[discriminant isize]
-inductive region.StackKind where
-| Current : Option Std.I32 → region.StackKind
-| Foreign : region.StackKind
-
-/-- [async_ebpf_verified::region::RegKind]
-    Source: '../../src/verified/region.rs', lines 82:0-88:1
-    Visibility: public -/
-@[discriminant isize]
-inductive region.RegKind where
-| Uninit : region.RegKind
-| Stack : region.StackKind → region.RegKind
-| Data : region.RegKind
-| Scalar : region.RegKind
-| Unknown : region.RegKind
-
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::RegKind}::clone]:
     Source: '../../src/verified/region.rs', lines 80:9-80:14
     Visibility: public -/
@@ -1820,125 +3192,6 @@ def region.StackKind.Insts.CoreMarkerCopy : core.marker.Copy region.StackKind
   cloneInst := region.StackKind.Insts.CoreCloneClone
 }
 
-/-- [async_ebpf_verified::region::kind_eq]:
-    Source: '../../src/verified/region.rs', lines 99:0-112:1
-    Visibility: public -/
-def region.kind_eq
-  (a : region.RegKind) (b : region.RegKind) : Result Bool := do
-  match a with
-  | region.RegKind.Uninit =>
-    match b with
-    | region.RegKind.Uninit => ok true
-    | region.RegKind.Stack _ => ok false
-    | region.RegKind.Data => ok false
-    | region.RegKind.Scalar => ok false
-    | region.RegKind.Unknown => ok false
-  | region.RegKind.Stack sk =>
-    match b with
-    | region.RegKind.Uninit => ok false
-    | region.RegKind.Stack sk1 =>
-      match sk with
-      | region.StackKind.Current o =>
-        match sk1 with
-        | region.StackKind.Current o1 =>
-          match o with
-          | none => match o1 with
-                    | none => ok true
-                    | some _ => ok false
-          | some x => match o1 with
-                      | none => ok false
-                      | some y => ok (x = y)
-        | region.StackKind.Foreign => ok false
-      | region.StackKind.Foreign =>
-        match sk1 with
-        | region.StackKind.Current _ => ok false
-        | region.StackKind.Foreign => ok true
-    | region.RegKind.Data => ok false
-    | region.RegKind.Scalar => ok false
-    | region.RegKind.Unknown => ok false
-  | region.RegKind.Data =>
-    match b with
-    | region.RegKind.Uninit => ok false
-    | region.RegKind.Stack _ => ok false
-    | region.RegKind.Data => ok true
-    | region.RegKind.Scalar => ok false
-    | region.RegKind.Unknown => ok false
-  | region.RegKind.Scalar =>
-    match b with
-    | region.RegKind.Uninit => ok false
-    | region.RegKind.Stack _ => ok false
-    | region.RegKind.Data => ok false
-    | region.RegKind.Scalar => ok true
-    | region.RegKind.Unknown => ok false
-  | region.RegKind.Unknown =>
-    match b with
-    | region.RegKind.Uninit => ok false
-    | region.RegKind.Stack _ => ok false
-    | region.RegKind.Data => ok false
-    | region.RegKind.Scalar => ok false
-    | region.RegKind.Unknown => ok true
-
-/-- [async_ebpf_verified::region::meet]:
-    Source: '../../src/verified/region.rs', lines 115:0-135:1
-    Visibility: public -/
-def region.meet
-  (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
-  let b1 ← region.kind_eq a b
-  if b1
-  then ok a
-  else
-    match a with
-    | region.RegKind.Uninit => ok b
-    | region.RegKind.Stack x =>
-      match b with
-      | region.RegKind.Uninit => ok a
-      | region.RegKind.Stack y =>
-        match x with
-        | region.StackKind.Current o =>
-          match y with
-          | region.StackKind.Current o1 =>
-            match o with
-            | none => ok a
-            | some p =>
-              match o1 with
-              | none => ok b
-              | some q =>
-                if p = q
-                then ok a
-                else ok (region.RegKind.Stack (region.StackKind.Current none))
-          | region.StackKind.Foreign =>
-            ok (region.RegKind.Stack (region.StackKind.Current none))
-        | region.StackKind.Foreign =>
-          match y with
-          | region.StackKind.Current _ =>
-            ok (region.RegKind.Stack (region.StackKind.Current none))
-          | region.StackKind.Foreign =>
-            ok (region.RegKind.Stack region.StackKind.Foreign)
-      | region.RegKind.Data => ok region.RegKind.Unknown
-      | region.RegKind.Scalar => ok region.RegKind.Unknown
-      | region.RegKind.Unknown => ok region.RegKind.Unknown
-    | region.RegKind.Data =>
-      match b with
-      | region.RegKind.Uninit => ok region.RegKind.Data
-      | region.RegKind.Stack _ => ok region.RegKind.Unknown
-      | region.RegKind.Data => ok region.RegKind.Unknown
-      | region.RegKind.Scalar => ok region.RegKind.Unknown
-      | region.RegKind.Unknown => ok region.RegKind.Unknown
-    | region.RegKind.Scalar =>
-      match b with
-      | region.RegKind.Uninit => ok region.RegKind.Scalar
-      | region.RegKind.Stack _ => ok region.RegKind.Unknown
-      | region.RegKind.Data => ok region.RegKind.Unknown
-      | region.RegKind.Scalar => ok region.RegKind.Unknown
-      | region.RegKind.Unknown => ok region.RegKind.Unknown
-    | region.RegKind.Unknown =>
-      match b with
-      | region.RegKind.Uninit => ok region.RegKind.Unknown
-      | region.RegKind.Stack _ => ok region.RegKind.Unknown
-      | region.RegKind.Data => ok region.RegKind.Unknown
-      | region.RegKind.Scalar => ok region.RegKind.Unknown
-      | region.RegKind.Unknown => ok region.RegKind.Unknown
-
 /-- [async_ebpf_verified::region::region_of]:
     Source: '../../src/verified/region.rs', lines 138:0-144:1
     Visibility: public -/
@@ -1949,28 +3202,6 @@ def region.region_of (kind : region.RegKind) : Result Std.U8 := do
   | region.RegKind.Data => ok region.REGION_DATA
   | region.RegKind.Scalar => ok region.REGION_UNKNOWN
   | region.RegKind.Unknown => ok region.REGION_UNKNOWN
-
-/-- [async_ebpf_verified::region::is_pointer]:
-    Source: '../../src/verified/region.rs', lines 146:0-152:1
-    Visibility: public -/
-def region.is_pointer (kind : region.RegKind) : Result Bool := do
-  match kind with
-  | region.RegKind.Uninit => ok false
-  | region.RegKind.Stack _ => ok true
-  | region.RegKind.Data => ok true
-  | region.RegKind.Scalar => ok false
-  | region.RegKind.Unknown => ok false
-
-/-- [async_ebpf_verified::region::is_stack]:
-    Source: '../../src/verified/region.rs', lines 154:0-159:1
-    Visibility: public -/
-def region.is_stack (kind : region.RegKind) : Result Bool := do
-  match kind with
-  | region.RegKind.Uninit => ok false
-  | region.RegKind.Stack _ => ok true
-  | region.RegKind.Data => ok false
-  | region.RegKind.Scalar => ok false
-  | region.RegKind.Unknown => ok false
 
 /-- [async_ebpf_verified::region::foreign_for_call]:
     Source: '../../src/verified/region.rs', lines 162:0-167:1
@@ -1984,34 +3215,6 @@ def region.foreign_for_call
   | region.RegKind.Data => ok region.RegKind.Data
   | region.RegKind.Scalar => ok region.RegKind.Scalar
   | region.RegKind.Unknown => ok region.RegKind.Unknown
-
-/-- [async_ebpf_verified::region::aliases_current_stack]:
-    Source: '../../src/verified/region.rs', lines 170:0-175:1
-    Visibility: public -/
-def region.aliases_current_stack (kind : region.RegKind) : Result Bool := do
-  match kind with
-  | region.RegKind.Uninit => ok true
-  | region.RegKind.Stack sk =>
-    match sk with
-    | region.StackKind.Current _ => ok true
-    | region.StackKind.Foreign => ok false
-  | region.RegKind.Data => ok true
-  | region.RegKind.Scalar => ok true
-  | region.RegKind.Unknown => ok true
-
-/-- [async_ebpf_verified::region::frame_pointer_kind]:
-    Source: '../../src/verified/region.rs', lines 178:0-180:1
-    Visibility: public -/
-def region.frame_pointer_kind : Result region.RegKind := do
-  ok (region.RegKind.Stack (region.StackKind.Current (some 0#i32)))
-
-/-- [async_ebpf_verified::region::Slot]
-    Source: '../../src/verified/region.rs', lines 186:0-190:1
-    Visibility: public -/
-structure region.Slot where
-  off : Std.I32
-  epoch : Std.U64
-  kind : region.RegKind
 
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::Slot}::clone]:
     Source: '../../src/verified/region.rs', lines 184:9-184:14
@@ -2034,14 +3237,6 @@ def region.Slot.Insts.CoreMarkerCopy : core.marker.Copy region.Slot := {
   cloneInst := region.Slot.Insts.CoreCloneClone
 }
 
-/-- [async_ebpf_verified::region::Spills]
-    Source: '../../src/verified/region.rs', lines 200:0-207:1
-    Visibility: public -/
-structure region.Spills where
-  slots : Array region.Slot 32#usize
-  num_slots : Std.Usize
-  invalid_epoch : Std.U64
-
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::Spills}::clone]:
     Source: '../../src/verified/region.rs', lines 198:9-198:14
     Visibility: public -/
@@ -2063,343 +3258,12 @@ def region.Spills.Insts.CoreMarkerCopy : core.marker.Copy region.Spills := {
   cloneInst := region.Spills.Insts.CoreCloneClone
 }
 
-/-- [async_ebpf_verified::region::State]
-    Source: '../../src/verified/region.rs', lines 213:0-216:1
-    Visibility: public -/
-structure region.State where
-  regs : Array region.RegKind 11#usize
-  spills : region.Spills
-
-/-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::State}::clone]:
-    Source: '../../src/verified/region.rs', lines 211:9-211:14
-    Visibility: public -/
-def region.State.Insts.CoreCloneClone.clone
-  (self : region.State) : Result region.State := do
-  ok self
-
-/-- Trait implementation: [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::State}]
-    Source: '../../src/verified/region.rs', lines 211:9-211:14 -/
-@[reducible]
-def region.State.Insts.CoreCloneClone : core.clone.Clone region.State := {
-  clone := region.State.Insts.CoreCloneClone.clone
-}
-
 /-- Trait implementation: [async_ebpf_verified::region::{impl core::marker::Copy for async_ebpf_verified::region::State}]
     Source: '../../src/verified/region.rs', lines 211:16-211:20 -/
 @[reducible]
 def region.State.Insts.CoreMarkerCopy : core.marker.Copy region.State := {
   cloneInst := region.State.Insts.CoreCloneClone
 }
-
-/-- [async_ebpf_verified::region::EMPTY_SLOT]
-    Source: '../../src/verified/region.rs', lines 218:0-222:2 -/
-@[global_simps, irreducible]
-def region.EMPTY_SLOT : region.Slot :=
-  { off := 0#i32, epoch := 0#u64, kind := region.RegKind.Uninit }
-
-/-- [async_ebpf_verified::region::top]:
-    Source: '../../src/verified/region.rs', lines 225:0-234:1
-    Visibility: public -/
-def region.top : Result region.State := do
-  let a := Array.repeat 11#usize region.RegKind.Uninit
-  let a1 := Array.repeat 32#usize region.EMPTY_SLOT
-  ok
-    {
-      regs := a,
-      spills := { slots := a1, num_slots := 0#usize, invalid_epoch := 0#u64 }
-    }
-
-/-- [async_ebpf_verified::region::effective_kind]:
-    Source: '../../src/verified/region.rs', lines 237:0-243:1 -/
-def region.effective_kind
-  (spills : region.Spills) (epoch : Std.U64) (kind : region.RegKind) :
-  Result region.RegKind
-  := do
-  if epoch >= spills.invalid_epoch
-  then ok kind
-  else ok region.RegKind.Unknown
-
-/-- [async_ebpf_verified::region::find_slot]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 248:2-255:1 -/
-@[rust_loop_body]
-def region.find_slot_loop.body
-  (spills : region.Spills) (off : Std.I32) (i : Std.Usize) :
-  Result (ControlFlow Std.Usize (Option Std.Usize))
-  := do
-  if i < spills.num_slots
-  then
-    let s ← Array.index_usize spills.slots i
-    if s.off = off
-    then ok (done (some i))
-    else let i1 ← i + 1#usize
-         ok (cont i1)
-  else ok (done none)
-
-/-- [async_ebpf_verified::region::find_slot]: loop 0:
-    Source: '../../src/verified/region.rs', lines 248:2-255:1 -/
-@[rust_loop]
-def region.find_slot_loop
-  (spills : region.Spills) (off : Std.I32) (i : Std.Usize) :
-  Result (Option Std.Usize)
-  := do
-  loop
-    (fun i1 => region.find_slot_loop.body spills off i1)
-    i
-
-/-- [async_ebpf_verified::region::find_slot]:
-    Source: '../../src/verified/region.rs', lines 246:0-255:1 -/
-@[reducible]
-def region.find_slot
-  (spills : region.Spills) (off : Std.I32) : Result (Option Std.Usize) := do
-  region.find_slot_loop spills off 0#usize
-
-/-- [async_ebpf_verified::region::slot_kind]:
-    Source: '../../src/verified/region.rs', lines 259:0-264:1
-    Visibility: public -/
-def region.slot_kind
-  (spills : region.Spills) (off : Std.I32) : Result region.RegKind := do
-  let o ← region.find_slot spills off
-  match o with
-  | none => ok region.RegKind.Uninit
-  | some i =>
-    let s ← Array.index_usize spills.slots i
-    region.effective_kind spills s.epoch s.kind
-
-/-- [async_ebpf_verified::region::insert_slot]:
-    Source: '../../src/verified/region.rs', lines 268:0-284:1
-    Visibility: public -/
-def region.insert_slot
-  (spills : region.Spills) (off : Std.I32) (epoch : Std.U64)
-  (kind : region.RegKind) :
-  Result (Bool × region.Spills)
-  := do
-  let o ← region.find_slot spills off
-  match o with
-  | none =>
-    if spills.num_slots < region.MAX_TRACKED_SLOTS
-    then
-      let a ←
-        Array.update spills.slots spills.num_slots ({ off, epoch, kind } :
-          region.Slot)
-      let i ← spills.num_slots + 1#usize
-      ok (true, { spills with slots := a, num_slots := i })
-    else ok (false, spills)
-  | some i =>
-    let a ← Array.update spills.slots i ({ off, epoch, kind } : region.Slot)
-    ok (true, { spills with slots := a })
-
-/-- [async_ebpf_verified::region::invalidate_slots]:
-    Source: '../../src/verified/region.rs', lines 289:0-291:1
-    Visibility: public -/
-def region.invalidate_slots
-  (spills : region.Spills) : Result region.Spills := do
-  let i ← spills.invalid_epoch + 1#u64
-  ok { spills with invalid_epoch := i }
-
-/-- [async_ebpf_verified::region::slot_overlaps]:
-    Source: '../../src/verified/region.rs', lines 294:0-302:1 -/
-def region.slot_overlaps
-  (slot_off : Std.I32) (start : Std.I32) («end» : Std.I32) :
-  Result Bool
-  := do
-  let i ← core.num.I32.MAX - 8#i32
-  if slot_off > i
-  then ok true
-  else
-    let slot_end ← slot_off + 8#i32
-    if start < slot_end
-    then ok (slot_off < «end»)
-    else ok false
-
-/-- [async_ebpf_verified::region::invalidate_stack_write]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 322:2-331:3
-    Visibility: public -/
-@[rust_loop_body]
-def region.invalidate_stack_write_loop.body
-  (start : Std.I32) («end» : Std.I32) (spills : region.Spills)
-  (i : Std.Usize) :
-  Result (ControlFlow (region.Spills × Std.Usize) ((Array region.Slot
-    32#usize) × Std.Usize × Std.U64))
-  := do
-  if i < spills.num_slots
-  then
-    let s ← Array.index_usize spills.slots i
-    let b ← region.slot_overlaps s.off start «end»
-    if b
-    then
-      let a ←
-        Array.update spills.slots i
-          {
-            s
-              with
-              epoch := spills.invalid_epoch, kind := region.RegKind.Unknown
-          }
-      let i1 ← i + 1#usize
-      ok (cont ({ spills with slots := a }, i1))
-    else let i1 ← i + 1#usize
-         ok (cont (spills, i1))
-  else ok (done (spills.slots, spills.num_slots, spills.invalid_epoch))
-
-/-- [async_ebpf_verified::region::invalidate_stack_write]: loop 0:
-    Source: '../../src/verified/region.rs', lines 322:2-331:3
-    Visibility: public -/
-@[rust_loop]
-def region.invalidate_stack_write_loop
-  (spills : region.Spills) (start : Std.I32) («end» : Std.I32)
-  (i : Std.Usize) :
-  Result ((Array region.Slot 32#usize) × Std.Usize × Std.U64)
-  := do
-  loop
-    (fun (spills1, i1) => region.invalidate_stack_write_loop.body start «end»
-      spills1 i1)
-    (spills, i)
-
-/-- [async_ebpf_verified::region::invalidate_stack_write]:
-    Source: '../../src/verified/region.rs', lines 307:0-332:1
-    Visibility: public -/
-def region.invalidate_stack_write
-  (spills : region.Spills) (start : Option Std.I32) (width : Std.U8) :
-  Result region.Spills
-  := do
-  match start with
-  | none => region.invalidate_slots spills
-  | some s =>
-    let width1 ← lift (UScalar.hcast .I32 width)
-    let i ← core.num.I32.MAX - width1
-    if s > i
-    then region.invalidate_slots spills
-    else
-      let «end» ← s + width1
-      let (a, i1, i2) ←
-        region.invalidate_stack_write_loop spills s «end» 0#usize
-      ok { slots := a, num_slots := i1, invalid_epoch := i2 }
-
-/-- [async_ebpf_verified::region::meet_regs]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 338:2-345:3 -/
-@[rust_loop_body]
-def region.meet_regs_loop.body
-  (other : Array region.RegKind 11#usize)
-  (regs : Array region.RegKind 11#usize) (changed : Bool) (r : Std.Usize) :
-  Result (ControlFlow ((Array region.RegKind 11#usize) × Bool × Std.Usize)
-    (Bool × (Array region.RegKind 11#usize)))
-  := do
-  if r < region.NUM_REGS
-  then
-    let rk ← Array.index_usize regs r
-    let rk1 ← Array.index_usize other r
-    let merged ← region.meet rk rk1
-    let b ← region.kind_eq merged rk
-    if b
-    then let r1 ← r + 1#usize
-         ok (cont (regs, changed, r1))
-    else
-      let a ← Array.update regs r merged
-      let r1 ← r + 1#usize
-      ok (cont (a, true, r1))
-  else ok (done (changed, regs))
-
-/-- [async_ebpf_verified::region::meet_regs]: loop 0:
-    Source: '../../src/verified/region.rs', lines 338:2-345:3 -/
-@[rust_loop]
-def region.meet_regs_loop
-  (regs : Array region.RegKind 11#usize)
-  (other : Array region.RegKind 11#usize) (changed : Bool) (r : Std.Usize) :
-  Result (Bool × (Array region.RegKind 11#usize))
-  := do
-  loop
-    (fun (regs1, changed1, r1) => region.meet_regs_loop.body other regs1
-      changed1 r1)
-    (regs, changed, r)
-
-/-- [async_ebpf_verified::region::meet_regs]:
-    Source: '../../src/verified/region.rs', lines 335:0-347:1 -/
-@[reducible]
-def region.meet_regs
-  (regs : Array region.RegKind 11#usize)
-  (other : Array region.RegKind 11#usize) :
-  Result (Bool × (Array region.RegKind 11#usize))
-  := do
-  region.meet_regs_loop regs other false 0#usize
-
-/-- [async_ebpf_verified::region::meet_spills]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 363:4-380:5 -/
-@[rust_loop_body]
-def region.meet_spills_loop.body
-  (other : region.Spills) (spills : region.Spills) (changed : Bool)
-  (refused : Bool) (i : Std.Usize) :
-  Result (ControlFlow (region.Spills × Bool × Bool × Std.Usize)
-    (region.Spills × Bool × Bool))
-  := do
-  if i < other.num_slots
-  then
-    let s ← Array.index_usize other.slots i
-    let cur ← region.slot_kind spills s.off
-    let incoming ← region.effective_kind other s.epoch s.kind
-    let merged ← region.meet cur incoming
-    let b ← region.kind_eq merged cur
-    let (spills1, changed1, refused1) ←
-      if b
-      then ok (spills, changed, refused)
-      else
-        do
-        let (b1, spills2) ←
-          region.insert_slot spills s.off spills.invalid_epoch merged
-        let (b2, b3) ← if b1
-                         then ok (true, refused)
-                         else ok (changed, true)
-        ok (spills2, b2, b3)
-    let i1 ← i + 1#usize
-    ok (cont (spills1, changed1, refused1, i1))
-  else ok (done (spills, changed, refused))
-
-/-- [async_ebpf_verified::region::meet_spills]: loop 0:
-    Source: '../../src/verified/region.rs', lines 363:4-380:5 -/
-@[rust_loop]
-def region.meet_spills_loop
-  (spills : region.Spills) (other : region.Spills) (changed : Bool)
-  (refused : Bool) (i : Std.Usize) :
-  Result (region.Spills × Bool × Bool)
-  := do
-  loop
-    (fun (spills1, changed1, refused1, i1) => region.meet_spills_loop.body
-      other spills1 changed1 refused1 i1)
-    (spills, changed, refused, i)
-
-/-- [async_ebpf_verified::region::meet_spills]:
-    Source: '../../src/verified/region.rs', lines 351:0-383:1 -/
-def region.meet_spills
-  (spills : region.Spills) (other : region.Spills) :
-  Result ((Bool × Bool) × region.Spills)
-  := do
-  if spills.num_slots = 0#usize
-  then
-    if other.num_slots != 0#usize
-    then ok ((true, false), other)
-    else ok ((false, false), spills)
-  else
-    let (spills1, changed, refused) ←
-      region.meet_spills_loop spills other false false 0#usize
-    ok ((changed, refused), spills1)
-
-/-- [async_ebpf_verified::region::meet_from]:
-    Source: '../../src/verified/region.rs', lines 387:0-391:1
-    Visibility: public -/
-def region.meet_from
-  (state : region.State) (other : region.State) :
-  Result ((Bool × Bool) × region.State)
-  := do
-  let (regs_changed, a) ← region.meet_regs state.regs other.regs
-  let ((spills_changed, refused), s) ←
-    region.meet_spills state.spills other.spills
-  if regs_changed
-  then ok ((true, refused), { regs := a, spills := s })
-  else ok ((spills_changed, refused), { regs := a, spills := s })
-
-/-- [async_ebpf_verified::region::PointerSignature]
-    Source: '../../src/verified/region.rs', lines 396:0-398:1
-    Visibility: public -/
-structure region.PointerSignature where
-  regs : Array region.RegKind 11#usize
 
 /-- [async_ebpf_verified::region::{impl core::clone::Clone for async_ebpf_verified::region::PointerSignature}::clone]:
     Source: '../../src/verified/region.rs', lines 394:9-394:14
@@ -2452,17 +3316,6 @@ def region.entry_signature : Result region.PointerSignature := do
   let regs2 ← Array.update regs1 region.R10 rk
   ok { regs := regs2 }
 
-/-- [async_ebpf_verified::region::apply_signature]:
-    Source: '../../src/verified/region.rs', lines 423:0-426:1
-    Visibility: public -/
-def region.apply_signature
-  (sig : region.PointerSignature) (state : region.State) :
-  Result region.State
-  := do
-  let rk ← region.frame_pointer_kind
-  let a ← Array.update sig.regs region.R10 rk
-  ok { state with regs := a }
-
 /-- [async_ebpf_verified::region::signature_from_state]: loop body 0:
     Source: '../../src/verified/region.rs', lines 433:2-438:3
     Visibility: public -/
@@ -2508,127 +3361,15 @@ def region.signature_from_state
   let regs1 ← Array.update regs region.R10 rk
   ok { regs := regs1 }
 
-/-- [async_ebpf_verified::region::set_kind]:
-    Source: '../../src/verified/region.rs', lines 458:0-460:1 -/
-def region.set_kind
-  (regs : Array region.RegKind 11#usize) (reg : Std.Usize)
-  (kind : region.RegKind) :
-  Result (Array region.RegKind 11#usize)
-  := do
-  Array.update regs reg kind
-
-/-- [async_ebpf_verified::region::mask_signature]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 448:2-453:3
-    Visibility: public -/
-@[rust_loop_body]
-def region.mask_signature_loop.body
-  (mask : Std.U16) (regs : Array region.RegKind 11#usize) (reg : Std.Usize) :
-  Result (ControlFlow ((Array region.RegKind 11#usize) × Std.Usize) (Array
-    region.RegKind 11#usize))
-  := do
-  if reg < region.NUM_REGS
-  then
-    let regs1 ←
-      if reg != region.R10
-      then
-        do
-        let i ← 1#u16 <<< reg
-        let i1 ← lift (mask &&& i)
-        if i1 = 0#u16
-        then region.set_kind regs reg region.RegKind.Unknown
-        else ok regs
-      else ok regs
-    let reg1 ← reg + 1#usize
-    ok (cont (regs1, reg1))
-  else ok (done regs)
-
-/-- [async_ebpf_verified::region::mask_signature]: loop 0:
-    Source: '../../src/verified/region.rs', lines 448:2-453:3
-    Visibility: public -/
-@[rust_loop]
-def region.mask_signature_loop
-  (mask : Std.U16) (regs : Array region.RegKind 11#usize) (reg : Std.Usize) :
-  Result (Array region.RegKind 11#usize)
-  := do
-  loop
-    (fun (regs1, reg1) => region.mask_signature_loop.body mask regs1 reg1)
-    (regs, reg)
-
 /-- [async_ebpf_verified::region::mask_signature]:
-    Source: '../../src/verified/region.rs', lines 445:0-455:1
+    Source: '../../src/verified/region.rs', lines 468:0-472:1
     Visibility: public -/
 def region.mask_signature
   (sig : region.PointerSignature) (mask : Std.U16) :
   Result region.PointerSignature
   := do
-  let regs ← region.mask_signature_loop mask sig.regs 0#usize
+  let regs ← region.project_regs sig.regs mask
   ok { regs }
-
-/-- [async_ebpf_verified::region::access_width]:
-    Source: '../../src/verified/region.rs', lines 463:0-470:1
-    Visibility: public -/
-def region.access_width (opcode : Std.U8) : Result Std.U8 := do
-  let i ← lift (opcode &&& 24#u8)
-  match i with
-  | 0#uscalar => ok 4#u8
-  | 8#uscalar => ok 2#u8
-  | 16#uscalar => ok 1#u8
-  | _ => ok 8#u8
-
-/-- [async_ebpf_verified::region::is_atomic]:
-    Source: '../../src/verified/region.rs', lines 473:0-475:1
-    Visibility: public -/
-def region.is_atomic (opcode : Std.U8) : Result Bool := do
-  let i ← lift (opcode &&& isa.CLS_MASK)
-  if i = isa.CLS_STX
-  then let i1 ← lift (opcode &&& 224#u8)
-       ok (i1 = 192#u8)
-  else ok false
-
-/-- [async_ebpf_verified::region::checked_add_i32]:
-    Source: '../../src/verified/region.rs', lines 486:0-495:1 -/
-def region.checked_add_i32
-  (a : Std.I32) (b : Std.I32) : Result (Option Std.I32) := do
-  if b >= 0#i32
-  then
-    let i ← core.num.I32.MAX - b
-    if a > i
-    then ok none
-    else let i1 ← a + b
-         ok (some i1)
-  else
-    let i ← core.num.I32.MIN - b
-    if a < i
-    then ok none
-    else let i1 ← a + b
-         ok (some i1)
-
-/-- [async_ebpf_verified::region::stack_access_start]:
-    Source: '../../src/verified/region.rs', lines 479:0-484:1
-    Visibility: public -/
-def region.stack_access_start
-  (base : region.RegKind) (offset : Std.I16) : Result (Option Std.I32) := do
-  match base with
-  | region.RegKind.Uninit => ok none
-  | region.RegKind.Stack sk =>
-    match sk with
-    | region.StackKind.Current o =>
-      match o with
-      | none => ok none
-      | some base_off =>
-        let i ← lift (IScalar.cast .I32 offset)
-        region.checked_add_i32 base_off i
-    | region.StackKind.Foreign => ok none
-  | region.RegKind.Data => ok none
-  | region.RegKind.Scalar => ok none
-  | region.RegKind.Unknown => ok none
-
-/-- [async_ebpf_verified::region::wrapping_neg_i32]:
-    Source: '../../src/verified/region.rs', lines 498:0-504:1 -/
-def region.wrapping_neg_i32 (imm : Std.I32) : Result Std.I32 := do
-  if imm = core.num.I32.MIN
-  then ok core.num.I32.MIN
-  else -. imm
 
 /-- [async_ebpf_verified::stack::in_frame_window]:
     Source: '../../src/verified/stack.rs', lines 86:0-90:1
@@ -2647,7 +3388,7 @@ def stack.in_frame_window
   else ok false
 
 /-- [async_ebpf_verified::region::frame_access]:
-    Source: '../../src/verified/region.rs', lines 526:0-537:1
+    Source: '../../src/verified/region.rs', lines 552:0-563:1
     Visibility: public -/
 def region.frame_access
   (state : region.State) (inst : isa.Insn) (base : Std.Usize)
@@ -2671,7 +3412,7 @@ def region.frame_access
     else ok false
 
 /-- [async_ebpf_verified::region::classify]:
-    Source: '../../src/verified/region.rs', lines 543:0-560:1
+    Source: '../../src/verified/region.rs', lines 569:0-586:1
     Visibility: public -/
 def region.classify
   (state : region.State) (inst : isa.Insn) (frame_size : Std.U16) :
@@ -2709,371 +3450,8 @@ def region.classify
         else ok (true, plain, plain)
       else ok (false, region.REGION_UNKNOWN, region.REGION_UNKNOWN)
 
-/-- [async_ebpf_verified::region::add_kinds]:
-    Source: '../../src/verified/region.rs', lines 563:0-574:1
-    Visibility: public -/
-def region.add_kinds
-  (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
-  match a with
-  | region.RegKind.Uninit => ok region.RegKind.Unknown
-  | region.RegKind.Stack sk =>
-    match b with
-    | region.RegKind.Uninit => ok region.RegKind.Unknown
-    | region.RegKind.Stack _ => ok region.RegKind.Unknown
-    | region.RegKind.Data => ok region.RegKind.Unknown
-    | region.RegKind.Scalar =>
-      match sk with
-      | region.StackKind.Current _ =>
-        ok (region.RegKind.Stack (region.StackKind.Current none))
-      | region.StackKind.Foreign => ok a
-    | region.RegKind.Unknown => ok region.RegKind.Unknown
-  | region.RegKind.Data =>
-    match b with
-    | region.RegKind.Uninit => ok region.RegKind.Unknown
-    | region.RegKind.Stack _ => ok region.RegKind.Unknown
-    | region.RegKind.Data => ok region.RegKind.Unknown
-    | region.RegKind.Scalar => ok region.RegKind.Data
-    | region.RegKind.Unknown => ok region.RegKind.Unknown
-  | region.RegKind.Scalar =>
-    match b with
-    | region.RegKind.Uninit => ok region.RegKind.Unknown
-    | region.RegKind.Stack sk =>
-      match sk with
-      | region.StackKind.Current _ =>
-        ok (region.RegKind.Stack (region.StackKind.Current none))
-      | region.StackKind.Foreign => ok b
-    | region.RegKind.Data => ok region.RegKind.Data
-    | region.RegKind.Scalar => ok region.RegKind.Scalar
-    | region.RegKind.Unknown => ok region.RegKind.Unknown
-  | region.RegKind.Unknown => ok region.RegKind.Unknown
-
-/-- [async_ebpf_verified::region::sub_kinds]:
-    Source: '../../src/verified/region.rs', lines 577:0-587:1
-    Visibility: public -/
-def region.sub_kinds
-  (a : region.RegKind) (b : region.RegKind) : Result region.RegKind := do
-  match a with
-  | region.RegKind.Uninit => ok region.RegKind.Unknown
-  | region.RegKind.Stack sk =>
-    match b with
-    | region.RegKind.Uninit => ok region.RegKind.Unknown
-    | region.RegKind.Stack _ => ok region.RegKind.Scalar
-    | region.RegKind.Data => ok region.RegKind.Unknown
-    | region.RegKind.Scalar =>
-      match sk with
-      | region.StackKind.Current _ =>
-        ok (region.RegKind.Stack (region.StackKind.Current none))
-      | region.StackKind.Foreign => ok a
-    | region.RegKind.Unknown => ok region.RegKind.Unknown
-  | region.RegKind.Data =>
-    match b with
-    | region.RegKind.Uninit => ok region.RegKind.Unknown
-    | region.RegKind.Stack _ => ok region.RegKind.Unknown
-    | region.RegKind.Data => ok region.RegKind.Scalar
-    | region.RegKind.Scalar => ok region.RegKind.Data
-    | region.RegKind.Unknown => ok region.RegKind.Unknown
-  | region.RegKind.Scalar =>
-    match b with
-    | region.RegKind.Uninit => ok region.RegKind.Unknown
-    | region.RegKind.Stack _ => ok region.RegKind.Unknown
-    | region.RegKind.Data => ok region.RegKind.Unknown
-    | region.RegKind.Scalar => ok region.RegKind.Scalar
-    | region.RegKind.Unknown => ok region.RegKind.Unknown
-  | region.RegKind.Unknown => ok region.RegKind.Unknown
-
-/-- [async_ebpf_verified::region::add_imm_kind]:
-    Source: '../../src/verified/region.rs', lines 591:0-602:1
-    Visibility: public -/
-def region.add_imm_kind
-  (a : region.RegKind) (imm : Std.I32) : Result region.RegKind := do
-  match a with
-  | region.RegKind.Uninit => ok region.RegKind.Unknown
-  | region.RegKind.Stack sk =>
-    match sk with
-    | region.StackKind.Current o =>
-      match o with
-      | none => ok a
-      | some off =>
-        let o1 ← region.checked_add_i32 off imm
-        ok (region.RegKind.Stack (region.StackKind.Current o1))
-    | region.StackKind.Foreign => ok a
-  | region.RegKind.Data => ok region.RegKind.Data
-  | region.RegKind.Scalar => ok region.RegKind.Scalar
-  | region.RegKind.Unknown => ok region.RegKind.Unknown
-
-/-- [async_ebpf_verified::region::load_kind]:
-    Source: '../../src/verified/region.rs', lines 606:0-617:1 -/
-def region.load_kind
-  (spills : region.Spills) (inst : isa.Insn) : Result region.RegKind := do
-  let i ← lift (UScalar.cast .Usize inst.src)
-  if i = region.R10
-  then
-    let i1 ← lift (IScalar.cast .I32 inst.offset)
-    let k ← region.slot_kind spills i1
-    let b ← region.is_pointer k
-    if b
-    then ok k
-    else ok region.RegKind.Scalar
-  else ok region.RegKind.Scalar
-
-/-- [async_ebpf_verified::region::set_reg]:
-    Source: '../../src/verified/region.rs', lines 622:0-624:1 -/
-def region.set_reg
-  (state : region.State) (reg : Std.Usize) (kind : region.RegKind) :
-  Result region.State
-  := do
-  let a ← Array.update state.regs reg kind
-  ok { state with regs := a }
-
-/-- [async_ebpf_verified::region::transfer_store]:
-    Source: '../../src/verified/region.rs', lines 628:0-683:1 -/
-def region.transfer_store
-  (s : region.State) (inst : isa.Insn) (cls : Std.U8) :
-  Result (Bool × region.State)
-  := do
-  let atomic ← region.is_atomic inst.opcode
-  let (s1, value) ←
-    if cls = isa.CLS_ST
-    then ok (s, region.RegKind.Scalar)
-    else
-      do
-      let i ← lift (UScalar.cast .Usize inst.src)
-      let value1 ← Array.index_usize s.regs i
-      ok (s, value1)
-  let width ← region.access_width inst.opcode
-  let i ← lift (UScalar.cast .Usize inst.dst)
-  let (s2, stack_base) ←
-    if i = region.R10
-    then do
-         let stack_base1 ← region.frame_pointer_kind
-         ok (s1, stack_base1)
-    else
-      do
-      let i1 ← lift (UScalar.cast .Usize inst.dst)
-      let stack_base1 ← Array.index_usize s1.regs i1
-      ok (s1, stack_base1)
-  let b ← region.is_stack stack_base
-  let (s3, atomic1, refused) ←
-    if b
-    then
-      do
-      let b1 ← region.aliases_current_stack stack_base
-      let s4 ←
-        if b1
-        then
-          do
-          let start ← region.stack_access_start stack_base inst.offset
-          let s5 ← region.invalidate_stack_write s2.spills start width
-          ok { s2 with spills := s5 }
-        else ok s2
-      let stored ←
-        if atomic
-        then ok region.RegKind.Unknown
-        else
-          match value with
-          | region.RegKind.Uninit => ok region.RegKind.Unknown
-          | region.RegKind.Stack _ => ok value
-          | region.RegKind.Data => ok region.RegKind.Data
-          | region.RegKind.Scalar => ok region.RegKind.Scalar
-          | region.RegKind.Unknown => ok region.RegKind.Unknown
-      let (s5, b2) ←
-        if atomic
-        then ok (s4, false)
-        else
-          if width = 8#u8
-          then
-            do
-            let o ← region.stack_access_start stack_base inst.offset
-            match o with
-            | none => ok (s4, false)
-            | some start =>
-              let (b3, s6) ←
-                region.insert_slot s4.spills start s4.spills.invalid_epoch
-                  stored
-              let b4 ← if b3
-                         then ok false
-                         else ok true
-              ok ({ s4 with spills := s6 }, b4)
-          else ok (s4, false)
-      ok (s5, atomic, b2)
-    else
-      do
-      let i1 ← lift (UScalar.cast .Usize inst.dst)
-      let rk ← Array.index_usize s2.regs i1
-      let s4 ←
-        match rk with
-        | region.RegKind.Uninit => region.invalidate_slots s2.spills
-        | region.RegKind.Stack _ => region.invalidate_slots s2.spills
-        | region.RegKind.Data => ok s2.spills
-        | region.RegKind.Scalar => region.invalidate_slots s2.spills
-        | region.RegKind.Unknown => region.invalidate_slots s2.spills
-      ok ({ s2 with spills := s4 }, atomic, false)
-  if atomic1
-  then
-    let i1 ← lift (UScalar.cast .Usize inst.src)
-    let (_, index_mut_back) ← Array.index_mut_usize s3.regs i1
-    let i2 ← lift (inst.imm &&& region.ATOMIC_OP_MASK)
-    if i2 = region.ATOMIC_OP_CMPXCHG
-    then
-      let a := index_mut_back region.RegKind.Unknown
-      let a1 ← Array.update a 0#usize region.RegKind.Unknown
-      ok (refused, { s3 with regs := a1 })
-    else
-      let a := index_mut_back region.RegKind.Unknown
-      ok (refused, { s3 with regs := a })
-  else ok (refused, s3)
-
-/-- [async_ebpf_verified::region::transfer_alu64]:
-    Source: '../../src/verified/region.rs', lines 686:0-717:1 -/
-def region.transfer_alu64
-  (s : region.State) (inst : isa.Insn) : Result region.State := do
-  let op ← lift (inst.opcode &&& isa.ALU_MASK)
-  let i ← lift (inst.opcode &&& isa.SRC_REG)
-  let dst ← lift (UScalar.cast .Usize inst.dst)
-  let src ← lift (UScalar.cast .Usize inst.src)
-  if op = region.ALU_OP_MOV
-  then
-    let (s1, k) ←
-      if i != 0#u8
-      then
-        do
-        let rk ← Array.index_usize s.regs src
-        let rk1 ←
-          match rk with
-          | region.RegKind.Uninit => ok region.RegKind.Unknown
-          | region.RegKind.Stack _ => ok rk
-          | region.RegKind.Data => ok rk
-          | region.RegKind.Scalar => ok rk
-          | region.RegKind.Unknown => ok rk
-        ok (s, rk1)
-      else ok (s, region.RegKind.Scalar)
-    let a ← Array.update s1.regs dst k
-    ok { s1 with regs := a }
-  else
-    if op = region.ALU_OP_ADD
-    then
-      let rk ←
-        if i != 0#u8
-        then
-          do
-          let rk1 ← Array.index_usize s.regs dst
-          let rk2 ← Array.index_usize s.regs src
-          region.add_kinds rk1 rk2
-        else
-          do
-          let rk1 ← Array.index_usize s.regs dst
-          region.add_imm_kind rk1 inst.imm
-      let a ← Array.update s.regs dst rk
-      ok { s with regs := a }
-    else
-      if op = region.ALU_OP_SUB
-      then
-        let rk ←
-          if i != 0#u8
-          then
-            do
-            let rk1 ← Array.index_usize s.regs dst
-            let rk2 ← Array.index_usize s.regs src
-            region.sub_kinds rk1 rk2
-          else
-            do
-            let rk1 ← Array.index_usize s.regs dst
-            let i1 ← region.wrapping_neg_i32 inst.imm
-            region.add_imm_kind rk1 i1
-        let a ← Array.update s.regs dst rk
-        ok { s with regs := a }
-      else
-        let a ← Array.update s.regs dst region.RegKind.Scalar
-        ok { s with regs := a }
-
-/-- [async_ebpf_verified::region::transfer]: loop body 0:
-    Source: '../../src/verified/region.rs', lines 763:4-766:5
-    Visibility: public -/
-@[rust_loop_body]
-def region.transfer_loop.body
-  (s : region.State) (r : Std.Usize) :
-  Result (ControlFlow (region.State × Std.Usize) region.State)
-  := do
-  if r <= 5#usize
-  then
-    let s1 ← region.set_reg s r region.RegKind.Unknown
-    let r1 ← r + 1#usize
-    ok (cont (s1, r1))
-  else ok (done s)
-
-/-- [async_ebpf_verified::region::transfer]: loop 0:
-    Source: '../../src/verified/region.rs', lines 763:4-766:5
-    Visibility: public -/
-@[rust_loop]
-def region.transfer_loop
-  (s : region.State) (r : Std.Usize) : Result region.State := do
-  loop
-    (fun (s1, r1) => region.transfer_loop.body s1 r1)
-    (s, r)
-
-/-- [async_ebpf_verified::region::transfer]:
-    Source: '../../src/verified/region.rs', lines 723:0-770:1
-    Visibility: public -/
-def region.transfer
-  (in_state : region.State) (inst : isa.Insn) (lddw_addr : Std.U64)
-  (data_lo : Std.U64) (data_hi : Std.U64) :
-  Result (region.State × Bool)
-  := do
-  let cls ← lift (inst.opcode &&& isa.CLS_MASK)
-  if cls = isa.CLS_LD
-  then
-    let rk ←
-      if inst.opcode = isa.OP_LDDW
-      then
-        if lddw_addr >= data_lo
-        then
-          if lddw_addr < data_hi
-          then ok region.RegKind.Data
-          else ok region.RegKind.Scalar
-        else ok region.RegKind.Scalar
-      else ok region.RegKind.Unknown
-    let i ← lift (UScalar.cast .Usize inst.dst)
-    let a ← Array.update in_state.regs i rk
-    ok ({ in_state with regs := a }, false)
-  else
-    if cls = isa.CLS_LDX
-    then
-      let rk ← region.load_kind in_state.spills inst
-      let i ← lift (UScalar.cast .Usize inst.dst)
-      let a ← Array.update in_state.regs i rk
-      ok ({ in_state with regs := a }, false)
-    else
-      if cls = isa.CLS_ST
-      then
-        let (refused, in_state1) ← region.transfer_store in_state inst cls
-        ok (in_state1, refused)
-      else
-        if cls = isa.CLS_STX
-        then
-          let (refused, in_state1) ← region.transfer_store in_state inst cls
-          ok (in_state1, refused)
-        else
-          if cls = isa.CLS_ALU
-          then
-            let i ← lift (UScalar.cast .Usize inst.dst)
-            let a ← Array.update in_state.regs i region.RegKind.Scalar
-            ok ({ in_state with regs := a }, false)
-          else
-            if cls = isa.CLS_ALU64
-            then
-              let in_state1 ← region.transfer_alu64 in_state inst
-              ok (in_state1, false)
-            else
-              if inst.opcode = isa.OP_CALL
-              then
-                let in_state1 ←
-                  region.set_reg in_state 0#usize region.RegKind.Scalar
-                let in_state2 ← region.transfer_loop in_state1 1#usize
-                ok (in_state2, false)
-              else ok (in_state, false)
-
 /-- [async_ebpf_verified::region::reg_bit]:
-    Source: '../../src/verified/region.rs', lines 773:0-779:1
+    Source: '../../src/verified/region.rs', lines 799:0-805:1
     Visibility: public -/
 def region.reg_bit (reg : Std.Usize) : Result Std.U16 := do
   if reg < region.R10
@@ -3081,7 +3459,7 @@ def region.reg_bit (reg : Std.Usize) : Result Std.U16 := do
   else ok 0#u16
 
 /-- [async_ebpf_verified::region::uses_and_defs]:
-    Source: '../../src/verified/region.rs', lines 789:0-846:1
+    Source: '../../src/verified/region.rs', lines 815:0-872:1
     Visibility: public -/
 def region.uses_and_defs
   (inst : isa.Insn) (callee_live_in : Std.U16) :

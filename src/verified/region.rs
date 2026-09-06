@@ -38,11 +38,10 @@
 //! (`classify_frame`, carried to executions by `Semantics/Frames.lean`);
 //! `R10`'s kind survives every transfer and meet of an accepted
 //! instruction; and `transfer` reads only the registers `uses_and_defs`
-//! names, which is what the live-in masking of call signatures rests on:
-//! `lean/AsyncEbpf/Region/Masking.lean` carries that through `meet_from`,
-//! [`classify`], [`signature_from_state`] and [`mask_signature`] to any
-//! common worklist schedule. The two runs' schedules differing is covered
-//! by `region_analysis::masking_fuzz`, not by Lean.
+//! names. The live-in masking of call signatures is exactly neutral
+//! (`lean/AsyncEbpf/Region/Masking.lean`): the fixed point projects every
+//! state onto its slot's live-in registers ([`project`]), so a signature
+//! and its masked form give the same entry state and the same solution.
 
 use super::isa::*;
 use super::stack::in_frame_window;
@@ -440,18 +439,44 @@ pub fn signature_from_state(state: &State) -> PointerSignature {
   PointerSignature { regs }
 }
 
+/// Sets every register outside `mask` to `Unknown`, `R10` excepted.
+///
+/// This is the projection onto a slot's live-in registers. [`entry_state`]
+/// applies it to a function's entry and `fixpoint::propagate` to every value
+/// flowing into a slot, so a dead register never carries a kind at all:
+/// what the analysis reports cannot depend on one, and neither can the
+/// order in which its worklist visits slots. Masking a call signature
+/// ([`mask_signature`]) is the same projection.
+pub fn project_regs(regs: &mut [RegKind; NUM_REGS], mask: RegMask) {
+  let mut reg = 0;
+  while reg < NUM_REGS {
+    if reg != R10 && mask & (1 << reg) == 0 {
+      set_kind(regs, reg, RegKind::Unknown);
+    }
+    reg += 1;
+  }
+}
+
+/// Projects `state`'s registers onto `live`; the spill slots are untouched.
+pub fn project(state: &mut State, live: RegMask) {
+  project_regs(&mut state.regs, live);
+}
+
 /// Drops every register outside `mask`, i.e. every register the callee
 /// cannot observe.
 pub fn mask_signature(sig: &PointerSignature, mask: RegMask) -> PointerSignature {
   let mut regs = sig.regs;
-  let mut reg = 0;
-  while reg < NUM_REGS {
-    if reg != R10 && mask & (1 << reg) == 0 {
-      set_kind(&mut regs, reg, RegKind::Unknown);
-    }
-    reg += 1;
-  }
+  project_regs(&mut regs, mask);
   PointerSignature { regs }
+}
+
+/// The state a function starts in under `sig`, projected onto the live-in
+/// registers of its entry slot.
+pub fn entry_state(sig: &PointerSignature, live: RegMask) -> State {
+  let mut state = top();
+  apply_signature(sig, &mut state);
+  project(&mut state, live);
+  state
 }
 
 /// `regs[reg] = kind`; see [`set_reg`] for why this is a function.

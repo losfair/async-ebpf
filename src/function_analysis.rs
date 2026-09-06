@@ -23,6 +23,10 @@ pub(crate) struct FunctionLayout {
   /// which is the only thing that sees every section at once; empty for a
   /// lone fragment, whose cross-section call sites then mask nothing.
   pub(crate) cross_section_arg_masks: HashMap<usize, RegMask>,
+  /// Per slot of the section, the registers live at its entry: what the
+  /// region analysis projects each state onto. Empty (all registers) until
+  /// [`analyze_program`] has solved the whole program.
+  pub(crate) slot_live_in: Vec<RegMask>,
 }
 
 impl FunctionLayout {
@@ -35,6 +39,7 @@ impl FunctionLayout {
       pc_to_func: vec![0; num_insns],
       arg_masks: vec![ALL_SIGNATURE_REGS],
       cross_section_arg_masks: HashMap::new(),
+      slot_live_in: vec![ALL_SIGNATURE_REGS; num_insns],
     }
   }
 }
@@ -141,7 +146,7 @@ fn live_in_fixed_point(
     })
     .collect::<Vec<_>>();
 
-  let masks = {
+  let live_in = {
     let starts = layouts
       .iter()
       .map(|layout| {
@@ -165,8 +170,9 @@ fn live_in_fixed_point(
     program_live_in(&inputs, &call_sites)
   };
 
-  for (layout, masks) in layouts.iter_mut().zip(masks) {
+  for ((layout, masks), slots) in layouts.iter_mut().zip(live_in.masks).zip(live_in.slots) {
     layout.arg_masks = masks;
+    layout.slot_live_in = slots;
   }
   // Project each callee's mask back onto its call site, so per-function region
   // analysis can mask a cross-section call without holding the whole program.
@@ -230,6 +236,7 @@ fn partition_section(section: &SectionInput<'_>) -> Result<FunctionLayout, Strin
       pc_to_func: Vec::new(),
       arg_masks: Vec::new(),
       cross_section_arg_masks: HashMap::new(),
+      slot_live_in: Vec::new(),
     });
   }
 
@@ -272,6 +279,7 @@ fn partition_section(section: &SectionInput<'_>) -> Result<FunctionLayout, Strin
     pc_to_func: layout.pc_to_func,
     arg_masks: vec![ALL_SIGNATURE_REGS; layout.starts.len()],
     cross_section_arg_masks: HashMap::new(),
+    slot_live_in: vec![ALL_SIGNATURE_REGS; num_insns],
   })
 }
 

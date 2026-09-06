@@ -27,17 +27,23 @@
 //! original dual-region probe.
 //!
 //! The analysis is a standard forward dataflow over the instruction-slot CFG
-//! with a per-register lattice and a meet at control-flow joins. Local calls
-//! add an edge to the callee entry (carrying `R10`/`R6-R9`), so callee stack
-//! accesses are analyzed too; argument-derived pointers (`R1-R5`) reach the
-//! callee as `Unknown`. Any slot still unreached keeps its registers `Uninit`
-//! and yields `UNKNOWN` hints — safe, just unoptimized.
+//! with a per-register lattice and a meet at control-flow joins. The loader
+//! analyzes one function at a time (`verified::fixpoint::solve`), from the
+//! signature its caller passes, with every state projected onto the slot's
+//! live-in registers; the whole-section walk of [`analyze`] instead follows
+//! local calls into their callees (carrying `R10`/`R6-R9`), with
+//! argument-derived pointers (`R1-R5`) reaching the callee as `Unknown`. Any
+//! slot still unreached keeps its registers `Uninit` and yields `UNKNOWN`
+//! hints — safe, just unoptimized.
 
 use std::collections::HashMap;
 
+use crate::verified::fixpoint;
 use crate::verified::isa::Insn;
+#[cfg(any(test, feature = "testing"))]
+use crate::verified::region::apply_signature;
 use crate::verified::region::{
-  self as core, apply_signature, entry_signature, mask_signature, signature_from_state,
+  self as core, entry_signature, mask_signature, signature_from_state,
 };
 pub(crate) use crate::verified::region::{
   PointerSignature, RegMask, ALL_SIGNATURE_REGS, R10, REGION_UNKNOWN,
@@ -48,6 +54,7 @@ pub(crate) use crate::verified::region::{
 };
 
 /// The abstract state at a program point. See `crate::verified::region`.
+#[cfg(any(test, feature = "testing"))]
 type State = core::State;
 
 // eBPF opcode encoding helpers.
@@ -131,8 +138,10 @@ fn warn_cap_reached(cap_warning_emitted: &mut bool) {
   }
 }
 
-/// Applies the transfer function and the meet into every successor, keeping
-/// the worklist bookkeeping the two drivers share.
+/// Applies the transfer function and the meet into every successor, for the
+/// whole-section walk of [`analyze`]. The per-function analysis runs
+/// `verified::fixpoint::solve` instead, which projects onto live-in registers.
+#[cfg(any(test, feature = "testing"))]
 fn propagate(
   states: &mut [State],
   reached: &mut [bool],
@@ -255,14 +264,16 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   RegionAnalysis { hints, unresolved }
 }
 
-// How many slots the worklist of `analyze_function` has popped on this
-// thread. Test-only: the masking test reads it to check that the runs it
-// compares really do process slots in different orders.
-#[cfg(test)]
-thread_local! {
-  pub(crate) static WORKLIST_POPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
+/// Analyzes the function `[start_pc, end_pc)` of a section from the
+/// signature `incoming`.
+///
+/// The fixed point is `verified::fixpoint::solve`, over the section decoded
+/// as the verified core reads it and the per-slot live-in table of
+/// `layout`; this decodes, warns once if the spill-slot cap bit, classifies
+/// every reached access from its settled state, computes the masked
+/// signature each local call hands its callee, and groups accesses into the
+/// plan. A layout whose live-in table does not cover the section (a
+/// fragment analyzed outside the loader) projects nothing.
 pub(crate) fn analyze_function(
   code: &[u8],
   start_pc: usize,
@@ -277,6 +288,7 @@ pub(crate) fn analyze_function(
   let mut hints = vec![REGION_UNKNOWN; num_slots];
   let mut unresolved = Vec::new();
   let mut call_signatures = std::collections::HashMap::new();
+  let insns = Insn::decode_all(&code[..num_slots * 8]).expect("length is a multiple of 8");
   if start_pc >= end_pc || end_pc > num_slots {
     return FunctionRegionAnalysis {
       hints,
@@ -286,24 +298,30 @@ pub(crate) fn analyze_function(
     };
   }
 
-  let mut states: Vec<State> = (0..num_slots).map(|_| core::top()).collect();
-  let mut reached = vec![false; num_slots];
-  apply_signature(&incoming, &mut states[start_pc]);
-  reached[start_pc] = true;
+  let everything;
+  let live: &[RegMask] = if layout.slot_live_in.len() == num_slots {
+    &layout.slot_live_in
+  } else {
+    everything = vec![ALL_SIGNATURE_REGS; num_slots];
+    &everything
+  };
+  let fixpoint::Solution {
+    states,
+    reached,
+    refused,
+  } = fixpoint::solve(&insns, start_pc, end_pc, &incoming, live, data_lo, data_hi);
+  if refused {
+    warn_cap_reached(&mut false);
+  }
 
-  let mut worklist = vec![start_pc];
-  let mut on_list = vec![false; num_slots];
-  on_list[start_pc] = true;
-  let mut cap_warning_emitted = false;
-
-  while let Some(pc) = worklist.pop() {
-    #[cfg(test)]
-    WORKLIST_POPS.with(|c| c.set(c.get() + 1));
-    on_list[pc] = false;
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    if inst.opcode == EBPF_OP_CALL && (inst.src == 1 || inst.src == 2) {
-      let mask = if inst.src == 1 {
-        let target = (pc as i64 + 1 + inst.imm as i64) as usize;
+  for pc in start_pc..end_pc {
+    if !reached[pc] {
+      continue;
+    }
+    let insn = insns[pc];
+    if insn.opcode == EBPF_OP_CALL && (insn.src == 1 || insn.src == 2) {
+      let mask = if insn.src == 1 {
+        let target = (pc as i64 + 1 + insn.imm as i64) as usize;
         layout
           .pc_to_func
           .get(target)
@@ -322,31 +340,7 @@ pub(crate) fn analyze_function(
       };
       call_signatures.insert(pc, mask_signature(&signature_from_state(&states[pc]), mask));
     }
-    let lddw_addr = lddw_full_imm(code, pc, &inst);
-    let (out, refused) = core::transfer(&states[pc], &to_insn(&inst), lddw_addr, data_lo, data_hi);
-    if refused {
-      warn_cap_reached(&mut cap_warning_emitted);
-    }
-
-    let succs = function_successors(pc, &inst, num_slots, start_pc, end_pc);
-    propagate(
-      &mut states,
-      &mut reached,
-      &mut on_list,
-      &mut worklist,
-      pc,
-      &out,
-      &succs,
-      &mut cap_warning_emitted,
-    );
-  }
-
-  for pc in start_pc..end_pc {
-    if !reached[pc] {
-      continue;
-    }
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    let (is_access, hint, region) = core::classify(&states[pc], &to_insn(&inst), frame_size);
+    let (is_access, hint, region) = core::classify(&states[pc], &insn, frame_size);
     if !is_access {
       continue;
     }
@@ -490,6 +484,15 @@ pub(crate) fn function_live_in(
   live[start_pc]
 }
 
+/// What [`program_live_in`] solves: per section, one mask per function
+/// (the liveness of its entry slot, the mask its call sites apply) and one
+/// mask per slot (what `verified::fixpoint::solve` projects onto). An
+/// unreachable slot's mask is empty; the analysis never visits one.
+pub(crate) struct LiveIn {
+  pub(crate) masks: Vec<Vec<RegMask>>,
+  pub(crate) slots: Vec<Vec<RegMask>>,
+}
+
 /// One code section, already partitioned into local functions, as
 /// [`program_live_in`] sees it.
 pub(crate) struct LiveInSection<'a> {
@@ -556,12 +559,18 @@ pub(crate) struct CrossSectionCallSite {
 pub(crate) fn program_live_in(
   sections: &[LiveInSection<'_>],
   cross_section_calls: &[CrossSectionCallSite],
-) -> Vec<Vec<RegMask>> {
-  let conservative = || -> Vec<Vec<RegMask>> {
-    sections
-      .iter()
-      .map(|section| vec![ALL_SIGNATURE_REGS; section.starts.len()])
-      .collect()
+) -> LiveIn {
+  let conservative = || -> LiveIn {
+    LiveIn {
+      masks: sections
+        .iter()
+        .map(|section| vec![ALL_SIGNATURE_REGS; section.starts.len()])
+        .collect(),
+      slots: sections
+        .iter()
+        .map(|section| vec![ALL_SIGNATURE_REGS; section.code.len() / 8])
+        .collect(),
+    }
   };
 
   // Slot and function ids run consecutively across sections, so one worklist
@@ -855,19 +864,27 @@ pub(crate) fn program_live_in(
     }
   }
 
-  sections
-    .iter()
-    .enumerate()
-    .map(|(si, section)| {
-      (0..section.starts.len())
-        .map(|fi| live[func_start_slot[func_base[si] + fi] as usize])
-        .collect()
-    })
-    .collect()
+  LiveIn {
+    masks: sections
+      .iter()
+      .enumerate()
+      .map(|(si, section)| {
+        (0..section.starts.len())
+          .map(|fi| live[func_start_slot[func_base[si] + fi] as usize])
+          .collect()
+      })
+      .collect(),
+    slots: sections
+      .iter()
+      .enumerate()
+      .map(|(si, section)| live[slot_base[si]..slot_base[si] + section.code.len() / 8].to_vec())
+      .collect(),
+  }
 }
 
 /// Full 64-bit immediate of a `lddw` (low half in `inst`, high half in the next
 /// slot's imm field). Returns 0 for non-`lddw` instructions.
+#[cfg(any(test, feature = "testing"))]
 fn lddw_full_imm(code: &[u8], pc: usize, inst: &Inst) -> u64 {
   if inst.opcode != EBPF_OP_LDDW || (pc + 2) * 8 > code.len() {
     return 0;
@@ -2334,7 +2351,7 @@ mod tests {
         .collect::<Vec<_>>();
 
       assert_eq!(
-        program_live_in(&sections, &cross_section_calls),
+        program_live_in(&sections, &cross_section_calls).masks,
         sweep_program_live_in(&sections, &cross_section_calls),
         "flat solver diverged from the per-function sweep on {codes:?} \
          starts {starts:?} cross calls {cross_section_calls:?}"
@@ -2426,7 +2443,7 @@ mod tests {
         pc_to_func: &[0, 0],
       }];
       assert_eq!(
-        program_live_in(&sections, &[]),
+        program_live_in(&sections, &[]).masks,
         vec![vec![ALL_SIGNATURE_REGS; starts.len()]],
         "starts {starts:?} was not refused"
       );
@@ -2470,7 +2487,7 @@ mod tests {
     }];
 
     assert_eq!(
-      program_live_in(&sections, &stray),
+      program_live_in(&sections, &stray).masks,
       vec![vec![0], vec![ALL_SIGNATURE_REGS]],
       "a stray call site rebound an unrelated section's call"
     );
@@ -2492,7 +2509,7 @@ mod tests {
     }];
 
     assert_eq!(
-      program_live_in(&sections, &[]),
+      program_live_in(&sections, &[]).masks,
       vec![vec![ALL_SIGNATURE_REGS]]
     );
   }
@@ -2913,15 +2930,14 @@ mod tests {
   }
 }
 
-/// Live-in masking of call signatures must not change what the analysis
-/// reports. `lean/AsyncEbpf/Region/Masking.lean` proves that for any *common*
-/// worklist schedule; the two runs of [`analyze_function`] do not share one,
-/// because the worklist re-queues a slot on a change to any register, dead
-/// ones included, and `transfer` is not monotone (`load_kind`), so the proof
-/// stops there. This test covers the gap: random programs, random incoming
-/// signatures, the masked and the unmasked run must agree on every hint,
-/// every unresolved access and every onward signature — and the runs must
-/// really take different schedules often enough for that to mean something.
+/// The per-function fixed point projects every state onto its slot's
+/// live-in registers, which is what makes masking a call signature exactly
+/// neutral (`lean/AsyncEbpf/Region/Masking.lean`). The projection itself is
+/// meant to cost no precision either: a dead register feeds no hint, no
+/// unresolved access and no onward signature. That is the claim this checks,
+/// against the unprojected walk, on random programs and random incoming
+/// signatures; the masked-against-unmasked comparison rides along as a
+/// sanity check of the theorem.
 #[cfg(test)]
 mod masking_fuzz {
   use super::*;
@@ -3016,16 +3032,14 @@ mod masking_fuzz {
     }
   }
 
-  fn pops_of(f: impl FnOnce() -> FunctionRegionAnalysis) -> (FunctionRegionAnalysis, usize) {
-    WORKLIST_POPS.with(|c| c.set(0));
-    let result = f();
-    (result, WORKLIST_POPS.with(|c| c.get()))
+  fn same(a: &FunctionRegionAnalysis, b: &FunctionRegionAnalysis) -> bool {
+    a.hints == b.hints && a.unresolved == b.unresolved && a.call_signatures == b.call_signatures
   }
 
   #[test]
-  fn masking_is_precision_neutral() {
+  fn projection_and_masking_are_precision_neutral() {
     let mut rng = Lcg(12345);
-    let mut diverged = 0;
+    let mut unprojected_differs = 0;
     for trial in 0..50_000u64 {
       let n = 3 + rng.below(14) as usize;
       let code: Vec<u8> = gen(&mut rng, n).iter().flatten().copied().collect();
@@ -3036,28 +3050,73 @@ mod masking_fuzz {
       }
       regs[10] = crate::verified::region::frame_pointer_kind();
       let sig = PointerSignature { regs };
-      let mask = function_live_in(&code, 0, num, &|_| 0);
+      let layout = crate::function_analysis::analyze_functions(&code).unwrap();
+      assert_eq!(layout.slot_live_in.len(), num);
+      let mask = layout.arg_masks[0];
       let masked = mask_signature(&sig, mask);
-      let layout = crate::function_analysis::FunctionLayout::unmasked(num);
-      let (a, pops_a) =
-        pops_of(|| analyze_function(&code, 0, num, sig, 0x10000, 0x20000, &layout, 512));
-      let (b, pops_b) =
-        pops_of(|| analyze_function(&code, 0, num, masked, 0x10000, 0x20000, &layout, 512));
-      if pops_a != pops_b {
-        diverged += 1;
-      }
-      let same = a.hints == b.hints
-        && a.unresolved == b.unresolved
-        && a.call_signatures == b.call_signatures;
+      let projected = analyze_function(&code, 0, num, sig, 0x10000, 0x20000, &layout, 512);
+      let from_masked = analyze_function(&code, 0, num, masked, 0x10000, 0x20000, &layout, 512);
       assert!(
-        same,
+        same(&projected, &from_masked),
         "trial {trial}: mask {mask:#x}\nsig {sig:?}\nmasked {masked:?}\ncode {code:?}\n\
          hints {:?} vs {:?}\nunresolved {:?} vs {:?}",
-        a.hints, b.hints, a.unresolved, b.unresolved
+        projected.hints,
+        from_masked.hints,
+        projected.unresolved,
+        from_masked.unresolved
       );
+      let unmasked_layout = crate::function_analysis::FunctionLayout::unmasked(num);
+      let unprojected =
+        analyze_function(&code, 0, num, sig, 0x10000, 0x20000, &unmasked_layout, 512);
+      if !same(&projected, &unprojected) {
+        unprojected_differs += 1;
+        if unprojected_differs <= 3 {
+          eprintln!(
+            "trial {trial}: projected differs from unprojected\nlive {:?}\nsig {sig:?}\ncode {code:?}\n\
+             hints {:?} vs {:?}\nunresolved {:?} vs {:?}",
+            layout.slot_live_in, projected.hints, unprojected.hints, projected.unresolved,
+            unprojected.unresolved
+          );
+        }
+      }
     }
-    // The runs really do take different schedules, so agreement is a
-    // statement about the driver and not just about `transfer`.
-    assert!(diverged > 1000, "only {diverged} trials diverged");
+    assert_eq!(unprojected_differs, 0);
+  }
+
+  /// The verified driver's successor function is the one the live-in solver
+  /// uses, on every opcode form, so the projection keys off the same edges
+  /// the liveness was solved on.
+  #[test]
+  fn verified_function_successors_agree_with_the_solver() {
+    let offsets = [i16::MIN, -3, -1, 0, 1, 2, i16::MAX];
+    let imms = [i32::MIN, -4, -1, 0, 1, 3, i32::MAX];
+    let ranges = [(1, 0, 1), (4, 0, 4), (6, 2, 5), (8, 3, 4), (9, 0, 9)];
+    for opcode in 0..=255u8 {
+      for src in 0..16u8 {
+        for &offset in &offsets {
+          for &imm in &imms {
+            for &(num_slots, start_pc, end_pc) in &ranges {
+              let raw = slot(opcode, 0, src, offset, imm);
+              let inst = decode(&raw);
+              let insns = vec![Insn::from_u64(u64::from_le_bytes(raw)); num_slots];
+              for pc in start_pc..end_pc {
+                let mut out = [0usize; 2];
+                let written =
+                  function_successors_into(pc, &inst, num_slots, start_pc, end_pc, &mut out);
+                let (count, first, second) =
+                  fixpoint::function_successors(&insns, pc, start_pc, end_pc);
+                let got: Vec<usize> = [first, second][..count].to_vec();
+                assert_eq!(
+                  got,
+                  out[..written].to_vec(),
+                  "opcode {opcode:#04x} src {src} offset {offset} imm {imm} pc {pc} in \
+                   [{start_pc}, {end_pc}) of {num_slots}"
+                );
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }

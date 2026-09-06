@@ -3,39 +3,36 @@ import AsyncEbpf.Region.Proofs
 /-!
 # Live-in masking does not change what the region analysis sees
 
-`region_analysis::analyze_function` runs `transfer` and `meet_from` to a
-fixed point over a function's control-flow graph from the signature its
-caller passes, and the caller first masks that signature to the callee's
-live-in registers (`mask_signature`), so that callees are not specialized
-on registers they never read. This file states what makes the masking
-harmless, at the level of the extracted core:
+`region_analysis::analyze_function` runs `fixpoint::solve`: from the entry
+state a signature gives, `transfer` and `meet_from` to a fixed point over
+the function's control-flow graph, with every value flowing into a slot
+first projected onto that slot's live-in registers (`project`), the entry
+state included (`entry_state`). A caller masks the signature it hands a
+callee to the callee's live-in (`mask_signature`), so that callees are not
+specialized on registers they never read. Two things are shown here.
 
-* `AgreeAt L S₁ S₂`: two states agree on the registers `L` names, on `R10`,
-  and on the spill slots;
-* `LiveSolution`: a live-in table `L` solves the dataflow equations the
-  Rust live-in solver computes — at every reachable slot it covers the
-  slot's uses and, minus the slot's defs, the live-in of every successor;
-* `step_agree`: one `transfer` from states that agree at `p` yields states
-  that agree at every successor `q` of `p`, and the same cap flag;
-* `meet_from_agree`: `meet_from` keeps the agreement;
-* `run_agree`: hence any schedule of the worklist — any sequence of slots,
-  each processed by a transfer and a meet into its successors — keeps two
-  state tables agreeing at every slot;
-* `classify_agree`, `call_signature_agree`: agreeing states classify
-  every access alike and hand every callee the same masked signature;
-* `masked_entry_agree`: the masked and the unmasked entry states agree at
-  the entry slot.
+**Masking is exactly neutral** (`solve_masked_eq`): `solve` from a
+signature and from its masked form return the same solution, whenever the
+mask covers the entry's live-in — which is how the loader builds it. The
+projection makes the two entry states equal (`entry_state_eq`), and `solve`
+is a function of its entry state. Nothing about the worklist is needed.
 
-What this does not say is that the two actual runs of the driver process
-the same schedule: the driver's worklist re-queues a slot when *any*
-register changes, dead ones included, so the masked and the unmasked run
-can process slots in different orders. `transfer` is not monotone in the
-kind lattice (a fill from an untracked slot reads as a scalar, from a
-tracked one as the spilled pointer), so a different order can in principle
-reach a different fixed point. The unit test
-`region_analysis::masking_fuzz::masking_is_precision_neutral` checks that
-it does not, on random programs whose two runs do take different
-schedules; that step is tested, not proved.
+**Projecting costs no precision, step by step.** A state and its
+projection agree on the live registers (`project_agree`), and agreement on
+the live registers, `R10` and the spills (`AgreeAt`) is all the analysis
+ever consults: it survives a `transfer` into every successor (`step_agree`)
+given a live-in table that solves the solver's equations (`LiveSolution`),
+survives `meet_from` (`meet_from_agree`), and therefore survives any
+schedule of the worklist, whether or not it projects (`run_agree`,
+`projection_neutral`); agreeing states classify every access alike
+(`hint_agree`) and hand every callee the same masked signature
+(`call_signature_agree`). What this leaves open is that the projecting and
+the non-projecting driver take the same schedule; the worklist re-queues a
+slot when any register changes, and `transfer` is not monotone, so they
+need not, and in principle a different order can reach a different fixed
+point. That the projecting driver's results are those of the old walk on
+random programs is checked by
+`region_analysis::masking_fuzz::projection_and_masking_are_precision_neutral`.
 -/
 open Aeneas Aeneas.Std Result
 
@@ -146,6 +143,14 @@ structure AgreeAt (live : U16) (S₁ S₂ : region.State) : Prop where
 
 theorem AgreeAt.of_eq {live : U16} {S : region.State} : AgreeAt live S S :=
   ⟨fun _ _ => rfl, rfl, rfl⟩
+
+theorem AgreeAt.symm {live : U16} {S₁ S₂ : region.State} (h : AgreeAt live S₁ S₂) :
+    AgreeAt live S₂ S₁ :=
+  ⟨fun r hr => (h.live r hr).symm, h.fp.symm, h.spills.symm⟩
+
+theorem AgreeAt.trans {live : U16} {S₁ S₂ S₃ : region.State} (h : AgreeAt live S₁ S₂)
+    (h' : AgreeAt live S₂ S₃) : AgreeAt live S₁ S₃ :=
+  ⟨fun r hr => (h.live r hr).trans (h'.live r hr), h.fp.trans h'.fp, h.spills.trans h'.spills⟩
 
 /-- `meet_from` keeps agreement: where both inputs agree, so does the meet. -/
 theorem meet_from_agree {live : U16} {S₁ S₂ O₁ O₂ T₁ T₂ : region.State} {c₁ c₂ r₁ r₂ : Bool}
@@ -265,51 +270,78 @@ theorem trace_agree {insn : Nat → isa.Insn} {callee : Nat → U16} {succs : Na
 
 /-! ## Along a schedule of the worklist -/
 
-/-- `MeetInto out qs T T'`: meet `out` into each slot of `qs` in turn. -/
-inductive MeetInto (out : region.State) : List Nat → (Nat → region.State) → (Nat → region.State) → Prop
-  | nil {T : Nat → region.State} : MeetInto out [] T T
-  | cons {q : Nat} {qs : List Nat} {T T' : Nat → region.State} {U : region.State} {c r : Bool} :
-      region.meet_from (T q) out = ok ((c, r), U) → MeetInto out qs (Function.update T q U) T' →
-      MeetInto out (q :: qs) T T'
+/-- What a driver does to a value before meeting it into slot `q`:
+`Pre q out out'` says `out'` is what arrives. -/
+abbrev Pre := Nat → region.State → region.State → Prop
 
-/-- `Run sched T T'`: the worklist processes the slots of `sched` in order,
-each by one transfer and a meet into its successors. -/
-inductive Run (insn : Nat → isa.Insn) (succs : Nat → List Nat) (lddw : Nat → U64) (lo hi : U64) :
+/-- The walk that meets values in as they are. -/
+def NoProject : Pre := fun _ out out' => out' = out
+
+/-- The walk that projects onto the slot's live-in first (`fixpoint::propagate`). -/
+def Project (L : Nat → U16) : Pre := fun q out out' => region.project out (L q) = ok out'
+
+/-- `MeetInto pre out qs T T'`: meet `out`, as `pre` delivers it, into each
+slot of `qs` in turn. -/
+inductive MeetInto (pre : Pre) (out : region.State) :
     List Nat → (Nat → region.State) → (Nat → region.State) → Prop
-  | nil {T : Nat → region.State} : Run insn succs lddw lo hi [] T T
+  | nil {T : Nat → region.State} : MeetInto pre out [] T T
+  | cons {q : Nat} {qs : List Nat} {T T' : Nat → region.State} {out' U : region.State} {c r : Bool} :
+      pre q out out' → region.meet_from (T q) out' = ok ((c, r), U) →
+      MeetInto pre out qs (Function.update T q U) T' → MeetInto pre out (q :: qs) T T'
+
+/-- `Run pre sched T T'`: the worklist processes the slots of `sched` in
+order, each by one transfer and a meet into its successors. -/
+inductive Run (pre : Pre) (insn : Nat → isa.Insn) (succs : Nat → List Nat) (lddw : Nat → U64)
+    (lo hi : U64) : List Nat → (Nat → region.State) → (Nat → region.State) → Prop
+  | nil {T : Nat → region.State} : Run pre insn succs lddw lo hi [] T T
   | cons {p : Nat} {ps : List Nat} {T T' T'' : Nat → region.State} {out : region.State} {b : Bool} :
-      region.transfer (T p) (insn p) (lddw p) lo hi = ok (out, b) → MeetInto out (succs p) T T' →
-      Run insn succs lddw lo hi ps T' T'' → Run insn succs lddw lo hi (p :: ps) T T''
+      region.transfer (T p) (insn p) (lddw p) lo hi = ok (out, b) → MeetInto pre out (succs p) T T' →
+      Run pre insn succs lddw lo hi ps T' T'' → Run pre insn succs lddw lo hi (p :: ps) T T''
+
+/-- A `Pre` that keeps agreement on the slot's live-in. -/
+def PreAgree (L : Nat → U16) (pre : Pre) : Prop :=
+  ∀ q out out', pre q out out' → AgreeAt (L q) out out'
+
+theorem noProject_agree (L : Nat → U16) : PreAgree L NoProject := by
+  intro q out out' h
+  rw [h]
+  exact AgreeAt.of_eq
 
 /-- Two state tables agree at every slot. -/
 def TablesAgree (L : Nat → U16) (T₁ T₂ : Nat → region.State) : Prop :=
   ∀ p, AgreeAt (L p) (T₁ p) (T₂ p)
 
-theorem meet_into_agree {L : Nat → U16} {out₁ out₂ : region.State} {qs : List Nat}
+theorem meet_into_agree {L : Nat → U16} {pre₁ pre₂ : Pre} (hp₁ : PreAgree L pre₁)
+    (hp₂ : PreAgree L pre₂) {out₁ out₂ : region.State} {qs : List Nat}
     {T₁ T₂ T₁' T₂' : Nat → region.State}
     (hout : ∀ q, q ∈ qs → AgreeAt (L q) out₁ out₂) (hT : TablesAgree L T₁ T₂)
-    (h₁ : MeetInto out₁ qs T₁ T₁') (h₂ : MeetInto out₂ qs T₂ T₂') : TablesAgree L T₁' T₂' := by
+    (h₁ : MeetInto pre₁ out₁ qs T₁ T₁') (h₂ : MeetInto pre₂ out₂ qs T₂ T₂') :
+    TablesAgree L T₁' T₂' := by
   induction h₁ generalizing T₂ with
   | nil => cases h₂; exact hT
-  | @cons q qs T T' U c r hm hrest ih =>
+  | @cons q qs T T' out' U c r hpre hm hrest ih =>
     cases h₂ with
-    | cons hm' hrest' =>
+    | cons hpre' hm' hrest' =>
       apply ih (fun q' hq' => hout q' (List.mem_cons_of_mem _ hq')) _ hrest'
       intro p
       by_cases hpq : p = q
       · subst hpq
         simp only [Function.update_self]
-        exact (meet_from_agree (hT p) (hout p (List.mem_cons_self ..)) hm hm').1
+        have hin : AgreeAt (L p) out' _ :=
+          ((hp₁ p _ _ hpre).symm.trans (hout p (List.mem_cons_self ..))).trans (hp₂ p _ _ hpre')
+        exact (meet_from_agree (hT p) hin hm hm').1
       · simp only [Function.update_of_ne hpq]
         exact hT p
 
-/-- Any common schedule keeps two agreeing tables agreeing. -/
+/-- Any common schedule keeps two agreeing tables agreeing, whether either
+driver projects or not. -/
 theorem run_agree {insn : Nat → isa.Insn} {callee : Nat → U16} {succs : Nat → List Nat}
     {R : Nat → Prop} {L : Nat → U16} (hL : LiveSolution insn callee succs R L)
-    (hregs : RegsOk insn R) {lddw : Nat → U64} {lo hi : U64} {sched : List Nat}
+    (hregs : RegsOk insn R) {pre₁ pre₂ : Pre} (hp₁ : PreAgree L pre₁) (hp₂ : PreAgree L pre₂)
+    {lddw : Nat → U64} {lo hi : U64} {sched : List Nat}
     (hsched : ∀ p, p ∈ sched → R p) {T₁ T₂ T₁' T₂' : Nat → region.State}
-    (hT : TablesAgree L T₁ T₂) (h₁ : Run insn succs lddw lo hi sched T₁ T₁')
-    (h₂ : Run insn succs lddw lo hi sched T₂ T₂') : TablesAgree L T₁' T₂' := by
+    (hT : TablesAgree L T₁ T₂) (h₁ : Run pre₁ insn succs lddw lo hi sched T₁ T₁')
+    (h₂ : Run pre₂ insn succs lddw lo hi sched T₂ T₂') : TablesAgree L T₁' T₂' := by
   induction h₁ generalizing T₂ with
   | nil => cases h₂; exact hT
   | @cons p ps T T' T'' out b htr hmi hrest ih =>
@@ -317,7 +349,8 @@ theorem run_agree {insn : Nat → isa.Insn} {callee : Nat → U16} {succs : Nat 
     | cons htr' hmi' hrest' =>
       have hp : R p := hsched p (List.mem_cons_self ..)
       refine ih (fun q hq => hsched q (List.mem_cons_of_mem _ hq)) ?_ hrest'
-      exact meet_into_agree (fun q hq => (step_agree hL hregs hp hq (hT p) htr htr').1) hT hmi hmi'
+      exact meet_into_agree hp₁ hp₂ (fun q hq => (step_agree hL hregs hp hq (hT p) htr htr').1)
+        hT hmi hmi'
 
 /-! ## What the analysis reports -/
 
@@ -600,28 +633,25 @@ theorem signature_from_state_spec {S : region.State} {sig : region.PointerSignat
     refine ⟨f, hf, ?_⟩
     rw [hregs1, List.getElem?_set_ne (Ne.symm hk10), hk]
 
-/-- `mask_signature` drops every register outside the mask except `R10`. -/
-theorem mask_signature_spec {sig sig' : region.PointerSignature} {m : U16}
-    (h : region.mask_signature sig m = ok sig') :
-    ∀ (k : Nat), k < 11 → sig'.regs.val[k]? =
-      (if k ≠ 10 ∧ ¬ m.val.testBit k then some region.RegKind.Unknown else sig.regs.val[k]?) := by
-  unfold region.mask_signature at h
-  obtain_bind ⟨regs, hregs, h⟩ := h
-  simp only [ok.injEq] at h
-  subst h
-  unfold region.mask_signature_loop at hregs
+/-- `project_regs` sets every register outside the mask to `Unknown`, `R10`
+excepted. -/
+theorem project_regs_spec {regs regs' : Std.Array region.RegKind 11#usize} {m : U16}
+    (h : region.project_regs regs m = ok regs') :
+    ∀ (k : Nat), k < 11 → regs'.val[k]? =
+      (if k ≠ 10 ∧ ¬ m.val.testBit k then some region.RegKind.Unknown else regs.val[k]?) := by
+  unfold region.project_regs region.project_regs_loop at h
   exact loop_ok_induction _
     (fun st => st.2.val ≤ 11 ∧
       (∀ (k : Nat), k < st.2.val → st.1.val[k]? =
-        (if k ≠ 10 ∧ ¬ m.val.testBit k then some region.RegKind.Unknown else sig.regs.val[k]?)) ∧
-      (∀ (k : Nat), st.2.val ≤ k → st.1.val[k]? = sig.regs.val[k]?))
+        (if k ≠ 10 ∧ ¬ m.val.testBit k then some region.RegKind.Unknown else regs.val[k]?)) ∧
+      (∀ (k : Nat), st.2.val ≤ k → st.1.val[k]? = regs.val[k]?))
     (fun y => ∀ (k : Nat), k < 11 → y.val[k]? =
-      (if k ≠ 10 ∧ ¬ m.val.testBit k then some region.RegKind.Unknown else sig.regs.val[k]?))
+      (if k ≠ 10 ∧ ¬ m.val.testBit k then some region.RegKind.Unknown else regs.val[k]?))
     (by
       rintro ⟨rs, r⟩ ⟨hr, hlt, hge⟩ res hb
       dsimp only at hr hlt hge
-      change region.mask_signature_loop.body m rs r = ok res at hb
-      unfold region.mask_signature_loop.body at hb
+      change region.project_regs_loop.body m rs r = ok res at hb
+      unfold region.project_regs_loop.body at hb
       split at hb
       · rename_i hlt11
         have hlt11' : r.val < 11 := by
@@ -699,7 +729,18 @@ theorem mask_signature_spec {sig sig' : region.PointerSignature} {m : U16}
           have := usize_not_lt hge11; simpa [region.NUM_REGS] using this
         intro k hk
         exact hlt k (by omega))
-    _ _ ⟨by simp, fun k hk => by simp at hk, fun k _ => rfl⟩ hregs
+    _ _ ⟨by simp, fun k hk => by simp at hk, fun k _ => rfl⟩ h
+
+/-- `mask_signature` is `project_regs` on the signature. -/
+theorem mask_signature_spec {sig sig' : region.PointerSignature} {m : U16}
+    (h : region.mask_signature sig m = ok sig') :
+    ∀ (k : Nat), k < 11 → sig'.regs.val[k]? =
+      (if k ≠ 10 ∧ ¬ m.val.testBit k then some region.RegKind.Unknown else sig.regs.val[k]?) := by
+  unfold region.mask_signature at h
+  obtain_bind ⟨regs, hregs, h⟩ := h
+  simp only [ok.injEq] at h
+  subst h
+  exact project_regs_spec hregs
 
 /-- Two states that agree on the registers a mask names hand a callee the
 same masked signature. -/
@@ -787,57 +828,124 @@ theorem local_call_uses {inst : isa.Insn} {callee uses defs : U16}
     simp only [ok.injEq, Prod.mk.injEq] at hud
     exact hud.1.symm
 
-/-! ## The entry -/
+/-! ## Projection -/
 
-/-- The masked and the unmasked signature give entry states that agree at
-the entry slot, whenever the mask covers the entry's live-in. -/
-theorem masked_entry_agree {σ σ' : region.PointerSignature} {m live : U16}
+/-- `project` keeps every live register, `R10`, and the spills. -/
+theorem project_spec {S S' : region.State} {live : U16} (h : region.project S live = ok S') :
+    S'.spills = S.spills ∧ ∀ (k : Nat), k < 11 → S'.regs.val[k]? =
+      (if k ≠ 10 ∧ ¬ live.val.testBit k then some region.RegKind.Unknown else S.regs.val[k]?) := by
+  unfold region.project at h
+  obtain_bind ⟨a, ha, h⟩ := h
+  simp only [ok.injEq] at h
+  subst h
+  exact ⟨rfl, project_regs_spec ha⟩
+
+/-- A state agrees with its projection at the live registers. -/
+theorem project_agree {S S' : region.State} {live : U16} (h : region.project S live = ok S') :
+    AgreeAt live S S' := by
+  obtain ⟨hsp, hk⟩ := project_spec h
+  refine ⟨fun r hr => ?_, ?_, hsp.symm⟩
+  · by_cases hlt : r < 11
+    · rw [hk r hlt, if_neg (fun h => h.2 hr)]
+    · have l₁ : S.regs.val.length = 11 := by simp
+      have l₂ : S'.regs.val.length = 11 := by simp
+      rw [List.getElem?_eq_none (by omega), List.getElem?_eq_none (by omega)]
+  · rw [hk 10 (by omega), if_neg (fun h => h.1 rfl)]
+
+theorem project_preAgree (L : Nat → U16) : PreAgree L (Project L) :=
+  fun _ _ _ h => project_agree h
+
+/-- The masked and the unmasked signature give the same entry state, whenever
+the mask covers the entry slot's live-in. -/
+theorem entry_state_eq {σ σ' : region.PointerSignature} {m live : U16}
     (hcover : ∀ (r : Nat), live.val.testBit r → m.val.testBit r)
-    (hmask : region.mask_signature σ m = ok σ') {st E₁ E₂ : region.State}
-    (h₁ : region.apply_signature σ st = ok E₁) (h₂ : region.apply_signature σ' st = ok E₂) :
-    AgreeAt live E₁ E₂ := by
-  unfold region.apply_signature at h₁ h₂
-  obtain_bind ⟨rk, hrk, h₁⟩ := h₁
-  obtain_bind ⟨rk', hrk', h₂⟩ := h₂
+    (hmask : region.mask_signature σ m = ok σ') {E₁ E₂ : region.State}
+    (h₁ : region.entry_state σ live = ok E₁) (h₂ : region.entry_state σ' live = ok E₂) :
+    E₁ = E₂ := by
+  unfold region.entry_state at h₁ h₂
+  obtain_bind ⟨st, hst, h₁⟩ := h₁
+  obtain_bind ⟨st', hst', h₂⟩ := h₂
+  rw [hst] at hst'
+  simp only [ok.injEq] at hst'
+  subst hst'
+  obtain_bind ⟨A₁, hA₁, h₁⟩ := h₁
+  obtain_bind ⟨A₂, hA₂, h₂⟩ := h₂
+  unfold region.apply_signature at hA₁ hA₂
+  obtain_bind ⟨rk, hrk, hA₁⟩ := hA₁
+  obtain_bind ⟨rk', hrk', hA₂⟩ := hA₂
   rw [frame_pointer_kind_eq] at hrk hrk'
   simp only [ok.injEq] at hrk hrk'
   subst hrk hrk'
-  obtain_bind ⟨a₁, ha₁, h₁⟩ := h₁
-  obtain_bind ⟨a₂, ha₂, h₂⟩ := h₂
-  simp only [ok.injEq] at h₁ h₂
-  subst h₁ h₂
+  obtain_bind ⟨a₁, ha₁, hA₁⟩ := hA₁
+  obtain_bind ⟨a₂, ha₂, hA₂⟩ := hA₂
+  simp only [ok.injEq] at hA₁ hA₂
+  subst hA₁ hA₂
   obtain ⟨hl₁, ha₁⟩ := array_update_eq_ok ha₁
   obtain ⟨hl₂, ha₂⟩ := array_update_eq_ok ha₂
   have h10v : region.R10.val = 10 := by simp [region.R10]
   rw [h10v] at hl₁ hl₂ ha₁ ha₂
+  obtain ⟨hsp₁, hk₁⟩ := project_spec h₁
+  obtain ⟨hsp₂, hk₂⟩ := project_spec h₂
   have hs := mask_signature_spec hmask
-  refine ⟨fun r hr => ?_, ?_, rfl⟩
-  · show a₁.val[r]? = a₂.val[r]?
-    rw [ha₁, ha₂]
-    by_cases h10 : r = 10
-    · subst h10
-      rw [List.getElem?_set_self hl₁, List.getElem?_set_self hl₂]
-    · rw [List.getElem?_set_ne (Ne.symm h10), List.getElem?_set_ne (Ne.symm h10)]
-      by_cases hk : r < 11
-      · rw [hs r hk, if_neg (fun h => h.2 (hcover r hr))]
-      · have l₁ : σ.regs.val.length = 11 := by simp
-        have l₂ : σ'.regs.val.length = 11 := by simp
-        rw [List.getElem?_eq_none (by omega), List.getElem?_eq_none (by omega)]
-  · show a₁.val[10]? = a₂.val[10]?
-    rw [ha₁, ha₂, List.getElem?_set_self hl₁, List.getElem?_set_self hl₂]
+  have hext : ∀ (k : Nat), E₁.regs.val[k]? = E₂.regs.val[k]? := by
+    intro k
+    by_cases hk : k < 11
+    · rw [hk₁ k hk, hk₂ k hk]
+      by_cases hc : k ≠ 10 ∧ ¬ live.val.testBit k
+      · rw [if_pos hc, if_pos hc]
+      · rw [if_neg hc, if_neg hc]
+        dsimp only
+        rw [ha₁, ha₂]
+        by_cases h10 : k = 10
+        · subst h10
+          rw [List.getElem?_set_self hl₁, List.getElem?_set_self hl₂]
+        · rw [List.getElem?_set_ne (Ne.symm h10), List.getElem?_set_ne (Ne.symm h10)]
+          have hbit : live.val.testBit k := by
+            by_contra hn; exact hc ⟨h10, hn⟩
+          rw [hs k hk, if_neg (fun h => h.2 (hcover k hbit))]
+    · have l₁ : E₁.regs.val.length = 11 := by simp
+      have l₂ : E₂.regs.val.length = 11 := by simp
+      rw [List.getElem?_eq_none (by omega), List.getElem?_eq_none (by omega)]
+  cases E₁ with
+  | mk r₁ s₁ =>
+    cases E₂ with
+    | mk r₂ s₂ =>
+      simp only at hsp₁ hsp₂ hext
+      rw [hsp₁, hsp₂]
+      congr 1
+      apply (Aeneas.Std.Array.eq_iff _ _).mpr
+      exact List.ext_getElem? hext
 
 /-! ## The statement -/
 
-/-- Live-in masking is invisible to the analysis, schedule by schedule: run
-the worklist over any common schedule from the masked and the unmasked
-entry state, and at every reachable slot every access classifies alike and
-every local call receives the same masked signature. -/
-theorem masking_neutral {insn : Nat → isa.Insn} {callee : Nat → U16} {succs : Nat → List Nat}
+/-- Live-in masking is invisible to the analysis: `solve` from a signature
+and from its masked form return the same solution, whenever the mask
+covers the entry slot's live-in. -/
+theorem solve_masked_eq {σ σ' : region.PointerSignature} {m : U16}
+    {insns : Slice isa.Insn} {start «end» : Usize} {live : Slice U16} {lo hi : U64}
+    {L : U16} (hL : Slice.index_usize live start = ok L)
+    (hcover : ∀ (r : Nat), L.val.testBit r → m.val.testBit r)
+    (hmask : region.mask_signature σ m = ok σ') {S₁ S₂ : fixpoint.Solution}
+    (h₁ : fixpoint.solve insns start «end» σ live lo hi = ok S₁)
+    (h₂ : fixpoint.solve insns start «end» σ' live lo hi = ok S₂) : S₁ = S₂ := by
+  unfold fixpoint.solve at h₁ h₂
+  rw [hL] at h₁ h₂
+  simp only [bind_tc_ok] at h₁ h₂
+  obtain_bind ⟨E₁, hE₁, h₁⟩ := h₁
+  obtain_bind ⟨E₂, hE₂, h₂⟩ := h₂
+  rw [entry_state_eq hcover hmask hE₁ hE₂, h₂] at h₁
+  simp only [ok.injEq] at h₁
+  exact h₁.symm
+
+/-- Projecting is invisible too, schedule by schedule: the projecting and
+the non-projecting walk, over one schedule, classify every access alike at
+every reachable slot and hand every local call the same masked signature. -/
+theorem projection_neutral {insn : Nat → isa.Insn} {callee : Nat → U16} {succs : Nat → List Nat}
     {R : Nat → Prop} {L : Nat → U16} (hL : LiveSolution insn callee succs R L)
     (hregs : RegsOk insn R) {lddw : Nat → U64} {lo hi : U64} {sched : List Nat}
     (hsched : ∀ p, p ∈ sched → R p) {T₁ T₂ T₁' T₂' : Nat → region.State}
-    (hT : TablesAgree L T₁ T₂) (h₁ : Run insn succs lddw lo hi sched T₁ T₁')
-    (h₂ : Run insn succs lddw lo hi sched T₂ T₂') {p : Nat} (hp : R p) :
+    (hT : TablesAgree L T₁ T₂) (h₁ : Run NoProject insn succs lddw lo hi sched T₁ T₁')
+    (h₂ : Run (Project L) insn succs lddw lo hi sched T₂ T₂') {p : Nat} (hp : R p) :
     (∀ F, region.classify (T₁' p) (insn p) F = region.classify (T₂' p) (insn p) F) ∧
     ((insn p).opcode = isa.OP_CALL → (insn p).src.val = 1 ∨ (insn p).src.val = 2 →
       ∀ {sig₁ sig₂ sig₁' sig₂' : region.PointerSignature},
@@ -845,7 +953,7 @@ theorem masking_neutral {insn : Nat → isa.Insn} {callee : Nat → U16} {succs 
         region.signature_from_state (T₂' p) = ok sig₂ →
         region.mask_signature sig₁ (callee p) = ok sig₁' →
         region.mask_signature sig₂ (callee p) = ok sig₂' → sig₁' = sig₂') := by
-  have hA := run_agree hL hregs hsched hT h₁ h₂ p
+  have hA := run_agree hL hregs (noProject_agree L) (project_preAgree L) hsched hT h₁ h₂ p
   refine ⟨fun F => hint_agree hL hregs hp hA F, fun hop hsrc sig₁ sig₂ sig₁' sig₂' hs₁ hs₂ hm₁ hm₂ => ?_⟩
   obtain ⟨uses, defs, hud, huses, _⟩ := hL.live p hp
   have hu := local_call_uses hop hsrc hud

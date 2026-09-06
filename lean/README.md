@@ -27,7 +27,7 @@ lean/AsyncEbpf/AsyncEbpfVerified.lean   generated, do not edit
   ├─ AsyncEbpf/Layout/Decoder.lean       byte classes agree with the decoder
   ├─ AsyncEbpf/Stack/Proofs.lean         frame islands, floor and window arithmetic
   ├─ AsyncEbpf/Region/Proofs.lean        the region analysis' transfer function
-  ├─ AsyncEbpf/Region/Masking.lean       live-in masking, schedule by schedule
+  ├─ AsyncEbpf/Region/Masking.lean       live-in masking and projection
   ├─ AsyncEbpf/Semantics/Machine.lean    an operational semantics of eBPF
   ├─ AsyncEbpf/Semantics/Soundness.lean  accepted programs never go wrong
   ├─ AsyncEbpf/Semantics/Functions.lean  control never leaves a function
@@ -167,9 +167,10 @@ the statement the `debug_assert!` in `_run` and the comment on
 
 `src/verified/region.rs` is the dataflow core of `region_analysis.rs`: the
 abstract domain, its meet, the bounded spill-slot table, the transfer
-function, the uses/defs table and the per-slot classification. The
-worklists, the live-in solver and the access-plan builder stay outside and
-call into it.
+function, the uses/defs table, the per-slot classification and the call
+signatures. `src/verified/fixpoint.rs` is the worklist that drives them to
+a fixed point over one function (`solve`). The live-in solver and the
+access-plan builder stay outside and call into them.
 
 A word on what is *not* proved. The `STACK` and `DATA` hints narrow a
 bounds check the JIT keeps, so a wrong one costs a spurious fault, not
@@ -194,42 +195,54 @@ otherwise. It proves the three things the runtime relies on:
 - `transfer_agree`: two states that agree on the spill slots, on `R10`,
   and on the registers `uses_and_defs` names as uses produce, after
   `transfer`, states that agree on the spill slots, on the registers named
-  as defs, and — elsewhere — either agree or are each left untouched. This
-  is the per-instruction fact behind the live-in masking of call signatures
-  (`mask_signature`): a register that is not live-in is overwritten before
-  any read, so dropping it costs no precision.
+  as defs, and — elsewhere — either agree or are each left untouched.
 
-`Region/Masking.lean` lifts that to the function. `LiveSolution` is a
+`Region/Masking.lean` is about the live-in masking of call signatures.
+A caller hands its callee the caller's abstract registers, masked to the
+registers the callee can read before writing (`mask_signature`), so that
+callees are specialized on what they observe and not on the caller's
+incidental state. The fixed point projects every state onto its slot's
+live-in registers the same way (`project`, in `entry_state` and
+`fixpoint::propagate`): a register that is dead at a slot never holds a
+kind there. That makes the masking claim a one-line consequence:
+
+- `entry_state_eq`, `solve_masked_eq`: a signature and its masked form
+  give the same entry state whenever the mask covers the entry slot's
+  live-in — which is how the loader builds the mask — and `solve` is a
+  function of its entry state, so the two solutions are equal. Not merely
+  the same hints: the same states at every slot.
+
+What is left to show is that projecting costs nothing, which is a
+statement about the analysis before and after this change. `AgreeAt` is
+agreement on the live registers, `R10` and the spills; `LiveSolution` is a
 live-in table that solves the equations the Rust solver computes (at every
 reachable slot: the slot's uses, and every successor's live-in minus the
-slot's defs); `AgreeAt` is agreement on the live registers, `R10` and the
-spills. Then:
+slot's defs). Then:
 
+- `project_agree`: a state agrees with its projection;
 - `step_agree`, `trace_agree`: one transfer from states that agree at a
   slot gives states that agree at each of its successors, so along every
-  path of the control-flow graph the masked and the unmasked run agree;
+  path of the control-flow graph agreement is kept;
 - `meet_from_agree`, `run_agree`: the meet keeps the agreement, so a
   worklist processing any sequence of slots keeps two agreeing state
-  tables agreeing at every slot;
-- `hint_agree`, `call_signature_agree`, `masked_entry_agree`,
-  `masking_neutral`: at every reachable slot, `classify` gives the same
-  hint and the same routing region on both sides, every local call gets
-  the same masked signature (`signature_from_state` then
-  `mask_signature`), and the masked and the unmasked entry states agree
-  at the entry whenever the mask covers its live-in — which is how the
-  loader builds the mask.
+  tables agreeing, whether either of them projects or not;
+- `hint_agree`, `call_signature_agree`, `projection_neutral`: at every
+  reachable slot, agreeing states give the same hint and the same routing
+  region, and the same masked signature to every local call.
 
-What `masking_neutral` quantifies over is a *common* schedule: the same
-sequence of slots processed on both sides. The driver's two runs do not
-share one. Its worklist re-queues a slot when any register changes, dead
-ones included, so the masked and the unmasked run can process slots in
-different orders; and `transfer` is not monotone in the kind lattice (a
-fill from an untracked slot reads as a scalar, from a tracked one as the
-spilled pointer), so different orders can in principle reach different
-fixed points. Whether they do is the one step that is tested rather than
-proved: `region_analysis::masking_fuzz::masking_is_precision_neutral`
-compares the two runs on random programs and random incoming signatures,
-and counts that their schedules really do diverge on a good share of them.
+`projection_neutral` quantifies over a common schedule, the same sequence
+of slots processed by the projecting and the non-projecting walk. The two
+need not take one: the worklist re-queues a slot when any register
+changes, which the projection affects, and `transfer` is not monotone in
+the kind lattice (a fill from an untracked slot reads as a scalar, from a
+tracked one as the spilled pointer), so in principle different orders can
+reach different fixed points. That the projecting walk's results are those
+of the old one is checked, not proved:
+`region_analysis::masking_fuzz::projection_and_masking_are_precision_neutral`
+compares the two on random programs and random incoming signatures, and the
+golden and plan tests pin the hints of real programs. Note that this gap
+is now about a comparison with code that no longer runs; the masking claim
+itself no longer depends on any schedule.
 
 ## What is trusted
 
@@ -245,12 +258,13 @@ and counts that their schedules really do diverge on a good share of them.
   the emitted code does with `R10`: starts it at the top of the highest
   island and subtracts one stride per call. That the backends do so is
   checked by their tests, not here.
-- **The dataflow drivers.** `analyze_function`'s worklist and the live-in
-  solver are not extracted. `Region/Masking.lean` takes the live-in table
-  as a hypothesis (`LiveSolution`, the equations the solver's fixed point
-  satisfies) and the worklist's schedule as a parameter; that the solver
-  returns a solution, and that the two runs' schedules — which differ —
-  lead to the same result, are covered by the unit tests, not by Lean.
+- **The live-in solver.** `program_live_in` is not extracted. `solve` takes
+  its table as an input, and `Region/Masking.lean` assumes of it only what
+  `LiveSolution` states, the equations a fixed point of the solver
+  satisfies, or, for `solve_masked_eq`, nothing at all beyond the loader
+  masking with the entry's own row. That the table over-approximates what
+  a slot reads is what the projection's precision rests on, and it is the
+  same table the specialization of callees already keyed off.
 - **Aeneas and Charon.** The translation from Rust to Lean is trusted, as is
   the Aeneas standard library's model of `Vec`, slices and scalar arithmetic.
 - **The `extract` feature.** The Charon build hides the runtime-only
@@ -317,7 +331,9 @@ matter for whether the extraction is usable:
   (`regs[0] = Kind::Scalar`) came out as a unit write; go through a helper
   that takes the value as an argument (`set_reg` in `region.rs`). A local
   named after its module (`let region = …` inside `mod region`) shadows the
-  module's namespace in the translation.
+  module's namespace in the translation;
+- `Vec::pop` has no model. A worklist is a preallocated `Vec` and a height
+  (`solve_from` in `fixpoint.rs`), which also makes its bound explicit.
 
 On the Lean side, `loop_ok_induction` in `Loop.lean` is the tool for every
 extracted loop: give it an invariant of the loop state and what the exit
@@ -331,11 +347,11 @@ methods — goes behind `cfg(not(feature = "extract"))`.
 
 ## Next
 
-Closing the last gap in the masking argument — that the masked and the
-unmasked run's different schedules reach the same fixed point — needs
-either a confluence argument for this non-monotone transfer function or a
-driver whose schedule does not depend on dead registers. Extracting the
-worklist itself is the smaller part. The access-plan grouping in
-`region_analysis.rs` is advisory (the backends re-derive every condition
-before trusting it), so its safety is a property of the emitters, out of
-reach of this approach.
+`solve` is extracted but, beyond determinism, nothing is yet proved about
+its loop: that it reaches a post-fixed point (every reached slot's transfer
+is absorbed by its successors), and that it visits exactly the slots
+`partition` marks reachable, are the natural next invariants, and the
+`Run` model in `Region/Masking.lean` is the shape they would take. The
+access-plan grouping in `region_analysis.rs` is advisory (the backends
+re-derive every condition before trusting it), so its safety is a property
+of the emitters, out of reach of this approach.
