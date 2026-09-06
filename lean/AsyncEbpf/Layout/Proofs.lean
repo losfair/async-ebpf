@@ -802,4 +802,692 @@ theorem scan_function_ok {insns : Slice isa.Insn} {start «end» : Usize} {is_st
       cases res <;> exact this)
     _ _ hinit h rfl
 
+/-! ## All functions -/
+
+/-- The function starts of a `Slice Usize`, as slot numbers. -/
+def startVals (starts : Slice Usize) : List Nat := starts.val.map (fun s => s.val)
+
+theorem startVals_getElem? (starts : Slice Usize) (i : Nat) :
+    (startVals starts)[i]? = (starts.val[i]?).map (fun s => s.val) := by
+  simp [startVals]
+
+theorem startVals_length (starts : Slice Usize) : (startVals starts).length = starts.length := by
+  simp [startVals]
+
+/-- With sorted starts, function `j` ends at or before function `i > j` begins. -/
+theorem funcEnd_le {startsL : List Nat} {len i j start : Nat}
+    (hsorted : startsL.Pairwise (· < ·)) (hi : startsL[i]? = some start) (hj : j < i) :
+    funcEnd startsL len j ≤ start := by
+  obtain ⟨hi', rfl⟩ := List.getElem?_eq_some_iff.mp hi
+  have hj1 : j + 1 < startsL.length := by omega
+  simp only [funcEnd, List.getElem?_eq_getElem hj1]
+  by_cases heq : j + 1 = i
+  · subst heq; exact Nat.le_refl _
+  · exact Nat.le_of_lt (List.pairwise_iff_getElem.mp hsorted (j + 1) i hj1 hi' (by omega))
+
+theorem start_lt_of_lt {startsL : List Nat} {i j s start : Nat}
+    (hsorted : startsL.Pairwise (· < ·)) (hi : startsL[i]? = some start)
+    (hj : startsL[j]? = some s) (hji : j < i) : s < start := by
+  obtain ⟨hi', rfl⟩ := List.getElem?_eq_some_iff.mp hi
+  obtain ⟨hj', rfl⟩ := List.getElem?_eq_some_iff.mp hj
+  exact List.pairwise_iff_getElem.mp hsorted j i hj' hi' hji
+
+/-- The invariant of `scan_all`'s loop after the first `i` functions. -/
+structure ScanAllInv (insns : List isa.Insn) (startsL : List Nat) (is_start : List Bool)
+    (r : List Bool) (i : Nat) : Prop where
+  len : r.length = insns.length
+  /-- Everything marked so far is in a walked function. -/
+  marked_in : ∀ pc, Marked r pc → ∃ j, j < i ∧ InFunc startsL insns.length j pc
+  start_reach : ∀ j, j < i → ∀ s, startsL[j]? = some s → Marked r s
+  closed : ∀ j, j < i → ∀ pc, InFunc startsL insns.length j pc → Marked r pc →
+    ∀ q ∈ succB insns pc, InFunc startsL insns.length j q ∧ Marked r q
+  calls : ∀ pc, Marked r pc → ∀ h : pc < insns.length, IsLocalCall insns[pc] →
+    ∃ t : Nat, callTargetInt insns[pc] pc = (t : Int) ∧ is_start[t]? = some true
+
+theorem ScanAllInv.init {insns : List isa.Insn} {startsL : List Nat} {is_start : List Bool}
+    {r : List Bool} (hlen : r.length = insns.length) (hfalse : ∀ pc, ¬ Marked r pc) :
+    ScanAllInv insns startsL is_start r 0 :=
+  ⟨hlen, fun pc h => absurd h (hfalse pc), fun _ h => absurd h (Nat.not_lt_zero _),
+    fun _ h => absurd h (Nat.not_lt_zero _), fun pc h => absurd h (hfalse pc)⟩
+
+/-- Nothing of function `i` is marked before its walk. -/
+theorem ScanAllInv.fresh {insns : List isa.Insn} {startsL : List Nat} {is_start : List Bool}
+    {r : List Bool} {i start : Nat} (hsorted : startsL.Pairwise (· < ·))
+    (h : ScanAllInv insns startsL is_start r i) (hi : startsL[i]? = some start) :
+    ∀ pc, start ≤ pc → ¬ Marked r pc := by
+  intro pc hpc hm
+  obtain ⟨j, hj, s, hs, hs1, hs2⟩ := h.marked_in pc hm
+  have := funcEnd_le (len := insns.length) hsorted hi hj
+  omega
+
+/-- The walk of function `i` extends the invariant to `i + 1`. -/
+theorem ScanAllInv.step {insns : List isa.Insn} {startsL : List Nat} {is_start : List Bool}
+    {r r' : List Bool} {i start «end» : Nat} (hsorted : startsL.Pairwise (· < ·))
+    (h : ScanAllInv insns startsL is_start r i) (hi : startsL[i]? = some start)
+    (hend : «end» = funcEnd startsL insns.length i)
+    (post : ScanPost insns is_start start «end» r r') :
+    ScanAllInv insns startsL is_start r' (i + 1) := by
+  have hbelow : ∀ j, j < i → ∀ pc, InFunc startsL insns.length j pc → pc < start := by
+    intro j hj pc ⟨s, hs, _, hlt⟩
+    have := funcEnd_le (len := insns.length) hsorted hi hj
+    omega
+  have hin : ∀ pc, InFunc startsL insns.length i pc ↔ (start ≤ pc ∧ pc < «end») := by
+    intro pc
+    constructor
+    · rintro ⟨s, hs, h1, h2⟩
+      rw [hi] at hs
+      simp only [Option.some.injEq] at hs
+      subst hs
+      exact ⟨h1, hend ▸ h2⟩
+    · rintro ⟨h1, h2⟩
+      exact ⟨start, hi, h1, hend ▸ h2⟩
+  have hkeep : ∀ pc, pc < start → (Marked r' pc ↔ Marked r pc) := by
+    intro pc hpc
+    simp only [Marked]
+    rw [post.frame pc (by omega)]
+  refine ⟨post.len.trans h.len, ?_, ?_, ?_, ?_⟩
+  · intro pc hm
+    by_cases hr : start ≤ pc ∧ pc < «end»
+    · exact ⟨i, Nat.lt_succ_self _, (hin pc).mpr hr⟩
+    · have hm' : Marked r pc := by
+        simp only [Marked] at hm ⊢
+        rw [← post.frame pc hr]
+        exact hm
+      obtain ⟨j, hj, hf⟩ := h.marked_in pc hm'
+      exact ⟨j, by omega, hf⟩
+  · intro j hj s hs
+    by_cases hji : j < i
+    · have := start_lt_of_lt hsorted hi hs hji
+      exact (hkeep s this).mpr (h.start_reach j hji s hs)
+    · have : j = i := by omega
+      subst this
+      rw [hi] at hs
+      simp only [Option.some.injEq] at hs
+      subst hs
+      exact post.start_ok
+  · intro j hj pc hf hm q hq
+    by_cases hji : j < i
+    · have hpc := hbelow j hji pc hf
+      obtain ⟨hqf, hqm⟩ := h.closed j hji pc hf ((hkeep pc hpc).mp hm) q hq
+      exact ⟨hqf, (hkeep q (hbelow j hji q hqf)).mpr hqm⟩
+    · have : j = i := by omega
+      subst this
+      obtain ⟨h1, h2⟩ := (hin pc).mp hf
+      obtain ⟨hq1, hq2, hqm⟩ := post.closed pc h1 h2 hm q hq
+      exact ⟨(hin q).mpr ⟨hq1, hq2⟩, hqm⟩
+  · intro pc hm hpc hc
+    by_cases hr : start ≤ pc ∧ pc < «end»
+    · exact post.calls pc hr.1 hr.2 hm hpc hc
+    · have hm' : Marked r pc := by
+        simp only [Marked] at hm ⊢
+        rw [← post.frame pc hr]
+        exact hm
+      exact h.calls pc hm' hpc hc
+
+/-- What one iteration of `scan_all`'s loop must establish. -/
+def ScanAllStepPost (insns : List isa.Insn) (startsL : List Nat) (is_start : List Bool)
+    (res : ControlFlow (alloc.vec.Vec Bool × alloc.vec.Vec Usize × Usize)
+      (core.result.Result Unit layout.LayoutReject × alloc.vec.Vec Bool)) : Prop :=
+  match res with
+  | .cont x => ScanAllInv insns startsL is_start x.1.val x.2.2.val
+  | .done y => y.1 = .Ok () →
+      ∃ i, startsL.length ≤ i ∧ ScanAllInv insns startsL is_start y.2.val i
+
+theorem scan_all_step {insns : Slice isa.Insn} {starts : Slice Usize} {is_start : Slice Bool}
+    {num_insns : Usize} (hlen : insns.length < 2 ^ 63) (hnum : num_insns.val = insns.length)
+    (hsorted : (startVals starts).Pairwise (· < ·))
+    (r : alloc.vec.Vec Bool) (p : alloc.vec.Vec Usize) (i : Usize)
+    (hinv : ScanAllInv insns.val (startVals starts) is_start.val r.val i.val)
+    (res : ControlFlow (alloc.vec.Vec Bool × alloc.vec.Vec Usize × Usize)
+      (core.result.Result Unit layout.LayoutReject × alloc.vec.Vec Bool))
+    (hb : layout.scan_all_loop.body insns starts is_start num_insns r p i = ok res) :
+    ScanAllStepPost insns.val (startVals starts) is_start.val res := by
+  unfold layout.scan_all_loop.body at hb
+  dsimp only at hb
+  split at hb
+  · rename_i hlt
+    obtain_bind ⟨start, hsidx, hb⟩ := hb
+    obtain ⟨hi, hstart⟩ := index_usize_eq_ok hsidx
+    clear hsidx
+    obtain_bind ⟨i2, hi2, hb⟩ := hb
+    have hi2v := usize_add_eq_ok hi2
+    simp at hi2v
+    obtain_bind ⟨e, hend, hb⟩ := hb
+    have hi' : (startVals starts)[i.val]? = some start.val := by
+      rw [startVals_getElem?, List.getElem?_eq_getElem hi, hstart]
+      rfl
+    have hendv : e.val = funcEnd (startVals starts) insns.length i.val := by
+      split at hend
+      · rename_i hlt2
+        obtain ⟨hi2b, rfl⟩ := index_usize_eq_ok hend
+        simp only [funcEnd, startVals_getElem?, ← hi2v, List.getElem?_eq_getElem hi2b, Option.map_some]
+      · rename_i hge2
+        simp only [ok.injEq] at hend
+        subst hend
+        have hnone : (startVals starts)[i.val + 1]? = none := by
+          rw [startVals_getElem?, ← hi2v, List.getElem?_eq_none_iff.mpr]
+          · rfl
+          · simp only [not_lt] at hge2
+            exact hge2
+        simp only [funcEnd, hnone, hnum]
+    obtain_bind ⟨⟨rr, r1, p1⟩, hsf, hb⟩ := hb
+    try simp only at hb
+    obtain_bind ⟨cf, hbr, hb⟩ := hb
+    try_ok rr hbr hb with u
+    cases u
+    simp only [ok.injEq] at hb
+    subst hb
+    unfold ScanAllStepPost
+    simp only
+    rw [hi2v]
+    have hfresh : ∀ pc, start.val ≤ pc → pc < e.val → ¬ Marked r.val pc :=
+      fun pc h1 _ => hinv.fresh hsorted hi' pc h1
+    exact hinv.step hsorted hi' hendv (scan_function_ok hlen hfresh hsf)
+  · rename_i hge
+    simp only [ok.injEq] at hb
+    subst hb
+    unfold ScanAllStepPost
+    intro _
+    refine ⟨i.val, ?_, hinv⟩
+    simp only [not_lt] at hge
+    rw [startVals_length]
+    exact hge
+
+theorem scan_all_ok {insns : Slice isa.Insn} {starts : Slice Usize} {is_start : Slice Bool}
+    {r r' : alloc.vec.Vec Bool} (hlen : insns.length < 2 ^ 63)
+    (hsorted : (startVals starts).Pairwise (· < ·))
+    (hr : r.val = List.replicate insns.length false)
+    (h : layout.scan_all insns starts is_start r = ok (.Ok (), r')) :
+    ∃ i, (startVals starts).length ≤ i ∧ ScanAllInv insns.val (startVals starts) is_start.val r'.val i := by
+  unfold layout.scan_all at h
+  obtain_bind ⟨n2, hn2, h⟩ := h
+  obtain_bind ⟨n3, hn3, h⟩ := h
+  obtain_bind ⟨p, hp, h⟩ := h
+  unfold layout.scan_all_loop at h
+  have hinit : ScanAllInv insns.val (startVals starts) is_start.val r.val (0#usize).val := by
+    apply ScanAllInv.init
+    · simp [hr]
+    · intro pc hm
+      simp only [Marked, hr] at hm
+      rw [List.getElem?_replicate] at hm
+      split at hm <;> simp at hm
+  exact loop_ok_induction _
+    (fun x => ScanAllInv insns.val (startVals starts) is_start.val x.1.val x.2.2.val)
+    (fun y => y.1 = .Ok () →
+      ∃ i, (startVals starts).length ≤ i ∧ ScanAllInv insns.val (startVals starts) is_start.val y.2.val i)
+    (by
+      rintro ⟨r1, p1, i1⟩ hinv res hb
+      have := scan_all_step hlen (by simp) hsorted r1 p1 i1 hinv res hb
+      cases res <;> exact this)
+    _ _ hinit h rfl
+
+/-! ## Collecting the starts -/
+
+theorem vec_deref_val {α : Type} (v : alloc.vec.Vec α) : (alloc.vec.Vec.deref v).val = v.val := by
+  unfold alloc.vec.Vec.deref
+  exact Slice.from_val _ _
+
+/-- The predicate `collect_starts` filters by. -/
+def isStart (is_start : List Bool) (k : Nat) : Bool := is_start[k]? == some true
+
+def CollectInv (is_start : List Bool) (starts : List Usize) (pc : Nat) : Prop :=
+  pc ≤ is_start.length ∧ starts.map (fun s => s.val) = (List.range pc).filter (isStart is_start)
+
+def CollectStepPost (is_start : List Bool)
+    (res : ControlFlow (alloc.vec.Vec Usize × Usize) (alloc.vec.Vec Usize)) : Prop :=
+  match res with
+  | .cont x => CollectInv is_start x.1.val x.2.val
+  | .done y => y.val.map (fun s => s.val) = (List.range is_start.length).filter (isStart is_start)
+
+theorem collect_starts_step {is_start : Slice Bool} (starts : alloc.vec.Vec Usize) (pc : Usize)
+    (hinv : CollectInv is_start.val starts.val pc.val)
+    (res : ControlFlow (alloc.vec.Vec Usize × Usize) (alloc.vec.Vec Usize))
+    (hb : layout.collect_starts_loop.body is_start starts pc = ok res) :
+    CollectStepPost is_start.val res := by
+  unfold layout.collect_starts_loop.body at hb
+  dsimp only at hb
+  obtain ⟨hle, heq⟩ := hinv
+  split at hb
+  · rename_i hlt
+    have hpc : pc.val < is_start.val.length := by
+      have := hlt
+      rw [UScalar.lt_equiv] at this
+      simpa [Slice.length] using this
+    obtain_bind ⟨b, hidx, hb⟩ := hb
+    obtain ⟨_, rfl⟩ := index_usize_eq_ok hidx
+    clear hidx
+    obtain_bind ⟨starts1, hpush, hb⟩ := hb
+    obtain_bind ⟨pc1, hadd, hb⟩ := hb
+    have hpc1 := usize_add_eq_ok hadd
+    simp at hpc1
+    simp only [ok.injEq] at hb
+    subst hb
+    unfold CollectStepPost
+    dsimp only
+    refine ⟨by omega, ?_⟩
+    rw [hpc1, List.range_succ, List.filter_append, ← heq]
+    split at hpush
+    · rename_i htrue
+      rw [vec_push_eq_ok hpush]
+      simp [isStart, List.getElem?_eq_getElem hpc, htrue]
+    · rename_i hfalse
+      simp only [ok.injEq] at hpush
+      subst hpush
+      simp [isStart, List.getElem?_eq_getElem hpc, hfalse]
+  · rename_i hge
+    simp only [ok.injEq] at hb
+    subst hb
+    unfold CollectStepPost
+    have : is_start.val.length ≤ pc.val := by
+      have := usize_not_lt hge
+      simpa [Slice.length] using this
+    have : pc.val = is_start.val.length := by omega
+    rw [← this]
+    exact heq
+
+theorem collect_starts_ok {is_start : Slice Bool} {starts : alloc.vec.Vec Usize}
+    (h : layout.collect_starts is_start = ok starts) :
+    starts.val.map (fun s => s.val) = (List.range is_start.length).filter (isStart is_start.val) := by
+  unfold layout.collect_starts layout.collect_starts_loop at h
+  exact loop_ok_induction _
+    (fun x => CollectInv is_start.val x.1.val x.2.val)
+    (fun y => y.val.map (fun s => s.val) = (List.range is_start.length).filter (isStart is_start.val))
+    (by
+      rintro ⟨s1, pc1⟩ hinv res hb
+      have := collect_starts_step s1 pc1 hinv res hb
+      cases res <;> exact this)
+    _ _ ⟨Nat.zero_le _, by simp⟩ h
+
+/-- What the list of starts satisfies. -/
+theorem starts_facts {is_start : List Bool} {starts : List Nat}
+    (h : starts = (List.range is_start.length).filter (isStart is_start)) :
+    starts.Pairwise (· < ·) ∧ (∀ s ∈ starts, s < is_start.length) ∧
+    (∀ t, is_start[t]? = some true → t ∈ starts) := by
+  subst h
+  refine ⟨List.pairwise_lt_range.filter _, ?_, ?_⟩
+  · intro s hs
+    exact List.mem_range.mp (List.mem_filter.mp hs).1
+  · intro t ht
+    have : t < is_start.length := List.getElem?_eq_some_iff.mp ht |>.1
+    exact List.mem_filter.mpr ⟨List.mem_range.mpr this, by simp [isStart, ht]⟩
+
+/-- A sorted list containing `0` begins with it. -/
+theorem sorted_head_zero {l : List Nat} (hs : l.Pairwise (· < ·)) (h0 : 0 ∈ l) : l[0]? = some 0 := by
+  cases l with
+  | nil => simp at h0
+  | cons a rest =>
+    rw [List.pairwise_cons] at hs
+    simp only [List.mem_cons] at h0
+    rcases h0 with rfl | h0
+    · rfl
+    · have := hs.1 0 h0
+      omega
+
+/-! ## Assigning slots to functions -/
+
+def FillInv (f0 : List Usize) (start «end» : Nat) (func : Usize) (f : List Usize) (pc : Nat) : Prop :=
+  f.length = f0.length ∧ start ≤ pc ∧
+  (∀ k, start ≤ k → k < pc → k < «end» → f[k]? = some func) ∧
+  (∀ k, ¬ (start ≤ k ∧ k < pc ∧ k < «end») → f[k]? = f0[k]?)
+
+def FillPost (f0 : List Usize) (start «end» : Nat) (func : Usize) (f : List Usize) : Prop :=
+  f.length = f0.length ∧
+  (∀ k, start ≤ k → k < «end» → f[k]? = some func) ∧
+  (∀ k, ¬ (start ≤ k ∧ k < «end») → f[k]? = f0[k]?)
+
+def FillStepPost (f0 : List Usize) (start «end» : Nat) (func : Usize)
+    (res : ControlFlow (alloc.vec.Vec Usize × Usize) (alloc.vec.Vec Usize)) : Prop :=
+  match res with
+  | .cont x => FillInv f0 start «end» func x.1.val x.2.val
+  | .done y => FillPost f0 start «end» func y.val
+
+theorem fill_range_step (f0 : List Usize) (start : Nat) («end» func : Usize)
+    (f : alloc.vec.Vec Usize) (pc : Usize) (hinv : FillInv f0 start «end».val func f.val pc.val)
+    (res : ControlFlow (alloc.vec.Vec Usize × Usize) (alloc.vec.Vec Usize))
+    (hb : layout.fill_range_loop.body «end» func f pc = ok res) :
+    FillStepPost f0 start «end».val func res := by
+  unfold layout.fill_range_loop.body at hb
+  obtain ⟨hlen, hsp, hin, hout⟩ := hinv
+  split at hb
+  · rename_i hlt
+    have hpe : pc.val < «end».val := by rw [UScalar.lt_equiv] at hlt; exact hlt
+    obtain_bind ⟨⟨_, back⟩, hmut, hb⟩ := hb
+    try simp only at hb
+    obtain ⟨hpcf, _, rfl⟩ := vec_index_mut_eq_ok hmut
+    obtain_bind ⟨pc1, hadd, hb⟩ := hb
+    have hpc1 := usize_add_eq_ok hadd
+    simp at hpc1
+    simp only [ok.injEq] at hb
+    subst hb
+    unfold FillStepPost
+    dsimp only
+    simp only [alloc.vec.Vec.set_val_eq]
+    refine ⟨by simp [hlen], by omega, ?_, ?_⟩
+    · intro k h1 h2 h3
+      by_cases hk : k = pc.val
+      · subst hk; exact List.getElem?_set_self hpcf
+      · rw [List.getElem?_set_ne (Ne.symm hk)]
+        exact hin k h1 (by omega) h3
+    · intro k hk
+      have hne : pc.val ≠ k := by rintro rfl; exact hk ⟨by omega, by omega, hpe⟩
+      rw [List.getElem?_set_ne hne]
+      exact hout k (fun ⟨a, b, c⟩ => hk ⟨a, by omega, c⟩)
+  · rename_i hge
+    have hpe : «end».val ≤ pc.val := usize_not_lt hge
+    simp only [ok.injEq] at hb
+    subst hb
+    unfold FillStepPost
+    refine ⟨hlen, ?_, ?_⟩
+    · intro k h1 h2
+      exact hin k h1 (by omega) h2
+    · intro k hk
+      exact hout k (fun ⟨a, _, c⟩ => hk ⟨a, c⟩)
+
+theorem fill_range_ok {f f' : alloc.vec.Vec Usize} {start «end» func : Usize}
+    (h : layout.fill_range f start «end» func = ok f') :
+    FillPost f.val start.val «end».val func f'.val := by
+  unfold layout.fill_range layout.fill_range_loop at h
+  exact loop_ok_induction _
+    (fun x => FillInv f.val start.val «end».val func x.1.val x.2.val)
+    (fun y => FillPost f.val start.val «end».val func y.val)
+    (by
+      rintro ⟨f1, pc1⟩ hinv res hb
+      have := fill_range_step f.val start.val «end» func f1 pc1 hinv res hb
+      cases res <;> exact this)
+    _ _ (show FillInv f.val start.val «end».val func f.val start.val from
+      ⟨rfl, Nat.le_refl _, fun _ h1 h2 _ => absurd h2 (by omega), fun _ _ => rfl⟩) h
+
+/-- After the first `i` functions: their slots are assigned. -/
+def AssignInv (startsL : List Nat) (len : Nat) (f : List Usize) (i : Nat) : Prop :=
+  f.length = len ∧
+  ∀ j, j < i → ∀ (pc : Nat), InFunc startsL len j pc → (f[pc]?).map (fun x => x.val) = some j
+
+def AssignStepPost (startsL : List Nat) (len : Nat)
+    (res : ControlFlow (alloc.vec.Vec Usize × Usize) (alloc.vec.Vec Usize)) : Prop :=
+  match res with
+  | .cont x => AssignInv startsL len x.1.val x.2.val
+  | .done y => ∃ i, startsL.length ≤ i ∧ AssignInv startsL len y.val i
+
+theorem assign_functions_step {starts : Slice Usize} {num_insns : Usize}
+    (hsorted : (startVals starts).Pairwise (· < ·))
+    (f : alloc.vec.Vec Usize) (i : Usize) (hinv : AssignInv (startVals starts) num_insns.val f.val i.val)
+    (res : ControlFlow (alloc.vec.Vec Usize × Usize) (alloc.vec.Vec Usize))
+    (hb : layout.assign_functions_loop.body starts num_insns f i = ok res) :
+    AssignStepPost (startVals starts) num_insns.val res := by
+  unfold layout.assign_functions_loop.body at hb
+  dsimp only at hb
+  obtain ⟨hlen, hassigned⟩ := hinv
+  split at hb
+  · rename_i hlt
+    obtain_bind ⟨i2, hi2, hb⟩ := hb
+    have hi2v := usize_add_eq_ok hi2
+    simp at hi2v
+    obtain_bind ⟨e, hend, hb⟩ := hb
+    obtain_bind ⟨start, hsidx, hb⟩ := hb
+    obtain ⟨hi, hstart⟩ := index_usize_eq_ok hsidx
+    clear hsidx
+    have hi' : (startVals starts)[i.val]? = some start.val := by
+      rw [startVals_getElem?, List.getElem?_eq_getElem hi, hstart]
+      rfl
+    have hendv : e.val = funcEnd (startVals starts) num_insns.val i.val := by
+      split at hend
+      · rename_i hlt2
+        obtain ⟨hi2b, rfl⟩ := index_usize_eq_ok hend
+        simp only [funcEnd, startVals_getElem?, ← hi2v, List.getElem?_eq_getElem hi2b, Option.map_some]
+      · rename_i hge2
+        simp only [ok.injEq] at hend
+        subst hend
+        have hnone : (startVals starts)[i.val + 1]? = none := by
+          rw [startVals_getElem?, ← hi2v, List.getElem?_eq_none_iff.mpr]
+          · rfl
+          · simp only [not_lt] at hge2
+            exact hge2
+        simp only [funcEnd, hnone]
+    obtain_bind ⟨f1, hfill, hb⟩ := hb
+    obtain ⟨hlen1, hin, hout⟩ := fill_range_ok hfill
+    simp only [ok.injEq] at hb
+    subst hb
+    unfold AssignStepPost
+    simp only
+    rw [hi2v]
+    refine ⟨hlen1.trans hlen, ?_⟩
+    intro j hj pc hf
+    by_cases hji : j < i.val
+    · have hpc : pc < start.val := by
+        obtain ⟨s, hs, _, h2⟩ := hf
+        have := funcEnd_le (len := num_insns.val) hsorted hi' hji
+        omega
+      rw [hout pc (by omega)]
+      exact hassigned j hji pc hf
+    · have : j = i.val := by omega
+      subst this
+      obtain ⟨s, hs, h1, h2⟩ := hf
+      rw [hi'] at hs
+      simp only [Option.some.injEq] at hs
+      subst hs
+      rw [hin pc h1 (hendv ▸ h2)]
+      rfl
+  · rename_i hge
+    simp only [ok.injEq] at hb
+    subst hb
+    unfold AssignStepPost
+    refine ⟨i.val, ?_, hlen, hassigned⟩
+    simp only [not_lt] at hge
+    rw [startVals_length]
+    exact hge
+
+theorem assign_functions_ok {starts : Slice Usize} {num_insns : Usize} {f : alloc.vec.Vec Usize}
+    (hsorted : (startVals starts).Pairwise (· < ·))
+    (h : layout.assign_functions starts num_insns = ok f) :
+    f.length = num_insns.val ∧
+    ∀ j pc, InFunc (startVals starts) num_insns.val j pc → (f.val[pc]?).map (fun x => x.val) = some j := by
+  unfold layout.assign_functions at h
+  obtain_bind ⟨f0, hf0, h⟩ := h
+  have hf0v := from_elem_eq_ok rfl hf0
+  unfold layout.assign_functions_loop at h
+  have post := loop_ok_induction _
+    (fun x => AssignInv (startVals starts) num_insns.val x.1.val x.2.val)
+    (fun y => ∃ i, (startVals starts).length ≤ i ∧ AssignInv (startVals starts) num_insns.val y.val i)
+    (by
+      rintro ⟨f1, i1⟩ hinv res hb
+      have := assign_functions_step hsorted f1 i1 hinv res hb
+      cases res <;> exact this)
+    _ _ ⟨by simp [hf0v], fun _ h => absurd h (Nat.not_lt_zero _)⟩ h
+  obtain ⟨i, hi, hlen, hassigned⟩ := post
+  refine ⟨hlen, fun j pc hf => ?_⟩
+  obtain ⟨s, hs, _, _⟩ := hf
+  have : j < (startVals starts).length := List.getElem?_eq_some_iff.mp hs |>.1
+  exact hassigned j (by omega) pc ⟨s, hs, ‹_›, ‹_›⟩
+
+/-! ## Marking the starts -/
+
+/-- `mark_entries` and `mark_call_targets` only ever set flags. -/
+def MarkInv (s0 : List Bool) (s : List Bool) : Prop :=
+  s.length = s0.length ∧ ∀ (k : Nat), s0[k]? = some true → s[k]? = some true
+
+theorem MarkInv.refl (s0 : List Bool) : MarkInv s0 s0 := ⟨rfl, fun _ h => h⟩
+
+theorem MarkInv.set {s0 s : List Bool} (h : MarkInv s0 s) (k : Nat) : MarkInv s0 (s.set k true) := by
+  refine ⟨by simp [h.1], fun j hj => ?_⟩
+  by_cases hk : k = j
+  · subst hk
+    have := List.getElem?_eq_some_iff.mp (h.2 _ hj) |>.1
+    exact List.getElem?_set_self this
+  · rw [List.getElem?_set_ne hk]
+    exact h.2 j hj
+
+def MarkStepPost (s0 : List Bool)
+    (res : ControlFlow (alloc.vec.Vec Bool × Usize)
+      (core.result.Result Unit layout.LayoutReject × alloc.vec.Vec Bool)) : Prop :=
+  match res with
+  | .cont x => MarkInv s0 x.1.val
+  | .done y => MarkInv s0 y.2.val
+
+theorem mark_entries_step {entries : Slice Usize} {num_insns : Usize} (s0 : List Bool)
+    (s : alloc.vec.Vec Bool) (k : Usize) (hinv : MarkInv s0 s.val)
+    (res : ControlFlow (alloc.vec.Vec Bool × Usize)
+      (core.result.Result Unit layout.LayoutReject × alloc.vec.Vec Bool))
+    (hb : layout.mark_entries_loop.body entries num_insns s k = ok res) : MarkStepPost s0 res := by
+  unfold layout.mark_entries_loop.body at hb
+  dsimp only at hb
+  split at hb
+  · obtain_bind ⟨entry, hidx, hb⟩ := hb
+    split at hb
+    · simp only [ok.injEq] at hb; subst hb; exact hinv
+    · obtain_bind ⟨⟨_, back⟩, hmut, hb⟩ := hb
+      try simp only at hb
+      obtain ⟨_, _, rfl⟩ := vec_index_mut_eq_ok hmut
+      obtain_bind ⟨k1, hadd, hb⟩ := hb
+      simp only [ok.injEq] at hb
+      subst hb
+      unfold MarkStepPost
+      simp only [alloc.vec.Vec.set_val_eq]
+      exact hinv.set _
+  · simp only [ok.injEq] at hb; subst hb; exact hinv
+
+theorem mark_entries_ok {entries : Slice Usize} {num_insns : Usize} {s s' : alloc.vec.Vec Bool}
+    (h : layout.mark_entries entries num_insns s = ok (.Ok (), s')) : MarkInv s.val s'.val := by
+  unfold layout.mark_entries layout.mark_entries_loop at h
+  exact loop_ok_induction _
+    (fun x => MarkInv s.val x.1.val)
+    (fun y => MarkInv s.val y.2.val)
+    (by
+      rintro ⟨s1, k1⟩ hinv res hb
+      have := mark_entries_step s.val s1 k1 hinv res hb
+      cases res <;> exact this)
+    _ _ (MarkInv.refl _) h
+
+theorem mark_call_targets_step {insns : Slice isa.Insn} {num_insns : Usize} (s0 : List Bool)
+    (s : alloc.vec.Vec Bool) (pc : Usize) (hinv : MarkInv s0 s.val)
+    (res : ControlFlow (alloc.vec.Vec Bool × Usize)
+      (core.result.Result Unit layout.LayoutReject × alloc.vec.Vec Bool))
+    (hb : layout.mark_call_targets_loop.body insns num_insns s pc = ok res) : MarkStepPost s0 res := by
+  unfold layout.mark_call_targets_loop.body at hb
+  split at hb
+  · obtain_bind ⟨insn, hidx, hb⟩ := hb
+    obtain_bind ⟨b, hlc, hb⟩ := hb
+    split at hb
+    · obtain_bind ⟨r, hr, hb⟩ := hb
+      obtain_bind ⟨cf, hbr, hb⟩ := hb
+      rcases r with t | e
+      · rw [branch_Ok] at hbr
+        simp only [ok.injEq] at hbr
+        subst hbr
+        simp only at hb
+        obtain_bind ⟨⟨_, back⟩, hmut, hb⟩ := hb
+        try simp only at hb
+        obtain ⟨_, _, rfl⟩ := vec_index_mut_eq_ok hmut
+        obtain_bind ⟨pc1, hadd, hb⟩ := hb
+        simp only [ok.injEq] at hb
+        subst hb
+        unfold MarkStepPost
+        simp only [alloc.vec.Vec.set_val_eq]
+        exact hinv.set _
+      · rw [branch_Err] at hbr
+        simp only [ok.injEq] at hbr
+        subst hbr
+        simp only at hb
+        obtain_bind ⟨r1, hres, hb⟩ := hb
+        simp only [ok.injEq] at hb
+        subst hb
+        exact hinv
+    · obtain_bind ⟨pc1, hadd, hb⟩ := hb
+      simp only [ok.injEq] at hb
+      subst hb
+      exact hinv
+  · simp only [ok.injEq] at hb; subst hb; exact hinv
+
+theorem mark_call_targets_ok {insns : Slice isa.Insn} {s s' : alloc.vec.Vec Bool}
+    (h : layout.mark_call_targets insns s = ok (.Ok (), s')) : MarkInv s.val s'.val := by
+  unfold layout.mark_call_targets layout.mark_call_targets_loop at h
+  dsimp only at h
+  exact loop_ok_induction _
+    (fun x => MarkInv s.val x.1.val)
+    (fun y => MarkInv s.val y.2.val)
+    (by
+      rintro ⟨s1, pc1⟩ hinv res hb
+      have := mark_call_targets_step s.val s1 pc1 hinv res hb
+      cases res <;> exact this)
+    _ _ (MarkInv.refl _) h
+
+/-! ## The theorem -/
+
+/-- A layout `partition` returns is `LayoutOk`. -/
+theorem partition_ok {insns : Slice isa.Insn} {entries : Slice Usize} {L : layout.Layout}
+    (hlen : insns.length < 2 ^ 63) (hne : 0 < insns.length)
+    (h : layout.partition insns entries = ok (.Ok L)) : LayoutOk insns.val L := by
+  unfold layout.partition at h
+  dsimp only at h
+  obtain_bind ⟨s0, hs0, h⟩ := h
+  have hs0v := from_elem_eq_ok rfl hs0
+  obtain_bind ⟨⟨_, back⟩, hmut, h⟩ := h
+  try simp only at h
+  obtain ⟨_, _, rfl⟩ := vec_index_mut_eq_ok hmut
+  obtain_bind ⟨⟨r0, s2⟩, hme, h⟩ := h
+  try simp only at h
+  obtain_bind ⟨cf, hbr, h⟩ := h
+  try_ok r0 hbr h with u
+  cases u
+  obtain_bind ⟨⟨r1, s3⟩, hmc, h⟩ := h
+  try simp only at h
+  obtain_bind ⟨cf1, hbr1, h⟩ := h
+  try_ok r1 hbr1 h with u1
+  cases u1
+  obtain_bind ⟨sts, hcs, h⟩ := h
+  obtain_bind ⟨pc_to_func, haf, h⟩ := h
+  obtain_bind ⟨⟨r2, reachable⟩, hsa, h⟩ := h
+  try simp only at h
+  obtain_bind ⟨cf2, hbr2, h⟩ := h
+  try_ok r2 hbr2 h with u2
+  simp only [ok.injEq, core.result.Result.Ok.injEq] at h
+  subst h
+  set L : layout.Layout := ⟨sts, pc_to_func, reachable⟩ with hL
+  -- The flags: length `insns.length`, slot 0 set.
+  have hm1 := mark_entries_ok hme
+  have hm2 := mark_call_targets_ok hmc
+  simp only [alloc.vec.Vec.set_val_eq, hs0v, Slice.len_val] at hm1
+  have hs3len : s3.val.length = insns.length := hm2.1.trans (hm1.1.trans (by simp))
+  have hs3zero : s3.val[0]? = some true := by
+    apply hm2.2; apply hm1.2
+    have h0v : (0#usize).val = 0 := by simp
+    rw [h0v, List.getElem?_set_self]
+    simpa using hne
+  -- The starts.
+  have hcs' := collect_starts_ok hcs
+  rw [vec_deref_val, Slice.length, vec_deref_val, hs3len] at hcs'
+  have hstartsL : starts L = (List.range insns.length).filter (isStart s3.val) := by
+    show sts.val.map (fun s => s.val) = _
+    exact hcs'
+  have hsv : startVals (alloc.vec.Vec.deref sts) = starts L := by
+    simp only [startVals, vec_deref_val]; rfl
+  rw [← hs3len] at hstartsL
+  obtain ⟨hsorted, hlt, hmem⟩ := starts_facts hstartsL
+  rw [hs3len] at hlt
+  have hzero : (starts L)[0]? = some 0 := sorted_head_zero hsorted (hmem 0 hs3zero)
+  -- The assignment.
+  have haf' := assign_functions_ok (by rw [hsv]; exact hsorted) haf
+  rw [hsv] at haf'
+  simp only [Slice.len_val] at haf'
+  -- The walk.
+  obtain ⟨i, hi, hall⟩ := scan_all_ok hlen (by rw [hsv]; exact hsorted)
+    (by rw [hs0v]; rfl) hsa
+  rw [hsv] at hall hi
+  simp only [vec_deref_val] at hall
+  refine ⟨hzero, hsorted, hlt, haf'.1, hall.len, ?_, ?_, ?_, ?_⟩
+  · intro j pc hf
+    exact haf'.2 j pc hf
+  · intro j s hs
+    have : j < (starts L).length := List.getElem?_eq_some_iff.mp hs |>.1
+    exact hall.start_reach j (by omega) s hs
+  · intro j pc hf hr q hq
+    have : j < (starts L).length := by
+      obtain ⟨s, hs, _⟩ := hf
+      exact List.getElem?_eq_some_iff.mp hs |>.1
+    exact hall.closed j (by omega) pc hf hr q hq
+  · intro pc t hr ⟨hpc, hc, ht⟩
+    obtain ⟨t', ht', hst⟩ := hall.calls pc hr hpc hc
+    have : t' = t := by rw [ht] at ht'; exact_mod_cast ht'.symm
+    subst this
+    exact hmem t' hst
+
 end async_ebpf_verified
