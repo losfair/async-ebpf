@@ -181,20 +181,30 @@ pub struct Slot {
   pub kind: RegKind,
 }
 
-/// Abstract state at a program point: the kind of every register plus the
-/// kinds of values spilled to `R10`-relative stack slots. Absent slots are
-/// `Uninit` (top). An entry whose epoch predates `invalid_epoch` reads as
-/// `Unknown`.
+/// The tracked spill slots of a state. Absent slots are `Uninit` (top). An
+/// entry whose epoch predates `invalid_epoch` reads as `Unknown`.
+///
+/// Its own struct, and every function on it takes only it: what a spill
+/// slot reads back as depends on the slots alone, never on a register, and
+/// `lean/AsyncEbpf/Region` gets that for free.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(feature = "extract"), derive(PartialEq, Eq, Debug))]
-pub struct State {
-  pub regs: [RegKind; NUM_REGS],
+pub struct Spills {
   pub slots: [Slot; MAX_TRACKED_SLOTS],
   /// Entries `0..num_slots` of `slots` are meaningful.
   pub num_slots: usize,
   /// Bumped by [`invalidate_slots`]; every entry written before the current
   /// value reads as `Unknown`.
   pub invalid_epoch: u64,
+}
+
+/// Abstract state at a program point: the kind of every register plus the
+/// kinds of values spilled to `R10`-relative stack slots.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "extract"), derive(PartialEq, Eq, Debug))]
+pub struct State {
+  pub regs: [RegKind; NUM_REGS],
+  pub spills: Spills,
 }
 
 const EMPTY_SLOT: Slot = Slot {
@@ -207,15 +217,17 @@ const EMPTY_SLOT: Slot = Slot {
 pub fn top() -> State {
   State {
     regs: [RegKind::Uninit; NUM_REGS],
-    slots: [EMPTY_SLOT; MAX_TRACKED_SLOTS],
-    num_slots: 0,
-    invalid_epoch: 0,
+    spills: Spills {
+      slots: [EMPTY_SLOT; MAX_TRACKED_SLOTS],
+      num_slots: 0,
+      invalid_epoch: 0,
+    },
   }
 }
 
 /// The kind an entry written at `epoch` with value `kind` currently has.
-fn effective_kind(state: &State, epoch: u64, kind: RegKind) -> RegKind {
-  if epoch >= state.invalid_epoch {
+fn effective_kind(spills: &Spills, epoch: u64, kind: RegKind) -> RegKind {
+  if epoch >= spills.invalid_epoch {
     kind
   } else {
     RegKind::Unknown
@@ -223,10 +235,10 @@ fn effective_kind(state: &State, epoch: u64, kind: RegKind) -> RegKind {
 }
 
 /// The index of the entry for `off`, if tracked.
-fn find_slot(state: &State, off: i32) -> Option<usize> {
+fn find_slot(spills: &Spills, off: i32) -> Option<usize> {
   let mut i = 0;
-  while i < state.num_slots {
-    if state.slots[i].off == off {
+  while i < spills.num_slots {
+    if spills.slots[i].off == off {
       return Some(i);
     }
     i += 1;
@@ -236,25 +248,25 @@ fn find_slot(state: &State, off: i32) -> Option<usize> {
 
 /// The kind currently tracked at `off`: `Uninit` if untracked, `Unknown` if
 /// invalidated.
-pub fn slot_kind(state: &State, off: i32) -> RegKind {
-  match find_slot(state, off) {
+pub fn slot_kind(spills: &Spills, off: i32) -> RegKind {
+  match find_slot(spills, off) {
     None => RegKind::Uninit,
-    Some(i) => effective_kind(state, state.slots[i].epoch, state.slots[i].kind),
+    Some(i) => effective_kind(spills, spills.slots[i].epoch, spills.slots[i].kind),
   }
 }
 
 /// Inserts one spill entry if it is already tracked or the cap has room.
 /// Returns whether it was inserted.
-pub fn insert_slot(state: &mut State, off: i32, epoch: u64, kind: RegKind) -> bool {
-  match find_slot(state, off) {
+pub fn insert_slot(spills: &mut Spills, off: i32, epoch: u64, kind: RegKind) -> bool {
+  match find_slot(spills, off) {
     Some(i) => {
-      state.slots[i] = Slot { off, epoch, kind };
+      spills.slots[i] = Slot { off, epoch, kind };
       true
     }
     None => {
-      if state.num_slots < MAX_TRACKED_SLOTS {
-        state.slots[state.num_slots] = Slot { off, epoch, kind };
-        state.num_slots += 1;
+      if spills.num_slots < MAX_TRACKED_SLOTS {
+        spills.slots[spills.num_slots] = Slot { off, epoch, kind };
+        spills.num_slots += 1;
         true
       } else {
         false
@@ -266,8 +278,8 @@ pub fn insert_slot(state: &mut State, off: i32, epoch: u64, kind: RegKind) -> bo
 /// Marks every tracked slot `Unknown` after a store that may alias the
 /// stack at an offset that cannot be pinned down. Lazy: bumping the epoch
 /// makes every entry written before it read as `Unknown`.
-pub fn invalidate_slots(state: &mut State) {
-  state.invalid_epoch += 1;
+pub fn invalidate_slots(spills: &mut Spills) {
+  spills.invalid_epoch += 1;
 }
 
 /// Whether the 8-byte slot at `slot_off` overlaps `[start, end)`.
@@ -284,26 +296,26 @@ fn slot_overlaps(slot_off: i32, start: i32, end: i32) -> bool {
 /// Invalidates tracked spill slots overlapped by a stack write of `width`
 /// bytes at frame offset `start`; every slot if the offset is unknown or
 /// the range overflows.
-pub fn invalidate_stack_write(state: &mut State, start: Option<i32>, width: u8) {
+pub fn invalidate_stack_write(spills: &mut Spills, start: Option<i32>, width: u8) {
   let start = match start {
     None => {
-      invalidate_slots(state);
+      invalidate_slots(spills);
       return;
     }
     Some(s) => s,
   };
   let width = width as i32;
   if start > i32::MAX - width {
-    invalidate_slots(state);
+    invalidate_slots(spills);
     return;
   }
   let end = start + width;
   let mut i = 0;
-  while i < state.num_slots {
-    if slot_overlaps(state.slots[i].off, start, end) {
-      state.slots[i] = Slot {
-        off: state.slots[i].off,
-        epoch: state.invalid_epoch,
+  while i < spills.num_slots {
+    if slot_overlaps(spills.slots[i].off, start, end) {
+      spills.slots[i] = Slot {
+        off: spills.slots[i].off,
+        epoch: spills.invalid_epoch,
         kind: RegKind::Unknown,
       };
     }
@@ -311,34 +323,38 @@ pub fn invalidate_stack_write(state: &mut State, start: Option<i32>, width: u8) 
   }
 }
 
-/// Per-element meet of `state` with `other`. Returns `(changed, refused)`:
-/// whether `state` changed, and whether the slot cap refused an entry.
-pub fn meet_from(state: &mut State, other: &State) -> (bool, bool) {
+/// Per-register meet of `regs` with `other`. Returns whether `regs` changed.
+fn meet_regs(regs: &mut [RegKind; NUM_REGS], other: &[RegKind; NUM_REGS]) -> bool {
   let mut changed = false;
-  let mut refused = false;
   let mut r = 0;
   while r < NUM_REGS {
-    let merged = meet(state.regs[r], other.regs[r]);
-    if !kind_eq(merged, state.regs[r]) {
-      state.regs[r] = merged;
+    let merged = meet(regs[r], other[r]);
+    if !kind_eq(merged, regs[r]) {
+      regs[r] = merged;
       changed = true;
     }
     r += 1;
   }
-  if state.num_slots == 0 {
+  changed
+}
+
+/// Meet of the spill slots over the union of tracked offsets; an absent
+/// slot is `Uninit` (top). Returns `(changed, refused)`.
+fn meet_spills(spills: &mut Spills, other: &Spills) -> (bool, bool) {
+  let mut changed = false;
+  let mut refused = false;
+  if spills.num_slots == 0 {
     // Nothing tracked yet: every key of `other` meets Uninit into itself,
     // so adopt the incoming slots wholesale, epoch included.
     if other.num_slots != 0 {
-      state.slots = other.slots;
-      state.num_slots = other.num_slots;
-      state.invalid_epoch = other.invalid_epoch;
+      *spills = *other;
       changed = true;
     }
   } else {
     let mut i = 0;
     while i < other.num_slots {
       let off = other.slots[i].off;
-      let cur = slot_kind(state, off);
+      let cur = slot_kind(spills, off);
       let incoming = effective_kind(other, other.slots[i].epoch, other.slots[i].kind);
       let merged = meet(cur, incoming);
       if !kind_eq(merged, cur) {
@@ -346,7 +362,7 @@ pub fn meet_from(state: &mut State, other: &State) -> (bool, bool) {
         // safe fallback as an absent key, and leaves `changed` alone: the
         // state's observable behavior is unchanged, so the fixpoint
         // terminates as before.
-        if insert_slot(state, off, state.invalid_epoch, merged) {
+        if insert_slot(spills, off, spills.invalid_epoch, merged) {
           changed = true;
         } else {
           refused = true;
@@ -356,6 +372,14 @@ pub fn meet_from(state: &mut State, other: &State) -> (bool, bool) {
     }
   }
   (changed, refused)
+}
+
+/// Per-element meet of `state` with `other`. Returns `(changed, refused)`:
+/// whether `state` changed, and whether the slot cap refused an entry.
+pub fn meet_from(state: &mut State, other: &State) -> (bool, bool) {
+  let regs_changed = meet_regs(&mut state.regs, &other.regs);
+  let (spills_changed, refused) = meet_spills(&mut state.spills, &other.spills);
+  (regs_changed || spills_changed, refused)
 }
 
 /// The abstract register file a call site hands its callee.
@@ -571,9 +595,9 @@ pub fn add_imm_kind(a: RegKind, imm: i32) -> RegKind {
 
 /// The value a load yields: a spilled pointer when a fill off `R10` finds
 /// one tracked, a scalar otherwise.
-fn load_kind(state: &State, inst: &Insn) -> RegKind {
+fn load_kind(spills: &Spills, inst: &Insn) -> RegKind {
   if inst.src as usize == R10 {
-    let k = slot_kind(state, inst.offset as i32);
+    let k = slot_kind(spills, inst.offset as i32);
     if is_pointer(k) {
       k
     } else {
@@ -611,7 +635,7 @@ fn transfer_store(s: &mut State, inst: &Insn, cls: u8) -> bool {
   if is_stack(stack_base) {
     if aliases_current_stack(stack_base) {
       let start = stack_access_start(stack_base, inst.offset);
-      invalidate_stack_write(s, start, width);
+      invalidate_stack_write(&mut s.spills, start, width);
     }
     let stored = if atomic {
       RegKind::Unknown
@@ -623,7 +647,8 @@ fn transfer_store(s: &mut State, inst: &Insn, cls: u8) -> bool {
     };
     if !atomic && width == 8 {
       if let Some(start) = stack_access_start(stack_base, inst.offset) {
-        if !insert_slot(s, start, s.invalid_epoch, stored) {
+        let epoch = s.spills.invalid_epoch;
+        if !insert_slot(&mut s.spills, start, epoch, stored) {
           refused = true;
         }
       }
@@ -633,7 +658,7 @@ fn transfer_store(s: &mut State, inst: &Insn, cls: u8) -> bool {
       RegKind::Data => {}
       // A store through an unknown/scalar base may alias an untracked stack
       // slot; conservatively invalidate all tracked slots.
-      _ => invalidate_slots(s),
+      _ => invalidate_slots(&mut s.spills),
     }
   }
   if atomic {
@@ -713,7 +738,7 @@ pub fn transfer(
   } else if cls == CLS_LDX {
     // A value loaded from memory is a scalar for routing purposes, unless a
     // fill off R10 recovers a spilled pointer still tracked at that offset.
-    s.regs[inst.dst as usize] = load_kind(&s, inst);
+    s.regs[inst.dst as usize] = load_kind(&s.spills, inst);
   } else if cls == CLS_ST || cls == CLS_STX {
     refused = transfer_store(&mut s, inst, cls);
   } else if cls == CLS_ALU {
