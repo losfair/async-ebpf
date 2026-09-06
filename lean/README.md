@@ -5,10 +5,12 @@ validator and the function layout. The code the proofs describe is the code
 the runtime runs:
 
 ```
-src/verified/                   the verified core: isa.rs, validate.rs, layout.rs, stack.rs
+src/verified/                   the verified core: isa.rs, validate.rs, layout.rs,
+  │                             stack.rs, region.rs
   │  compiled into the runtime as crate::verified (jit::isa re-exports it,
   │  jit::validate and function_analysis call it and render the rejection,
-  │  program and region_analysis compute the frame geometry with it)
+  │  program computes the frame geometry with it, region_analysis drives
+  │  its transfer function to a fixed point)
   │
   │  also the library of lean/verified/Cargo.toml, a stand-alone crate
   │  charon cargo --preset=aeneas ; aeneas -backend lean
@@ -24,6 +26,7 @@ lean/AsyncEbpf/AsyncEbpfVerified.lean   generated, do not edit
   ├─ AsyncEbpf/Layout/Proofs.lean        partition = ok → LayoutOk
   ├─ AsyncEbpf/Layout/Decoder.lean       byte classes agree with the decoder
   ├─ AsyncEbpf/Stack/Proofs.lean         frame islands, floor and window arithmetic
+  ├─ AsyncEbpf/Region/Proofs.lean        the region analysis' transfer function
   ├─ AsyncEbpf/Semantics/Machine.lean    an operational semantics of eBPF
   ├─ AsyncEbpf/Semantics/Soundness.lean  accepted programs never go wrong
   ├─ AsyncEbpf/Semantics/Functions.lean  control never leaves a function
@@ -148,14 +151,55 @@ program
 
 - the frame pointer is the top of a mapped island at every reachable state
   (`frame_pointer_on_island`);
-- every access `in_frame_window` admits satisfies `island_access`: the
-  unchecked accesses are exactly ones the checked path would have accepted;
+- every access `in_frame_window` admits — in particular every access the
+  region analysis marks `FRAME` (`frame_hint_mapped`) — satisfies
+  `island_access`: the unchecked accesses are exactly ones the checked path
+  would have accepted;
 - the floor test the JIT emits before a local call passes exactly when the
   semantics admits another frame.
 
 The pure-arithmetic half (`frame_window_mapped` in `Stack/Proofs.lean`) is
 the statement the `debug_assert!` in `_run` and the comment on
 `frame_access` used to carry by hand.
+
+### The region analysis
+
+`src/verified/region.rs` is the dataflow core of `region_analysis.rs`: the
+abstract domain, its meet, the bounded spill-slot table, the transfer
+function, the uses/defs table and the per-slot classification. The
+worklists, the live-in solver and the access-plan builder stay outside and
+call into it.
+
+A word on what is *not* proved. The `STACK` and `DATA` hints narrow a
+bounds check the JIT keeps, so a wrong one costs a spurious fault, not
+memory safety, and the analysis uses that freedom: a value loaded from
+memory is a scalar, a helper's result is a scalar, spills survive calls,
+and a slot the 32-entry cap refuses reads back as a scalar. Under any
+natural provenance semantics each of these makes the kinds fail to
+over-approximate the values, so there is no theorem of the form "the
+analysis is sound" to prove, and `Region/Proofs.lean` does not pretend
+otherwise. It proves the three things the runtime relies on:
+
+- `classify_frame`: the `FRAME` hint, the one that removes a check, goes
+  only to a load, store or atomic whose base register is `R10` itself and
+  whose window `in_frame_window` admits, never to an atomic. With
+  `frame_hint_mapped` this closes the chain from the analysis' decision to
+  the mapped island;
+- `transfer_R10`, `meet_from_R10`: on an instruction the validator accepts
+  (destination `R10` only in a store form, atomic source not `R10`), the
+  transfer function and the meet keep `R10`'s kind, so `frame_access`'s
+  "R10 still holds the frame pointer" test never fails on an accepted
+  program;
+- `transfer_agree`: two states that agree on the spill slots, on `R10`,
+  and on the registers `uses_and_defs` names as uses produce, after
+  `transfer`, states that agree on the spill slots, on the registers named
+  as defs, and — elsewhere — either agree or are each left untouched. This
+  is the per-instruction fact behind the live-in masking of call signatures
+  (`mask_signature`): a register that is not live-in is overwritten before
+  any read, so dropping it costs no precision. Lifting it to the whole
+  fixed point is a standard argument over the worklist, which is not
+  extracted, so the global claim stays a documented consequence rather than
+  a theorem.
 
 ## What is trusted
 
@@ -171,6 +215,11 @@ the statement the `debug_assert!` in `_run` and the comment on
   the emitted code does with `R10`: starts it at the top of the highest
   island and subtracts one stride per call. That the backends do so is
   checked by their tests, not here.
+- **The dataflow drivers.** `analyze_function`'s worklist and the live-in
+  solver are not extracted. The theorems about `transfer` and `meet_from`
+  are about one step; that the driver reaches a post-fixed point, and that
+  masking non-live-in registers therefore changes no hint, are the standard
+  arguments the code comments make and are not machine-checked.
 - **Aeneas and Charon.** The translation from Rust to Lean is trusted, as is
   the Aeneas standard library's model of `Vec`, slices and scalar arithmetic.
 - **The `extract` feature.** The Charon build hides the runtime-only
@@ -232,7 +281,12 @@ matter for whether the extraction is usable:
   binary operation; compute such values once, before the `?`;
 - `?` on an `Option` extracts to an axiom (Aeneas has no model of its `Try`
   instance); spell the `match` out. `checked_add` and friends have no model
-  either, so `stack.rs` writes the overflow checks by hand.
+  either, so `stack.rs` writes the overflow checks by hand;
+- assigning a fieldless enum variant through a literal index
+  (`regs[0] = Kind::Scalar`) came out as a unit write; go through a helper
+  that takes the value as an argument (`set_reg` in `region.rs`). A local
+  named after its module (`let region = …` inside `mod region`) shadows the
+  module's namespace in the translation.
 
 On the Lean side, `loop_ok_induction` in `Loop.lean` is the tool for every
 extracted loop: give it an invariant of the loop state and what the exit
@@ -246,7 +300,9 @@ methods — goes behind `cfg(not(feature = "extract"))`.
 
 ## Next
 
-The semantics is the base the analysis passes can now be proved against. In
-order of value: the region analysis' transfer function against this
-semantics extended with pointer provenance, and the live-in non-interference
-claim behind signature masking.
+Extracting `analyze_function`'s worklist would turn the post-fixed-point
+property and the global live-in masking claim into theorems; the
+single-step lemmas they need are in place. The access-plan grouping in
+`region_analysis.rs` is advisory (the backends re-derive every condition
+before trusting it), so its safety is a property of the emitters, out of
+reach of this approach.
