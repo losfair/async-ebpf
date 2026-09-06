@@ -27,5 +27,6 @@
 
 pub mod isa;
 pub mod layout;
+pub mod region;
 pub mod stack;
 pub mod validate;

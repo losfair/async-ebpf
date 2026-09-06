@@ -35,17 +35,20 @@
 
 use std::collections::HashMap;
 
-use crate::verified::stack::in_frame_window;
+use crate::verified::isa::Insn;
+use crate::verified::region::{
+  self as core, apply_signature, entry_signature, mask_signature, signature_from_state,
+};
+pub(crate) use crate::verified::region::{
+  PointerSignature, RegMask, ALL_SIGNATURE_REGS, R10, REGION_UNKNOWN,
+};
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use crate::verified::region::{
+  RegKind, StackKind, NUM_REGS, REGION_DATA, REGION_FRAME, REGION_STACK,
+};
 
-/// Routing hint values shared with the JIT (`JIT_REGION_*` in the backends).
-pub const REGION_UNKNOWN: u8 = 0;
-pub const REGION_STACK: u8 = 1;
-pub const REGION_DATA: u8 = 2;
-/// A displacement off an unmodified frame pointer that provably stays inside
-/// the guest stack. See [`frame_access`].
-pub const REGION_FRAME: u8 = 3;
-
-const NUM_REGS: usize = 11;
+/// The abstract state at a program point. See `crate::verified::region`.
+type State = core::State;
 
 // eBPF opcode encoding helpers.
 const EBPF_CLS_MASK: u8 = 0x07;
@@ -58,19 +61,12 @@ const EBPF_CLS_JMP: u8 = 0x05;
 const EBPF_CLS_JMP32: u8 = 0x06;
 const EBPF_CLS_ALU64: u8 = 0x07;
 
+#[cfg(test)]
 const EBPF_SRC_REG: u8 = 0x08;
-const EBPF_ALU_OP_MASK: u8 = 0xf0;
+#[cfg(test)]
 const EBPF_ALU_OP_ADD: u8 = 0x00;
-const EBPF_ALU_OP_SUB: u8 = 0x10;
+#[cfg(test)]
 const EBPF_ALU_OP_MOV: u8 = 0xb0;
-
-/// Operation selector inside an atomic instruction's `imm` field, and the
-/// CMPXCHG value. These mirror `EBPF_ALU_OP_MASK` and
-/// `EBPF_ATOMIC_OP_CMPXCHG & ~EBPF_ATOMIC_OP_FETCH` in the JIT backends; the
-/// comparison is written the same way the backends switch on `imm` so the
-/// analysis and the emitted code always agree on which ops are CMPXCHG.
-const EBPF_ATOMIC_OP_MASK: i32 = 0xf0;
-const EBPF_ATOMIC_OP_CMPXCHG: i32 = 0xf0;
 
 const EBPF_OP_LDDW: u8 = EBPF_CLS_LD | 0x18; // LD | IMM | DW
 const EBPF_OP_JA: u8 = EBPF_CLS_JMP; // JMP | JA (mode 0)
@@ -78,317 +74,9 @@ const EBPF_OP_JA32: u8 = EBPF_CLS_JMP32;
 const EBPF_OP_CALL: u8 = EBPF_CLS_JMP | 0x80; // JMP | CALL
 const EBPF_OP_EXIT: u8 = EBPF_CLS_JMP | 0x90; // JMP | EXIT
 
-/// Abstract value tracked per register. The lattice top is [`RegKind::Uninit`]
-/// (no information / unreachable); the meet of two distinct concrete kinds is
-/// [`RegKind::Unknown`] (bottom for routing purposes).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum RegKind {
-  Uninit,
-  Stack(StackKind),
-  Data,
-  Scalar,
-  Unknown,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum StackKind {
-  Current(Option<i32>),
-  Foreign,
-}
-
-impl RegKind {
-  /// Greatest-lower-bound used at control-flow joins.
-  fn meet(self, other: RegKind) -> RegKind {
-    match (self, other) {
-      (a, b) if a == b => a,
-      (RegKind::Uninit, b) => b,
-      (a, RegKind::Uninit) => a,
-      (RegKind::Stack(a), RegKind::Stack(b)) => match (a, b) {
-        (StackKind::Current(a), StackKind::Current(b)) => {
-          if a == b {
-            RegKind::Stack(StackKind::Current(a))
-          } else {
-            RegKind::Stack(StackKind::Current(None))
-          }
-        }
-        (StackKind::Foreign, StackKind::Foreign) => RegKind::Stack(StackKind::Foreign),
-        _ => RegKind::Stack(StackKind::Current(None)),
-      },
-      _ => RegKind::Unknown,
-    }
-  }
-
-  fn region(self) -> u8 {
-    match self {
-      RegKind::Stack(_) => REGION_STACK,
-      RegKind::Data => REGION_DATA,
-      _ => REGION_UNKNOWN,
-    }
-  }
-
-  fn is_pointer(self) -> bool {
-    matches!(self, RegKind::Stack(_) | RegKind::Data)
-  }
-
-  fn is_stack(self) -> bool {
-    matches!(self, RegKind::Stack(_))
-  }
-
-  fn foreign_for_call(self) -> Self {
-    match self {
-      RegKind::Stack(_) => RegKind::Stack(StackKind::Foreign),
-      other => other,
-    }
-  }
-
-  fn aliases_current_stack(self) -> bool {
-    !matches!(self, RegKind::Stack(StackKind::Foreign))
-  }
-}
-
-/// Index of the read-only frame pointer register `R10`.
-const R10: usize = 10;
-
-/// Abstract state at a program point: the kind of every register plus the kinds
-/// of values spilled to `R10`-relative stack slots (keyed by byte offset).
-/// Spill/fill tracking lets the analysis follow pointers that the compiler
-/// round-trips through the stack (e.g. argument spills), which is the dominant
-/// pattern in `-O2` BPF output. Absent register/slot entries are `Uninit` (top).
-/// The spill map is a persistent red-black tree rather than a plain map so
-/// that `State::clone` is O(1) (structural sharing) and every insert is
-/// O(log k). A straight-line function with `n` distinct store offsets would
-/// otherwise cost Θ(n²) time and retained memory: each instruction clones the
-/// whole map and every slot's state keeps its own merged copy. With a
-/// persistent map the retained states share their trees, so the analysis
-/// stays O(n log n) no matter how many offsets a hostile program invents.
-///
-/// Invalidation (an unpinnable stack write) is the same shape of trap at one
-/// remove: it maps *every* value to the same constant `Unknown`, so rewriting
-/// the map per event costs O(k). Instead each entry carries the state's
-/// invalidation epoch at write time, and an entry older than the state's
-/// current epoch reads as `Unknown`. Whole-map invalidation is then a single
-/// epoch bump, O(1), while a spill written after the bump keeps its kind —
-/// exactly what eager rewriting would produce.
-///
-/// The number of distinct spill offsets one state may track is capped at
-/// [`MAX_TRACKED_SLOTS`]. The map is pure precision, never soundness — a slot
-/// the cap refuses reads back as a scalar and falls back to the JIT's
-/// dual-region probe, the same path every untracked slot already takes — and
-/// the cap is what bounds a hostile function that invents distinct store
-/// offsets: time O(n · M · log M) and a retained node pool of O(n · log M)
-/// instead of Θ(n²) time and memory (measured worst case ≈ 0.1 s / 140 MB at
-/// M = 32 for a maximum-size program). Real code — including unoptimized
-/// builds — stays far below it: three measured objects (redis.sock and two
-/// zeroserve variants) peak at 13 distinct offsets per function.
-/// How many distinct `R10`-relative spill offsets one state may track.
-///
-/// See the [`State`] docs for the cost bound and the precision fallback; the
-/// value covers everything measured in real builds (max 13 per function,
-/// including unoptimized ones) with headroom, while keeping a hostile
-/// function's worst case at ~0.1 s / ~140 MB.
-const MAX_TRACKED_SLOTS: usize = 32;
-
-#[derive(Clone, PartialEq, Eq)]
-struct State {
-  regs: [RegKind; NUM_REGS],
-  /// Spill slots, keyed by `R10`-relative byte offset. The value is the kind
-  /// stored there together with the state's invalidation epoch at write time;
-  /// an entry is effectively `Unknown` when its epoch predates
-  /// [`State::invalid_epoch`].
-  slots: rpds::RedBlackTreeMap<i32, (u64, RegKind)>,
-  /// Bumped by [`State::invalidate_slots`]; every entry written before the
-  /// current value reads as `Unknown`.
-  invalid_epoch: u64,
-}
-
-impl State {
-  fn top() -> State {
-    State {
-      regs: [RegKind::Uninit; NUM_REGS],
-      slots: rpds::RedBlackTreeMap::new(),
-      invalid_epoch: 0,
-    }
-  }
-
-  /// The kind an entry written at `epoch` with value `kind` currently has.
-  fn effective_kind(&self, epoch: u64, kind: RegKind) -> RegKind {
-    if epoch >= self.invalid_epoch {
-      kind
-    } else {
-      RegKind::Unknown
-    }
-  }
-
-  /// Per-element meet with `other`; returns whether `self` changed.
-  fn meet_from(&mut self, other: &State, cap_warning_emitted: &mut bool) -> bool {
-    let mut changed = false;
-    for r in 0..NUM_REGS {
-      let merged = self.regs[r].meet(other.regs[r]);
-      if merged != self.regs[r] {
-        self.regs[r] = merged;
-        changed = true;
-      }
-    }
-    // Meet slots over the union of keys; an absent slot is Uninit (top).
-    if self.slots.is_empty() {
-      // Nothing tracked yet means every key of `other` meets Uninit (top)
-      // into itself, so adopt the incoming map wholesale. The clone is O(1)
-      // under structural sharing, which is what keeps straight-line analysis
-      // linear in the number of distinct spill offsets. The epoch is adopted
-      // with it: the entries' epochs are all consistent with `other`'s
-      // counter, and `self` having no entries means its own (possibly higher)
-      // epoch is irrelevant — it only ever matters for entries, and none
-      // survive.
-      if !other.slots.is_empty() {
-        self.slots = other.slots.clone();
-        self.invalid_epoch = other.invalid_epoch;
-        changed = true;
-      }
-    } else {
-      for (&off, &(other_epoch, other_kind)) in &other.slots {
-        let cur = self
-          .slots
-          .get(&off)
-          .map(|&(e, k)| self.effective_kind(e, k))
-          .unwrap_or(RegKind::Uninit);
-        let merged = cur.meet(other.effective_kind(other_epoch, other_kind));
-        if merged != cur {
-          // Cap the map: a key the cap refuses stays untracked (reads as
-          // Scalar), the same safe fallback as an absent key. Skipping the
-          // insert leaves `changed` false: the state's observable behavior
-          // is unchanged, so the fixpoint terminates as before.
-          if self.insert_slot(off, (self.invalid_epoch, merged), cap_warning_emitted) {
-            changed = true;
-          }
-        }
-      }
-    }
-    changed
-  }
-
-  /// Inserts one spill entry if it is already tracked or the cap has room.
-  /// Warns at most once per analysis when a new offset has to be refused.
-  fn insert_slot(
-    &mut self,
-    off: i32,
-    entry: (u64, RegKind),
-    cap_warning_emitted: &mut bool,
-  ) -> bool {
-    if self.slots.contains_key(&off) || self.slots.size() < MAX_TRACKED_SLOTS {
-      self.slots = self.slots.insert(off, entry);
-      return true;
-    }
-
-    if !*cap_warning_emitted {
-      tracing::warn!(
-        max_tracked_slots = MAX_TRACKED_SLOTS,
-        spill_offset = off,
-        "region analysis spill-slot tracking cap reached; additional offsets will use dynamic \
-         region routing"
-      );
-      *cap_warning_emitted = true;
-    }
-    false
-  }
-
-  /// Marks every tracked slot `Unknown` after a store that may alias the
-  /// stack at an offset we cannot pin down. Lazy: bumping the epoch makes
-  /// every entry written before it read as `Unknown`, so the map itself is
-  /// untouched — O(1) however large it is — and the imprecision still
-  /// survives control-flow joins, because the entries remain present.
-  fn invalidate_slots(&mut self) {
-    self.invalid_epoch += 1;
-  }
-
-  /// Invalidates tracked R10-relative spill slots overlapped by a stack write.
-  /// If the write address is not a known frame-relative range, invalidate all
-  /// tracked slots because any spill may have been overwritten.
-  fn invalidate_stack_write(&mut self, start: Option<i32>, width: usize) {
-    let Some(start) = start else {
-      self.invalidate_slots();
-      return;
-    };
-    let Some(end) = start.checked_add(width as i32) else {
-      self.invalidate_slots();
-      return;
-    };
-
-    // Only slots overlapping [start, start + width) can be affected, and
-    // overlapping slots are contiguous in offset order, so a range scan
-    // replaces a full-map scan: O(log k + overlaps) instead of O(k) per
-    // stack write. A hostile straight-line program of distinct-offset
-    // stores would otherwise still be quadratic, one full scan per store.
-    // The saturating bounds only widen the range at the extremes of i32;
-    // every candidate is still re-checked below.
-    let affected: Vec<i32> = self
-      .slots
-      .range((
-        std::ops::Bound::Included(start.saturating_sub(7)),
-        std::ops::Bound::Included(end.saturating_sub(1)),
-      ))
-      .filter_map(|(&slot_off, _)| {
-        let slot_start = slot_off;
-        let Some(slot_end) = slot_start.checked_add(8) else {
-          return Some(slot_off);
-        };
-        if start < slot_end && slot_start < end {
-          Some(slot_off)
-        } else {
-          None
-        }
-      })
-      .collect();
-    // Stamp the affected entries with the current epoch and `Unknown`, so
-    // they read as invalidated while entries outside the range keep their
-    // kinds.
-    for off in affected {
-      self.slots = self
-        .slots
-        .insert(off, (self.invalid_epoch, RegKind::Unknown));
-    }
-  }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) struct PointerSignature {
-  regs: [RegKind; NUM_REGS],
-}
-
 impl PointerSignature {
   pub(crate) fn entry() -> Self {
-    // The entry trampoline zeroes every eBPF register except `R1` (the ctx) and
-    // `R10` (the frame pointer), so everything else provably holds the scalar 0.
-    let mut regs = [RegKind::Scalar; NUM_REGS];
-    regs[1] = RegKind::Stack(StackKind::Current(None));
-    regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
-    Self { regs }
-  }
-
-  fn apply_to_state(self, state: &mut State) {
-    state.regs = self.regs;
-    state.regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
-  }
-
-  fn from_state(state: &State) -> Self {
-    let mut regs = state.regs;
-    for (reg, kind) in regs.iter_mut().enumerate() {
-      if reg != R10 {
-        *kind = kind.foreign_for_call();
-      }
-    }
-    regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
-    Self { regs }
-  }
-
-  /// Drops every register outside `mask`, i.e. every register the callee cannot
-  /// observe. See [`function_live_in`] for why that costs no precision.
-  fn masked(mut self, mask: RegMask) -> Self {
-    for (reg, kind) in self.regs.iter_mut().enumerate() {
-      if reg != R10 && mask & (1 << reg) == 0 {
-        *kind = RegKind::Unknown;
-      }
-    }
-    self
+    entry_signature()
   }
 
   #[cfg(any(test, feature = "testing"))]
@@ -416,50 +104,58 @@ fn decode(slot: &[u8]) -> Inst {
   }
 }
 
+/// The instruction as the verified core reads it.
+fn to_insn(inst: &Inst) -> Insn {
+  Insn {
+    opcode: inst.opcode,
+    dst: inst.dst as u8,
+    src: inst.src as u8,
+    offset: inst.offset,
+    imm: inst.imm,
+  }
+}
+
 fn access_width(opcode: u8) -> usize {
-  match opcode & 0x18 {
-    0x00 => 4, // W
-    0x08 => 2, // H
-    0x10 => 1, // B
-    0x18 => 8, // DW
-    _ => 8,
+  core::access_width(opcode) as usize
+}
+
+/// Warns at most once per analysis when the spill-slot cap refuses an offset.
+fn warn_cap_reached(cap_warning_emitted: &mut bool) {
+  if !*cap_warning_emitted {
+    tracing::warn!(
+      max_tracked_slots = core::MAX_TRACKED_SLOTS,
+      "region analysis spill-slot tracking cap reached; additional offsets will use dynamic \
+       region routing"
+    );
+    *cap_warning_emitted = true;
   }
 }
 
-/// Whether `inst`, whose pointer operand is register `base`, is a frame access
-/// the JIT may emit with no bounds check at all.
-///
-/// This is the one hint that removes a runtime check rather than narrowing one,
-/// so the conditions are worth stating in full:
-///
-///  * **The base is `R10` itself**, not a register derived from it. A derived
-///    register holds a *guest* address at run time - the backend hands programs
-///    the guest frame pointer wherever they read `R10` as a value - so its
-///    displacement is not the one a native frame access would use.
-///  * **`R10` still holds the frame pointer.** No instruction can assign it and
-///    the loader refuses every program that tries, but an assignment would show
-///    up here as `Unknown`, so check rather than assume. This is the only part
-///    of the claim the backend cannot re-derive for itself.
-///  * **The access lies in `[R10 - frame_size, R10)`.** That window is inside
-///    the guest stack at every call depth the loader accepts.
-///
-/// Atomics are excluded: a fetching atomic writes its source register, so it is
-/// not purely an access, and the loader refuses the frame-pointer cases anyway.
-fn frame_access(state: &State, inst: &Inst, base: usize, frame_size: u16) -> bool {
-  if base != R10 || state.regs[R10] != RegKind::Stack(StackKind::Current(Some(0))) {
-    return false;
+/// Applies the transfer function and the meet into every successor, keeping
+/// the worklist bookkeeping the two drivers share.
+fn propagate(
+  states: &mut [State],
+  reached: &mut [bool],
+  on_list: &mut [bool],
+  worklist: &mut Vec<usize>,
+  pc: usize,
+  out: &State,
+  succs: &[usize],
+  cap_warning_emitted: &mut bool,
+) {
+  let _ = pc;
+  for &succ in succs {
+    let was_reached = reached[succ];
+    reached[succ] = true;
+    let (changed, refused) = core::meet_from(&mut states[succ], out);
+    if refused {
+      warn_cap_reached(cap_warning_emitted);
+    }
+    if (!was_reached || changed) && !on_list[succ] {
+      on_list[succ] = true;
+      worklist.push(succ);
+    }
   }
-  if inst.opcode & EBPF_CLS_MASK == EBPF_CLS_STX && inst.opcode & 0xe0 == 0xc0 {
-    return false;
-  }
-  in_frame_window(frame_size, inst.offset, access_width(inst.opcode) as u8)
-}
-
-fn stack_access_start(base: RegKind, offset: i16) -> Option<i32> {
-  let RegKind::Stack(StackKind::Current(Some(base_off))) = base else {
-    return None;
-  };
-  base_off.checked_add(offset as i32)
 }
 
 /// Result of the region analysis for one code section.
@@ -499,13 +195,11 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   }
 
   // Forward dataflow to a fixpoint over the instruction-slot CFG.
-  let mut states: Vec<State> = (0..num_slots).map(|_| State::top()).collect();
+  let mut states: Vec<State> = (0..num_slots).map(|_| core::top()).collect();
   let mut reached = vec![false; num_slots];
   // Entry: R1 holds ctx (points into the guest stack), R10 is the frame pointer,
   // and the entry trampoline zeroed everything else.
-  states[0].regs = [RegKind::Scalar; NUM_REGS];
-  states[0].regs[1] = RegKind::Stack(StackKind::Current(None));
-  states[0].regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
+  apply_signature(&entry_signature(), &mut states[0]);
   reached[0] = true;
 
   let mut worklist: Vec<usize> = vec![0];
@@ -517,24 +211,22 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
     on_list[pc] = false;
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
     let lddw_addr = lddw_full_imm(code, pc, &inst);
-    let out = transfer(
-      &states[pc],
-      &inst,
-      lddw_addr,
-      data_lo,
-      data_hi,
+    let (out, refused) = core::transfer(&states[pc], &to_insn(&inst), lddw_addr, data_lo, data_hi);
+    if refused {
+      warn_cap_reached(&mut cap_warning_emitted);
+    }
+
+    let succs = successors(pc, &inst, num_slots);
+    propagate(
+      &mut states,
+      &mut reached,
+      &mut on_list,
+      &mut worklist,
+      pc,
+      &out,
+      &succs,
       &mut cap_warning_emitted,
     );
-
-    for succ in successors(pc, &inst, num_slots) {
-      let was_reached = reached[succ];
-      reached[succ] = true;
-      let changed = states[succ].meet_from(&out, &mut cap_warning_emitted);
-      if (!was_reached || changed) && !on_list[succ] {
-        on_list[succ] = true;
-        worklist.push(succ);
-      }
-    }
   }
 
   // Classify every memory access from the converged entry state of its slot.
@@ -546,23 +238,14 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
       continue;
     }
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    let cls = inst.opcode & EBPF_CLS_MASK;
-    let base = match cls {
-      EBPF_CLS_LDX => inst.src,               // load: pointer is src
-      EBPF_CLS_ST | EBPF_CLS_STX => inst.dst, // store/atomic: pointer is dst
-      _ => continue,
-    };
-    let region = states[pc].regs[base].region();
-    let hint = if frame_access(
+    let (is_access, hint, region) = core::classify(
       &states[pc],
-      &inst,
-      base,
+      &to_insn(&inst),
       crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
-    ) {
-      REGION_FRAME
-    } else {
-      region
-    };
+    );
+    if !is_access {
+      continue;
+    }
     hints[pc] = hint;
     if region == REGION_UNKNOWN {
       unresolved.push(pc);
@@ -595,9 +278,9 @@ pub(crate) fn analyze_function(
     };
   }
 
-  let mut states: Vec<State> = (0..num_slots).map(|_| State::top()).collect();
+  let mut states: Vec<State> = (0..num_slots).map(|_| core::top()).collect();
   let mut reached = vec![false; num_slots];
-  incoming.apply_to_state(&mut states[start_pc]);
+  apply_signature(&incoming, &mut states[start_pc]);
   reached[start_pc] = true;
 
   let mut worklist = vec![start_pc];
@@ -627,27 +310,25 @@ pub(crate) fn analyze_function(
           .copied()
           .unwrap_or(ALL_SIGNATURE_REGS)
       };
-      call_signatures.insert(pc, PointerSignature::from_state(&states[pc]).masked(mask));
+      call_signatures.insert(pc, mask_signature(&signature_from_state(&states[pc]), mask));
     }
     let lddw_addr = lddw_full_imm(code, pc, &inst);
-    let out = transfer(
-      &states[pc],
-      &inst,
-      lddw_addr,
-      data_lo,
-      data_hi,
+    let (out, refused) = core::transfer(&states[pc], &to_insn(&inst), lddw_addr, data_lo, data_hi);
+    if refused {
+      warn_cap_reached(&mut cap_warning_emitted);
+    }
+
+    let succs = function_successors(pc, &inst, num_slots, start_pc, end_pc);
+    propagate(
+      &mut states,
+      &mut reached,
+      &mut on_list,
+      &mut worklist,
+      pc,
+      &out,
+      &succs,
       &mut cap_warning_emitted,
     );
-
-    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
-      let was_reached = reached[succ];
-      reached[succ] = true;
-      let changed = states[succ].meet_from(&out, &mut cap_warning_emitted);
-      if (!was_reached || changed) && !on_list[succ] {
-        on_list[succ] = true;
-        worklist.push(succ);
-      }
-    }
   }
 
   for pc in start_pc..end_pc {
@@ -655,18 +336,10 @@ pub(crate) fn analyze_function(
       continue;
     }
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    let cls = inst.opcode & EBPF_CLS_MASK;
-    let base = match cls {
-      EBPF_CLS_LDX => inst.src,
-      EBPF_CLS_ST | EBPF_CLS_STX => inst.dst,
-      _ => continue,
-    };
-    let region = states[pc].regs[base].region();
-    let hint = if frame_access(&states[pc], &inst, base, frame_size) {
-      REGION_FRAME
-    } else {
-      region
-    };
+    let (is_access, hint, region) = core::classify(&states[pc], &to_insn(&inst), frame_size);
+    if !is_access {
+      continue;
+    }
     hints[pc] = hint;
     if region == REGION_UNKNOWN {
       unresolved.push(pc);
@@ -684,95 +357,9 @@ pub(crate) fn analyze_function(
   }
 }
 
-/// Mask over the registers a [`PointerSignature`] can carry (`R0`-`R9`). `R10`
-/// is never included: it is the frame pointer, fixed to
-/// `Stack(Current(Some(0)))` at every function entry regardless of the caller.
-pub(crate) type RegMask = u16;
-
-/// Every register a signature can carry.
-pub(crate) const ALL_SIGNATURE_REGS: RegMask = 0x03ff;
-
-/// Registers a helper call reads (`R1`-`R5`) and the ones any call leaves
-/// clobbered (`R0`-`R5`), matching how [`transfer`] models `EBPF_OP_CALL`.
-const HELPER_ARG_REGS: RegMask = 0b011_1110;
-const CALL_CLOBBERED_REGS: RegMask = 0b011_1111;
-
-fn reg_bit(reg: usize) -> RegMask {
-  if reg < R10 {
-    1 << reg
-  } else {
-    0
-  }
-}
-
-/// Registers `inst` reads and writes.
-///
-/// `uses` comes from the instruction encoding - every register the opcode
-/// reads, whether or not [`transfer`] consults its kind. That is more than
-/// strictly necessary, but it stays sound if `transfer` later starts reading a
-/// register the instruction names.
-///
-/// `defs` must be a *subset* of what the instruction overwrites: a def kills
-/// liveness, so over-claiming one would drop a register the callee can still
-/// observe. Fetching atomics write `src` (and CMPXCHG writes `R0`) conditionally
-/// on the operation selector, so they claim no definition at all.
+/// Registers `inst` reads and writes. See `crate::verified::region::uses_and_defs`.
 fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
-  match inst.opcode & EBPF_CLS_MASK {
-    // Only LDDW reaches here; it materializes a constant into dst.
-    EBPF_CLS_LD => (0, reg_bit(inst.dst)),
-    EBPF_CLS_LDX => (reg_bit(inst.src), reg_bit(inst.dst)),
-    EBPF_CLS_ST => (reg_bit(inst.dst), 0),
-    EBPF_CLS_STX => {
-      let is_atomic = (inst.opcode & 0xe0) == 0xc0;
-      let mut uses = reg_bit(inst.dst) | reg_bit(inst.src);
-      if is_atomic {
-        uses |= reg_bit(0);
-      }
-      (uses, 0)
-    }
-    EBPF_CLS_ALU | EBPF_CLS_ALU64 => {
-      let src = if inst.opcode & EBPF_SRC_REG != 0 {
-        reg_bit(inst.src)
-      } else {
-        0
-      };
-      if inst.opcode & EBPF_ALU_OP_MASK == EBPF_ALU_OP_MOV {
-        (src, reg_bit(inst.dst))
-      } else {
-        (src | reg_bit(inst.dst), reg_bit(inst.dst))
-      }
-    }
-    EBPF_CLS_JMP | EBPF_CLS_JMP32 => {
-      if inst.opcode == EBPF_OP_EXIT {
-        // `exit` hands the callee's R0 back to its caller, but the caller
-        // models the result of any call as a fresh scalar (see `transfer`), so
-        // an incoming R0 kind is never observable through a return. Counting R0
-        // as a use here would make it live-in for every function with a path
-        // that does not assign it - which is exactly the incidental caller
-        // state this mask exists to drop.
-        (0, 0)
-      } else if inst.opcode == EBPF_OP_CALL {
-        match inst.src {
-          0 => (HELPER_ARG_REGS, CALL_CLOBBERED_REGS),
-          // A local callee sees the caller's whole register file: R1-R5 are
-          // passed, R6-R9 are preserved across the call by the caller's stub,
-          // and R0 survives it. So the call reads whatever the callee reads.
-          1 | 2 => (callee_live_in, CALL_CLOBBERED_REGS),
-          _ => (0, 0),
-        }
-      } else if inst.opcode == EBPF_OP_JA || inst.opcode == EBPF_OP_JA32 {
-        (0, 0)
-      } else {
-        let src = if inst.opcode & EBPF_SRC_REG != 0 {
-          reg_bit(inst.src)
-        } else {
-          0
-        };
-        (src | reg_bit(inst.dst), 0)
-      }
-    }
-    _ => (0, 0),
-  }
+  core::uses_and_defs(&to_insn(inst), callee_live_in)
 }
 
 /// Where a local call sends control, as seen from inside one code section.
@@ -1422,214 +1009,6 @@ fn function_successors(
   let mut out = [0usize; 2];
   let written = function_successors_into(pc, inst, num_slots, start_pc, end_pc, &mut out);
   out[..written].to_vec()
-}
-
-/// Abstract transfer function: register/slot state after executing `inst`.
-fn transfer(
-  in_state: &State,
-  inst: &Inst,
-  lddw_addr: u64,
-  data_lo: u64,
-  data_hi: u64,
-  cap_warning_emitted: &mut bool,
-) -> State {
-  let mut s = in_state.clone();
-  let cls = inst.opcode & EBPF_CLS_MASK;
-
-  match cls {
-    EBPF_CLS_LD => {
-      // Only LDDW reaches here (LD|IMM|DW). It materializes a 64-bit constant;
-      // a relocated data pointer falls inside [data_lo, data_hi).
-      if inst.opcode == EBPF_OP_LDDW {
-        s.regs[inst.dst] = if lddw_addr >= data_lo && lddw_addr < data_hi {
-          RegKind::Data
-        } else {
-          RegKind::Scalar
-        };
-      } else {
-        s.regs[inst.dst] = RegKind::Unknown;
-      }
-    }
-    EBPF_CLS_LDX => {
-      // A value loaded from memory is a scalar for routing purposes. Treating
-      // it as Scalar (rather than Unknown) lets it serve as an index into a
-      // known pointer — `ptr + loaded_index` keeps the pointer's region — which
-      // is both common (e.g. `literal[i]`) and safe: using a loaded value
-      // directly as a pointer base still yields Scalar (unroutable), and the
-      // retained single-region bounds check backstops any mis-sized index.
-      //
-      // A fill off R10 recovers a spilled *pointer* only when a concrete
-      // Stack/Data kind is still tracked at that offset. An absent, scalar, or
-      // call-invalidated slot reads back as a scalar — e.g. a byte loaded from a
-      // stack buffer after a helper call, which must not poison later pointer
-      // arithmetic that uses it as an index.
-      s.regs[inst.dst] = if inst.src == R10 {
-        match s.slots.get(&(inst.offset as i32)) {
-          Some(&(e, k)) if e >= s.invalid_epoch && k.is_pointer() => k,
-          _ => RegKind::Scalar,
-        }
-      } else {
-        RegKind::Scalar
-      };
-    }
-    EBPF_CLS_ST | EBPF_CLS_STX => {
-      let is_atomic = cls == EBPF_CLS_STX && (inst.opcode & 0xe0) == 0xc0;
-      // Value being stored: ST writes an immediate (scalar); STX writes a reg.
-      let value = if cls == EBPF_CLS_ST {
-        RegKind::Scalar
-      } else {
-        s.regs[inst.src]
-      };
-      let width = access_width(inst.opcode);
-      let stack_base = if inst.dst == R10 {
-        RegKind::Stack(StackKind::Current(Some(0)))
-      } else {
-        s.regs[inst.dst]
-      };
-      if stack_base.is_stack() {
-        if stack_base.aliases_current_stack() {
-          let start = stack_access_start(stack_base, inst.offset);
-          s.invalidate_stack_write(start, width);
-        }
-        let stored = if is_atomic {
-          RegKind::Unknown
-        } else if value == RegKind::Uninit {
-          RegKind::Unknown
-        } else {
-          value
-        };
-        if !is_atomic && width == 8 {
-          if let Some(start) = stack_access_start(stack_base, inst.offset) {
-            // Cap the map at MAX_TRACKED_SLOTS distinct offsets: an already
-            // tracked slot always updates in place, a new one only while room
-            // remains. Refused slots stay untracked and read back as scalars —
-            // the same fallback as slots the analysis never saw.
-            s.insert_slot(start, (s.invalid_epoch, stored), cap_warning_emitted);
-          }
-        }
-      } else if s.regs[inst.dst] != RegKind::Data {
-        // A store through an unknown/scalar base may alias an untracked stack
-        // slot; conservatively invalidate all tracked slots.
-        s.invalidate_slots();
-      }
-      if is_atomic {
-        // An atomic fetch writes the previous value into src.
-        s.regs[inst.src] = RegKind::Unknown;
-        if inst.imm & EBPF_ATOMIC_OP_MASK == EBPF_ATOMIC_OP_CMPXCHG {
-          // CMPXCHG is the exception: it leaves src alone and writes the
-          // previous memory contents into R0 instead (x86-64 lowers it to
-          // `lock cmpxchg`, whose comparand is RAX; the arm64 backend mirrors
-          // that). The guest chooses those contents, so R0 must not keep the
-          // provenance it had before the instruction.
-          s.regs[0] = RegKind::Unknown;
-        }
-      }
-    }
-    EBPF_CLS_ALU => {
-      // 32-bit ALU result cannot be a valid 64-bit pointer.
-      s.regs[inst.dst] = RegKind::Scalar;
-    }
-    EBPF_CLS_ALU64 => {
-      let op = inst.opcode & EBPF_ALU_OP_MASK;
-      let is_reg = inst.opcode & EBPF_SRC_REG != 0;
-      match op {
-        EBPF_ALU_OP_MOV => {
-          s.regs[inst.dst] = if is_reg {
-            match s.regs[inst.src] {
-              RegKind::Uninit => RegKind::Unknown,
-              k => k,
-            }
-          } else {
-            RegKind::Scalar
-          };
-        }
-        EBPF_ALU_OP_ADD => {
-          s.regs[inst.dst] = if is_reg {
-            add_kinds(s.regs[inst.dst], s.regs[inst.src])
-          } else {
-            add_imm_kind(s.regs[inst.dst], inst.imm)
-          };
-        }
-        EBPF_ALU_OP_SUB => {
-          s.regs[inst.dst] = if is_reg {
-            sub_kinds(s.regs[inst.dst], s.regs[inst.src])
-          } else {
-            add_imm_kind(s.regs[inst.dst], inst.imm.wrapping_neg())
-          };
-        }
-        // All other 64-bit ALU ops (mul/div/and/or/xor/shifts/neg/mod/end)
-        // are conservatively scalars for routing purposes.
-        _ => s.regs[inst.dst] = RegKind::Scalar,
-      }
-    }
-    EBPF_CLS_JMP | EBPF_CLS_JMP32 => {
-      if inst.opcode == EBPF_OP_CALL {
-        // Helper/local call: R0 is the return value, R1-R5 are caller-saved and
-        // clobbered; R6-R10 are preserved. Keep tracked stack spill provenance
-        // across calls: generated code commonly spills stack/data pointers,
-        // calls a helper, then reloads those pointers for later buffer work.
-        // If a helper/callee actually overwrites a pointer spill, the emitted
-        // single-region bounds translation still protects the access; the worst
-        // case is a spurious fault from a stale region hint.
-        //
-        // The return value is treated as a scalar: helpers return handles,
-        // lengths, and status codes, so a returned value commonly indexes a
-        // pointer (`buf + helper_len`) and must keep that pointer's region.
-        // Using a returned value directly as a pointer base still yields Scalar
-        // (unroutable), and the single-region bounds check backstops any
-        // out-of-range index, so this stays safe.
-        s.regs[0] = RegKind::Scalar;
-        for r in 1..=5 {
-          s.regs[r] = RegKind::Unknown;
-        }
-      }
-    }
-    _ => {}
-  }
-
-  s
-}
-
-/// `ptr + scalar` preserves the pointer's region; `scalar + scalar` is scalar.
-fn add_kinds(a: RegKind, b: RegKind) -> RegKind {
-  match (a, b) {
-    (RegKind::Stack(_), RegKind::Scalar) | (RegKind::Scalar, RegKind::Stack(_)) => match (a, b) {
-      (RegKind::Stack(StackKind::Foreign), _) | (_, RegKind::Stack(StackKind::Foreign)) => {
-        RegKind::Stack(StackKind::Foreign)
-      }
-      _ => RegKind::Stack(StackKind::Current(None)),
-    },
-    (RegKind::Data, RegKind::Scalar) | (RegKind::Scalar, RegKind::Data) => RegKind::Data,
-    (RegKind::Scalar, RegKind::Scalar) => RegKind::Scalar,
-    _ => RegKind::Unknown,
-  }
-}
-
-/// `ptr - scalar` preserves the region; `ptr - ptr` (same region) is a scalar.
-fn sub_kinds(a: RegKind, b: RegKind) -> RegKind {
-  match (a, b) {
-    (RegKind::Stack(StackKind::Foreign), RegKind::Scalar) => RegKind::Stack(StackKind::Foreign),
-    (RegKind::Stack(_), RegKind::Scalar) => RegKind::Stack(StackKind::Current(None)),
-    (RegKind::Data, RegKind::Scalar) => RegKind::Data,
-    (RegKind::Stack(_), RegKind::Stack(_)) | (RegKind::Data, RegKind::Data) => RegKind::Scalar,
-    (RegKind::Scalar, RegKind::Scalar) => RegKind::Scalar,
-    _ => RegKind::Unknown,
-  }
-}
-
-/// Adding an immediate preserves region; for known stack aliases, also update
-/// the frame-relative offset.
-fn add_imm_kind(a: RegKind, imm: i32) -> RegKind {
-  match a {
-    RegKind::Stack(StackKind::Current(Some(off))) => {
-      RegKind::Stack(StackKind::Current(off.checked_add(imm)))
-    }
-    RegKind::Stack(StackKind::Current(None)) => RegKind::Stack(StackKind::Current(None)),
-    RegKind::Stack(StackKind::Foreign) => RegKind::Stack(StackKind::Foreign),
-    RegKind::Data => RegKind::Data,
-    RegKind::Scalar => RegKind::Scalar,
-    _ => RegKind::Unknown,
-  }
 }
 
 /// One entry per instruction slot, handed to the JIT alongside the region hints
