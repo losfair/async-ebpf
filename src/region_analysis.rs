@@ -37,9 +37,9 @@ use std::collections::HashMap;
 
 use crate::verified::fixpoint;
 use crate::verified::isa::Insn;
-#[cfg(any(test, feature = "testing"))]
-use crate::verified::region::entry_signature;
-use crate::verified::region::{self as core, mask_signature, signature_from_state};
+use crate::verified::region::{
+  self as core, entry_signature, mask_signature, signature_from_state,
+};
 pub(crate) use crate::verified::region::{
   PointerSignature, RegMask, ALL_SIGNATURE_REGS, R10, REGION_UNKNOWN,
 };
