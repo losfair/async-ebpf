@@ -35,6 +35,8 @@
 
 use std::collections::HashMap;
 
+use crate::verified::stack::in_frame_window;
+
 /// Routing hint values shared with the JIT (`JIT_REGION_*` in the backends).
 pub const REGION_UNKNOWN: u8 = 0;
 pub const REGION_STACK: u8 = 1;
@@ -450,9 +452,7 @@ fn frame_access(state: &State, inst: &Inst, base: usize, frame_size: u16) -> boo
   if inst.opcode & EBPF_CLS_MASK == EBPF_CLS_STX && inst.opcode & 0xe0 == 0xc0 {
     return false;
   }
-  let width = access_width(inst.opcode) as i32;
-  let offset = inst.offset as i32;
-  offset >= -(frame_size as i32) && offset <= -width
+  in_frame_window(frame_size, inst.offset, access_width(inst.opcode) as u8)
 }
 
 fn stack_access_start(base: RegKind, offset: i16) -> Option<i32> {

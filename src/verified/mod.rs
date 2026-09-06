@@ -3,7 +3,9 @@
 //! This directory is compiled twice. The runtime includes it as
 //! `crate::verified` and executes it: `jit::isa` re-exports [`isa`]'s types,
 //! `jit::validate` calls [`validate::validate`] and only renders the
-//! rejection, and `function_analysis` calls [`layout::partition`] likewise. `lean/verified` is a Cargo manifest whose library *is* this
+//! rejection, `function_analysis` calls [`layout::partition`] likewise, and
+//! `program` and `region_analysis` compute the guest stack's frame geometry
+//! with [`stack`]. `lean/verified` is a Cargo manifest whose library *is* this
 //! directory, built by Charon and translated by Aeneas into
 //! `lean/AsyncEbpf/AsyncEbpfVerified.lean`, which the theorems under `lean/`
 //! are about. So the code the proofs describe is the code that runs, not a
@@ -25,4 +27,5 @@
 
 pub mod isa;
 pub mod layout;
+pub mod stack;
 pub mod validate;

@@ -1701,6 +1701,115 @@ def layout.partition
     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
       layout.Layout (core.convert.FromSame layout.LayoutReject) residual
 
+/-- [async_ebpf_verified::stack::FrameLayout]
+    Source: '../../src/verified/stack.rs', lines 32:0-39:1
+    Visibility: public -/
+structure stack.FrameLayout where
+  frame_size : Std.Usize
+  frame_stride : Std.Usize
+  frame_count : Std.Usize
+
+/-- [async_ebpf_verified::stack::{impl core::clone::Clone for async_ebpf_verified::stack::FrameLayout}::clone]:
+    Source: '../../src/verified/stack.rs', lines 30:9-30:14
+    Visibility: public -/
+def stack.FrameLayout.Insts.CoreCloneClone.clone
+  (self : stack.FrameLayout) : Result stack.FrameLayout := do
+  ok self
+
+/-- Trait implementation: [async_ebpf_verified::stack::{impl core::clone::Clone for async_ebpf_verified::stack::FrameLayout}]
+    Source: '../../src/verified/stack.rs', lines 30:9-30:14 -/
+@[reducible]
+def stack.FrameLayout.Insts.CoreCloneClone : core.clone.Clone stack.FrameLayout
+  := {
+  clone := stack.FrameLayout.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [async_ebpf_verified::stack::{impl core::marker::Copy for async_ebpf_verified::stack::FrameLayout}]
+    Source: '../../src/verified/stack.rs', lines 30:16-30:20 -/
+@[reducible]
+def stack.FrameLayout.Insts.CoreMarkerCopy : core.marker.Copy stack.FrameLayout
+  := {
+  cloneInst := stack.FrameLayout.Insts.CoreCloneClone
+}
+
+/-- [async_ebpf_verified::stack::add_checked]:
+    Source: '../../src/verified/stack.rs', lines 42:0-47:1 -/
+def stack.add_checked
+  (a : Std.Usize) (b : Std.Usize) : Result (Option Std.Usize) := do
+  let i ← core.num.Usize.MAX - b
+  if a > i
+  then ok none
+  else let i1 ← a + b
+       ok (some i1)
+
+/-- [async_ebpf_verified::stack::mul_checked]:
+    Source: '../../src/verified/stack.rs', lines 50:0-55:1 -/
+def stack.mul_checked
+  (a : Std.Usize) (b : Std.Usize) : Result (Option Std.Usize) := do
+  if b != 0#usize
+  then
+    let i ← core.num.Usize.MAX / b
+    if a > i
+    then ok none
+    else let i1 ← a * b
+         ok (some i1)
+  else let i ← a * b
+       ok (some i)
+
+/-- [async_ebpf_verified::stack::root_frame_offset]:
+    Source: '../../src/verified/stack.rs', lines 60:0-69:1
+    Visibility: public -/
+def stack.root_frame_offset
+  (layout : stack.FrameLayout) : Result (Option Std.Usize) := do
+  if layout.frame_count = 0#usize
+  then ok none
+  else
+    let i ← layout.frame_count - 1#usize
+    let o ← stack.mul_checked i layout.frame_stride
+    match o with
+    | none => ok none
+    | some span => stack.add_checked span layout.frame_size
+
+/-- [async_ebpf_verified::stack::local_call_floor]:
+    Source: '../../src/verified/stack.rs', lines 73:0-75:1
+    Visibility: public -/
+def stack.local_call_floor
+  (layout : stack.FrameLayout) : Result (Option Std.Usize) := do
+  stack.add_checked layout.frame_size layout.frame_stride
+
+/-- [async_ebpf_verified::stack::island_access]:
+    Source: '../../src/verified/stack.rs', lines 78:0-82:1
+    Visibility: public -/
+def stack.island_access
+  (layout : stack.FrameLayout) (offset : Std.Usize) (size : Std.Usize) :
+  Result Bool
+  := do
+  let slot ← offset / layout.frame_stride
+  let within ← offset % layout.frame_stride
+  if slot < layout.frame_count
+  then
+    if within < layout.frame_size
+    then let i ← layout.frame_size - within
+         ok (size <= i)
+    else ok false
+  else ok false
+
+/-- [async_ebpf_verified::stack::in_frame_window]:
+    Source: '../../src/verified/stack.rs', lines 86:0-90:1
+    Visibility: public -/
+def stack.in_frame_window
+  (frame_size : Std.U16) (offset : Std.I16) (width : Std.U8) :
+  Result Bool
+  := do
+  let offset1 ← lift (IScalar.cast .I32 offset)
+  let width1 ← lift (UScalar.hcast .I32 width)
+  let i ← lift (UScalar.hcast .I32 frame_size)
+  let i1 ← -. i
+  if offset1 >= i1
+  then let i2 ← -. width1
+       ok (offset1 <= i2)
+  else ok false
+
 /-- [async_ebpf_verified::validate::Config]
     Source: '../../src/verified/validate.rs', lines 40:0-50:1
     Visibility: public -/

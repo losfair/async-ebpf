@@ -37,6 +37,7 @@ use crate::{
   pointer_cage::PointerCage,
   region_analysis::PointerSignature,
   util::nonnull_bytes_overlap,
+  verified::stack::{island_access, local_call_floor, root_frame_offset, FrameLayout},
 };
 
 /// Native stack left below the deepest admitted JIT frame for the entry
@@ -657,12 +658,16 @@ impl GuestStackLayout {
         "guarded stack frame stride overflow",
       ))?;
     let calldata_capacity = MAX_CALLDATA_SIZE.next_multiple_of(page_size);
-    let calldata_offset = (frame_count - 1)
-      .checked_mul(frame_stride)
-      .and_then(|offset| offset.checked_add(frame_size))
-      .ok_or(RuntimeError::InvalidArgument(
-        "guarded stack frame span overflow",
-      ))?;
+    // The calldata slab sits right above the highest island, where the entry
+    // frame pointer starts.
+    let calldata_offset = root_frame_offset(&FrameLayout {
+      frame_size,
+      frame_stride,
+      frame_count,
+    })
+    .ok_or(RuntimeError::InvalidArgument(
+      "guarded stack frame span overflow",
+    ))?;
     let address_span =
       calldata_offset
         .checked_add(calldata_capacity)
@@ -1114,12 +1119,15 @@ impl JitMemory {
 
     guest.checked_add(size)?;
     let offset = guest.checked_sub(self.stack_guest_bottom)?;
-    let slot = offset / self.stack_frame_stride;
-    let within = offset % self.stack_frame_stride;
-    if slot >= self.stack_frame_count
-      || within >= self.stack_frame_size
-      || size > self.stack_frame_size - within
-    {
+    if !island_access(
+      &FrameLayout {
+        frame_size: self.stack_frame_size,
+        frame_stride: self.stack_frame_stride,
+        frame_count: self.stack_frame_count,
+      },
+      offset,
+      size,
+    ) {
       return None;
     }
     let native = self.stack_native_base.checked_add(offset)? as *mut u8;
@@ -2571,10 +2579,13 @@ impl Program {
       );
       let ctx = &mut *ectx.ctx;
       let stack_native_base = ctx.guest_stack.as_mut_ptr() as usize;
-      let local_call_guest_floor = stack_native_base
-        .checked_add(guest_frame)
-        .and_then(|floor| floor.checked_add(stack_layout.frame_stride))
-        .expect("local-call guest stack floor overflow");
+      let local_call_guest_floor = local_call_floor(&FrameLayout {
+        frame_size: guest_frame,
+        frame_stride: stack_layout.frame_stride,
+        frame_count: stack_layout.frame_count,
+      })
+      .and_then(|floor| stack_native_base.checked_add(floor))
+      .expect("local-call guest stack floor overflow");
       let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
       if page_size <= 0 {
         return Err(RuntimeError::PlatformError("failed to query page size"));

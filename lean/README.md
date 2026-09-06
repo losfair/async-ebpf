@@ -5,9 +5,10 @@ validator and the function layout. The code the proofs describe is the code
 the runtime runs:
 
 ```
-src/verified/                   the verified core: isa.rs, validate.rs, layout.rs
+src/verified/                   the verified core: isa.rs, validate.rs, layout.rs, stack.rs
   │  compiled into the runtime as crate::verified (jit::isa re-exports it,
-  │  jit::validate and function_analysis call it and render the rejection)
+  │  jit::validate and function_analysis call it and render the rejection,
+  │  program and region_analysis compute the frame geometry with it)
   │
   │  also the library of lean/verified/Cargo.toml, a stand-alone crate
   │  charon cargo --preset=aeneas ; aeneas -backend lean
@@ -22,9 +23,11 @@ lean/AsyncEbpf/AsyncEbpfVerified.lean   generated, do not edit
   ├─ AsyncEbpf/Layout/Spec.lean          what a good function layout looks like
   ├─ AsyncEbpf/Layout/Proofs.lean        partition = ok → LayoutOk
   ├─ AsyncEbpf/Layout/Decoder.lean       byte classes agree with the decoder
+  ├─ AsyncEbpf/Stack/Proofs.lean         frame islands, floor and window arithmetic
   ├─ AsyncEbpf/Semantics/Machine.lean    an operational semantics of eBPF
   ├─ AsyncEbpf/Semantics/Soundness.lean  accepted programs never go wrong
-  └─ AsyncEbpf/Semantics/Functions.lean  control never leaves a function
+  ├─ AsyncEbpf/Semantics/Functions.lean  control never leaves a function
+  └─ AsyncEbpf/Semantics/Frames.lean     unchecked frame accesses stay mapped
 ```
 
 Every analysis pass that gains a proof moves into `src/verified/`; the crate
@@ -124,15 +127,50 @@ check that every successor the semantics can take is one the byte
 classification lists. The layout's over-approximation is harmless: it may
 walk a slot the machine never reaches, never the reverse.
 
+### Stack frames
+
+`src/verified/stack.rs` holds the arithmetic the guarded guest stack rests
+on. The stack is `frame_count` mapped islands of `frame_size` bytes,
+`frame_stride` apart, with unmapped gaps between them. `root_frame_offset`
+is where the entry frame pointer starts (the top of the highest island;
+`program.rs` places the calldata slab there), `local_call_floor` is the
+lowest frame pointer the JIT allows a local call from (`LOCAL_CALL_GUEST_FLOOR`
+in the memory descriptor), `island_access` is the runtime's test for a
+guest range lying in one island (`checked_stack_region`), and
+`in_frame_window` is the region analysis' test for an `R10`-relative access
+the JIT may emit with no bounds check (`frame_access`).
+
+`frame_access_mapped` and `floor_iff_depth` (in `Semantics/Frames.lean`):
+with the machine's parameters taken from the layout (`StackParams`: `R10`
+starts at the top of the highest island, moves one stride per call, and the
+stack admits `frame_count - 1` calls), in every execution of an accepted
+program
+
+- the frame pointer is the top of a mapped island at every reachable state
+  (`frame_pointer_on_island`);
+- every access `in_frame_window` admits satisfies `island_access`: the
+  unchecked accesses are exactly ones the checked path would have accepted;
+- the floor test the JIT emits before a local call passes exactly when the
+  semantics admits another frame.
+
+The pure-arithmetic half (`frame_window_mapped` in `Stack/Proofs.lean`) is
+the statement the `debug_assert!` in `_run` and the comment on
+`frame_access` used to carry by hand.
+
 ## What is trusted
 
 - **The adapters.** `jit::validate` folds the embedder's helper callback into
   the list of known indices the core consults, and renders each `Reject` as
   the message embedders match on; `function_analysis` decodes the section
   bytes, renders each `LayoutReject`, and reads the call graph off the
-  `Layout`. None of these changes a decision. The recorded decision sweeps in
-  `src/jit/validate.rs` pin every message, so a change shows up as a golden
-  diff.
+  `Layout`; `program.rs` builds the `FrameLayout` from the configured sizes
+  and adds the mapping's base to the offsets the core computes. None of these
+  changes a decision. The recorded decision sweeps in `src/jit/validate.rs`
+  pin every message, so a change shows up as a golden diff.
+- **The JIT's floor test and native frame base.** `StackParams` states what
+  the emitted code does with `R10`: starts it at the top of the highest
+  island and subtracts one stride per call. That the backends do so is
+  checked by their tests, not here.
 - **Aeneas and Charon.** The translation from Rust to Lean is trusted, as is
   the Aeneas standard library's model of `Vec`, slices and scalar arithmetic.
 - **The `extract` feature.** The Charon build hides the runtime-only
@@ -191,7 +229,10 @@ matter for whether the extraction is usable:
   and branch on it once (`successors` in `layout.rs` returns a count and up
   to two targets for this reason);
 - recomputing `pc + 1` after a `?` made Charon stop with an unimplemented
-  binary operation; compute such values once, before the `?`.
+  binary operation; compute such values once, before the `?`;
+- `?` on an `Option` extracts to an axiom (Aeneas has no model of its `Try`
+  instance); spell the `match` out. `checked_add` and friends have no model
+  either, so `stack.rs` writes the overflow checks by hand.
 
 On the Lean side, `loop_ok_induction` in `Loop.lean` is the tool for every
 extracted loop: give it an invariant of the loop state and what the exit
@@ -206,7 +247,6 @@ methods — goes behind `cfg(not(feature = "extract"))`.
 ## Next
 
 The semantics is the base the analysis passes can now be proved against. In
-order of value: the frame-window arithmetic the JIT's stack accesses rest on,
-the region analysis' transfer function against this semantics extended with
-pointer provenance, and the live-in non-interference claim behind signature
-masking.
+order of value: the region analysis' transfer function against this
+semantics extended with pointer provenance, and the live-in non-interference
+claim behind signature masking.
