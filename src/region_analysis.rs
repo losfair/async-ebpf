@@ -255,6 +255,14 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   RegionAnalysis { hints, unresolved }
 }
 
+// How many slots the worklist of `analyze_function` has popped on this
+// thread. Test-only: the masking test reads it to check that the runs it
+// compares really do process slots in different orders.
+#[cfg(test)]
+thread_local! {
+  pub(crate) static WORKLIST_POPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn analyze_function(
   code: &[u8],
   start_pc: usize,
@@ -289,6 +297,8 @@ pub(crate) fn analyze_function(
   let mut cap_warning_emitted = false;
 
   while let Some(pc) = worklist.pop() {
+    #[cfg(test)]
+    WORKLIST_POPS.with(|c| c.set(c.get() + 1));
     on_list[pc] = false;
     let inst = decode(&code[pc * 8..pc * 8 + 8]);
     if inst.opcode == EBPF_OP_CALL && (inst.src == 1 || inst.src == 2) {
@@ -2900,5 +2910,154 @@ mod tests {
     ]);
     let result = analyze(&code, DATA_LO, DATA_HI);
     assert!(result.unresolved.is_empty());
+  }
+}
+
+/// Live-in masking of call signatures must not change what the analysis
+/// reports. `lean/AsyncEbpf/Region/Masking.lean` proves that for any *common*
+/// worklist schedule; the two runs of [`analyze_function`] do not share one,
+/// because the worklist re-queues a slot on a change to any register, dead
+/// ones included, and `transfer` is not monotone (`load_kind`), so the proof
+/// stops there. This test covers the gap: random programs, random incoming
+/// signatures, the masked and the unmasked run must agree on every hint,
+/// every unresolved access and every onward signature — and the runs must
+/// really take different schedules often enough for that to mean something.
+#[cfg(test)]
+mod masking_fuzz {
+  use super::*;
+  use crate::verified::region::{RegKind, StackKind};
+
+  fn slot(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> [u8; 8] {
+    let mut s = [0u8; 8];
+    s[0] = opcode;
+    s[1] = (dst & 0x0f) | (src << 4);
+    s[2..4].copy_from_slice(&offset.to_le_bytes());
+    s[4..8].copy_from_slice(&imm.to_le_bytes());
+    s
+  }
+
+  /// A fixed-seed generator, so a failure names a reproducible trial.
+  struct Lcg(u64);
+  impl Lcg {
+    fn next(&mut self) -> u64 {
+      self.0 = self
+        .0
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+      self.0 >> 33
+    }
+    fn below(&mut self, n: u64) -> u64 {
+      self.next() % n
+    }
+  }
+
+  const LDXDW: u8 = EBPF_CLS_LDX | 0x18;
+  const STXDW: u8 = EBPF_CLS_STX | 0x18;
+  const MOV64_REG: u8 = EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_MOV;
+  const MOV64_IMM: u8 = EBPF_CLS_ALU64 | EBPF_ALU_OP_MOV;
+  const ADD64_IMM: u8 = EBPF_CLS_ALU64 | EBPF_ALU_OP_ADD;
+  const ADD64_REG: u8 = EBPF_CLS_ALU64 | EBPF_SRC_REG | EBPF_ALU_OP_ADD;
+  const JEQ_IMM: u8 = EBPF_CLS_JMP | 0x10;
+
+  /// A random function of `n` slots plus a trailing `exit`: register moves and
+  /// adds, spills to and fills from two frame slots, loads through registers,
+  /// helper calls, data-pointer immediates, and plenty of jumps, so the
+  /// worklist has joins to re-queue.
+  fn gen(rng: &mut Lcg, n: usize) -> Vec<[u8; 8]> {
+    let mut code = Vec::new();
+    let mut i = 0;
+    while i < n {
+      let a = rng.below(10) as u8;
+      let b = rng.below(10) as u8;
+      let off = if rng.below(2) == 0 { -8 } else { -16 };
+      let jump = |rng: &mut Lcg, i: usize| (rng.below(n as u64) as i64 - i as i64 - 1) as i16;
+      let s = match rng.below(14) {
+        0 => slot(MOV64_REG, a, b, 0, 0),
+        1 => slot(MOV64_IMM, a, 0, 0, 7),
+        2 => slot(ADD64_IMM, a, 0, 0, 8),
+        3 => slot(ADD64_REG, a, b, 0, 0),
+        4 => slot(STXDW, 10, a, off, 0),
+        5 => slot(LDXDW, a, 10, off, 0),
+        6 => slot(LDXDW, a, b, 0, 0),
+        7 | 12 | 13 => {
+          let target = jump(rng, i);
+          slot(JEQ_IMM, a, 0, target, 0)
+        }
+        8 => {
+          let target = jump(rng, i);
+          slot(EBPF_OP_JA, 0, 0, target, 0)
+        }
+        9 => slot(EBPF_OP_CALL, 0, 0, 0, 1),
+        10 => {
+          if i + 1 < n {
+            code.push(slot(EBPF_OP_LDDW, a, 0, 0, 0x10008));
+            i += 1;
+            slot(0, 0, 0, 0, 0)
+          } else {
+            slot(MOV64_IMM, a, 0, 0, 1)
+          }
+        }
+        _ => slot(STXDW, a, b, 0, 0),
+      };
+      code.push(s);
+      i += 1;
+    }
+    code.push(slot(EBPF_OP_EXIT, 0, 0, 0, 0));
+    code
+  }
+
+  fn kind(rng: &mut Lcg) -> RegKind {
+    match rng.below(5) {
+      0 => RegKind::Scalar,
+      1 => RegKind::Data,
+      2 => RegKind::Stack(StackKind::Current(None)),
+      3 => RegKind::Stack(StackKind::Foreign),
+      _ => RegKind::Unknown,
+    }
+  }
+
+  fn pops_of(f: impl FnOnce() -> FunctionRegionAnalysis) -> (FunctionRegionAnalysis, usize) {
+    WORKLIST_POPS.with(|c| c.set(0));
+    let result = f();
+    (result, WORKLIST_POPS.with(|c| c.get()))
+  }
+
+  #[test]
+  fn masking_is_precision_neutral() {
+    let mut rng = Lcg(12345);
+    let mut diverged = 0;
+    for trial in 0..50_000u64 {
+      let n = 3 + rng.below(14) as usize;
+      let code: Vec<u8> = gen(&mut rng, n).iter().flatten().copied().collect();
+      let num = code.len() / 8;
+      let mut regs = [RegKind::Scalar; NUM_REGS];
+      for r in regs.iter_mut().take(10) {
+        *r = kind(&mut rng);
+      }
+      regs[10] = crate::verified::region::frame_pointer_kind();
+      let sig = PointerSignature { regs };
+      let mask = function_live_in(&code, 0, num, &|_| 0);
+      let masked = mask_signature(&sig, mask);
+      let layout = crate::function_analysis::FunctionLayout::unmasked(num);
+      let (a, pops_a) =
+        pops_of(|| analyze_function(&code, 0, num, sig, 0x10000, 0x20000, &layout, 512));
+      let (b, pops_b) =
+        pops_of(|| analyze_function(&code, 0, num, masked, 0x10000, 0x20000, &layout, 512));
+      if pops_a != pops_b {
+        diverged += 1;
+      }
+      let same = a.hints == b.hints
+        && a.unresolved == b.unresolved
+        && a.call_signatures == b.call_signatures;
+      assert!(
+        same,
+        "trial {trial}: mask {mask:#x}\nsig {sig:?}\nmasked {masked:?}\ncode {code:?}\n\
+         hints {:?} vs {:?}\nunresolved {:?} vs {:?}",
+        a.hints, b.hints, a.unresolved, b.unresolved
+      );
+    }
+    // The runs really do take different schedules, so agreement is a
+    // statement about the driver and not just about `transfer`.
+    assert!(diverged > 1000, "only {diverged} trials diverged");
   }
 }

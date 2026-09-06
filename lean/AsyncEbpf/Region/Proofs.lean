@@ -25,6 +25,8 @@ over-approximate the values" but the three things the runtime relies on:
   This is the per-instruction fact the live-in masking of call signatures
   rests on: two states that agree on the live-in registers and the slots
   produce states that agree on the live-out registers and the slots.
+  `Region/Masking.lean` carries it through the meet, the classification
+  and the call signatures to any common worklist schedule.
 -/
 open Aeneas Aeneas.Std Result
 

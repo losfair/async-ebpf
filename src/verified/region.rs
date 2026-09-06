@@ -38,7 +38,11 @@
 //! (`classify_frame`, carried to executions by `Semantics/Frames.lean`);
 //! `R10`'s kind survives every transfer and meet of an accepted
 //! instruction; and `transfer` reads only the registers `uses_and_defs`
-//! names, which is what the live-in masking of call signatures rests on.
+//! names, which is what the live-in masking of call signatures rests on:
+//! `lean/AsyncEbpf/Region/Masking.lean` carries that through `meet_from`,
+//! [`classify`], [`signature_from_state`] and [`mask_signature`] to any
+//! common worklist schedule. The two runs' schedules differing is covered
+//! by `region_analysis::masking_fuzz`, not by Lean.
 
 use super::isa::*;
 use super::stack::in_frame_window;
