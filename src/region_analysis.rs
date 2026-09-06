@@ -555,7 +555,7 @@ pub(crate) fn program_live_in(
   // a caller that ignores that cap gets the conservative summary, not a wrong
   // one. Same for a `starts` array that does not partition its section: every
   // walk below assumes `starts[i] < starts[i + 1] <= num_slots`.
-  if total_slots >= (u32::MAX - 1) as usize {
+  if total_slots >= (u32::MAX / 2) as usize {
     return conservative();
   }
   for section in sections {
@@ -580,6 +580,19 @@ pub(crate) fn program_live_in(
     {
       return conservative();
     }
+    // The solver wakes a function's call sites when its entry slot grows, and
+    // it recognizes the entry through `pc_to_func`, so each entry must map to
+    // its own function (`Shape.entry_func` in `Liveness/Proofs.lean`). The
+    // layout guarantees this; refusing it here keeps the proof's hypotheses
+    // checked rather than assumed.
+    if section
+      .starts
+      .iter()
+      .enumerate()
+      .any(|(fi, &start)| section.pc_to_func[start] != fi)
+    {
+      return conservative();
+    }
   }
   if total_funcs == 0 {
     return conservative();
@@ -595,33 +608,32 @@ pub(crate) fn program_live_in(
     (section.starts[fi], end)
   };
 
-  let section_insns: Vec<Vec<Insn>> = sections
-    .iter()
-    .map(|section| decode_section(section.code))
-    .collect();
-
-  // Reachable slots only. This is a speedup, not a correctness requirement:
-  // liveness runs backward, and every successor of a reachable slot is itself
-  // reachable, so an unreachable slot's liveness can only ever flow to other
-  // unreachable slots and never reaches a function entry. Skipping them also
-  // keeps this identical to `function_live_in`, which filters the same way.
-  let mut reachable = vec![false; total_slots];
-  let mut stack: Vec<usize> = Vec::new();
+  // The whole program laid end to end, as `verified::liveness::solve` takes
+  // it: every section's slots decoded in order, each slot's function as a
+  // whole-program id, each function's bounds and its entry as whole-program
+  // slot ids, and each call site's callee. Building this is the adapter's
+  // whole job; the solve is the verified core's. The checks above are what
+  // `Liveness/Proofs.lean` assumes of these tables (`Shape`): every index in
+  // range, every entry inside its function, fewer than `2^31` slots.
+  let mut insns: Vec<Insn> = Vec::with_capacity(total_slots);
+  let mut slot_func: Vec<u32> = Vec::with_capacity(total_slots);
+  let mut func_start: Vec<u32> = Vec::with_capacity(total_funcs);
+  let mut func_end: Vec<u32> = Vec::with_capacity(total_funcs);
   for (si, section) in sections.iter().enumerate() {
-    let base = slot_base[si];
+    let num_slots = section.code.len() / 8;
+    insns.extend(decode_section(section.code));
+    slot_func.extend(
+      section
+        .pc_to_func
+        .iter()
+        .map(|&function| (func_base[si] + function) as u32),
+    );
     for fi in 0..section.starts.len() {
       let (start, end) = bounds(si, fi);
-      reachable[base + start] = true;
-      stack.push(start);
-      while let Some(pc) = stack.pop() {
-        for succ in successors_of(&section_insns[si], pc, start, end) {
-          if !reachable[base + succ] {
-            reachable[base + succ] = true;
-            stack.push(succ);
-          }
-        }
-      }
+      func_start.push((slot_base[si] + start) as u32);
+      func_end.push((slot_base[si] + end) as u32);
     }
+    debug_assert_eq!(insns.len(), slot_base[si] + num_slots);
   }
 
   // Each call site's callee, indexed by global slot id. Dense rather than a
@@ -634,9 +646,8 @@ pub(crate) fn program_live_in(
   // a call whose target this analysis cannot name, which reads everything. The
   // loader's own validation refuses the latter long before here, so it is a
   // backstop. Both sentinels are outside the id space: the bail above keeps
-  // `total_funcs <= total_slots < u32::MAX - 1`.
-  const NOT_A_CALL: u32 = u32::MAX;
-  const UNRESOLVED: u32 = u32::MAX - 1;
+  // `total_funcs <= total_slots < 2^31`.
+  use crate::verified::liveness::{NOT_A_CALL, UNRESOLVED};
   let mut callee_of = vec![NOT_A_CALL; total_slots];
   let mut cross_callee: HashMap<u32, u32> = HashMap::new();
   for call in cross_section_calls {
@@ -662,10 +673,7 @@ pub(crate) fn program_live_in(
     let num_slots = section.code.len() / 8;
     let base = slot_base[si];
     for pc in 0..num_slots {
-      if !reachable[base + pc] {
-        continue;
-      }
-      let inst = section_insns[si][pc];
+      let inst = insns[base + pc];
       if inst.opcode != EBPF_OP_CALL {
         continue;
       }
@@ -689,137 +697,8 @@ pub(crate) fn program_live_in(
     }
   }
 
-  // The global slot each function starts at: a function's mask is exactly the
-  // liveness of that slot, which is what makes this one dataflow problem.
-  let mut func_start_slot = vec![0u32; total_funcs];
-  for (si, section) in sections.iter().enumerate() {
-    for (fi, &start) in section.starts.iter().enumerate() {
-      func_start_slot[func_base[si] + fi] = (slot_base[si] + start) as u32;
-    }
-  }
-
-  // Predecessors, and the call sites reading each function's entry, both as
-  // flat CSR arrays. Built once for the whole program: rebuilding a
-  // `Vec<Vec<_>>` per function per visit is the cost this solve exists to
-  // avoid.
-  let mut pred_offset = vec![0u32; total_slots + 1];
-  let mut caller_offset = vec![0u32; total_funcs + 1];
-  let for_each_edge = |mut on_pred: Box<dyn FnMut(usize, usize) + '_>,
-                       mut on_caller: Box<dyn FnMut(usize, usize) + '_>| {
-    for (si, section) in sections.iter().enumerate() {
-      let num_slots = section.code.len() / 8;
-      let base = slot_base[si];
-      for pc in 0..num_slots {
-        if !reachable[base + pc] {
-          continue;
-        }
-        let (start, end) = bounds(si, section.pc_to_func[pc]);
-        for succ in successors_of(&section_insns[si], pc, start, end) {
-          on_pred(base + succ, base + pc);
-        }
-        let callee = callee_of[base + pc];
-        if callee != NOT_A_CALL && callee != UNRESOLVED {
-          on_caller(callee as usize, base + pc);
-        }
-      }
-    }
-  };
-  for_each_edge(
-    Box::new(|succ, _| pred_offset[succ + 1] += 1),
-    Box::new(|callee, _| caller_offset[callee + 1] += 1),
-  );
-  for i in 0..total_slots {
-    pred_offset[i + 1] += pred_offset[i];
-  }
-  for i in 0..total_funcs {
-    caller_offset[i + 1] += caller_offset[i];
-  }
-  let mut pred_entries = vec![0u32; pred_offset[total_slots] as usize];
-  let mut caller_entries = vec![0u32; caller_offset[total_funcs] as usize];
-  {
-    let mut pred_cursor = pred_offset.clone();
-    let mut caller_cursor = caller_offset.clone();
-    for_each_edge(
-      Box::new(|succ, pred| {
-        pred_entries[pred_cursor[succ] as usize] = pred as u32;
-        pred_cursor[succ] += 1;
-      }),
-      Box::new(|callee, call_slot| {
-        caller_entries[caller_cursor[callee] as usize] = call_slot as u32;
-        caller_cursor[callee] += 1;
-      }),
-    );
-  }
-
-  let mut live = vec![0 as RegMask; total_slots];
-  let mut queued = vec![false; total_slots];
-  // Seeded in ascending program order so a LIFO worklist starts at the last
-  // slot and forward edges converge on the first visit. This is a constant
-  // factor either way, and not always the right one - descending seeding is
-  // about twice as fast on a call-heavy program at the size ceiling and about
-  // 20% slower on the call-chain shape the budget tests use.
-  let mut work: Vec<u32> = (0..total_slots as u32)
-    .filter(|&slot| reachable[slot as usize])
-    .collect();
-  for &slot in &work {
-    queued[slot as usize] = true;
-  }
-
-  while let Some(slot) = work.pop() {
-    let slot = slot as usize;
-    queued[slot] = false;
-    // `slot_base` is ascending, so the owning section is the last base at or
-    // below this slot. A section with no slots contributes none, and so is
-    // never selected.
-    let si = slot_base.partition_point(|&base| base <= slot) - 1;
-    let section = &sections[si];
-    let pc = slot - slot_base[si];
-    let fi = section.pc_to_func[pc];
-    let (start, end) = bounds(si, fi);
-
-    let inst = section_insns[si][pc];
-    let mut live_out = 0;
-    for succ in successors_of(&section_insns[si], pc, start, end) {
-      live_out |= live[slot_base[si] + succ];
-    }
-    let callee = match callee_of[slot] {
-      NOT_A_CALL => 0,
-      UNRESOLVED => ALL_SIGNATURE_REGS,
-      callee => live[func_start_slot[callee as usize] as usize],
-    };
-    let (uses, defs) = core::uses_and_defs(&inst, callee);
-    // Monotone: `uses` grows with the callee summary and `live_out` with the
-    // successors, both of which only ever gain bits. The union with the
-    // previous value is therefore a no-op today, and is kept because it is
-    // what makes termination independent of that property: without it, a
-    // future non-monotone change loops forever here, on the load path, rather
-    // than returning a slightly imprecise mask.
-    let computed = uses | (live_out & !defs);
-    debug_assert_eq!(live[slot] & !computed, 0);
-    let next = live[slot] | computed;
-    if next == live[slot] {
-      continue;
-    }
-    live[slot] = next;
-
-    let mut wake = |target: usize| {
-      if !queued[target] {
-        queued[target] = true;
-        work.push(target as u32);
-      }
-    };
-    for i in pred_offset[slot]..pred_offset[slot + 1] {
-      wake(pred_entries[i as usize] as usize);
-    }
-    // A function's mask is its entry slot's liveness, so growing that slot is
-    // what wakes its call sites - anywhere in the program.
-    if start == pc {
-      let func = func_base[si] + fi;
-      for i in caller_offset[func]..caller_offset[func + 1] {
-        wake(caller_entries[i as usize] as usize);
-      }
-    }
-  }
+  let live =
+    crate::verified::liveness::solve(&insns, &slot_func, &func_start, &func_end, &callee_of);
 
   LiveIn {
     masks: sections
@@ -827,7 +706,7 @@ pub(crate) fn program_live_in(
       .enumerate()
       .map(|(si, section)| {
         (0..section.starts.len())
-          .map(|fi| live[func_start_slot[func_base[si] + fi] as usize])
+          .map(|fi| live[func_start[func_base[si] + fi] as usize])
           .collect()
       })
       .collect(),

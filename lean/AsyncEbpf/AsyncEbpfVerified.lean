@@ -3124,6 +3124,577 @@ def layout.partition
     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
       layout.Layout (core.convert.FromSame layout.LayoutReject) residual
 
+/-- [async_ebpf_verified::liveness::NOT_A_CALL]
+    Source: '../../src/verified/liveness.rs', lines 42:0-42:37
+    Visibility: public -/
+@[global_simps, irreducible]
+def liveness.NOT_A_CALL : Std.U32 := core.num.U32.MAX
+
+/-- [async_ebpf_verified::liveness::UNRESOLVED]
+    Source: '../../src/verified/liveness.rs', lines 44:0-44:41
+    Visibility: public -/
+@[global_simps, irreducible]
+def liveness.UNRESOLVED : Result Std.U32 := core.num.U32.MAX - 1#u32
+
+/-- [async_ebpf_verified::liveness::NO_EDGE]
+    Source: '../../src/verified/liveness.rs', lines 46:0-46:30 -/
+@[global_simps, irreducible] def liveness.NO_EDGE : Std.U32 := core.num.U32.MAX
+
+/-- [async_ebpf_verified::liveness::link]:
+    Source: '../../src/verified/liveness.rs', lines 49:0-52:1 -/
+def liveness.link
+  (head : alloc.vec.Vec Std.U32) (next : alloc.vec.Vec Std.U32)
+  (target : Std.Usize) (edge : Std.Usize) :
+  Result ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32))
+  := do
+  let i ←
+    alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32) head
+      target
+  let (_, index_mut_back) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U32)
+      next edge
+  let (_, index_mut_back1) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U32)
+      head target
+  let i1 ← lift (UScalar.cast .U32 edge)
+  let head1 := index_mut_back1 i1
+  let next1 := index_mut_back i
+  ok (head1, next1)
+
+/-- [async_ebpf_verified::liveness::build_preds]: loop body 0:
+    Source: '../../src/verified/liveness.rs', lines 65:2-76:3 -/
+@[rust_loop_body]
+def liveness.build_preds_loop.body
+  (insns : Slice isa.Insn) (slot_func : Slice Std.U32)
+  (func_start : Slice Std.U32) (func_end : Slice Std.U32)
+  (head : alloc.vec.Vec Std.U32) (next : alloc.vec.Vec Std.U32) (p : Std.Usize)
+  :
+  Result (ControlFlow ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32) ×
+    Std.Usize) ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32)))
+  := do
+  let i := Slice.len insns
+  if p < i
+  then
+    let i1 ← Slice.index_usize slot_func p
+    let f ← lift (UScalar.cast .Usize i1)
+    let i2 ← Slice.index_usize func_start f
+    let i3 ← lift (UScalar.cast .Usize i2)
+    let i4 ← Slice.index_usize func_end f
+    let i5 ← lift (UScalar.cast .Usize i4)
+    let (count, first, second) ← fixpoint.function_successors insns p i3 i5
+    let (head1, next1) ←
+      if count >= 1#usize
+      then do
+           let i6 ← 2#usize * p
+           liveness.link head next first i6
+      else ok (head, next)
+    let (head2, next2) ←
+      if count >= 2#usize
+      then
+        do
+        let i6 ← 2#usize * p
+        let i7 ← i6 + 1#usize
+        liveness.link head1 next1 second i7
+      else ok (head1, next1)
+    let p1 ← p + 1#usize
+    ok (cont (head2, next2, p1))
+  else ok (done (head, next))
+
+/-- [async_ebpf_verified::liveness::build_preds]: loop 0:
+    Source: '../../src/verified/liveness.rs', lines 65:2-76:3 -/
+@[rust_loop]
+def liveness.build_preds_loop
+  (insns : Slice isa.Insn) (slot_func : Slice Std.U32)
+  (func_start : Slice Std.U32) (func_end : Slice Std.U32)
+  (head : alloc.vec.Vec Std.U32) (next : alloc.vec.Vec Std.U32) (p : Std.Usize)
+  :
+  Result ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32))
+  := do
+  loop
+    (fun (head1, next1, p1) => liveness.build_preds_loop.body insns slot_func
+      func_start func_end head1 next1 p1)
+    (head, next, p)
+
+/-- [async_ebpf_verified::liveness::build_preds]:
+    Source: '../../src/verified/liveness.rs', lines 56:0-77:1 -/
+@[reducible]
+def liveness.build_preds
+  (insns : Slice isa.Insn) (slot_func : Slice Std.U32)
+  (func_start : Slice Std.U32) (func_end : Slice Std.U32)
+  (head : alloc.vec.Vec Std.U32) (next : alloc.vec.Vec Std.U32) :
+  Result ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32))
+  := do
+  liveness.build_preds_loop insns slot_func func_start func_end head next
+    0#usize
+
+/-- [async_ebpf_verified::liveness::build_callers]: loop body 0:
+    Source: '../../src/verified/liveness.rs', lines 83:2-89:3 -/
+@[rust_loop_body]
+def liveness.build_callers_loop.body
+  (callee : Slice Std.U32) (head : alloc.vec.Vec Std.U32)
+  (next : alloc.vec.Vec Std.U32) (p : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32) ×
+    Std.Usize) ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32)))
+  := do
+  let i := Slice.len callee
+  if p < i
+  then
+    let c ← Slice.index_usize callee p
+    let (head1, next1) ←
+      if c != liveness.NOT_A_CALL
+      then
+        do
+        let i1 ← liveness.UNRESOLVED
+        if c != i1
+        then
+          let i2 ← lift (UScalar.cast .Usize c)
+          liveness.link head next i2 p
+        else ok (head, next)
+      else ok (head, next)
+    let p1 ← p + 1#usize
+    ok (cont (head1, next1, p1))
+  else ok (done (head, next))
+
+/-- [async_ebpf_verified::liveness::build_callers]: loop 0:
+    Source: '../../src/verified/liveness.rs', lines 83:2-89:3 -/
+@[rust_loop]
+def liveness.build_callers_loop
+  (callee : Slice Std.U32) (head : alloc.vec.Vec Std.U32)
+  (next : alloc.vec.Vec Std.U32) (p : Std.Usize) :
+  Result ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32))
+  := do
+  loop
+    (fun (head1, next1, p1) => liveness.build_callers_loop.body callee head1
+      next1 p1)
+    (head, next, p)
+
+/-- [async_ebpf_verified::liveness::build_callers]:
+    Source: '../../src/verified/liveness.rs', lines 81:0-90:1 -/
+@[reducible]
+def liveness.build_callers
+  (callee : Slice Std.U32) (head : alloc.vec.Vec Std.U32)
+  (next : alloc.vec.Vec Std.U32) :
+  Result ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Std.U32))
+  := do
+  liveness.build_callers_loop callee head next 0#usize
+
+/-- [async_ebpf_verified::liveness::wake]: loop body 0:
+    Source: '../../src/verified/liveness.rs', lines 104:2-112:3 -/
+@[rust_loop_body]
+def liveness.wake_loop.body
+  (next : Slice Std.U32) (per_slot : Std.U32) (queued : alloc.vec.Vec Bool)
+  (stack : alloc.vec.Vec Std.U32) (e : Std.U32) (top : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Bool) × (alloc.vec.Vec Std.U32) ×
+    Std.U32 × Std.Usize) (Std.Usize × (alloc.vec.Vec Bool) × (alloc.vec.Vec
+    Std.U32)))
+  := do
+  if e != liveness.NO_EDGE
+  then
+    let i ← e / per_slot
+    let p ← lift (UScalar.cast .Usize i)
+    let b ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Bool) queued p
+    let (queued1, stack1, top1) ←
+      if b
+      then ok (queued, stack, top)
+      else
+        do
+        let (_, index_mut_back) ←
+          alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+            queued p
+        let (_, index_mut_back1) ←
+          alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+            Std.U32) stack top
+        let i1 ← lift (UScalar.cast .U32 p)
+        let top2 ← top + 1#usize
+        let stack2 := index_mut_back1 i1
+        let queued2 := index_mut_back true
+        ok (queued2, stack2, top2)
+    let i1 ← lift (UScalar.cast .Usize e)
+    let e1 ← Slice.index_usize next i1
+    ok (cont (queued1, stack1, e1, top1))
+  else ok (done (top, queued, stack))
+
+/-- [async_ebpf_verified::liveness::wake]: loop 0:
+    Source: '../../src/verified/liveness.rs', lines 104:2-112:3 -/
+@[rust_loop]
+def liveness.wake_loop
+  (next : Slice Std.U32) (queued : alloc.vec.Vec Bool)
+  (stack : alloc.vec.Vec Std.U32) (per_slot : Std.U32) (e : Std.U32)
+  (top : Std.Usize) :
+  Result (Std.Usize × (alloc.vec.Vec Bool) × (alloc.vec.Vec Std.U32))
+  := do
+  loop
+    (fun (queued1, stack1, e1, top1) => liveness.wake_loop.body next per_slot
+      queued1 stack1 e1 top1)
+    (queued, stack, e, top)
+
+/-- [async_ebpf_verified::liveness::wake]:
+    Source: '../../src/verified/liveness.rs', lines 94:0-114:1 -/
+@[reducible]
+def liveness.wake
+  (next : Slice Std.U32) (queued : alloc.vec.Vec Bool)
+  (stack : alloc.vec.Vec Std.U32) (sp : Std.Usize) (edge : Std.U32)
+  (per_slot : Std.U32) :
+  Result (Std.Usize × (alloc.vec.Vec Bool) × (alloc.vec.Vec Std.U32))
+  := do
+  liveness.wake_loop next queued stack per_slot edge sp
+
+/-- [async_ebpf_verified::region::ALL_SIGNATURE_REGS]
+    Source: '../../src/verified/region.rs', lines 405:0-405:47
+    Visibility: public -/
+@[global_simps, irreducible]
+def region.ALL_SIGNATURE_REGS : Std.U16 := 1023#u16
+
+/-- [async_ebpf_verified::liveness::callee_summary]:
+    Source: '../../src/verified/liveness.rs', lines 119:0-127:1 -/
+def liveness.callee_summary
+  (callee : Std.U32) (func_start : Slice Std.U32) (live : Slice Std.U16) :
+  Result Std.U16
+  := do
+  if callee = liveness.NOT_A_CALL
+  then ok 0#u16
+  else
+    let i ← liveness.UNRESOLVED
+    if callee = i
+    then ok region.ALL_SIGNATURE_REGS
+    else
+      let i1 ← lift (UScalar.cast .Usize callee)
+      let i2 ← Slice.index_usize func_start i1
+      let i3 ← lift (UScalar.cast .Usize i2)
+      Slice.index_usize live i3
+
+/-- [async_ebpf_verified::liveness::seed]: loop body 0:
+    Source: '../../src/verified/liveness.rs', lines 133:2-136:3 -/
+@[rust_loop_body]
+def liveness.seed_loop.body
+  (stack : alloc.vec.Vec Std.U32) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U32) × Std.Usize) (alloc.vec.Vec
+    Std.U32))
+  := do
+  let i1 := alloc.vec.Vec.len stack
+  if i < i1
+  then
+    let (_, index_mut_back) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U32)
+        stack i
+    let i2 ← lift (UScalar.cast .U32 i)
+    let i3 ← i + 1#usize
+    let stack1 := index_mut_back i2
+    ok (cont (stack1, i3))
+  else ok (done stack)
+
+/-- [async_ebpf_verified::liveness::seed]: loop 0:
+    Source: '../../src/verified/liveness.rs', lines 133:2-136:3 -/
+@[rust_loop]
+def liveness.seed_loop
+  (stack : alloc.vec.Vec Std.U32) (i : Std.Usize) :
+  Result (alloc.vec.Vec Std.U32)
+  := do
+  loop
+    (fun (stack1, i1) => liveness.seed_loop.body stack1 i1)
+    (stack, i)
+
+/-- [async_ebpf_verified::liveness::seed]:
+    Source: '../../src/verified/liveness.rs', lines 131:0-137:1 -/
+@[reducible]
+def liveness.seed
+  (stack : alloc.vec.Vec Std.U32) : Result (alloc.vec.Vec Std.U32) := do
+  liveness.seed_loop stack 0#usize
+
+/-- [async_ebpf_verified::region::reg_bit]:
+    Source: '../../src/verified/region.rs', lines 798:0-804:1
+    Visibility: public -/
+def region.reg_bit (reg : Std.Usize) : Result Std.U16 := do
+  if reg < region.R10
+  then 1#u16 <<< reg
+  else ok 0#u16
+
+/-- [async_ebpf_verified::region::CALL_CLOBBERED_REGS]
+    Source: '../../src/verified/region.rs', lines 410:0-410:52
+    Visibility: public -/
+@[global_simps, irreducible] def region.CALL_CLOBBERED_REGS : Std.U16 := 63#u16
+
+/-- [async_ebpf_verified::region::HELPER_ARG_REGS]
+    Source: '../../src/verified/region.rs', lines 409:0-409:48
+    Visibility: public -/
+@[global_simps, irreducible] def region.HELPER_ARG_REGS : Std.U16 := 62#u16
+
+/-- [async_ebpf_verified::region::uses_and_defs]:
+    Source: '../../src/verified/region.rs', lines 814:0-871:1
+    Visibility: public -/
+def region.uses_and_defs
+  (inst : isa.Insn) (callee_live_in : Std.U16) :
+  Result (Std.U16 × Std.U16)
+  := do
+  let cls ← lift (inst.opcode &&& isa.CLS_MASK)
+  let dst ← lift (UScalar.cast .Usize inst.dst)
+  let src ← lift (UScalar.cast .Usize inst.src)
+  if cls = isa.CLS_LD
+  then let i ← region.reg_bit dst
+       ok (0#u16, i)
+  else
+    if cls = isa.CLS_LDX
+    then let i ← region.reg_bit src
+         let i1 ← region.reg_bit dst
+         ok (i, i1)
+    else
+      if cls = isa.CLS_ST
+      then let i ← region.reg_bit dst
+           ok (i, 0#u16)
+      else
+        if cls = isa.CLS_STX
+        then
+          let i ← region.reg_bit dst
+          let i1 ← region.reg_bit src
+          let uses ← lift (i ||| i1)
+          let b ← region.is_atomic inst.opcode
+          if b
+          then
+            let i2 ← region.reg_bit 0#usize
+            let uses1 ← lift (uses ||| i2)
+            ok (uses1, 0#u16)
+          else ok (uses, 0#u16)
+        else
+          if cls = isa.CLS_ALU
+          then
+            let i ← lift (inst.opcode &&& isa.SRC_REG)
+            let src_bits ← if i != 0#u8
+                             then region.reg_bit src
+                             else ok 0#u16
+            let i1 ← lift (inst.opcode &&& isa.ALU_MASK)
+            if i1 = region.ALU_OP_MOV
+            then let i2 ← region.reg_bit dst
+                 ok (src_bits, i2)
+            else
+              let i2 ← region.reg_bit dst
+              let i3 ← lift (src_bits ||| i2)
+              ok (i3, i2)
+          else
+            if cls = isa.CLS_ALU64
+            then
+              let i ← lift (inst.opcode &&& isa.SRC_REG)
+              let src_bits ←
+                if i != 0#u8
+                then region.reg_bit src
+                else ok 0#u16
+              let i1 ← lift (inst.opcode &&& isa.ALU_MASK)
+              if i1 = region.ALU_OP_MOV
+              then let i2 ← region.reg_bit dst
+                   ok (src_bits, i2)
+              else
+                let i2 ← region.reg_bit dst
+                let i3 ← lift (src_bits ||| i2)
+                ok (i3, i2)
+            else
+              if cls = isa.CLS_JMP
+              then
+                if inst.opcode = isa.OP_EXIT
+                then ok (0#u16, 0#u16)
+                else
+                  if inst.opcode = isa.OP_CALL
+                  then
+                    if inst.src = 0#u8
+                    then
+                      ok (region.HELPER_ARG_REGS, region.CALL_CLOBBERED_REGS)
+                    else
+                      if inst.src = 1#u8
+                      then ok (callee_live_in, region.CALL_CLOBBERED_REGS)
+                      else
+                        if inst.src = 2#u8
+                        then ok (callee_live_in, region.CALL_CLOBBERED_REGS)
+                        else ok (0#u16, 0#u16)
+                  else
+                    if inst.opcode = isa.OP_JA
+                    then ok (0#u16, 0#u16)
+                    else
+                      if inst.opcode = isa.OP_JA32
+                      then ok (0#u16, 0#u16)
+                      else
+                        let i ← lift (inst.opcode &&& isa.SRC_REG)
+                        let src_bits ←
+                          if i != 0#u8
+                          then region.reg_bit src
+                          else ok 0#u16
+                        let i1 ← region.reg_bit dst
+                        let i2 ← lift (src_bits ||| i1)
+                        ok (i2, 0#u16)
+              else
+                if cls = isa.CLS_JMP32
+                then
+                  if inst.opcode = isa.OP_EXIT
+                  then ok (0#u16, 0#u16)
+                  else
+                    if inst.opcode = isa.OP_CALL
+                    then
+                      if inst.src = 0#u8
+                      then
+                        ok (region.HELPER_ARG_REGS, region.CALL_CLOBBERED_REGS)
+                      else
+                        if inst.src = 1#u8
+                        then ok (callee_live_in, region.CALL_CLOBBERED_REGS)
+                        else
+                          if inst.src = 2#u8
+                          then ok (callee_live_in, region.CALL_CLOBBERED_REGS)
+                          else ok (0#u16, 0#u16)
+                    else
+                      if inst.opcode = isa.OP_JA
+                      then ok (0#u16, 0#u16)
+                      else
+                        if inst.opcode = isa.OP_JA32
+                        then ok (0#u16, 0#u16)
+                        else
+                          let i ← lift (inst.opcode &&& isa.SRC_REG)
+                          let src_bits ←
+                            if i != 0#u8
+                            then region.reg_bit src
+                            else ok 0#u16
+                          let i1 ← region.reg_bit dst
+                          let i2 ← lift (src_bits ||| i1)
+                          ok (i2, 0#u16)
+                else ok (0#u16, 0#u16)
+
+/-- [async_ebpf_verified::liveness::solve]: loop body 0:
+    Source: '../../src/verified/liveness.rs', lines 174:2-202:3
+    Visibility: public -/
+@[rust_loop_body]
+def liveness.solve_loop.body
+  (insns : Slice isa.Insn) (slot_func : Slice Std.U32)
+  (func_start : Slice Std.U32) (func_end : Slice Std.U32)
+  (callee : Slice Std.U32) (pred_head : alloc.vec.Vec Std.U32)
+  (pred_next : alloc.vec.Vec Std.U32) (caller_head : alloc.vec.Vec Std.U32)
+  (caller_next : alloc.vec.Vec Std.U32) (live : alloc.vec.Vec Std.U16)
+  (queued : alloc.vec.Vec Bool) (stack : alloc.vec.Vec Std.U32)
+  (sp : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U16) × (alloc.vec.Vec Bool) ×
+    (alloc.vec.Vec Std.U32) × Std.Usize) (alloc.vec.Vec Std.U16))
+  := do
+  if sp > 0#usize
+  then
+    let sp1 ← sp - 1#usize
+    let i ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32) stack
+        sp1
+    let p ← lift (UScalar.cast .Usize i)
+    let (_, index_mut_back) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+        queued p
+    let i1 ← Slice.index_usize slot_func p
+    let f ← lift (UScalar.cast .Usize i1)
+    let i2 ← Slice.index_usize func_start f
+    let start ← lift (UScalar.cast .Usize i2)
+    let i3 ← Slice.index_usize func_end f
+    let i4 ← lift (UScalar.cast .Usize i3)
+    let (count, first, second) ←
+      fixpoint.function_successors insns p start i4
+    let (queued1, live_out) ←
+      if count >= 1#usize
+      then
+        do
+        let i5 ←
+          alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U16)
+            live first
+        let live_out1 ← lift (0#u16 ||| i5)
+        let queued2 := index_mut_back false
+        ok (queued2, live_out1)
+      else let queued2 := index_mut_back false
+           ok (queued2, 0#u16)
+    let live_out1 ←
+      if count >= 2#usize
+      then
+        do
+        let i5 ←
+          alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U16)
+            live second
+        ok (live_out ||| i5)
+      else ok live_out
+    let i5 ← Slice.index_usize callee p
+    let s := alloc.vec.Vec.deref live
+    let summary ← liveness.callee_summary i5 func_start s
+    let i6 ← Slice.index_usize insns p
+    let (uses, defs) ← region.uses_and_defs i6 summary
+    let i7 ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U16) live
+        p
+    let i8 ← lift (i7 ||| uses)
+    let i9 ← lift (~~~ defs)
+    let i10 ← lift (live_out1 &&& i9)
+    let next ← lift (i8 ||| i10)
+    if next != i7
+    then
+      let (_, index_mut_back1) ←
+        alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U16)
+          live p
+      let s1 := alloc.vec.Vec.deref pred_next
+      let i11 ←
+        alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32)
+          pred_head p
+      let (sp2, queued2, stack1) ←
+        liveness.wake s1 queued1 stack sp1 i11 2#u32
+      if p = start
+      then
+        let s2 := alloc.vec.Vec.deref caller_next
+        let i12 ←
+          alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32)
+            caller_head f
+        let (sp3, queued3, stack2) ←
+          liveness.wake s2 queued2 stack1 sp2 i12 1#u32
+        let live1 := index_mut_back1 next
+        ok (cont (live1, queued3, stack2, sp3))
+      else
+        let live1 := index_mut_back1 next
+        ok (cont (live1, queued2, stack1, sp2))
+    else ok (cont (live, queued1, stack, sp1))
+  else ok (done live)
+
+/-- [async_ebpf_verified::liveness::solve]: loop 0:
+    Source: '../../src/verified/liveness.rs', lines 174:2-202:3
+    Visibility: public -/
+@[rust_loop]
+def liveness.solve_loop
+  (insns : Slice isa.Insn) (slot_func : Slice Std.U32)
+  (func_start : Slice Std.U32) (func_end : Slice Std.U32)
+  (callee : Slice Std.U32) (pred_head : alloc.vec.Vec Std.U32)
+  (pred_next : alloc.vec.Vec Std.U32) (caller_head : alloc.vec.Vec Std.U32)
+  (caller_next : alloc.vec.Vec Std.U32) (live : alloc.vec.Vec Std.U16)
+  (queued : alloc.vec.Vec Bool) (stack : alloc.vec.Vec Std.U32)
+  (sp : Std.Usize) :
+  Result (alloc.vec.Vec Std.U16)
+  := do
+  loop
+    (fun (live1, queued1, stack1, sp1) => liveness.solve_loop.body insns
+      slot_func func_start func_end callee pred_head pred_next caller_head
+      caller_next live1 queued1 stack1 sp1)
+    (live, queued, stack, sp)
+
+/-- [async_ebpf_verified::liveness::solve]:
+    Source: '../../src/verified/liveness.rs', lines 145:0-205:1
+    Visibility: public -/
+def liveness.solve
+  (insns : Slice isa.Insn) (slot_func : Slice Std.U32)
+  (func_start : Slice Std.U32) (func_end : Slice Std.U32)
+  (callee : Slice Std.U32) :
+  Result (alloc.vec.Vec Std.U16)
+  := do
+  let n := Slice.len insns
+  let nf := Slice.len func_start
+  let pred_head ← alloc.vec.from_elem core.clone.CloneU32 liveness.NO_EDGE n
+  let i ← 2#usize * n
+  let pred_next ← alloc.vec.from_elem core.clone.CloneU32 liveness.NO_EDGE i
+  let (pred_head1, pred_next1) ←
+    liveness.build_preds insns slot_func func_start func_end pred_head
+      pred_next
+  let caller_head ←
+    alloc.vec.from_elem core.clone.CloneU32 liveness.NO_EDGE nf
+  let (caller_head1, caller_next) ←
+    liveness.build_callers callee caller_head pred_head
+  let live ← alloc.vec.from_elem core.clone.CloneU16 0#u16 n
+  let queued ← alloc.vec.from_elem core.clone.CloneBool true n
+  let stack ← alloc.vec.from_elem core.clone.CloneU32 0#u32 n
+  let stack1 ← liveness.seed stack
+  liveness.solve_loop insns slot_func func_start func_end callee pred_head1
+    pred_next1 caller_head1 caller_next live queued stack1 n
+
 /-- [async_ebpf_verified::region::REGION_UNKNOWN]
     Source: '../../src/verified/region.rs', lines 50:0-50:33
     Visibility: public -/
@@ -3284,22 +3855,6 @@ def region.PointerSignature.Insts.CoreMarkerCopy : core.marker.Copy
   cloneInst := region.PointerSignature.Insts.CoreCloneClone
 }
 
-/-- [async_ebpf_verified::region::ALL_SIGNATURE_REGS]
-    Source: '../../src/verified/region.rs', lines 405:0-405:47
-    Visibility: public -/
-@[global_simps, irreducible]
-def region.ALL_SIGNATURE_REGS : Std.U16 := 1023#u16
-
-/-- [async_ebpf_verified::region::HELPER_ARG_REGS]
-    Source: '../../src/verified/region.rs', lines 409:0-409:48
-    Visibility: public -/
-@[global_simps, irreducible] def region.HELPER_ARG_REGS : Std.U16 := 62#u16
-
-/-- [async_ebpf_verified::region::CALL_CLOBBERED_REGS]
-    Source: '../../src/verified/region.rs', lines 410:0-410:52
-    Visibility: public -/
-@[global_simps, irreducible] def region.CALL_CLOBBERED_REGS : Std.U16 := 63#u16
-
 /-- [async_ebpf_verified::region::entry_signature]:
     Source: '../../src/verified/region.rs', lines 414:0-419:1
     Visibility: public -/
@@ -3445,148 +4000,6 @@ def region.classify
         then ok (true, region.REGION_FRAME, plain)
         else ok (true, plain, plain)
       else ok (false, region.REGION_UNKNOWN, region.REGION_UNKNOWN)
-
-/-- [async_ebpf_verified::region::reg_bit]:
-    Source: '../../src/verified/region.rs', lines 798:0-804:1
-    Visibility: public -/
-def region.reg_bit (reg : Std.Usize) : Result Std.U16 := do
-  if reg < region.R10
-  then 1#u16 <<< reg
-  else ok 0#u16
-
-/-- [async_ebpf_verified::region::uses_and_defs]:
-    Source: '../../src/verified/region.rs', lines 814:0-871:1
-    Visibility: public -/
-def region.uses_and_defs
-  (inst : isa.Insn) (callee_live_in : Std.U16) :
-  Result (Std.U16 × Std.U16)
-  := do
-  let cls ← lift (inst.opcode &&& isa.CLS_MASK)
-  let dst ← lift (UScalar.cast .Usize inst.dst)
-  let src ← lift (UScalar.cast .Usize inst.src)
-  if cls = isa.CLS_LD
-  then let i ← region.reg_bit dst
-       ok (0#u16, i)
-  else
-    if cls = isa.CLS_LDX
-    then let i ← region.reg_bit src
-         let i1 ← region.reg_bit dst
-         ok (i, i1)
-    else
-      if cls = isa.CLS_ST
-      then let i ← region.reg_bit dst
-           ok (i, 0#u16)
-      else
-        if cls = isa.CLS_STX
-        then
-          let i ← region.reg_bit dst
-          let i1 ← region.reg_bit src
-          let uses ← lift (i ||| i1)
-          let b ← region.is_atomic inst.opcode
-          if b
-          then
-            let i2 ← region.reg_bit 0#usize
-            let uses1 ← lift (uses ||| i2)
-            ok (uses1, 0#u16)
-          else ok (uses, 0#u16)
-        else
-          if cls = isa.CLS_ALU
-          then
-            let i ← lift (inst.opcode &&& isa.SRC_REG)
-            let src_bits ← if i != 0#u8
-                             then region.reg_bit src
-                             else ok 0#u16
-            let i1 ← lift (inst.opcode &&& isa.ALU_MASK)
-            if i1 = region.ALU_OP_MOV
-            then let i2 ← region.reg_bit dst
-                 ok (src_bits, i2)
-            else
-              let i2 ← region.reg_bit dst
-              let i3 ← lift (src_bits ||| i2)
-              ok (i3, i2)
-          else
-            if cls = isa.CLS_ALU64
-            then
-              let i ← lift (inst.opcode &&& isa.SRC_REG)
-              let src_bits ←
-                if i != 0#u8
-                then region.reg_bit src
-                else ok 0#u16
-              let i1 ← lift (inst.opcode &&& isa.ALU_MASK)
-              if i1 = region.ALU_OP_MOV
-              then let i2 ← region.reg_bit dst
-                   ok (src_bits, i2)
-              else
-                let i2 ← region.reg_bit dst
-                let i3 ← lift (src_bits ||| i2)
-                ok (i3, i2)
-            else
-              if cls = isa.CLS_JMP
-              then
-                if inst.opcode = isa.OP_EXIT
-                then ok (0#u16, 0#u16)
-                else
-                  if inst.opcode = isa.OP_CALL
-                  then
-                    if inst.src = 0#u8
-                    then
-                      ok (region.HELPER_ARG_REGS, region.CALL_CLOBBERED_REGS)
-                    else
-                      if inst.src = 1#u8
-                      then ok (callee_live_in, region.CALL_CLOBBERED_REGS)
-                      else
-                        if inst.src = 2#u8
-                        then ok (callee_live_in, region.CALL_CLOBBERED_REGS)
-                        else ok (0#u16, 0#u16)
-                  else
-                    if inst.opcode = isa.OP_JA
-                    then ok (0#u16, 0#u16)
-                    else
-                      if inst.opcode = isa.OP_JA32
-                      then ok (0#u16, 0#u16)
-                      else
-                        let i ← lift (inst.opcode &&& isa.SRC_REG)
-                        let src_bits ←
-                          if i != 0#u8
-                          then region.reg_bit src
-                          else ok 0#u16
-                        let i1 ← region.reg_bit dst
-                        let i2 ← lift (src_bits ||| i1)
-                        ok (i2, 0#u16)
-              else
-                if cls = isa.CLS_JMP32
-                then
-                  if inst.opcode = isa.OP_EXIT
-                  then ok (0#u16, 0#u16)
-                  else
-                    if inst.opcode = isa.OP_CALL
-                    then
-                      if inst.src = 0#u8
-                      then
-                        ok (region.HELPER_ARG_REGS, region.CALL_CLOBBERED_REGS)
-                      else
-                        if inst.src = 1#u8
-                        then ok (callee_live_in, region.CALL_CLOBBERED_REGS)
-                        else
-                          if inst.src = 2#u8
-                          then ok (callee_live_in, region.CALL_CLOBBERED_REGS)
-                          else ok (0#u16, 0#u16)
-                    else
-                      if inst.opcode = isa.OP_JA
-                      then ok (0#u16, 0#u16)
-                      else
-                        if inst.opcode = isa.OP_JA32
-                        then ok (0#u16, 0#u16)
-                        else
-                          let i ← lift (inst.opcode &&& isa.SRC_REG)
-                          let src_bits ←
-                            if i != 0#u8
-                            then region.reg_bit src
-                            else ok 0#u16
-                          let i1 ← region.reg_bit dst
-                          let i2 ← lift (src_bits ||| i1)
-                          ok (i2, 0#u16)
-                else ok (0#u16, 0#u16)
 
 /-- [async_ebpf_verified::stack::FrameLayout]
     Source: '../../src/verified/stack.rs', lines 32:0-39:1

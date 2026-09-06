@@ -28,6 +28,7 @@ lean/AsyncEbpf/AsyncEbpfVerified.lean   generated, do not edit
   ├─ AsyncEbpf/Stack/Proofs.lean         frame islands, floor and window arithmetic
   ├─ AsyncEbpf/Region/Proofs.lean        the region analysis' transfer function
   ├─ AsyncEbpf/Region/Masking.lean       live-in masking and projection
+  ├─ AsyncEbpf/Liveness/Proofs.lean      the live-in solver solves its equations
   ├─ AsyncEbpf/Semantics/Machine.lean    an operational semantics of eBPF
   ├─ AsyncEbpf/Semantics/Soundness.lean  accepted programs never go wrong
   ├─ AsyncEbpf/Semantics/Functions.lean  control never leaves a function
@@ -169,8 +170,9 @@ the statement the `debug_assert!` in `_run` and the comment on
 abstract domain, its meet, the bounded spill-slot table, the transfer
 function, the uses/defs table, the per-slot classification and the call
 signatures. `src/verified/fixpoint.rs` is the worklist that drives them to
-a fixed point over one function (`solve`). The live-in solver and the
-access-plan builder stay outside and call into them.
+a fixed point over one function (`solve`), and `src/verified/liveness.rs`
+is the whole-program live-in solver whose table the masking reads. The
+access-plan builder stays outside and calls into them.
 
 A word on what is *not* proved. The `STACK` and `DATA` hints narrow a
 bounds check the JIT keeps, so a wrong one costs a spurious fault, not
@@ -236,6 +238,30 @@ nothing in the runtime walks without projecting any more, and the hints
 of real programs are pinned by the golden and plan tests, which the
 projection left unchanged.
 
+`Liveness/Proofs.lean` discharges the one hypothesis `Masking.lean` makes
+about the table. `src/verified/liveness.rs` solves the whole program at
+once: every section's slots end to end, each slot's function and each
+function's bounds beside them, and each local call's callee resolved by
+the loader, so that a call site reads its callee's entry row and every
+function and every summary is one dataflow problem. It is a worklist over
+intrusive predecessor and call-site lists. Then:
+
+- `build_preds_ok`, `build_callers_ok`: every successor edge
+  `fixpoint::function_successors` names is on its target's list, and every
+  resolved call is on its callee's;
+- `wake_ok`: waking a list queues each of its members and dequeues none,
+  keeping the stack a set of distinct in-range slots (`StackInv`);
+- `solve_step`, `solve_ok`: the loop keeps every slot that is not queued
+  at a value satisfying its equation, so when the worklist empties the
+  table satisfies every slot's equation, at every slot (`Holds`);
+- `solve_live_solution`: that table is a `LiveSolution` — for the whole
+  program, with each call's summary read from the table itself — over the
+  successor lists `function_successors` computes, which
+  `function_successors_bounds` keeps inside the slot's function.
+
+The hypotheses (`Shape`) are what `program_live_in` builds: every index in
+range, every function's entry inside it, fewer than `2^31` slots.
+
 ## What is trusted
 
 - **The adapters.** `jit::validate` folds the embedder's helper callback into
@@ -250,15 +276,18 @@ projection left unchanged.
   the emitted code does with `R10`: starts it at the top of the highest
   island and subtracts one stride per call. That the backends do so is
   checked by their tests, not here.
-- **The live-in solver.** `program_live_in` is not extracted. `solve` takes
-  its table as an input, and `Region/Masking.lean` assumes of it only what
-  `LiveSolution` states, the equations a fixed point of the solver
-  satisfies, or, for `solve_masked_eq`, nothing at all beyond the loader
-  masking with the entry's own row. That the table over-approximates what
-  a slot reads is what the projection's precision rests on, and it is the
-  same table the specialization of callees already keyed off. The solver
-  walks the edges `fixpoint::function_successors` gives, the same function
-  the extracted driver runs over, so the two cannot disagree on the graph.
+- **The live-in adapter.** `program_live_in` lays the sections end to end
+  and builds the per-slot function, per-function bounds and per-call callee
+  tables `liveness::solve` reads; `Liveness/Proofs.lean` takes their shape
+  (`Shape`: indices in range, entries inside their functions) as given.
+  That the callee it names for a call is the function the call enters, and
+  that the bounds it hands the solver are the ones the per-function
+  analysis runs over, so that both walk the edges
+  `fixpoint::function_successors` gives, are adapter facts like the others
+  in this list. `Masking.lean` assumes of the table only what
+  `LiveSolution` states, which `solve_live_solution` now proves of the
+  table the solver computes, or, for `solve_masked_eq`, nothing at all
+  beyond the loader masking with the entry's own row.
 - **Aeneas and Charon.** The translation from Rust to Lean is trusted, as is
   the Aeneas standard library's model of `Vec`, slices and scalar arithmetic.
 - **The `extract` feature.** The Charon build hides the runtime-only

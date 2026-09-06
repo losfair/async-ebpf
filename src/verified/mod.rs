@@ -6,7 +6,8 @@
 //! rejection, `function_analysis` calls [`layout::partition`] likewise, and
 //! `program` and `region_analysis` compute the guest stack's frame geometry
 //! with [`stack`], and `region_analysis` runs the region analysis' fixed
-//! point with [`fixpoint::solve`]. `lean/verified` is a Cargo manifest whose library *is* this
+//! point with [`fixpoint::solve`] and the live-in solve with
+//! [`liveness::solve`]. `lean/verified` is a Cargo manifest whose library *is* this
 //! directory, built by Charon and translated by Aeneas into
 //! `lean/AsyncEbpf/AsyncEbpfVerified.lean`, which the theorems under `lean/`
 //! are about. So the code the proofs describe is the code that runs, not a
@@ -30,6 +31,7 @@
 pub mod fixpoint;
 pub mod isa;
 pub mod layout;
+pub mod liveness;
 pub mod region;
 pub mod stack;
 pub mod validate;

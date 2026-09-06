@@ -14,10 +14,12 @@
 //! worklist's order, which depends on which registers change, cannot depend
 //! on a dead one either.
 //!
-//! The live-in table is an input; `region_analysis::program_live_in`
-//! computes it. It must over-approximate the registers a slot can read
-//! before writing, else the projection would drop a kind the slot still
-//! consults; the same table already keys the specialization of callees.
+//! The live-in table is an input; `liveness::solve` computes it, over the
+//! same `function_successors` edges this driver walks. It must
+//! over-approximate the registers a slot can read before writing, else the
+//! projection would drop a kind the slot still consults;
+//! `lean/AsyncEbpf/Liveness/Proofs.lean` proves that it does, and the same
+//! table already keys the specialization of callees.
 
 use super::isa::*;
 use super::region::{meet_from, project, top, transfer, PointerSignature, RegMask, State};

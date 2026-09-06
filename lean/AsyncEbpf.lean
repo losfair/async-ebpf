@@ -10,6 +10,7 @@ import AsyncEbpf.Layout.Decoder
 import AsyncEbpf.Stack.Proofs
 import AsyncEbpf.Region.Proofs
 import AsyncEbpf.Region.Masking
+import AsyncEbpf.Liveness.Proofs
 import AsyncEbpf.Semantics.Machine
 import AsyncEbpf.Semantics.Soundness
 import AsyncEbpf.Semantics.Functions
