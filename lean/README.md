@@ -14,33 +14,72 @@ src/verified/                   the verified core: isa.rs, validate.rs
   ▼
 lean/AsyncEbpf/AsyncEbpfVerified.lean   generated, do not edit
   │
-  ├─ AsyncEbpf/Validate/Spec.lean     what an accepted program looks like
-  ├─ AsyncEbpf/Validate/Proofs.lean   validate = ok → WellFormed
-  └─ AsyncEbpf/Validate/Decoder.lean  the opcode table, pinned to bytes
+  ├─ AsyncEbpf/Validate/Spec.lean        what an accepted program looks like
+  ├─ AsyncEbpf/Validate/Structure.lean   jump, call and lddw rules, read off the code
+  ├─ AsyncEbpf/Validate/Proofs.lean      validate = ok → WellFormed
+  ├─ AsyncEbpf/Validate/Decoder.lean     the opcode table, pinned to bytes
+  ├─ AsyncEbpf/Semantics/Machine.lean    an operational semantics of eBPF
+  └─ AsyncEbpf/Semantics/Soundness.lean  accepted programs never go wrong
 ```
 
 Every analysis pass that gains a proof moves into `src/verified/`; the crate
 under `lean/verified` is that directory and nothing else.
 
+## The semantics
+
+`Semantics/Machine.lean` is a small-step operational semantics of the
+instruction set, written against the decoder extracted from
+`src/verified/isa.rs` so that it and the runtime agree on what each byte
+means. It models the eleven 64-bit registers, the program counter, and a call
+stack whose frames save `R6`–`R9` and the frame pointer, with `R10` moving
+down one stride per local call. Every ALU and jump instruction is given with
+the ISA's fine print: 32-bit operations compute on the low half and
+zero-extend, shift amounts are masked, division by zero is defined, `arsh` is
+arithmetic at its width, 32-bit jumps compare the low halves, immediates are
+sign-extended, `lddw` reads its high half from the next slot. A run ends by
+`exit` at depth zero, by running off the end, or by a fault.
+
+Memory is abstracted: a load yields any value of its width, a store changes
+nothing the state records, and any memory instruction or helper may fault.
+Helpers return any `R0` and may clobber `R1`–`R5`. Every real execution is one
+of these, so a property proved of all of them holds of the real ones.
+
 ## What is proved
 
-`validate_ok_wellFormed` (in `Proofs.lean`): if `validate` accepts a program,
-then every instruction slot the validator walks
+`validate_sound` (in `Semantics/Soundness.lean`): along every execution of a
+program `validate` accepts, from the entry state,
 
-- decodes to a defined instruction,
-- has a source register at most R10, and
-- names a destination at most R9, or names R10 and is a store form (`st`,
-  `stx`, or an atomic), whose destination is a memory base rather than a
-  written register.
+- the program counter is on an instruction slot the validator walked, or
+  exactly at the end of the instruction stream;
+- the machine is never stuck: it can always step, halt at `exit`, or run off
+  the end. It never reaches an undefined instruction, never jumps or calls
+  into the high half of an `lddw`, never jumps or calls out of the program;
+- every return address on the call stack is such a slot;
+- `R10` is the frame base for the current call depth
+  (`validate_sound_frame_pointer`), so the only instructions that ever move
+  it are local calls and returns.
 
-The last clause is `validate_ok_no_frame_pointer_write`, the premise the JIT's
-unchecked frame-relative access path rests on: `frame_access` in
-`src/region_analysis.rs` calls "R10 still holds the frame pointer" the one
-condition the backend cannot re-derive for itself.
+The last clause is what the JIT's unchecked frame-relative accesses rest on:
+`frame_access` in `src/region_analysis.rs` calls "R10 still holds the frame
+pointer" the one condition the backend cannot re-derive for itself, and this
+shows it holds in every execution, not just at the instruction that reads it.
+
+The proof is progress and preservation over an invariant, fed by
+`validate_ok_wellFormed` (in `Validate/Proofs.lean`): every slot the
+validator walks decodes, keeps its source register at or below R10 and its
+destination at or below R9 unless it is a store form, and satisfies the
+structural rule for its kind: a jump or local call lands on a real slot
+inside the program and never on itself, an `lddw` has its zero high half. The
+structural half is read off the generated `check_jump`, `check_call_kind` and
+`check_structure` in `Validate/Structure.lean`.
 
 `Decoder.lean` pins the classes the spec states through the decoder to
 concrete bytes: the store forms are exactly `0x62 0x6a 0x72 0x7a 0x63 0x6b
-0x73 0x7b 0xc3 0xdb`, and `0x18` is the one two-slot instruction.
+0x73 0x7b 0xc3 0xdb`, `0x18` is the one two-slot instruction, and every
+atomic's filter row bounds its source at R9.
+
+The theorems assume the program is shorter than `2^63` slots, so that the
+validator's `i64` target arithmetic is exact.
 
 ## What is trusted
 
@@ -108,7 +147,8 @@ methods — goes behind `cfg(not(feature = "extract"))`.
 
 ## Next
 
-The same pattern applies to the other passes. In order of value: the
-function-layout partition in `src/function_analysis.rs`, the live-in
-non-interference claim behind signature masking, and the region analysis'
-transfer function against a concrete semantics with pointer provenance.
+The semantics is the base the analysis passes can now be proved against. In
+order of value: the region analysis' transfer function against this
+semantics extended with pointer provenance, the live-in non-interference
+claim behind signature masking, and the function-layout partition in
+`src/function_analysis.rs`.

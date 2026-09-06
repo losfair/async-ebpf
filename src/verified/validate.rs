@@ -277,10 +277,25 @@ pub fn check_call(
   pc: usize,
   cross_section: bool,
 ) -> Result<(), Reject> {
-  let num_insns = insns.len();
   if cross_section && insn.src != 2 {
     return Err(Reject::CrossSectionMetadata(pc));
   }
+  check_call_kind(config, known_helpers, insn, insns, pc, cross_section)
+}
+
+/// The per-kind rule: a helper index the embedder knows, a local target
+/// inside the program that is not the high half of an `lddw`, or a tagged
+/// cross-section call. Its own function so that the translation carries one
+/// copy of it rather than one per branch of the tag check above.
+fn check_call_kind(
+  config: &Config,
+  known_helpers: &[u32],
+  insn: &Insn,
+  insns: &[Insn],
+  pc: usize,
+  cross_section: bool,
+) -> Result<(), Reject> {
+  let num_insns = insns.len();
   if insn.src == 0 {
     if insn.imm < 0 {
       return Err(Reject::HelperImm(pc));
@@ -307,6 +322,29 @@ pub fn check_call(
     return Err(Reject::BtfCall(pc));
   }
   Err(Reject::CallType(pc))
+}
+
+/// Checks a jump: not to itself, inside the program, and not onto the high
+/// half of an `lddw`. `ja32` puts its displacement in the immediate;
+/// everything else uses the offset.
+pub fn check_jump(insns: &[Insn], pc: usize, insn: &Insn) -> Result<(), Reject> {
+  let num_insns = insns.len();
+  let displacement = if insn.opcode == OP_JA32 {
+    insn.imm
+  } else {
+    insn.offset as i32
+  };
+  if displacement == -1 {
+    return Err(Reject::InfiniteLoop(pc));
+  }
+  let target = pc as i64 + 1 + displacement as i64;
+  if target < 0 || target >= num_insns as i64 {
+    return Err(Reject::JumpOutOfBounds(pc));
+  }
+  if insns[target as usize].opcode == 0 {
+    return Err(Reject::JumpIntoLddw(pc));
+  }
+  Ok(())
 }
 
 /// The opcodes whose destination field is a memory base rather than a written
@@ -368,24 +406,7 @@ pub fn check_structure(
       Ok(())
     }
     Op::Atomic { .. } => check_atomic_selector(insn, pc),
-    Op::Ja { .. } | Op::Jmp { .. } => {
-      let displacement = if insn.opcode == OP_JA32 {
-        insn.imm
-      } else {
-        insn.offset as i32
-      };
-      if displacement == -1 {
-        return Err(Reject::InfiniteLoop(pc));
-      }
-      let target = pc as i64 + 1 + displacement as i64;
-      if target < 0 || target >= num_insns as i64 {
-        return Err(Reject::JumpOutOfBounds(pc));
-      }
-      if insns[target as usize].opcode == 0 {
-        return Err(Reject::JumpIntoLddw(pc));
-      }
-      Ok(())
-    }
+    Op::Ja { .. } | Op::Jmp { .. } => check_jump(insns, pc, insn),
     Op::Call => {
       let cross_section = if pc < external_calls.len() {
         external_calls[pc]

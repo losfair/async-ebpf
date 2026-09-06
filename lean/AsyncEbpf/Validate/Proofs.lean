@@ -1,4 +1,5 @@
-import AsyncEbpf.Validate.Spec
+import AsyncEbpf.Validate.Structure
+import AsyncEbpf.Validate.Decoder
 
 /-!
 # The validator characterization
@@ -11,48 +12,6 @@ open Aeneas Aeneas.Std Result
 
 namespace async_ebpf_verified
 
-/-! ## Monad plumbing -/
-
-theorem bind_eq_ok {α β : Type} {x : Result α} {f : α → Result β} {y : β}
-    (h : (x >>= f) = ok y) : ∃ a, x = ok a ∧ f a = ok y := by
-  cases x <;> simp_all
-
-theorem index_usize_eq_ok {α : Type} {v : Slice α} {i : Usize} {x : α}
-    (h : Slice.index_usize v i = ok x) : ∃ hi : i.val < v.length, x = v.val[i.val] := by
-  unfold Slice.index_usize at h
-  rw [Slice.getElem?_Usize_eq] at h
-  split at h
-  · simp at h
-  · rename_i hget
-    simp only [ok.injEq] at h
-    subst h
-    rw [List.getElem?_eq_some_iff] at hget
-    obtain ⟨hi, hx⟩ := hget
-    exact ⟨hi, hx.symm⟩
-
-theorem branch_Ok {T E : Type} (v : T) :
-    core.result.Result.Insts.CoreOpsTry.branch (E := E) (.Ok v) = ok (.Continue v) := rfl
-
-theorem branch_Err {T E : Type} (e : E) :
-    core.result.Result.Insts.CoreOpsTry.branch (T := T) (.Err e) = ok (.Break (.Err e)) := rfl
-
-theorem from_residual_ne_ok {T E : Type} (r : core.result.Result core.convert.Infallible E) (x : T) :
-    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-      T (core.convert.FromSame E) r ≠ ok (.Ok x) := by
-  cases r with
-  | Ok i => nomatch i
-  | Err e =>
-    simp [core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual]
-
-theorem from_residual_Err {T E : Type} (e : E) :
-    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-      T (core.convert.FromSame E) (.Err e) = ok (.Err e) := rfl
-
-theorem usize_add_eq_ok {x y z : Usize} (h : x + y = ok z) : z.val = x.val + y.val := by
-  have := UScalar.add_equiv x y
-  rw [h] at this
-  exact this.2.1
-
 /-! ## One slot -/
 
 theorem check_slot_ok {config : validate.Config} {kh : Slice U32} {insns : Slice isa.Insn}
@@ -60,9 +19,11 @@ theorem check_slot_ok {config : validate.Config} {kh : Slice U32} {insns : Slice
     (h : validate.check_slot config kh insns ext pc = ok (.Ok skip)) :
     ∃ (hpc : pc.val < insns.length) (op : isa.Op),
       isa.decode insns.val[pc.val].opcode = ok (some op) ∧
+      validate.check_structure config kh insns ext pc insns.val[pc.val] op = ok (.Ok ()) ∧
       insns.val[pc.val].src.val ≤ 10 ∧
       (insns.val[pc.val].dst.val ≤ 9 ∨
         (insns.val[pc.val].dst.val = 10 ∧ validate.is_store_form op = ok true)) ∧
+      validate.check_operand_filter insns.val[pc.val] pc = ok (.Ok ()) ∧
       validate.is_load_imm64 op = ok skip := by
   unfold validate.check_slot at h
   obtain ⟨insn, hidx, h⟩ := bind_eq_ok h
@@ -91,7 +52,7 @@ theorem check_slot_ok {config : validate.Config} {kh : Slice U32} {insns : Slice
       split at h
       · simp at h
       · rename_i hsrc
-        refine ⟨by scalar_tac, ?_⟩
+        refine ⟨hcs, by scalar_tac, ?_⟩
         split at h
         · rename_i hdst
           obtain ⟨b, hsf, h⟩ := bind_eq_ok h
@@ -117,7 +78,7 @@ theorem check_slot_ok {config : validate.Config} {kh : Slice U32} {insns : Slice
                 simp only [ok.injEq, core.result.Result.Ok.injEq] at h
                 subst h
                 subst hb
-                exact ⟨Or.inr ⟨by scalar_tac, hsf⟩, hli⟩
+                exact ⟨Or.inr ⟨by scalar_tac, hsf⟩, hf, hli⟩
             · simp at h
           · simp at h
         · rename_i hdst
@@ -138,20 +99,29 @@ theorem check_slot_ok {config : validate.Config} {kh : Slice U32} {insns : Slice
             obtain ⟨b1, hli, h⟩ := bind_eq_ok h
             simp only [ok.injEq, core.result.Result.Ok.injEq] at h
             subst h
-            exact ⟨Or.inl (by scalar_tac), hli⟩
+            exact ⟨Or.inl (by scalar_tac), hf, hli⟩
 
 /-- The `SlotOk` facts, packaged, plus how the slot after this one is chosen. -/
 theorem check_slot_slotOk {config : validate.Config} {kh : Slice U32} {insns : Slice isa.Insn}
-    {ext : Slice Bool} {pc : Usize} {skip : Bool}
+    {ext : Slice Bool} {pc : Usize} {skip : Bool} (hlen : insns.length < 2 ^ 63)
     (h : validate.check_slot config kh insns ext pc = ok (.Ok skip)) :
     ∃ hpc : pc.val < insns.length,
       SlotOk insns.val pc.val hpc ∧
-      ∃ op, isa.decode insns.val[pc.val].opcode = ok (some op) ∧ validate.is_load_imm64 op = ok skip := by
-  obtain ⟨hpc, op, hdec, hsrc, hdst, hli⟩ := check_slot_ok h
-  refine ⟨hpc, ⟨⟨op, hdec⟩, hsrc, ?_⟩, op, hdec, hli⟩
-  rcases hdst with hle | ⟨h10, hsf⟩
-  · exact Or.inl hle
-  · exact Or.inr ⟨h10, op, hdec, hsf⟩
+      ∃ op, isa.decode insns.val[pc.val].opcode = ok (some op) ∧
+        validate.is_load_imm64 op = ok skip := by
+  obtain ⟨hpc, op, hdec, hcs, hsrc, hdst, hf, hli⟩ := check_slot_ok h
+  have hpc' : pc.val < 2 ^ 63 := by omega
+  refine ⟨hpc, ⟨op, hdec, ?_⟩, op, hdec, hli⟩
+  obtain ⟨fl, hfl, _, hsrc_hi⟩ := check_operand_filter_ok hf
+  exact {
+    src_bound := hsrc
+    dst_bound := hdst
+    atomic_src := by
+      intro hat
+      cases op with
+      | Atomic w o b => exact le_trans hsrc_hi (atomic_src_hi _ w o b hdec fl hfl)
+      | _ => exact absurd hat (by simp [IsAtomic])
+    structure_ok := check_structure_ok hlen hpc' hcs }
 
 /-- Two classifications of one opcode agree on `is_load_imm64`. -/
 theorem is_load_imm64_det {opcode : U8} {op op' : isa.Op} {b b' : Bool}
@@ -173,7 +143,7 @@ theorem Walk.le {insns : List isa.Insn} {i j : Nat} (h : Walk insns i j) : i ≤
   | lddw _ _ _ ih => omega
 
 theorem validate_loop_ok (il : Usize) (b b1 : Bool) (kh : Slice U32) (insns : Slice isa.Insn)
-    (ext : Slice Bool) (n : Usize) :
+    (ext : Slice Bool) (n : Usize) (hlen : insns.length < 2 ^ 63) :
     ∀ (k : Nat) (i1 : Usize), n.val - i1.val = k →
       validate.validate_loop il b b1 kh insns ext n i1 = ok (.Ok ()) →
       ∀ j (hj : j < insns.length), Walk insns.val i1.val j → j < n.val →
@@ -210,7 +180,7 @@ theorem validate_loop_ok (il : Usize) (b b1 : Bool) (kh : Slice U32) (insns : Sl
       simp only [ok.injEq] at hbr
       subst hbr
       simp only at hb
-      obtain ⟨hpc, hok, op, hdec, hli⟩ := check_slot_slotOk hcs
+      obtain ⟨hpc, hok, op, hdec, hli⟩ := check_slot_slotOk hlen hcs
       -- The next slot the loop visits.
       have step : ∃ i2 : Usize, r = ControlFlow.cont i2 ∧
           ((skip = true ∧ i2.val = i1.val + 2) ∨ (skip = false ∧ i2.val = i1.val + 1)) := by
@@ -255,23 +225,28 @@ theorem validate_loop_ok (il : Usize) (b b1 : Bool) (kh : Slice U32) (insns : Sl
 /-- Every program `validate` accepts is `WellFormed`. In particular no
 instruction slot of it writes R10 except through a store form. -/
 theorem validate_ok_wellFormed (config : validate.Config) (kh : Slice U32) (insns : Slice isa.Insn)
-    (ext : Slice Bool) (h : validate.validate config kh insns ext = ok (.Ok ())) :
+    (ext : Slice Bool) (hlen : insns.length < 2 ^ 63)
+    (h : validate.validate config kh insns ext = ok (.Ok ())) :
     WellFormed insns.val := by
   unfold validate.validate at h
   dsimp only at h
   split at h
   · simp at h
   · intro j hj hs
-    exact validate_loop_ok _ _ _ _ _ _ _ _ 0#usize rfl h j hj hs (by simpa using hj)
+    exact validate_loop_ok _ _ _ _ _ _ _ hlen _ 0#usize rfl h j hj hs (by simpa using hj)
 
 /-- The headline, spelled out: an accepted program never assigns the frame
 pointer outside the store forms. -/
 theorem validate_ok_no_frame_pointer_write (config : validate.Config) (kh : Slice U32)
-    (insns : Slice isa.Insn) (ext : Slice Bool) (h : validate.validate config kh insns ext = ok (.Ok ()))
+    (insns : Slice isa.Insn) (ext : Slice Bool) (hlen : insns.length < 2 ^ 63)
+    (h : validate.validate config kh insns ext = ok (.Ok ()))
     (j : Nat) (hj : j < insns.length) (hs : InsnSlot insns.val j) :
-    insns.val[j].dst.val ≤ 9 ∨ (insns.val[j].dst.val = 10 ∧ StoreForm insns.val[j].opcode) := by
-  have hw := validate_ok_wellFormed config kh insns ext h
+    NoFramePointerWrite insns.val j hj := by
+  have hw := validate_ok_wellFormed config kh insns ext hlen h
   unfold WellFormed at hw
-  exact (hw j hj hs).no_fp_write
+  obtain ⟨op, hdec, facts⟩ := hw j hj hs
+  rcases facts.dst_bound with hle | ⟨h10, hsf⟩
+  · exact Or.inl hle
+  · exact Or.inr ⟨h10, op, hdec, hsf⟩
 
 end async_ebpf_verified

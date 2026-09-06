@@ -74,3 +74,30 @@ theorem IsLddw_imp_eq (x : U8) (h : IsLddw x) : x.val = 0x18 := by
   simpa using hc
 
 end async_ebpf_verified
+
+namespace async_ebpf_verified
+
+/-- Where the decoder sees an atomic, the filter row bounds the source at R9:
+a fetching atomic writes its source, which must not be the frame pointer. -/
+def atomicSrcCheck (n : Nat) (h : n < 256) : Bool :=
+  match isa.decode (byte n h) with
+  | ok (some (.Atomic _ _ _)) =>
+    match validate.filter_for (byte n h) with
+    | ok (some f) => decide (f.src_hi.val ≤ 9)
+    | _ => false
+  | _ => true
+
+theorem atomicSrcCheck_all : ∀ n : Fin 256, atomicSrcCheck n.val n.isLt = true := by
+  with_unfolding_all decide +kernel
+
+theorem atomic_src_hi (x : U8) (w : isa.Width) (o : isa.AtomicOp) (b : Bool)
+    (hdec : isa.decode x = ok (some (.Atomic w o b))) (f : validate.Filter)
+    (hf : validate.filter_for x = ok (some f)) : f.src_hi.val ≤ 9 := by
+  have hlt : x.val < 256 := by scalar_tac
+  have hc := atomicSrcCheck_all ⟨x.val, hlt⟩
+  unfold atomicSrcCheck at hc
+  rw [← eq_byte x, hdec] at hc
+  simp only [hf] at hc
+  simpa using hc
+
+end async_ebpf_verified

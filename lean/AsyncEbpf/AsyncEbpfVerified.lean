@@ -1670,98 +1670,102 @@ def validate.helper_known
     else validate.helper_known_loop known_helpers index 0#usize
   else ok false
 
+/-- [async_ebpf_verified::validate::check_call_kind]:
+    Source: '../../src/verified/validate.rs', lines 290:0-325:1 -/
+def validate.check_call_kind
+  (config : validate.Config) (known_helpers : Slice Std.U32) (insn : isa.Insn)
+  (insns : Slice isa.Insn) (pc : Std.Usize) (cross_section : Bool) :
+  Result (core.result.Result Unit validate.Reject)
+  := do
+  let num_insns := Slice.len insns
+  if insn.src = 0#u8
+  then
+    if insn.imm < 0#i32
+    then ok (core.result.Result.Err (validate.Reject.HelperImm pc))
+    else
+      let i ← lift (IScalar.hcast .U32 insn.imm)
+      let b ← validate.helper_known config known_helpers i
+      if b
+      then ok (core.result.Result.Ok ())
+      else ok (core.result.Result.Err (validate.Reject.UnknownHelper pc))
+  else
+    if insn.src = 1#u8
+    then
+      let i ← lift (UScalar.hcast .I64 pc)
+      let i1 ← i + 1#i64
+      let i2 ← lift (IScalar.cast .I64 insn.imm)
+      let target ← i1 + i2
+      if target < 0#i64
+      then
+        ok (core.result.Result.Err (validate.Reject.LocalCallOutOfBounds pc))
+      else
+        let i3 ← lift (UScalar.hcast .I64 num_insns)
+        if target >= i3
+        then
+          ok (core.result.Result.Err (validate.Reject.LocalCallOutOfBounds pc))
+        else
+          let i4 ← lift (IScalar.hcast .Usize target)
+          let i5 ← Slice.index_usize insns i4
+          if i5.opcode = 0#u8
+          then ok (core.result.Result.Err (validate.Reject.CallIntoLddw pc))
+          else ok (core.result.Result.Ok ())
+    else
+      if insn.src = 2#u8
+      then
+        if cross_section
+        then ok (core.result.Result.Ok ())
+        else ok (core.result.Result.Err (validate.Reject.BtfCall pc))
+      else ok (core.result.Result.Err (validate.Reject.CallType pc))
+
 /-- [async_ebpf_verified::validate::check_call]:
-    Source: '../../src/verified/validate.rs', lines 272:0-310:1
+    Source: '../../src/verified/validate.rs', lines 272:0-284:1
     Visibility: public -/
 def validate.check_call
   (config : validate.Config) (known_helpers : Slice Std.U32) (insn : isa.Insn)
   (insns : Slice isa.Insn) (pc : Std.Usize) (cross_section : Bool) :
   Result (core.result.Result Unit validate.Reject)
   := do
-  let num_insns := Slice.len insns
   if cross_section
   then
     if insn.src != 2#u8
     then ok (core.result.Result.Err (validate.Reject.CrossSectionMetadata pc))
-    else
-      if insn.src = 0#u8
-      then
-        if insn.imm < 0#i32
-        then ok (core.result.Result.Err (validate.Reject.HelperImm pc))
-        else
-          let i ← lift (IScalar.hcast .U32 insn.imm)
-          let b ← validate.helper_known config known_helpers i
-          if b
-          then ok (core.result.Result.Ok ())
-          else ok (core.result.Result.Err (validate.Reject.UnknownHelper pc))
-      else
-        if insn.src = 1#u8
-        then
-          let i ← lift (UScalar.hcast .I64 pc)
-          let i1 ← i + 1#i64
-          let i2 ← lift (IScalar.cast .I64 insn.imm)
-          let target ← i1 + i2
-          if target < 0#i64
-          then
-            ok (core.result.Result.Err (validate.Reject.LocalCallOutOfBounds
-              pc))
-          else
-            let i3 ← lift (UScalar.hcast .I64 num_insns)
-            if target >= i3
-            then
-              ok (core.result.Result.Err (validate.Reject.LocalCallOutOfBounds
-                pc))
-            else
-              let i4 ← lift (IScalar.hcast .Usize target)
-              let i5 ← Slice.index_usize insns i4
-              if i5.opcode = 0#u8
-              then
-                ok (core.result.Result.Err (validate.Reject.CallIntoLddw pc))
-              else ok (core.result.Result.Ok ())
-        else
-          if insn.src = 2#u8
-          then ok (core.result.Result.Ok ())
-          else ok (core.result.Result.Err (validate.Reject.CallType pc))
+    else validate.check_call_kind config known_helpers insn insns pc true
+  else validate.check_call_kind config known_helpers insn insns pc false
+
+/-- [async_ebpf_verified::validate::check_jump]:
+    Source: '../../src/verified/validate.rs', lines 330:0-348:1
+    Visibility: public -/
+def validate.check_jump
+  (insns : Slice isa.Insn) (pc : Std.Usize) (insn : isa.Insn) :
+  Result (core.result.Result Unit validate.Reject)
+  := do
+  let num_insns := Slice.len insns
+  let displacement ←
+    if insn.opcode = isa.OP_JA32
+    then ok insn.imm
+    else ok (IScalar.cast .I32 insn.offset)
+  if displacement = (-1)#i32
+  then ok (core.result.Result.Err (validate.Reject.InfiniteLoop pc))
   else
-    if insn.src = 0#u8
-    then
-      if insn.imm < 0#i32
-      then ok (core.result.Result.Err (validate.Reject.HelperImm pc))
-      else
-        let i ← lift (IScalar.hcast .U32 insn.imm)
-        let b ← validate.helper_known config known_helpers i
-        if b
-        then ok (core.result.Result.Ok ())
-        else ok (core.result.Result.Err (validate.Reject.UnknownHelper pc))
+    let i ← lift (UScalar.hcast .I64 pc)
+    let i1 ← i + 1#i64
+    let i2 ← lift (IScalar.cast .I64 displacement)
+    let target ← i1 + i2
+    if target < 0#i64
+    then ok (core.result.Result.Err (validate.Reject.JumpOutOfBounds pc))
     else
-      if insn.src = 1#u8
-      then
-        let i ← lift (UScalar.hcast .I64 pc)
-        let i1 ← i + 1#i64
-        let i2 ← lift (IScalar.cast .I64 insn.imm)
-        let target ← i1 + i2
-        if target < 0#i64
-        then
-          ok (core.result.Result.Err (validate.Reject.LocalCallOutOfBounds pc))
-        else
-          let i3 ← lift (UScalar.hcast .I64 num_insns)
-          if target >= i3
-          then
-            ok (core.result.Result.Err (validate.Reject.LocalCallOutOfBounds
-              pc))
-          else
-            let i4 ← lift (IScalar.hcast .Usize target)
-            let i5 ← Slice.index_usize insns i4
-            if i5.opcode = 0#u8
-            then ok (core.result.Result.Err (validate.Reject.CallIntoLddw pc))
-            else ok (core.result.Result.Ok ())
+      let i3 ← lift (UScalar.hcast .I64 num_insns)
+      if target >= i3
+      then ok (core.result.Result.Err (validate.Reject.JumpOutOfBounds pc))
       else
-        if insn.src = 2#u8
-        then ok (core.result.Result.Err (validate.Reject.BtfCall pc))
-        else ok (core.result.Result.Err (validate.Reject.CallType pc))
+        let i4 ← lift (IScalar.hcast .Usize target)
+        let i5 ← Slice.index_usize insns i4
+        if i5.opcode = 0#u8
+        then ok (core.result.Result.Err (validate.Reject.JumpIntoLddw pc))
+        else ok (core.result.Result.Ok ())
 
 /-- [async_ebpf_verified::validate::is_store_form]:
-    Source: '../../src/verified/validate.rs', lines 317:0-322:1
+    Source: '../../src/verified/validate.rs', lines 355:0-360:1
     Visibility: public -/
 def validate.is_store_form (op : isa.Op) : Result Bool := do
   match op with
@@ -1778,7 +1782,7 @@ def validate.is_store_form (op : isa.Op) : Result Bool := do
   | isa.Op.Exit => ok false
 
 /-- [async_ebpf_verified::validate::is_load_imm64]:
-    Source: '../../src/verified/validate.rs', lines 325:0-330:1
+    Source: '../../src/verified/validate.rs', lines 363:0-368:1
     Visibility: public -/
 def validate.is_load_imm64 (op : isa.Op) : Result Bool := do
   match op with
@@ -1795,7 +1799,7 @@ def validate.is_load_imm64 (op : isa.Op) : Result Bool := do
   | isa.Op.Exit => ok false
 
 /-- [async_ebpf_verified::validate::check_structure]:
-    Source: '../../src/verified/validate.rs', lines 334:0-401:1
+    Source: '../../src/verified/validate.rs', lines 372:0-422:1
     Visibility: public -/
 def validate.check_structure
   (config : validate.Config) (known_helpers : Slice Std.U32)
@@ -1860,54 +1864,8 @@ def validate.check_structure
                 ok (core.result.Result.Err (validate.Reject.LddwSecondHalf i))
               else ok (core.result.Result.Ok ())
   | isa.Op.Atomic _ _ _ => validate.check_atomic_selector insn pc
-  | isa.Op.Ja _ =>
-    let displacement ←
-      if insn.opcode = isa.OP_JA32
-      then ok insn.imm
-      else ok (IScalar.cast .I32 insn.offset)
-    if displacement = (-1)#i32
-    then ok (core.result.Result.Err (validate.Reject.InfiniteLoop pc))
-    else
-      let i ← lift (UScalar.hcast .I64 pc)
-      let i1 ← i + 1#i64
-      let i2 ← lift (IScalar.cast .I64 displacement)
-      let target ← i1 + i2
-      if target < 0#i64
-      then ok (core.result.Result.Err (validate.Reject.JumpOutOfBounds pc))
-      else
-        let i3 ← lift (UScalar.hcast .I64 num_insns)
-        if target >= i3
-        then ok (core.result.Result.Err (validate.Reject.JumpOutOfBounds pc))
-        else
-          let i4 ← lift (IScalar.hcast .Usize target)
-          let i5 ← Slice.index_usize insns i4
-          if i5.opcode = 0#u8
-          then ok (core.result.Result.Err (validate.Reject.JumpIntoLddw pc))
-          else ok (core.result.Result.Ok ())
-  | isa.Op.Jmp _ _ _ =>
-    let displacement ←
-      if insn.opcode = isa.OP_JA32
-      then ok insn.imm
-      else ok (IScalar.cast .I32 insn.offset)
-    if displacement = (-1)#i32
-    then ok (core.result.Result.Err (validate.Reject.InfiniteLoop pc))
-    else
-      let i ← lift (UScalar.hcast .I64 pc)
-      let i1 ← i + 1#i64
-      let i2 ← lift (IScalar.cast .I64 displacement)
-      let target ← i1 + i2
-      if target < 0#i64
-      then ok (core.result.Result.Err (validate.Reject.JumpOutOfBounds pc))
-      else
-        let i3 ← lift (UScalar.hcast .I64 num_insns)
-        if target >= i3
-        then ok (core.result.Result.Err (validate.Reject.JumpOutOfBounds pc))
-        else
-          let i4 ← lift (IScalar.hcast .Usize target)
-          let i5 ← Slice.index_usize insns i4
-          if i5.opcode = 0#u8
-          then ok (core.result.Result.Err (validate.Reject.JumpIntoLddw pc))
-          else ok (core.result.Result.Ok ())
+  | isa.Op.Ja _ => validate.check_jump insns pc insn
+  | isa.Op.Jmp _ _ _ => validate.check_jump insns pc insn
   | isa.Op.Call =>
     let i := Slice.len external_calls
     let cross_section ←
@@ -1918,7 +1876,7 @@ def validate.check_structure
   | isa.Op.Exit => ok (core.result.Result.Ok ())
 
 /-- [async_ebpf_verified::validate::check_slot]:
-    Source: '../../src/verified/validate.rs', lines 405:0-431:1
+    Source: '../../src/verified/validate.rs', lines 426:0-452:1
     Visibility: public -/
 def validate.check_slot
   (config : validate.Config) (known_helpers : Slice Std.U32)
@@ -1972,14 +1930,14 @@ def validate.check_slot
         Bool (core.convert.FromSame validate.Reject) residual
 
 /-- [async_ebpf_verified::validate::is_unconditional_jump]:
-    Source: '../../src/verified/validate.rs', lines 460:0-462:1 -/
+    Source: '../../src/verified/validate.rs', lines 481:0-483:1 -/
 def validate.is_unconditional_jump (insn : isa.Insn) : Result Bool := do
   if insn.opcode = isa.OP_JA
   then ok true
   else ok (insn.opcode = isa.OP_JA32)
 
 /-- [async_ebpf_verified::validate::check_sub_program]: loop body 0:
-    Source: '../../src/verified/validate.rs', lines 498:2-522:1 -/
+    Source: '../../src/verified/validate.rs', lines 519:2-543:1 -/
 @[rust_loop_body]
 def validate.check_sub_program_loop.body
   (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
@@ -2080,7 +2038,7 @@ def validate.check_sub_program_loop.body
       else ok (done (core.result.Result.Err (validate.Reject.SubProgramEnd i)))
 
 /-- [async_ebpf_verified::validate::check_sub_program]: loop 0:
-    Source: '../../src/verified/validate.rs', lines 498:2-522:1 -/
+    Source: '../../src/verified/validate.rs', lines 519:2-543:1 -/
 @[rust_loop]
 def validate.check_sub_program_loop
   (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
@@ -2092,7 +2050,7 @@ def validate.check_sub_program_loop
     j
 
 /-- [async_ebpf_verified::validate::check_sub_program]:
-    Source: '../../src/verified/validate.rs', lines 496:0-522:1 -/
+    Source: '../../src/verified/validate.rs', lines 517:0-543:1 -/
 @[reducible]
 def validate.check_sub_program
   (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize) :
@@ -2101,7 +2059,7 @@ def validate.check_sub_program
   validate.check_sub_program_loop insns start «end» start
 
 /-- [async_ebpf_verified::validate::sub_program_end]: loop body 0:
-    Source: '../../src/verified/validate.rs', lines 485:2-492:1 -/
+    Source: '../../src/verified/validate.rs', lines 506:2-513:1 -/
 @[rust_loop_body]
 def validate.sub_program_end_loop.body
   (is_start : Slice Bool) («end» : Std.Usize) :
@@ -2119,7 +2077,7 @@ def validate.sub_program_end_loop.body
        ok (done end1)
 
 /-- [async_ebpf_verified::validate::sub_program_end]: loop 0:
-    Source: '../../src/verified/validate.rs', lines 485:2-492:1 -/
+    Source: '../../src/verified/validate.rs', lines 506:2-513:1 -/
 @[rust_loop]
 def validate.sub_program_end_loop
   (is_start : Slice Bool) («end» : Std.Usize) : Result Std.Usize := do
@@ -2128,21 +2086,21 @@ def validate.sub_program_end_loop
     «end»
 
 /-- [async_ebpf_verified::validate::sub_program_end]:
-    Source: '../../src/verified/validate.rs', lines 483:0-492:1 -/
+    Source: '../../src/verified/validate.rs', lines 504:0-513:1 -/
 def validate.sub_program_end
   (is_start : Slice Bool) (start : Std.Usize) : Result Std.Usize := do
   let «end» ← start + 1#usize
   validate.sub_program_end_loop is_start «end»
 
 /-- [async_ebpf_verified::validate::is_local_call]:
-    Source: '../../src/verified/validate.rs', lines 456:0-458:1 -/
+    Source: '../../src/verified/validate.rs', lines 477:0-479:1 -/
 def validate.is_local_call (insn : isa.Insn) : Result Bool := do
   if insn.opcode = isa.OP_CALL
   then ok (insn.src = 1#u8)
   else ok false
 
 /-- [async_ebpf_verified::validate::mark_sub_program_starts]: loop body 0:
-    Source: '../../src/verified/validate.rs', lines 469:2-477:3 -/
+    Source: '../../src/verified/validate.rs', lines 490:2-498:3 -/
 @[rust_loop_body]
 def validate.mark_sub_program_starts_loop.body
   (insns : Slice isa.Insn) (is_start : alloc.vec.Vec Bool) (any : Bool)
@@ -2175,7 +2133,7 @@ def validate.mark_sub_program_starts_loop.body
   else ok (done (any, is_start))
 
 /-- [async_ebpf_verified::validate::mark_sub_program_starts]: loop 0:
-    Source: '../../src/verified/validate.rs', lines 469:2-477:3 -/
+    Source: '../../src/verified/validate.rs', lines 490:2-498:3 -/
 @[rust_loop]
 def validate.mark_sub_program_starts_loop
   (insns : Slice isa.Insn) (is_start : alloc.vec.Vec Bool) (any : Bool)
@@ -2188,7 +2146,7 @@ def validate.mark_sub_program_starts_loop
     (is_start, any, i)
 
 /-- [async_ebpf_verified::validate::mark_sub_program_starts]:
-    Source: '../../src/verified/validate.rs', lines 466:0-479:1 -/
+    Source: '../../src/verified/validate.rs', lines 487:0-500:1 -/
 @[reducible]
 def validate.mark_sub_program_starts
   (insns : Slice isa.Insn) (is_start : alloc.vec.Vec Bool) :
@@ -2197,7 +2155,7 @@ def validate.mark_sub_program_starts
   validate.mark_sub_program_starts_loop insns is_start false 0#usize
 
 /-- [async_ebpf_verified::validate::check_self_contained_sub_programs]: loop body 0:
-    Source: '../../src/verified/validate.rs', lines 535:2-541:1
+    Source: '../../src/verified/validate.rs', lines 556:2-562:1
     Visibility: public -/
 @[rust_loop_body]
 def validate.check_self_contained_sub_programs_loop.body
@@ -2221,7 +2179,7 @@ def validate.check_self_contained_sub_programs_loop.body
   else ok (done (core.result.Result.Ok ()))
 
 /-- [async_ebpf_verified::validate::check_self_contained_sub_programs]: loop 0:
-    Source: '../../src/verified/validate.rs', lines 535:2-541:1
+    Source: '../../src/verified/validate.rs', lines 556:2-562:1
     Visibility: public -/
 @[rust_loop]
 def validate.check_self_contained_sub_programs_loop
@@ -2235,7 +2193,7 @@ def validate.check_self_contained_sub_programs_loop
     start
 
 /-- [async_ebpf_verified::validate::check_self_contained_sub_programs]:
-    Source: '../../src/verified/validate.rs', lines 526:0-541:1
+    Source: '../../src/verified/validate.rs', lines 547:0-562:1
     Visibility: public -/
 def validate.check_self_contained_sub_programs
   (insns : Slice isa.Insn) :
@@ -2255,7 +2213,7 @@ def validate.check_self_contained_sub_programs
   else ok (core.result.Result.Ok ())
 
 /-- [async_ebpf_verified::validate::validate]: loop body 0:
-    Source: '../../src/verified/validate.rs', lines 445:2-454:1
+    Source: '../../src/verified/validate.rs', lines 466:2-475:1
     Visibility: public -/
 @[rust_loop_body]
 def validate.validate_loop.body
@@ -2290,7 +2248,7 @@ def validate.validate_loop.body
        ok (done r)
 
 /-- [async_ebpf_verified::validate::validate]: loop 0:
-    Source: '../../src/verified/validate.rs', lines 445:2-454:1
+    Source: '../../src/verified/validate.rs', lines 466:2-475:1
     Visibility: public -/
 @[rust_loop]
 def validate.validate_loop
@@ -2305,7 +2263,7 @@ def validate.validate_loop
     i1
 
 /-- [async_ebpf_verified::validate::validate]:
-    Source: '../../src/verified/validate.rs', lines 434:0-454:1
+    Source: '../../src/verified/validate.rs', lines 455:0-475:1
     Visibility: public -/
 def validate.validate
   (config : validate.Config) (known_helpers : Slice Std.U32)
