@@ -7,6 +7,7 @@
 - `src/jit/` is the JIT: `isa.rs` (one instruction decode), `abi.rs` (the frame contract shared with the entry trampolines), `validate.rs`, `patch.rs`, and `emit/{x86_64,aarch64}.rs`.
 - `src/jit/goldens/` holds the machine code each backend is expected to emit. A diff there means code generation changed; regenerate with `ASYNC_EBPF_UPDATE_GOLDENS=1` and make the diff part of the change under review.
 - `src/jit/interp.rs` is a reference interpreter written from the instruction set rather than from the JIT, so it can be used to check the JIT's semantics independently.
+- `lean/` holds machine-checked proofs about the analysis passes (see `lean/README.md`). `lean/ebpf_validate` restates `src/jit/validate.rs` in the Rust subset Aeneas translates to Lean; the validator's decision sweeps assert the two agree, and `lean/AsyncEbpf/Validate/Proofs.lean` proves an accepted program never writes R10 outside the store forms. A change to what `validate` accepts must be mirrored in the kernel, or the sweeps fail.
 
 ## Build, Test, and Development Commands
 - `cargo build` — build the library.

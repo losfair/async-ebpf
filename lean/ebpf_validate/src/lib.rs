@@ -21,17 +21,24 @@
 //!   boolean array indexed by slot, which is the same set.
 //!
 //! What ties it to the runtime is `src/jit/validate.rs`'s
-//! `the_kernel_agrees_with_the_validator` test, which runs both over the
+//! `assert_kernel_agrees` check inside every decision sweep, which runs both over the
 //! recorded decision sweeps and asserts they accept and refuse the same
-//! programs. What ties it to Lean is `lean/AsyncEbpf/Validate.lean`, which
+//! programs. What ties it to Lean is `lean/AsyncEbpf/EbpfValidate.lean`, which
 //! Aeneas generates from this file, and the theorems proved about that output.
 //!
 //! Style constraints, all of them for the translator's sake: no closures, no
-//! iterator chains, no `String`, no wrapping arithmetic, one loop per function,
-//! and every early return in the function that owns the loop.
+//! iterator chains, no `String`, no wrapping arithmetic, no `==` on enums, one
+//! loop per function, and every early return in the function that owns the
+//! loop. See `lean/README.md` for why each matters.
+#![allow(
+  clippy::question_mark,
+  clippy::ptr_arg,
+  clippy::match_like_matches_macro
+)]
 
 /// A single eBPF instruction, unpacked exactly as `jit::isa::Insn` unpacks it.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub struct Insn {
   pub opcode: u8,
   pub dst: u8,
@@ -41,7 +48,8 @@ pub struct Insn {
 }
 
 /// The two facts about a `jit::Config` that the validator consults.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub struct Config {
   /// Exclusive upper bound on instruction slots; a program of exactly this
   /// many is refused.
@@ -56,7 +64,8 @@ pub struct Config {
 
 /// Why a program was refused, and at which slot. One variant per distinct
 /// rejection message of the runtime validator.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub enum Reject {
   TooManyInstructions,
   UnknownOpcode(usize),
@@ -158,7 +167,8 @@ pub const OP_EXIT: u8 = 0x95;
 pub const OP_JA: u8 = 0x05;
 pub const OP_JA32: u8 = 0x06;
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub enum Width {
   B,
   H,
@@ -166,19 +176,22 @@ pub enum Width {
   DW,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub enum AluWidth {
   W32,
   W64,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub enum Source {
   Imm,
   Reg,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub enum AluOp {
   Add,
   Sub,
@@ -195,7 +208,8 @@ pub enum AluOp {
   Arsh,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub enum JmpOp {
   Eq,
   Gt,
@@ -210,7 +224,8 @@ pub enum JmpOp {
   Sle,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub enum EndKind {
   Le,
   Be,
@@ -220,7 +235,8 @@ pub enum EndKind {
 /// Every defined instruction, decoded from its opcode byte alone. Mirrors
 /// `jit::isa::Op` variant for variant, minus the atomic operation selector,
 /// which lives in the immediate and is checked by [`check_atomic_selector`].
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub enum Op {
   Alu(AluWidth, AluOp, Source),
   End(EndKind),
@@ -309,6 +325,41 @@ fn jmp_op_from_nibble(nibble: u8) -> Option<JmpOp> {
   }
 }
 
+fn is_neg(op: AluOp) -> bool {
+  match op {
+    AluOp::Neg => true,
+    _ => false,
+  }
+}
+
+fn is_reg(source: Source) -> bool {
+  match source {
+    Source::Reg => true,
+    Source::Imm => false,
+  }
+}
+
+fn is_w64(width: AluWidth) -> bool {
+  match width {
+    AluWidth::W64 => true,
+    AluWidth::W32 => false,
+  }
+}
+
+fn is_w(width: Width) -> bool {
+  match width {
+    Width::W => true,
+    _ => false,
+  }
+}
+
+fn is_dw(width: Width) -> bool {
+  match width {
+    Width::DW => true,
+    _ => false,
+  }
+}
+
 /// Decodes an opcode byte. `None` for an undefined encoding. Same decisions as
 /// `jit::isa::Op::from_opcode`, arm for arm.
 pub fn decode(opcode: u8) -> Option<Op> {
@@ -336,7 +387,10 @@ pub fn decode(opcode: u8) -> Option<Op> {
     let Some(op) = alu_op_from_nibble(opcode & ALU_MASK) else {
       return None;
     };
-    if op == AluOp::Neg && source == Source::Reg {
+    // `neg` has no source operand and is only defined with the source bit
+    // clear. Enum comparisons are spelled as matches: a derived `PartialEq`
+    // extracts through `read_discriminant`, which Lean cannot evaluate.
+    if is_neg(op) && is_reg(source) {
       return None;
     }
     return Some(Op::Alu(width, op, source));
@@ -357,7 +411,7 @@ pub fn decode(opcode: u8) -> Option<Op> {
     if mode == MODE_MEM {
       return Some(Op::Load(width, false));
     }
-    if mode == MODE_MEMSX && width != Width::DW {
+    if mode == MODE_MEMSX && !is_dw(width) {
       return Some(Op::Load(width, true));
     }
     return None;
@@ -381,7 +435,7 @@ pub fn decode(opcode: u8) -> Option<Op> {
     if mode == MODE_MEM {
       return Some(Op::StoreReg(width));
     }
-    if mode == MODE_ATOMIC && (width == Width::W || width == Width::DW) {
+    if mode == MODE_ATOMIC && (is_w(width) || is_dw(width)) {
       return Some(Op::Atomic(width));
     }
     return None;
@@ -396,19 +450,19 @@ pub fn decode(opcode: u8) -> Option<Op> {
   };
   let nibble = opcode & JMP_MASK;
   if nibble == JMP_JA {
-    if source == Source::Reg {
+    if is_reg(source) {
       return None;
     }
     return Some(Op::Ja(width));
   }
   if nibble == JMP_CALL {
-    if width == AluWidth::W64 && source == Source::Imm {
+    if is_w64(width) && !is_reg(source) {
       return Some(Op::Call);
     }
     return None;
   }
   if nibble == JMP_EXIT {
-    if width == AluWidth::W64 && source == Source::Imm {
+    if is_w64(width) && !is_reg(source) {
       return Some(Op::Exit);
     }
     return None;
@@ -425,7 +479,8 @@ pub fn decode(opcode: u8) -> Option<Op> {
 
 /// Inclusive register, offset and immediate bounds for one opcode. The
 /// enumerated sets some opcodes carry are in [`offset_ok`] and [`imm_ok`].
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "test-support", derive(PartialEq, Eq, Debug))]
 pub struct Filter {
   pub src_lo: u8,
   pub src_hi: u8,
@@ -643,34 +698,50 @@ pub fn check_call(
   Err(Reject::CallType(pc))
 }
 
-/// The per-slot body of [`validate`]'s loop. Returns whether the slot after
-/// `pc` is the high half of a `lddw` and must be skipped.
-pub fn check_slot(
+/// The opcodes whose destination field is a memory base rather than a written
+/// register: `st`, `stx` and the atomics. These are the only instructions
+/// admitted with R10 as their destination. In the runtime validator this is
+/// the `store` flag set inside the opcode match; here it is a function of the
+/// decoded opcode so that the register check below reads as one statement.
+pub fn is_store_form(op: Op) -> bool {
+  match op {
+    Op::StoreImm(_) | Op::StoreReg(_) | Op::Atomic(_) => true,
+    _ => false,
+  }
+}
+
+/// Whether the instruction occupies two slots.
+pub fn is_load_imm64(op: Op) -> bool {
+  match op {
+    Op::LoadImm64 => true,
+    _ => false,
+  }
+}
+
+/// The per-opcode structural rules: `neg`'s source, endian widths, `lddw`
+/// pairing, atomic selectors, jump targets and call targets.
+pub fn check_structure(
   config: &Config,
   known_helpers: &[u32],
   insns: &[Insn],
   external_calls: &[bool],
   pc: usize,
-) -> Result<bool, Reject> {
+  insn: &Insn,
+  op: Op,
+) -> Result<(), Reject> {
   let num_insns = insns.len();
-  let insn = insns[pc];
-  let mut store = false;
-  let mut skip_next = false;
-
-  let Some(op) = decode(insn.opcode) else {
-    return Err(Reject::UnknownOpcode(pc));
-  };
-
   match op {
     Op::Alu(_, AluOp::Neg, _) => {
       if insn.src != 0 {
         return Err(Reject::NegSrc(pc));
       }
+      Ok(())
     }
     Op::End(_) => {
       if insn.imm != 16 && insn.imm != 32 && insn.imm != 64 {
         return Err(Reject::EndianImm(pc));
       }
+      Ok(())
     }
     Op::LoadImm64 => {
       if insn.src != 0 {
@@ -683,13 +754,9 @@ pub fn check_slot(
       if high.dst != 0 || high.src != 0 || high.offset != 0 {
         return Err(Reject::LddwSecondHalf(pc + 1));
       }
-      skip_next = true;
+      Ok(())
     }
-    Op::StoreImm(_) | Op::StoreReg(_) => store = true,
-    Op::Atomic(_) => {
-      store = true;
-      check_atomic_selector(&insn, pc)?;
-    }
+    Op::Atomic(_) => check_atomic_selector(insn, pc),
     Op::Ja(_) | Op::Jmp(_, _, _) => {
       let displacement = if insn.opcode == OP_JA32 {
         insn.imm
@@ -706,6 +773,7 @@ pub fn check_slot(
       if insns[target as usize].opcode == 0 {
         return Err(Reject::JumpIntoLddw(pc));
       }
+      Ok(())
     }
     Op::Call => {
       let cross_section = if pc < external_calls.len() {
@@ -713,22 +781,40 @@ pub fn check_slot(
       } else {
         false
       };
-      check_call(config, known_helpers, &insn, insns, pc, cross_section)?;
+      check_call(config, known_helpers, insn, insns, pc, cross_section)
     }
-    Op::Exit | Op::Alu(_, _, _) | Op::Load(_, _) => {}
+    Op::Exit | Op::Alu(_, _, _) | Op::Load(_, _) | Op::StoreImm(_) | Op::StoreReg(_) => Ok(()),
   }
+}
+
+/// The per-slot body of [`validate`]'s loop. Returns whether the slot after
+/// `pc` is the high half of a `lddw` and must be skipped.
+pub fn check_slot(
+  config: &Config,
+  known_helpers: &[u32],
+  insns: &[Insn],
+  external_calls: &[bool],
+  pc: usize,
+) -> Result<bool, Reject> {
+  let insn = insns[pc];
+
+  let Some(op) = decode(insn.opcode) else {
+    return Err(Reject::UnknownOpcode(pc));
+  };
+
+  check_structure(config, known_helpers, insns, external_calls, pc, &insn, op)?;
 
   if insn.src > 10 {
     return Err(Reject::InvalidSrc(pc));
   }
   // R10 is the frame pointer and read-only. The store forms name it as a
   // memory base rather than writing it, so they are the exception.
-  if insn.dst > 9 && !(store && insn.dst == 10) {
+  if insn.dst > 9 && !(is_store_form(op) && insn.dst == 10) {
     return Err(Reject::InvalidDst(pc));
   }
 
   check_operand_filter(&insn, pc)?;
-  Ok(skip_next)
+  Ok(is_load_imm64(op))
 }
 
 /// Validates a decoded program.
