@@ -66,8 +66,11 @@ const EBPF_ALU_OP_ADD: u8 = 0x00;
 #[cfg(test)]
 const EBPF_ALU_OP_MOV: u8 = 0xb0;
 
+#[cfg(test)]
 const EBPF_OP_LDDW: u8 = EBPF_CLS_LD | 0x18; // LD | IMM | DW
+#[cfg(test)]
 const EBPF_OP_JA: u8 = EBPF_CLS_JMP; // JMP | JA (mode 0)
+#[cfg(test)]
 const EBPF_OP_JA32: u8 = EBPF_CLS_JMP32;
 const EBPF_OP_CALL: u8 = EBPF_CLS_JMP | 0x80; // JMP | CALL
 const EBPF_OP_EXIT: u8 = EBPF_CLS_JMP | 0x90; // JMP | EXIT
@@ -83,12 +86,16 @@ impl PointerSignature {
   }
 }
 
+/// An instruction as the access-plan builder reads it: register numbers
+/// widened to indices. Control flow goes through `verified::isa::Insn`.
 #[derive(Clone, Copy)]
 struct Inst {
   opcode: u8,
   dst: usize,
   src: usize,
   offset: i16,
+  /// Read by the tests' whole-program successor reference only.
+  #[cfg_attr(not(test), allow(dead_code))]
   imm: i32,
 }
 
@@ -99,17 +106,6 @@ fn decode(slot: &[u8]) -> Inst {
     src: (slot[1] >> 4) as usize,
     offset: i16::from_le_bytes([slot[2], slot[3]]),
     imm: i32::from_le_bytes([slot[4], slot[5], slot[6], slot[7]]),
-  }
-}
-
-/// The instruction as the verified core reads it.
-fn to_insn(inst: &Inst) -> Insn {
-  Insn {
-    opcode: inst.opcode,
-    dst: inst.dst as u8,
-    src: inst.src as u8,
-    offset: inst.offset,
-    imm: inst.imm,
   }
 }
 
@@ -171,6 +167,7 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
       unresolved: Vec::new(),
     };
   }
+  let insns = decode_section(code);
   let layout = crate::function_analysis::analyze_functions(code)
     .unwrap_or_else(|_| crate::function_analysis::FunctionLayout::unmasked(num_slots));
   let bounds = |function: usize| -> (usize, usize) {
@@ -212,7 +209,7 @@ pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
     }
     unresolved.extend(result.unresolved);
     for (pc, callee_signature) in result.call_signatures {
-      let inst = decode(&code[pc * 8..pc * 8 + 8]);
+      let inst = insns[pc];
       if inst.src != 1 {
         continue;
       }
@@ -253,7 +250,7 @@ pub(crate) fn analyze_function(
   let mut hints = vec![REGION_UNKNOWN; num_slots];
   let mut unresolved = Vec::new();
   let mut call_signatures = std::collections::HashMap::new();
-  let insns = Insn::decode_all(&code[..num_slots * 8]).expect("length is a multiple of 8");
+  let insns = decode_section(code);
   if start_pc >= end_pc || end_pc > num_slots {
     return FunctionRegionAnalysis {
       hints,
@@ -316,7 +313,7 @@ pub(crate) fn analyze_function(
   }
 
   // Grouping runs last: it keys off the hints the loop above just settled.
-  let plan = build_access_plan(code, start_pc, end_pc, num_slots, &hints, &reached);
+  let plan = build_access_plan(code, &insns, start_pc, end_pc, num_slots, &hints, &reached);
 
   FunctionRegionAnalysis {
     hints,
@@ -324,11 +321,6 @@ pub(crate) fn analyze_function(
     unresolved,
     call_signatures,
   }
-}
-
-/// Registers `inst` reads and writes. See `crate::verified::region::uses_and_defs`.
-fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
-  core::uses_and_defs(&to_insn(inst), callee_live_in)
 }
 
 /// Where a local call sends control, as seen from inside one code section.
@@ -378,14 +370,15 @@ pub(crate) fn function_live_in(
     return ALL_SIGNATURE_REGS;
   }
 
+  let insns = decode_section(code);
+
   // Only reachable instructions can read anything; walking dead code would add
   // uses that no execution can perform.
   let mut reachable = vec![false; num_slots];
   let mut pending = vec![start_pc];
   reachable[start_pc] = true;
   while let Some(pc) = pending.pop() {
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+    for succ in successors_of(&insns, pc, start_pc, end_pc) {
       if !reachable[succ] {
         reachable[succ] = true;
         pending.push(succ);
@@ -410,8 +403,7 @@ pub(crate) fn function_live_in(
     if !reachable[pc] {
       continue;
     }
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+    for succ in successors_of(&insns, pc, start_pc, end_pc) {
       edges[pc - start_pc].push(succ);
       predecessors[succ - start_pc].push(pc);
     }
@@ -422,7 +414,7 @@ pub(crate) fn function_live_in(
   // change re-queues only the predecessors it can affect.
   let mut work: Vec<usize> = (start_pc..end_pc).filter(|&pc| reachable[pc]).collect();
   while let Some(pc) = work.pop() {
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    let inst = insns[pc];
     let mut live_out = 0;
     for &succ in &edges[pc - start_pc] {
       live_out |= live[succ];
@@ -438,7 +430,7 @@ pub(crate) fn function_live_in(
     } else {
       0
     };
-    let (uses, defs) = uses_and_defs(&inst, callee);
+    let (uses, defs) = core::uses_and_defs(&inst, callee);
     let next = uses | (live_out & !defs);
     if next != live[pc] {
       live[pc] = next;
@@ -598,6 +590,11 @@ pub(crate) fn program_live_in(
     (section.starts[fi], end)
   };
 
+  let section_insns: Vec<Vec<Insn>> = sections
+    .iter()
+    .map(|section| decode_section(section.code))
+    .collect();
+
   // Reachable slots only. This is a speedup, not a correctness requirement:
   // liveness runs backward, and every successor of a reachable slot is itself
   // reachable, so an unreachable slot's liveness can only ever flow to other
@@ -606,17 +603,13 @@ pub(crate) fn program_live_in(
   let mut reachable = vec![false; total_slots];
   let mut stack: Vec<usize> = Vec::new();
   for (si, section) in sections.iter().enumerate() {
-    let num_slots = section.code.len() / 8;
     let base = slot_base[si];
     for fi in 0..section.starts.len() {
       let (start, end) = bounds(si, fi);
       reachable[base + start] = true;
       stack.push(start);
       while let Some(pc) = stack.pop() {
-        let inst = decode(&section.code[pc * 8..pc * 8 + 8]);
-        let mut succs = [0usize; 2];
-        let written = function_successors_into(pc, &inst, num_slots, start, end, &mut succs);
-        for &succ in &succs[..written] {
+        for succ in successors_of(&section_insns[si], pc, start, end) {
           if !reachable[base + succ] {
             reachable[base + succ] = true;
             stack.push(succ);
@@ -667,7 +660,7 @@ pub(crate) fn program_live_in(
       if !reachable[base + pc] {
         continue;
       }
-      let inst = decode(&section.code[pc * 8..pc * 8 + 8]);
+      let inst = section_insns[si][pc];
       if inst.opcode != EBPF_OP_CALL {
         continue;
       }
@@ -715,11 +708,8 @@ pub(crate) fn program_live_in(
         if !reachable[base + pc] {
           continue;
         }
-        let inst = decode(&section.code[pc * 8..pc * 8 + 8]);
         let (start, end) = bounds(si, section.pc_to_func[pc]);
-        let mut succs = [0usize; 2];
-        let written = function_successors_into(pc, &inst, num_slots, start, end, &mut succs);
-        for &succ in &succs[..written] {
+        for succ in successors_of(&section_insns[si], pc, start, end) {
           on_pred(base + succ, base + pc);
         }
         let callee = callee_of[base + pc];
@@ -778,16 +768,13 @@ pub(crate) fn program_live_in(
     // never selected.
     let si = slot_base.partition_point(|&base| base <= slot) - 1;
     let section = &sections[si];
-    let num_slots = section.code.len() / 8;
     let pc = slot - slot_base[si];
     let fi = section.pc_to_func[pc];
     let (start, end) = bounds(si, fi);
 
-    let inst = decode(&section.code[pc * 8..pc * 8 + 8]);
+    let inst = section_insns[si][pc];
     let mut live_out = 0;
-    let mut succs = [0usize; 2];
-    let written = function_successors_into(pc, &inst, num_slots, start, end, &mut succs);
-    for &succ in &succs[..written] {
+    for succ in successors_of(&section_insns[si], pc, start, end) {
       live_out |= live[slot_base[si] + succ];
     }
     let callee = match callee_of[slot] {
@@ -795,7 +782,7 @@ pub(crate) fn program_live_in(
       UNRESOLVED => ALL_SIGNATURE_REGS,
       callee => live[func_start_slot[callee as usize] as usize],
     };
-    let (uses, defs) = uses_and_defs(&inst, callee);
+    let (uses, defs) = core::uses_and_defs(&inst, callee);
     // Monotone: `uses` grows with the callee summary and `live_out` with the
     // successors, both of which only ever gain bits. The union with the
     // previous value is therefore a no-op today, and is kept because it is
@@ -847,84 +834,24 @@ pub(crate) fn program_live_in(
   }
 }
 
-/// Writes `pc`'s in-function successor slots into `out` and returns how many
-/// were written.
-///
-/// Two is the ceiling: a conditional jump reaches its target and its
-/// fallthrough, and no encoding reaches more. A local call is not an edge here
-/// — its callee is a separate function with its own range — so every call form
-/// that returns contributes only the next slot.
-///
-/// Allocation-free because [`program_live_in`] walks this once per slot per
-/// worklist pop; [`function_successors`] is the `Vec`-returning wrapper, so the
-/// two cannot disagree.
-fn function_successors_into(
+/// The in-function successors of `pc`, as `verified::fixpoint::solve` walks
+/// them: the live-in table and the access plan are built on the same edges
+/// the region analysis runs over, by construction.
+fn successors_of(
+  insns: &[Insn],
   pc: usize,
-  inst: &Inst,
-  num_slots: usize,
   start_pc: usize,
   end_pc: usize,
-  out: &mut [usize; 2],
-) -> usize {
-  let mut raw = [0usize; 2];
-  let mut count = 0usize;
-  let mut push = |slot: usize| {
-    raw[count] = slot;
-    count += 1;
-  };
-
-  let cls = inst.opcode & EBPF_CLS_MASK;
-  if cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32 {
-    if inst.opcode == EBPF_OP_EXIT {
-      // Nothing follows an exit.
-    } else if inst.opcode == EBPF_OP_CALL {
-      match inst.src {
-        // Helper, section-local and cross-section calls all return to the
-        // next slot. Any other source branches to exit.
-        0 | 1 | 2 => push(pc + 1),
-        _ => {}
-      }
-    } else {
-      // JA32 is the only jump whose displacement is the 32-bit immediate.
-      let target = if inst.opcode == EBPF_OP_JA32 {
-        pc as i64 + 1 + inst.imm as i64
-      } else {
-        pc as i64 + 1 + inst.offset as i64
-      } as usize;
-      push(target);
-      if inst.opcode != EBPF_OP_JA && inst.opcode != EBPF_OP_JA32 {
-        push(pc + 1); // a conditional branch also falls through
-      }
-    }
-  } else if inst.opcode == EBPF_OP_LDDW {
-    // The second slot carries the immediate's high half, not an instruction.
-    push(pc + 2);
-  } else {
-    push(pc + 1);
-  }
-
-  let mut written = 0;
-  for &slot in &raw[..count] {
-    // The `as usize` above wraps a wild displacement to something enormous,
-    // which `< num_slots` rejects along with everything else out of range.
-    if slot < num_slots && slot >= start_pc && slot < end_pc {
-      out[written] = slot;
-      written += 1;
-    }
-  }
-  written
+) -> impl Iterator<Item = usize> {
+  let (count, first, second) = fixpoint::function_successors(insns, pc, start_pc, end_pc);
+  [first, second].into_iter().take(count)
 }
 
-fn function_successors(
-  pc: usize,
-  inst: &Inst,
-  num_slots: usize,
-  start_pc: usize,
-  end_pc: usize,
-) -> Vec<usize> {
-  let mut out = [0usize; 2];
-  let written = function_successors_into(pc, inst, num_slots, start_pc, end_pc, &mut out);
-  out[..written].to_vec()
+/// The section's instructions as the verified core reads them. `code` is
+/// whole slots; a trailing partial slot is not an instruction.
+fn decode_section(code: &[u8]) -> Vec<Insn> {
+  let num_slots = code.len() / 8;
+  Insn::decode_all(&code[..num_slots * 8]).expect("whole slots decode")
 }
 
 /// One entry per instruction slot, handed to the JIT alongside the region hints
@@ -1014,6 +941,7 @@ fn written_registers(inst: &Inst) -> Vec<usize> {
 /// window would save nothing.
 fn build_access_plan(
   code: &[u8],
+  insns: &[Insn],
   start_pc: usize,
   end_pc: usize,
   num_slots: usize,
@@ -1031,10 +959,10 @@ fn build_access_plan(
     if !reached[pc] {
       continue;
     }
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    let inst = insns[pc];
     let cls = inst.opcode & EBPF_CLS_MASK;
     if (cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32) && inst.opcode != EBPF_OP_EXIT {
-      for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+      for succ in successors_of(insns, pc, start_pc, end_pc) {
         is_target[succ] = true;
       }
     }
@@ -1987,12 +1915,12 @@ mod tests {
     if start_pc >= end_pc || end_pc > num_slots {
       return ALL_SIGNATURE_REGS;
     }
+    let insns = decode_section(code);
     let mut reachable = vec![false; num_slots];
     let mut pending = vec![start_pc];
     reachable[start_pc] = true;
     while let Some(pc) = pending.pop() {
-      let inst = decode(&code[pc * 8..pc * 8 + 8]);
-      for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+      for succ in successors_of(&insns, pc, start_pc, end_pc) {
         if !reachable[succ] {
           reachable[succ] = true;
           pending.push(succ);
@@ -2006,9 +1934,9 @@ mod tests {
         if !reachable[pc] {
           continue;
         }
-        let inst = decode(&code[pc * 8..pc * 8 + 8]);
+        let inst = insns[pc];
         let mut live_out = 0;
-        for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+        for succ in successors_of(&insns, pc, start_pc, end_pc) {
           live_out |= live[succ];
         }
         let callee = if inst.opcode == EBPF_OP_CALL {
@@ -2022,7 +1950,7 @@ mod tests {
         } else {
           0
         };
-        let (uses, defs) = uses_and_defs(&inst, callee);
+        let (uses, defs) = core::uses_and_defs(&inst, callee);
         let next = uses | (live_out & !defs);
         if next != live[pc] {
           live[pc] = next;
@@ -2252,22 +2180,11 @@ mod tests {
     );
   }
 
-  /// `function_successors_into` must agree with composing the whole-program
-  /// `successors` the way the per-function walk used to: override a local
-  /// call's edges with its fallthrough, then keep only what lands in
-  /// `[start_pc, end_pc)`.
-  ///
-  /// The randomized differential above cannot see this. Its reference,
-  /// `sweep_program_live_in`, reaches `function_successors` — the same
-  /// `function_successors_into` the solver uses — so a successor bug appears
-  /// identically on both sides and cancels. That blindness is real: a mutation
-  /// giving `call` with `src == 3` a fallthrough edge passes the whole suite
-  /// without this test.
   /// Successor slots in the whole-program CFG, in which a local call also enters
   /// its callee. Slot indices, not byte offsets.
   ///
   /// Nothing treats the program as one CFG any more; this is the reference
-  /// `function_successors_into_agrees_with_composing_the_whole_program_walk`
+  /// `function_successors_agree_with_composing_the_whole_program_walk`
   /// composes with the function filter.
   fn whole_program_successors(pc: usize, inst: &Inst, num_slots: usize) -> Vec<usize> {
     let fallthrough = if inst.opcode == EBPF_OP_LDDW {
@@ -2327,8 +2244,19 @@ mod tests {
     out
   }
 
+  /// `verified::fixpoint::function_successors` must agree with composing the
+  /// whole-program `successors` the way the per-function walk used to:
+  /// override a local call's edges with its fallthrough, then keep only what
+  /// lands in `[start_pc, end_pc)`.
+  ///
+  /// The randomized differential above cannot see this. Its reference,
+  /// `sweep_program_live_in`, reaches the same successor function the solver
+  /// and the region analysis use, so a successor bug appears identically on
+  /// both sides and cancels. That blindness is real: a mutation giving `call`
+  /// with `src == 3` a fallthrough edge passes the whole suite without this
+  /// test.
   #[test]
-  fn function_successors_into_agrees_with_composing_the_whole_program_walk() {
+  fn function_successors_agree_with_composing_the_whole_program_walk() {
     fn expected(
       pc: usize,
       inst: &Inst,
@@ -2358,14 +2286,14 @@ mod tests {
         for &offset in &offsets {
           for &imm in &imms {
             for &(num_slots, start_pc, end_pc) in &ranges {
+              let raw = slot(opcode, 0, src, offset, imm);
+              let inst = decode(&raw);
+              let insns = vec![Insn::from_u64(u64::from_le_bytes(raw)); num_slots];
               for pc in start_pc..end_pc {
-                let inst = decode(&slot(opcode, 0, src, offset, imm));
-                let mut out = [0usize; 2];
-                let written =
-                  function_successors_into(pc, &inst, num_slots, start_pc, end_pc, &mut out);
+                let got: Vec<usize> = successors_of(&insns, pc, start_pc, end_pc).collect();
                 assert_eq!(
-                  &out[..written],
-                  expected(pc, &inst, num_slots, start_pc, end_pc).as_slice(),
+                  got,
+                  expected(pc, &inst, num_slots, start_pc, end_pc),
                   "opcode {opcode:#04x} src {src} offset {offset} imm {imm} \
                    pc {pc} in [{start_pc}, {end_pc}) of {num_slots}"
                 );
@@ -2880,42 +2808,5 @@ mod tests {
     ]);
     let result = analyze(&code, DATA_LO, DATA_HI);
     assert!(result.unresolved.is_empty());
-  }
-
-  /// The verified driver's successor function is the one the live-in solver
-  /// uses, on every opcode form, so the projection keys off the same edges
-  /// the liveness was solved on.
-  #[test]
-  fn verified_function_successors_agree_with_the_solver() {
-    let offsets = [i16::MIN, -3, -1, 0, 1, 2, i16::MAX];
-    let imms = [i32::MIN, -4, -1, 0, 1, 3, i32::MAX];
-    let ranges = [(1, 0, 1), (4, 0, 4), (6, 2, 5), (8, 3, 4), (9, 0, 9)];
-    for opcode in 0..=255u8 {
-      for src in 0..16u8 {
-        for &offset in &offsets {
-          for &imm in &imms {
-            for &(num_slots, start_pc, end_pc) in &ranges {
-              let raw = slot(opcode, 0, src, offset, imm);
-              let inst = decode(&raw);
-              let insns = vec![Insn::from_u64(u64::from_le_bytes(raw)); num_slots];
-              for pc in start_pc..end_pc {
-                let mut out = [0usize; 2];
-                let written =
-                  function_successors_into(pc, &inst, num_slots, start_pc, end_pc, &mut out);
-                let (count, first, second) =
-                  fixpoint::function_successors(&insns, pc, start_pc, end_pc);
-                let got: Vec<usize> = [first, second][..count].to_vec();
-                assert_eq!(
-                  got,
-                  out[..written].to_vec(),
-                  "opcode {opcode:#04x} src {src} offset {offset} imm {imm} pc {pc} in \
-                   [{start_pc}, {end_pc}) of {num_slots}"
-                );
-              }
-            }
-          }
-        }
-      }
-    }
   }
 }

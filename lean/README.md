@@ -256,7 +256,9 @@ projection left unchanged.
   satisfies, or, for `solve_masked_eq`, nothing at all beyond the loader
   masking with the entry's own row. That the table over-approximates what
   a slot reads is what the projection's precision rests on, and it is the
-  same table the specialization of callees already keyed off.
+  same table the specialization of callees already keyed off. The solver
+  walks the edges `fixpoint::function_successors` gives, the same function
+  the extracted driver runs over, so the two cannot disagree on the graph.
 - **Aeneas and Charon.** The translation from Rust to Lean is trusted, as is
   the Aeneas standard library's model of `Vec`, slices and scalar arithmetic.
 - **The `extract` feature.** The Charon build hides the runtime-only
