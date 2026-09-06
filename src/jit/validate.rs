@@ -880,6 +880,86 @@ mod tests {
         Err(e) => Err(TranslateError::Failed(e.0)),
       };
       digest.add(&outcome);
+      assert_kernel_agrees(config, insns);
+    }
+
+    /// The Lean proof kernel (`lean/ebpf_validate`) restates [`validate`] in
+    /// the Rust subset Aeneas translates. The theorems in `lean/` are about
+    /// that restatement, so every decision the sweeps record is also put to
+    /// the kernel: it must accept and refuse exactly what [`validate`] does,
+    /// and where it refuses, it must name the same slot.
+    ///
+    /// The helper policy is fixed to "accept every index" because that is
+    /// what [`accept_every_helper`] does; a config without a dispatcher knows
+    /// no helper at all, which the kernel models directly.
+    fn assert_kernel_agrees(config: &Config, insns: &[Insn]) {
+      let kernel_config = ebpf_validate::Config {
+        instruction_limit: config.instruction_limit,
+        has_dispatcher: config.dispatcher.is_some() && config.dispatcher_validate.is_some(),
+        accept_every_helper: true,
+      };
+      let kernel_insns: Vec<ebpf_validate::Insn> = insns
+        .iter()
+        .map(|i| ebpf_validate::Insn {
+          opcode: i.opcode,
+          dst: i.dst,
+          src: i.src,
+          offset: i.offset,
+          imm: i.imm,
+        })
+        .collect();
+      let kernel = ebpf_validate::validate(&kernel_config, &[], &kernel_insns, &[]);
+      let runtime = validate(config, insns);
+      match (&runtime, &kernel) {
+        (Ok(()), Ok(())) => {}
+        (Err(message), Err(reject)) => {
+          // Every rejection but the instruction limit names a slot, and the
+          // kernel's variant carries the same one.
+          // "... at PC 7 requires ...", "(at PC 3) is out of bounds": the
+          // slot is the digit run right after the last "PC ".
+          let pc = message.rsplit("PC ").next().and_then(|tail| {
+            let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<usize>().ok()
+          });
+          let kernel_pc = kernel_reject_pc(*reject);
+          assert_eq!(
+            pc, kernel_pc,
+            "validator and kernel refuse at different slots: {message:?} vs {reject:?}\n{insns:#?}"
+          );
+        }
+        _ => panic!("validator and kernel disagree: {runtime:?} vs {kernel:?}\n{insns:#?}"),
+      }
+    }
+
+    fn kernel_reject_pc(reject: ebpf_validate::Reject) -> Option<usize> {
+      use ebpf_validate::Reject::*;
+      match reject {
+        TooManyInstructions => None,
+        UnknownOpcode(pc)
+        | NegSrc(pc)
+        | EndianImm(pc)
+        | LddwSrc(pc)
+        | IncompleteLddw(pc)
+        | LddwSecondHalf(pc)
+        | AtomicUnknown(pc)
+        | AtomicNeedsFetch(pc)
+        | InfiniteLoop(pc)
+        | JumpOutOfBounds(pc)
+        | JumpIntoLddw(pc)
+        | CrossSectionMetadata(pc)
+        | HelperImm(pc)
+        | UnknownHelper(pc)
+        | LocalCallOutOfBounds(pc)
+        | CallIntoLddw(pc)
+        | BtfCall(pc)
+        | CallType(pc)
+        | InvalidSrc(pc)
+        | InvalidDst(pc)
+        | SubProgramJump(pc)
+        | SubProgramEnd(pc) => Some(pc),
+        // The operand filter's messages name the opcode, not the slot.
+        FilterOpcode(_) | FilterDst(_) | FilterSrc(_) | FilterImm(_) | FilterOffset(_) => None,
+      }
     }
 
     /// Closes a sweep and writes it back.

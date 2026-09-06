@@ -1,0 +1,21 @@
+[package]
+name = "ebpf_validate"
+version = "0.1.0"
+edition = "2021"
+description = "Dependency-free kernel of the async-ebpf load-time validator, for Aeneas extraction to Lean"
+license = "Apache-2.0"
+publish = false
+
+# Stand-alone: the root crate excludes `lean/` from its workspace so that Charon
+# can build this crate on its own nightly without touching the runtime's
+# lockfile.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+# Charon reads this section when invoked as `charon cargo` in this directory.
+[package.metadata.charon]
+preset = "aeneas"

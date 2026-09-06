@@ -61,6 +61,7 @@ dependencies = [
  "async-ebpf",
  "cfg-if",
  "criterion",
+ "ebpf_validate",
  "elf",
  "futures",
  "libc",
@@ -291,6 +292,10 @@ dependencies = [
  "block-buffer",
  "crypto-common",
 ]
+
+[[package]]
+name = "ebpf_validate"
+version = "0.1.0"
 
 [[package]]
 name = "either"
