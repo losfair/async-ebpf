@@ -1,17 +1,10 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
+use crate::jit::isa::Insn;
 use crate::region_analysis::{
   program_live_in, CrossSectionCallSite, LiveInSection, RegMask, ALL_SIGNATURE_REGS,
 };
-
-const EBPF_OP_CALL: u8 = 0x05u8 | 0x80u8;
-const EBPF_OP_LDDW: u8 = 0x18;
-const EBPF_OP_EXIT: u8 = 0x95;
-const EBPF_CLS_MASK: u8 = 0x07;
-const EBPF_CLS_JMP: u8 = 0x05;
-const EBPF_CLS_JMP32: u8 = 0x06;
-const EBPF_OP_JA: u8 = 0x05;
-const EBPF_OP_JA32: u8 = 0x06;
+use crate::verified::layout::{partition, LayoutReject};
 #[derive(Clone, Debug)]
 pub(crate) struct FunctionLayout {
   pub(crate) functions: Vec<FunctionInfo>,
@@ -74,160 +67,41 @@ pub(crate) struct FunctionInfo {
   pub(crate) callers: Vec<usize>,
 }
 
-#[derive(Copy, Clone, Debug)]
-struct EbpfInsn {
-  opcode: u8,
-  offset: i16,
-  imm: i32,
-}
-
-impl EbpfInsn {
-  fn from_u64(insn: u64) -> Self {
-    Self {
-      opcode: (insn & 0xFF) as u8,
-      offset: ((insn >> 16) & 0xFFFF) as i16,
-      imm: (insn >> 32) as i32,
+/// The message for a refused layout, worded as the linker's callers expect.
+fn render(reject: LayoutReject, num_insns: usize) -> String {
+  match reject {
+    LayoutReject::EntryOutOfRange { entry } => {
+      format!("function entry PC {entry} is outside a program of {num_insns} instructions")
+    }
+    LayoutReject::LocalCallTargetOutOfRange { pc, target } => {
+      format!("local call target out of range at PC {pc}: {target}")
+    }
+    LayoutReject::JumpTargetOutOfRange { pc, target } => {
+      format!("jump target out of range at PC {pc}: {target}")
+    }
+    LayoutReject::ControlFlowOutside { pc, start, end } => {
+      format!("control flow reaches PC {pc} outside local function range [{start}, {end})")
+    }
+    LayoutReject::JumpOutside {
+      pc,
+      target,
+      start,
+      end,
+    } => {
+      format!("jump from PC {pc} reaches PC {target} outside local function range [{start}, {end})")
+    }
+    LayoutReject::FallthroughOutside {
+      pc,
+      target,
+      start,
+      end,
+    } => format!(
+      "fallthrough from PC {pc} reaches PC {target} outside local function range [{start}, {end})"
+    ),
+    LayoutReject::LocalCallNonFunction { pc, target } => {
+      format!("local call at PC {pc} targets non-function PC {target}")
     }
   }
-}
-
-fn insn_at(code: &[u8], pc: usize) -> EbpfInsn {
-  let mut raw = [0u8; 8];
-  raw.copy_from_slice(&code[pc * 8..pc * 8 + 8]);
-  EbpfInsn::from_u64(u64::from_le_bytes(raw))
-}
-
-fn local_call_target(pc: usize, insn: EbpfInsn, num_insns: usize) -> Result<usize, String> {
-  let target = pc as i64 + insn.imm as i64 + 1;
-  if target < 0 || target >= num_insns as i64 {
-    return Err(format!(
-      "local call target out of range at PC {pc}: {target}"
-    ));
-  }
-  Ok(target as usize)
-}
-
-fn jump_target(pc: usize, offset: i64, num_insns: usize) -> Result<usize, String> {
-  let target = pc as i64 + offset + 1;
-  if target < 0 || target >= num_insns as i64 {
-    return Err(format!("jump target out of range at PC {pc}: {target}"));
-  }
-  Ok(target as usize)
-}
-
-fn check_in_function_range(
-  pc: usize,
-  target: usize,
-  start: usize,
-  end: usize,
-  edge_kind: &str,
-) -> Result<(), String> {
-  if target < start || target >= end {
-    return Err(format!(
-      "{edge_kind} from PC {pc} reaches PC {target} outside local function range [{start}, {end})"
-    ));
-  }
-  Ok(())
-}
-
-fn check_fallthrough_in_function_range(
-  pc: usize,
-  step: usize,
-  start: usize,
-  end: usize,
-) -> Result<(), String> {
-  let target = pc
-    .checked_add(step)
-    .ok_or_else(|| format!("control flow target overflows at PC {pc}"))?;
-  check_in_function_range(pc, target, start, end, "fallthrough")
-}
-
-fn scan_local_function_ranges(
-  code: &[u8],
-  starts: &[usize],
-  func_for_pc: &[usize],
-) -> Result<Vec<Vec<usize>>, String> {
-  let num_insns = code.len() / 8;
-  let mut edges = vec![Vec::new(); starts.len()];
-
-  for (func_index, &start) in starts.iter().enumerate() {
-    let end = starts.get(func_index + 1).copied().unwrap_or(num_insns);
-    let mut visited = vec![false; end - start];
-    let mut pending = vec![start];
-
-    while let Some(pc) = pending.pop() {
-      if pc < start || pc >= end {
-        return Err(format!(
-          "control flow reaches PC {pc} outside local function range [{start}, {end})"
-        ));
-      }
-      if visited[pc - start] {
-        continue;
-      }
-      visited[pc - start] = true;
-
-      let insn = insn_at(code, pc);
-
-      if insn.opcode == EBPF_OP_EXIT {
-        continue;
-      }
-
-      if insn.opcode == EBPF_OP_CALL {
-        if insn_at(code, pc).opcode == EBPF_OP_CALL && insn_src(code, pc) == 1 {
-          let target = local_call_target(pc, insn, num_insns)?;
-          let callee_index = func_for_pc[target];
-          if starts[callee_index] != target {
-            return Err(format!(
-              "local call at PC {pc} targets non-function PC {target}"
-            ));
-          }
-          edges[func_index].push(callee_index);
-        }
-        check_fallthrough_in_function_range(pc, 1, start, end)?;
-        pending.push(pc + 1);
-        continue;
-      }
-
-      if insn.opcode == EBPF_OP_LDDW {
-        check_fallthrough_in_function_range(pc, 2, start, end)?;
-        pending.push(pc + 2);
-        continue;
-      }
-
-      if (insn.opcode & EBPF_CLS_MASK) == EBPF_CLS_JMP
-        || (insn.opcode & EBPF_CLS_MASK) == EBPF_CLS_JMP32
-      {
-        if insn.opcode == EBPF_OP_JA {
-          let target = jump_target(pc, insn.offset as i64, num_insns)?;
-          check_in_function_range(pc, target, start, end, "jump")?;
-          pending.push(target);
-        } else if insn.opcode == EBPF_OP_JA32 {
-          let target = jump_target(pc, insn.imm as i64, num_insns)?;
-          check_in_function_range(pc, target, start, end, "jump")?;
-          pending.push(target);
-        } else {
-          let target = jump_target(pc, insn.offset as i64, num_insns)?;
-          check_in_function_range(pc, target, start, end, "jump")?;
-          check_fallthrough_in_function_range(pc, 1, start, end)?;
-          pending.push(target);
-          pending.push(pc + 1);
-        }
-        continue;
-      }
-
-      check_fallthrough_in_function_range(pc, 1, start, end)?;
-      pending.push(pc + 1);
-    }
-
-    edges[func_index].sort_unstable();
-    edges[func_index].dedup();
-  }
-
-  Ok(edges)
-}
-
-fn insn_src(code: &[u8], pc: usize) -> u8 {
-  code[pc * 8 + 1] >> 4
 }
 
 /// Fills in every layout's argument masks from one whole-program solve.
@@ -338,13 +212,18 @@ pub(crate) fn analyze_program(
 
 /// Splits one section into local functions and records the calls between them,
 /// leaving the argument masks for the whole-program fixed point to fill in.
+///
+/// The partition and the closure check are `verified::layout::partition`,
+/// whose Lean proofs establish that control never leaves a function except
+/// through a call; this only decodes, renders the rejection, and derives the
+/// call graph from the slots the walk reached.
 fn partition_section(section: &SectionInput<'_>) -> Result<FunctionLayout, String> {
   let SectionInput { code, entries } = *section;
-  if code.len() % 8 != 0 {
+  let Some(insns) = Insn::decode_all(code) else {
     return Err("code length is not a multiple of 8".to_string());
-  }
+  };
 
-  let num_insns = code.len() / 8;
+  let num_insns = insns.len();
   if num_insns == 0 {
     return Ok(FunctionLayout {
       functions: Vec::new(),
@@ -354,44 +233,35 @@ fn partition_section(section: &SectionInput<'_>) -> Result<FunctionLayout, Strin
     });
   }
 
-  let mut starts = BTreeSet::from([0usize]);
-  for &entry in entries {
-    if entry >= num_insns {
-      return Err(format!(
-        "function entry PC {entry} is outside a program of {num_insns} instructions"
-      ));
-    }
-    starts.insert(entry);
-  }
-  for pc in 0..num_insns {
-    let insn = insn_at(code, pc);
-    if insn.opcode == EBPF_OP_CALL && insn_src(code, pc) == 1 {
-      starts.insert(local_call_target(pc, insn, num_insns)?);
+  let layout = partition(&insns, entries).map_err(|reject| render(reject, num_insns))?;
+
+  // The call graph: every reachable local call, whose target the walk has
+  // established is a function start.
+  let mut edges = vec![Vec::new(); layout.starts.len()];
+  for (pc, insn) in insns.iter().enumerate() {
+    if layout.reachable[pc] && insn.is_local_call() {
+      let target = (pc as i64 + insn.imm as i64 + 1) as usize;
+      edges[layout.pc_to_func[pc]].push(layout.pc_to_func[target]);
     }
   }
-  let starts = starts.into_iter().collect::<Vec<_>>();
-
-  let mut pc_to_func = vec![0usize; num_insns];
-  for (func_index, &start) in starts.iter().enumerate() {
-    let end = starts.get(func_index + 1).copied().unwrap_or(num_insns);
-    pc_to_func[start..end].fill(func_index);
+  for callees in &mut edges {
+    callees.sort_unstable();
+    callees.dedup();
   }
-
-  let edges = scan_local_function_ranges(code, &starts, &pc_to_func)?;
-
-  let mut callers = vec![Vec::new(); starts.len()];
+  let mut callers = vec![Vec::new(); layout.starts.len()];
   for (caller, callees) in edges.iter().enumerate() {
     for &callee in callees {
       callers[callee].push(caller);
     }
   }
 
-  let functions = starts
+  let functions = layout
+    .starts
     .iter()
     .enumerate()
     .map(|(i, &start_pc)| FunctionInfo {
       start_pc,
-      end_pc: starts.get(i + 1).copied().unwrap_or(num_insns),
+      end_pc: layout.starts.get(i + 1).copied().unwrap_or(num_insns),
       callees: edges[i].clone(),
       callers: callers[i].clone(),
     })
@@ -399,8 +269,8 @@ fn partition_section(section: &SectionInput<'_>) -> Result<FunctionLayout, Strin
 
   Ok(FunctionLayout {
     functions,
-    pc_to_func,
-    arg_masks: vec![ALL_SIGNATURE_REGS; starts.len()],
+    pc_to_func: layout.pc_to_func,
+    arg_masks: vec![ALL_SIGNATURE_REGS; layout.starts.len()],
     cross_section_arg_masks: HashMap::new(),
   })
 }
@@ -408,6 +278,7 @@ fn partition_section(section: &SectionInput<'_>) -> Result<FunctionLayout, Strin
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::verified::isa::{OP_CALL as EBPF_OP_CALL, OP_EXIT as EBPF_OP_EXIT};
 
   fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> [u8; 8] {
     let mut bytes = [0u8; 8];

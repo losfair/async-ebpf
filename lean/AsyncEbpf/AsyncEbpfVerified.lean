@@ -927,6 +927,780 @@ def isa.decode (opcode : Std.U8) : Result (Option isa.Op) := do
                     | none => ok none
                     | some op => ok (some (isa.Op.Jmp width op source))
 
+/-- [async_ebpf_verified::layout::LayoutReject]
+    Source: '../../src/verified/layout.rs', lines 27:0-53:1
+    Visibility: public -/
+@[discriminant isize]
+inductive layout.LayoutReject where
+| EntryOutOfRange : Std.Usize → layout.LayoutReject
+| LocalCallTargetOutOfRange : Std.Usize → Std.I64 → layout.LayoutReject
+| JumpTargetOutOfRange : Std.Usize → Std.I64 → layout.LayoutReject
+| ControlFlowOutside :
+  Std.Usize →
+  Std.Usize →
+  Std.Usize →
+  layout.LayoutReject
+| JumpOutside :
+  Std.Usize →
+  Std.Usize →
+  Std.Usize →
+  Std.Usize →
+  layout.LayoutReject
+| FallthroughOutside :
+  Std.Usize →
+  Std.Usize →
+  Std.Usize →
+  Std.Usize →
+  layout.LayoutReject
+| LocalCallNonFunction : Std.Usize → Std.Usize → layout.LayoutReject
+
+/-- [async_ebpf_verified::layout::{impl core::clone::Clone for async_ebpf_verified::layout::LayoutReject}::clone]:
+    Source: '../../src/verified/layout.rs', lines 25:15-25:20
+    Visibility: public -/
+def layout.LayoutReject.Insts.CoreCloneClone.clone
+  (self : layout.LayoutReject) : Result layout.LayoutReject := do
+  ok self
+
+/-- Trait implementation: [async_ebpf_verified::layout::{impl core::clone::Clone for async_ebpf_verified::layout::LayoutReject}]
+    Source: '../../src/verified/layout.rs', lines 25:15-25:20 -/
+@[reducible]
+def layout.LayoutReject.Insts.CoreCloneClone : core.clone.Clone
+  layout.LayoutReject := {
+  clone := layout.LayoutReject.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [async_ebpf_verified::layout::{impl core::marker::Copy for async_ebpf_verified::layout::LayoutReject}]
+    Source: '../../src/verified/layout.rs', lines 25:9-25:13 -/
+@[reducible]
+def layout.LayoutReject.Insts.CoreMarkerCopy : core.marker.Copy
+  layout.LayoutReject := {
+  cloneInst := layout.LayoutReject.Insts.CoreCloneClone
+}
+
+/-- [async_ebpf_verified::layout::Layout]
+    Source: '../../src/verified/layout.rs', lines 58:0-67:1
+    Visibility: public -/
+structure layout.Layout where
+  starts : alloc.vec.Vec Std.Usize
+  pc_to_func : alloc.vec.Vec Std.Usize
+  reachable : alloc.vec.Vec Bool
+
+/-- [async_ebpf_verified::layout::{impl core::clone::Clone for async_ebpf_verified::layout::Layout}::clone]:
+    Source: '../../src/verified/layout.rs', lines 56:9-56:14
+    Visibility: public -/
+def layout.Layout.Insts.CoreCloneClone.clone
+  (self : layout.Layout) : Result layout.Layout := do
+  let v ← alloc.vec.CloneVec.clone core.clone.CloneUsize self.starts
+  let v1 ← alloc.vec.CloneVec.clone core.clone.CloneUsize self.pc_to_func
+  let v2 ← alloc.vec.CloneVec.clone core.clone.CloneBool self.reachable
+  ok { starts := v, pc_to_func := v1, reachable := v2 }
+
+/-- Trait implementation: [async_ebpf_verified::layout::{impl core::clone::Clone for async_ebpf_verified::layout::Layout}]
+    Source: '../../src/verified/layout.rs', lines 56:9-56:14 -/
+@[reducible]
+def layout.Layout.Insts.CoreCloneClone : core.clone.Clone layout.Layout := {
+  clone := layout.Layout.Insts.CoreCloneClone.clone
+}
+
+/-- [async_ebpf_verified::layout::is_local_call]:
+    Source: '../../src/verified/layout.rs', lines 69:0-71:1 -/
+def layout.is_local_call (insn : isa.Insn) : Result Bool := do
+  if insn.opcode = isa.OP_CALL
+  then ok (insn.src = 1#u8)
+  else ok false
+
+/-- [async_ebpf_verified::layout::local_call_target]:
+    Source: '../../src/verified/layout.rs', lines 74:0-80:1 -/
+def layout.local_call_target
+  (pc : Std.Usize) (insn : isa.Insn) (num_insns : Std.Usize) :
+  Result (core.result.Result Std.Usize layout.LayoutReject)
+  := do
+  let i ← lift (UScalar.hcast .I64 pc)
+  let i1 ← lift (IScalar.cast .I64 insn.imm)
+  let i2 ← i + i1
+  let target ← i2 + 1#i64
+  if target < 0#i64
+  then
+    ok (core.result.Result.Err (layout.LayoutReject.LocalCallTargetOutOfRange
+      pc target))
+  else
+    let i3 ← lift (UScalar.hcast .I64 num_insns)
+    if target >= i3
+    then
+      ok (core.result.Result.Err (layout.LayoutReject.LocalCallTargetOutOfRange
+        pc target))
+    else
+      let i4 ← lift (IScalar.hcast .Usize target)
+      ok (core.result.Result.Ok i4)
+
+/-- [async_ebpf_verified::layout::jump_target]:
+    Source: '../../src/verified/layout.rs', lines 83:0-89:1 -/
+def layout.jump_target
+  (pc : Std.Usize) (displacement : Std.I64) (num_insns : Std.Usize) :
+  Result (core.result.Result Std.Usize layout.LayoutReject)
+  := do
+  let i ← lift (UScalar.hcast .I64 pc)
+  let i1 ← i + displacement
+  let target ← i1 + 1#i64
+  if target < 0#i64
+  then
+    ok (core.result.Result.Err (layout.LayoutReject.JumpTargetOutOfRange pc
+      target))
+  else
+    let i2 ← lift (UScalar.hcast .I64 num_insns)
+    if target >= i2
+    then
+      ok (core.result.Result.Err (layout.LayoutReject.JumpTargetOutOfRange pc
+        target))
+    else
+      let i3 ← lift (IScalar.hcast .Usize target)
+      ok (core.result.Result.Ok i3)
+
+/-- [async_ebpf_verified::layout::mark_entries]: loop body 0:
+    Source: '../../src/verified/layout.rs', lines 97:2-106:1 -/
+@[rust_loop_body]
+def layout.mark_entries_loop.body
+  (entries : Slice Std.Usize) (num_insns : Std.Usize)
+  (is_start : alloc.vec.Vec Bool) (k : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Bool) × Std.Usize) ((core.result.Result
+    Unit layout.LayoutReject) × (alloc.vec.Vec Bool)))
+  := do
+  let i := Slice.len entries
+  if k < i
+  then
+    let entry ← Slice.index_usize entries k
+    if entry >= num_insns
+    then
+      ok (done (core.result.Result.Err (layout.LayoutReject.EntryOutOfRange
+        entry), is_start))
+    else
+      let (_, index_mut_back) ←
+        alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+          is_start entry
+      let k1 ← k + 1#usize
+      let is_start1 := index_mut_back true
+      ok (cont (is_start1, k1))
+  else ok (done (core.result.Result.Ok (), is_start))
+
+/-- [async_ebpf_verified::layout::mark_entries]: loop 0:
+    Source: '../../src/verified/layout.rs', lines 97:2-106:1 -/
+@[rust_loop]
+def layout.mark_entries_loop
+  (entries : Slice Std.Usize) (num_insns : Std.Usize)
+  (is_start : alloc.vec.Vec Bool) (k : Std.Usize) :
+  Result ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec
+    Bool))
+  := do
+  loop
+    (fun (is_start1, k1) => layout.mark_entries_loop.body entries num_insns
+      is_start1 k1)
+    (is_start, k)
+
+/-- [async_ebpf_verified::layout::mark_entries]:
+    Source: '../../src/verified/layout.rs', lines 91:0-106:1 -/
+@[reducible]
+def layout.mark_entries
+  (entries : Slice Std.Usize) (num_insns : Std.Usize)
+  (is_start : alloc.vec.Vec Bool) :
+  Result ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec
+    Bool))
+  := do
+  layout.mark_entries_loop entries num_insns is_start 0#usize
+
+/-- [async_ebpf_verified::layout::mark_call_targets]: loop body 0:
+    Source: '../../src/verified/layout.rs', lines 111:2-119:1 -/
+@[rust_loop_body]
+def layout.mark_call_targets_loop.body
+  (insns : Slice isa.Insn) (num_insns : Std.Usize)
+  (is_start : alloc.vec.Vec Bool) (pc : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Bool) × Std.Usize) ((core.result.Result
+    Unit layout.LayoutReject) × (alloc.vec.Vec Bool)))
+  := do
+  if pc < num_insns
+  then
+    let i ← Slice.index_usize insns pc
+    let b ← layout.is_local_call i
+    if b
+    then
+      let r ← layout.local_call_target pc i num_insns
+      let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+      match cf with
+      | core.ops.control_flow.ControlFlow.Continue val =>
+        let (_, index_mut_back) ←
+          alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+            is_start val
+        let pc1 ← pc + 1#usize
+        let is_start1 := index_mut_back true
+        ok (cont (is_start1, pc1))
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        let r1 ←
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            Unit (core.convert.FromSame layout.LayoutReject) residual
+        ok (done (r1, is_start))
+    else let pc1 ← pc + 1#usize
+         ok (cont (is_start, pc1))
+  else ok (done (core.result.Result.Ok (), is_start))
+
+/-- [async_ebpf_verified::layout::mark_call_targets]: loop 0:
+    Source: '../../src/verified/layout.rs', lines 111:2-119:1 -/
+@[rust_loop]
+def layout.mark_call_targets_loop
+  (insns : Slice isa.Insn) (is_start : alloc.vec.Vec Bool)
+  (num_insns : Std.Usize) (pc : Std.Usize) :
+  Result ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec
+    Bool))
+  := do
+  loop
+    (fun (is_start1, pc1) => layout.mark_call_targets_loop.body insns num_insns
+      is_start1 pc1)
+    (is_start, pc)
+
+/-- [async_ebpf_verified::layout::mark_call_targets]:
+    Source: '../../src/verified/layout.rs', lines 108:0-119:1 -/
+def layout.mark_call_targets
+  (insns : Slice isa.Insn) (is_start : alloc.vec.Vec Bool) :
+  Result ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec
+    Bool))
+  := do
+  let num_insns := Slice.len insns
+  layout.mark_call_targets_loop insns is_start num_insns 0#usize
+
+/-- [async_ebpf_verified::layout::collect_starts]: loop body 0:
+    Source: '../../src/verified/layout.rs', lines 124:2-129:3 -/
+@[rust_loop_body]
+def layout.collect_starts_loop.body
+  (is_start : Slice Bool) (starts : alloc.vec.Vec Std.Usize) (pc : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.Usize) × Std.Usize) (alloc.vec.Vec
+    Std.Usize))
+  := do
+  let i := Slice.len is_start
+  if pc < i
+  then
+    let b ← Slice.index_usize is_start pc
+    let starts1 ← if b
+                    then alloc.vec.Vec.push starts pc
+                    else ok starts
+    let pc1 ← pc + 1#usize
+    ok (cont (starts1, pc1))
+  else ok (done starts)
+
+/-- [async_ebpf_verified::layout::collect_starts]: loop 0:
+    Source: '../../src/verified/layout.rs', lines 124:2-129:3 -/
+@[rust_loop]
+def layout.collect_starts_loop
+  (is_start : Slice Bool) (starts : alloc.vec.Vec Std.Usize) (pc : Std.Usize) :
+  Result (alloc.vec.Vec Std.Usize)
+  := do
+  loop
+    (fun (starts1, pc1) => layout.collect_starts_loop.body is_start starts1
+      pc1)
+    (starts, pc)
+
+/-- [async_ebpf_verified::layout::collect_starts]:
+    Source: '../../src/verified/layout.rs', lines 121:0-131:1 -/
+@[reducible]
+def layout.collect_starts
+  (is_start : Slice Bool) : Result (alloc.vec.Vec Std.Usize) := do
+  layout.collect_starts_loop is_start (alloc.vec.Vec.new Std.Usize) 0#usize
+
+/-- [async_ebpf_verified::layout::fill_range]: loop body 0:
+    Source: '../../src/verified/layout.rs', lines 136:2-139:3 -/
+@[rust_loop_body]
+def layout.fill_range_loop.body
+  («end» : Std.Usize) (func : Std.Usize)
+  (pc_to_func : alloc.vec.Vec Std.Usize) (pc : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.Usize) × Std.Usize) (alloc.vec.Vec
+    Std.Usize))
+  := do
+  if pc < «end»
+  then
+    let (_, index_mut_back) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.Usize)
+        pc_to_func pc
+    let pc1 ← pc + 1#usize
+    let pc_to_func1 := index_mut_back func
+    ok (cont (pc_to_func1, pc1))
+  else ok (done pc_to_func)
+
+/-- [async_ebpf_verified::layout::fill_range]: loop 0:
+    Source: '../../src/verified/layout.rs', lines 136:2-139:3 -/
+@[rust_loop]
+def layout.fill_range_loop
+  (pc_to_func : alloc.vec.Vec Std.Usize) («end» : Std.Usize)
+  (func : Std.Usize) (pc : Std.Usize) :
+  Result (alloc.vec.Vec Std.Usize)
+  := do
+  loop
+    (fun (pc_to_func1, pc1) => layout.fill_range_loop.body «end» func
+      pc_to_func1 pc1)
+    (pc_to_func, pc)
+
+/-- [async_ebpf_verified::layout::fill_range]:
+    Source: '../../src/verified/layout.rs', lines 134:0-140:1 -/
+@[reducible]
+def layout.fill_range
+  (pc_to_func : alloc.vec.Vec Std.Usize) (start : Std.Usize)
+  («end» : Std.Usize) (func : Std.Usize) :
+  Result (alloc.vec.Vec Std.Usize)
+  := do
+  layout.fill_range_loop pc_to_func «end» func start
+
+/-- [async_ebpf_verified::layout::assign_functions]: loop body 0:
+    Source: '../../src/verified/layout.rs', lines 147:2-155:3 -/
+@[rust_loop_body]
+def layout.assign_functions_loop.body
+  (starts : Slice Std.Usize) (num_insns : Std.Usize)
+  (pc_to_func : alloc.vec.Vec Std.Usize) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.Usize) × Std.Usize) (alloc.vec.Vec
+    Std.Usize))
+  := do
+  let i1 := Slice.len starts
+  if i < i1
+  then
+    let i2 ← i + 1#usize
+    let i3 := Slice.len starts
+    let «end» ←
+      if i2 < i3
+      then Slice.index_usize starts i2
+      else ok num_insns
+    let i4 ← Slice.index_usize starts i
+    let pc_to_func1 ← layout.fill_range pc_to_func i4 «end» i
+    ok (cont (pc_to_func1, i2))
+  else ok (done pc_to_func)
+
+/-- [async_ebpf_verified::layout::assign_functions]: loop 0:
+    Source: '../../src/verified/layout.rs', lines 147:2-155:3 -/
+@[rust_loop]
+def layout.assign_functions_loop
+  (starts : Slice Std.Usize) (num_insns : Std.Usize)
+  (pc_to_func : alloc.vec.Vec Std.Usize) (i : Std.Usize) :
+  Result (alloc.vec.Vec Std.Usize)
+  := do
+  loop
+    (fun (pc_to_func1, i1) => layout.assign_functions_loop.body starts
+      num_insns pc_to_func1 i1)
+    (pc_to_func, i)
+
+/-- [async_ebpf_verified::layout::assign_functions]:
+    Source: '../../src/verified/layout.rs', lines 144:0-157:1 -/
+def layout.assign_functions
+  (starts : Slice Std.Usize) (num_insns : Std.Usize) :
+  Result (alloc.vec.Vec Std.Usize)
+  := do
+  let pc_to_func ←
+    alloc.vec.from_elem core.clone.CloneUsize 0#usize num_insns
+  layout.assign_functions_loop starts num_insns pc_to_func 0#usize
+
+/-- [async_ebpf_verified::layout::check_in_range]:
+    Source: '../../src/verified/layout.rs', lines 159:0-183:1 -/
+def layout.check_in_range
+  (pc : Std.Usize) (target : Std.Usize) (start : Std.Usize)
+  («end» : Std.Usize) (jump : Bool) :
+  Result (core.result.Result Unit layout.LayoutReject)
+  := do
+  if target < start
+  then
+    if jump
+    then
+      ok (core.result.Result.Err (layout.LayoutReject.JumpOutside pc target
+        start «end»))
+    else
+      ok (core.result.Result.Err (layout.LayoutReject.FallthroughOutside pc
+        target start «end»))
+  else
+    if target >= «end»
+    then
+      if jump
+      then
+        ok (core.result.Result.Err (layout.LayoutReject.JumpOutside pc target
+          start «end»))
+      else
+        ok (core.result.Result.Err (layout.LayoutReject.FallthroughOutside pc
+          target start «end»))
+    else ok (core.result.Result.Ok ())
+
+/-- [async_ebpf_verified::layout::successors]:
+    Source: '../../src/verified/layout.rs', lines 192:0-229:1 -/
+def layout.successors
+  (insns : Slice isa.Insn) (pc : Std.Usize) (is_start : Slice Bool) :
+  Result (core.result.Result (Std.Usize × Std.Usize × Bool × Std.Usize)
+    layout.LayoutReject)
+  := do
+  let num_insns := Slice.len insns
+  let insn ← Slice.index_usize insns pc
+  if insn.opcode = isa.OP_EXIT
+  then ok (core.result.Result.Ok (0#usize, 0#usize, false, 0#usize))
+  else
+    if insn.opcode = isa.OP_CALL
+    then
+      if insn.src = 1#u8
+      then
+        let r ← layout.local_call_target pc insn num_insns
+        let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+        match cf with
+        | core.ops.control_flow.ControlFlow.Continue val =>
+          let b ← Slice.index_usize is_start val
+          if b
+          then
+            let i ← pc + 1#usize
+            ok (core.result.Result.Ok (1#usize, i, false, 0#usize))
+          else
+            ok (core.result.Result.Err
+              (layout.LayoutReject.LocalCallNonFunction pc val))
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            (Std.Usize × Std.Usize × Bool × Std.Usize)
+            (core.convert.FromSame layout.LayoutReject) residual
+      else
+        let i ← pc + 1#usize
+        ok (core.result.Result.Ok (1#usize, i, false, 0#usize))
+    else
+      if insn.opcode = isa.OP_LDDW
+      then
+        let i ← pc + 2#usize
+        ok (core.result.Result.Ok (1#usize, i, false, 0#usize))
+      else
+        let cls ← lift (insn.opcode &&& isa.CLS_MASK)
+        if cls = isa.CLS_JMP
+        then
+          if insn.opcode = isa.OP_JA
+          then
+            let i ← lift (IScalar.cast .I64 insn.offset)
+            let r ← layout.jump_target pc i num_insns
+            let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+            match cf with
+            | core.ops.control_flow.ControlFlow.Continue val =>
+              ok (core.result.Result.Ok (1#usize, val, true, 0#usize))
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                (Std.Usize × Std.Usize × Bool × Std.Usize)
+                (core.convert.FromSame layout.LayoutReject) residual
+          else
+            if insn.opcode = isa.OP_JA32
+            then
+              let i ← lift (IScalar.cast .I64 insn.imm)
+              let r ← layout.jump_target pc i num_insns
+              let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+              match cf with
+              | core.ops.control_flow.ControlFlow.Continue val =>
+                ok (core.result.Result.Ok (1#usize, val, true, 0#usize))
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                  (Std.Usize × Std.Usize × Bool × Std.Usize)
+                  (core.convert.FromSame layout.LayoutReject) residual
+            else
+              let i ← lift (IScalar.cast .I64 insn.offset)
+              let r ← layout.jump_target pc i num_insns
+              let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+              match cf with
+              | core.ops.control_flow.ControlFlow.Continue val =>
+                let i1 ← pc + 1#usize
+                ok (core.result.Result.Ok (2#usize, val, true, i1))
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                  (Std.Usize × Std.Usize × Bool × Std.Usize)
+                  (core.convert.FromSame layout.LayoutReject) residual
+        else
+          if cls = isa.CLS_JMP32
+          then
+            if insn.opcode = isa.OP_JA
+            then
+              let i ← lift (IScalar.cast .I64 insn.offset)
+              let r ← layout.jump_target pc i num_insns
+              let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+              match cf with
+              | core.ops.control_flow.ControlFlow.Continue val =>
+                ok (core.result.Result.Ok (1#usize, val, true, 0#usize))
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                  (Std.Usize × Std.Usize × Bool × Std.Usize)
+                  (core.convert.FromSame layout.LayoutReject) residual
+            else
+              if insn.opcode = isa.OP_JA32
+              then
+                let i ← lift (IScalar.cast .I64 insn.imm)
+                let r ← layout.jump_target pc i num_insns
+                let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+                match cf with
+                | core.ops.control_flow.ControlFlow.Continue val =>
+                  ok (core.result.Result.Ok (1#usize, val, true, 0#usize))
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    (Std.Usize × Std.Usize × Bool × Std.Usize)
+                    (core.convert.FromSame layout.LayoutReject) residual
+              else
+                let i ← lift (IScalar.cast .I64 insn.offset)
+                let r ← layout.jump_target pc i num_insns
+                let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+                match cf with
+                | core.ops.control_flow.ControlFlow.Continue val =>
+                  let i1 ← pc + 1#usize
+                  ok (core.result.Result.Ok (2#usize, val, true, i1))
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    (Std.Usize × Std.Usize × Bool × Std.Usize)
+                    (core.convert.FromSame layout.LayoutReject) residual
+          else
+            let i ← pc + 1#usize
+            ok (core.result.Result.Ok (1#usize, i, false, 0#usize))
+
+/-- [async_ebpf_verified::layout::scan_function]: loop body 0:
+    Source: '../../src/verified/layout.rs', lines 247:2-272:1 -/
+@[rust_loop_body]
+def layout.scan_function_loop.body
+  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
+  (is_start : Slice Bool) (reachable : alloc.vec.Vec Bool)
+  (pending : alloc.vec.Vec Std.Usize) (top : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Bool) × (alloc.vec.Vec Std.Usize) ×
+    Std.Usize) ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec
+    Bool) × (alloc.vec.Vec Std.Usize)))
+  := do
+  if top > 0#usize
+  then
+    let top1 ← top - 1#usize
+    let pc ←
+      alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.Usize)
+        pending top1
+    if pc < start
+    then
+      ok (done (core.result.Result.Err (layout.LayoutReject.ControlFlowOutside
+        pc start «end»), reachable, pending))
+    else
+      if pc >= «end»
+      then
+        ok (done (core.result.Result.Err
+          (layout.LayoutReject.ControlFlowOutside pc start «end»), reachable,
+          pending))
+      else
+        let b ←
+          alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Bool)
+            reachable pc
+        if b
+        then ok (cont (reachable, pending, top1))
+        else
+          let (_, index_mut_back) ←
+            alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+              Bool) reachable pc
+          let r ← layout.successors insns pc is_start
+          let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+          match cf with
+          | core.ops.control_flow.ControlFlow.Continue val =>
+            let (count, first, first_is_jump, second) := val
+            if count >= 1#usize
+            then
+              let r1 ←
+                layout.check_in_range pc first start «end» first_is_jump
+              let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+              match cf1 with
+              | core.ops.control_flow.ControlFlow.Continue _ =>
+                let (_, index_mut_back1) ←
+                  alloc.vec.Vec.index_mut
+                    (core.slice.index.SliceIndexUsizeSlice Std.Usize) pending
+                    top1
+                let top2 ← top1 + 1#usize
+                if count >= 2#usize
+                then
+                  let r2 ←
+                    layout.check_in_range pc second start «end» false
+                  let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+                  match cf2 with
+                  | core.ops.control_flow.ControlFlow.Continue _ =>
+                    let pending1 := index_mut_back1 first
+                    let (_, index_mut_back2) ←
+                      alloc.vec.Vec.index_mut
+                        (core.slice.index.SliceIndexUsizeSlice Std.Usize)
+                        pending1 top2
+                    let top3 ← top2 + 1#usize
+                    let pending2 := index_mut_back2 second
+                    let reachable1 := index_mut_back true
+                    ok (cont (reachable1, pending2, top3))
+                  | core.ops.control_flow.ControlFlow.Break residual =>
+                    let r3 ←
+                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                        Unit (core.convert.FromSame layout.LayoutReject)
+                        residual
+                    let pending1 := index_mut_back1 first
+                    let reachable1 := index_mut_back true
+                    ok (done (r3, reachable1, pending1))
+                else
+                  let pending1 := index_mut_back1 first
+                  let reachable1 := index_mut_back true
+                  ok (cont (reachable1, pending1, top2))
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                let r2 ←
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    Unit (core.convert.FromSame layout.LayoutReject) residual
+                let reachable1 := index_mut_back true
+                ok (done (r2, reachable1, pending))
+            else
+              if count >= 2#usize
+              then
+                let r1 ← layout.check_in_range pc second start «end» false
+                let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+                match cf1 with
+                | core.ops.control_flow.ControlFlow.Continue _ =>
+                  let (_, index_mut_back1) ←
+                    alloc.vec.Vec.index_mut
+                      (core.slice.index.SliceIndexUsizeSlice Std.Usize) pending
+                      top1
+                  let top2 ← top1 + 1#usize
+                  let pending1 := index_mut_back1 second
+                  let reachable1 := index_mut_back true
+                  ok (cont (reachable1, pending1, top2))
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  let r2 ←
+                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                      Unit (core.convert.FromSame layout.LayoutReject) residual
+                  let reachable1 := index_mut_back true
+                  ok (done (r2, reachable1, pending))
+              else
+                let reachable1 := index_mut_back true
+                ok (cont (reachable1, pending, top1))
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            let r1 ←
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                Unit (core.convert.FromSame layout.LayoutReject) residual
+            let reachable1 := index_mut_back true
+            ok (done (r1, reachable1, pending))
+  else ok (done (core.result.Result.Ok (), reachable, pending))
+
+/-- [async_ebpf_verified::layout::scan_function]: loop 0:
+    Source: '../../src/verified/layout.rs', lines 247:2-272:1 -/
+@[rust_loop]
+def layout.scan_function_loop
+  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
+  (is_start : Slice Bool) (reachable : alloc.vec.Vec Bool)
+  (pending : alloc.vec.Vec Std.Usize) (top : Std.Usize) :
+  Result ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec Bool)
+    × (alloc.vec.Vec Std.Usize))
+  := do
+  loop
+    (fun (reachable1, pending1, top1) => layout.scan_function_loop.body insns
+      start «end» is_start reachable1 pending1 top1)
+    (reachable, pending, top)
+
+/-- [async_ebpf_verified::layout::scan_function]:
+    Source: '../../src/verified/layout.rs', lines 236:0-272:1 -/
+def layout.scan_function
+  (insns : Slice isa.Insn) (start : Std.Usize) («end» : Std.Usize)
+  (is_start : Slice Bool) (reachable : alloc.vec.Vec Bool)
+  (pending : alloc.vec.Vec Std.Usize) :
+  Result ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec Bool)
+    × (alloc.vec.Vec Std.Usize))
+  := do
+  let (_, index_mut_back) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.Usize)
+      pending 0#usize
+  let pending1 := index_mut_back start
+  layout.scan_function_loop insns start «end» is_start reachable pending1
+    1#usize
+
+/-- [async_ebpf_verified::layout::scan_all]: loop body 0:
+    Source: '../../src/verified/layout.rs', lines 284:2-295:1 -/
+@[rust_loop_body]
+def layout.scan_all_loop.body
+  (insns : Slice isa.Insn) (starts : Slice Std.Usize) (is_start : Slice Bool)
+  (num_insns : Std.Usize) (reachable : alloc.vec.Vec Bool)
+  (pending : alloc.vec.Vec Std.Usize) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Bool) × (alloc.vec.Vec Std.Usize) ×
+    Std.Usize) ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec
+    Bool)))
+  := do
+  let i1 := Slice.len starts
+  if i < i1
+  then
+    let start ← Slice.index_usize starts i
+    let i2 ← i + 1#usize
+    let i3 := Slice.len starts
+    let «end» ←
+      if i2 < i3
+      then Slice.index_usize starts i2
+      else ok num_insns
+    let (r, reachable1, pending1) ←
+      layout.scan_function insns start «end» is_start reachable pending
+    let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+    match cf with
+    | core.ops.control_flow.ControlFlow.Continue _ =>
+      ok (cont (reachable1, pending1, i2))
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      let r1 ←
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          Unit (core.convert.FromSame layout.LayoutReject) residual
+      ok (done (r1, reachable1))
+  else ok (done (core.result.Result.Ok (), reachable))
+
+/-- [async_ebpf_verified::layout::scan_all]: loop 0:
+    Source: '../../src/verified/layout.rs', lines 284:2-295:1 -/
+@[rust_loop]
+def layout.scan_all_loop
+  (insns : Slice isa.Insn) (starts : Slice Std.Usize) (is_start : Slice Bool)
+  (reachable : alloc.vec.Vec Bool) (num_insns : Std.Usize)
+  (pending : alloc.vec.Vec Std.Usize) (i : Std.Usize) :
+  Result ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec
+    Bool))
+  := do
+  loop
+    (fun (reachable1, pending1, i1) => layout.scan_all_loop.body insns starts
+      is_start num_insns reachable1 pending1 i1)
+    (reachable, pending, i)
+
+/-- [async_ebpf_verified::layout::scan_all]:
+    Source: '../../src/verified/layout.rs', lines 275:0-295:1 -/
+def layout.scan_all
+  (insns : Slice isa.Insn) (starts : Slice Std.Usize) (is_start : Slice Bool)
+  (reachable : alloc.vec.Vec Bool) :
+  Result ((core.result.Result Unit layout.LayoutReject) × (alloc.vec.Vec
+    Bool))
+  := do
+  let num_insns := Slice.len insns
+  let i ← 2#usize * num_insns
+  let i1 ← i + 2#usize
+  let pending ← alloc.vec.from_elem core.clone.CloneUsize 0#usize i1
+  layout.scan_all_loop insns starts is_start reachable num_insns pending
+    0#usize
+
+/-- [async_ebpf_verified::layout::partition]:
+    Source: '../../src/verified/layout.rs', lines 300:0-315:1
+    Visibility: public -/
+def layout.partition
+  (insns : Slice isa.Insn) (entries : Slice Std.Usize) :
+  Result (core.result.Result layout.Layout layout.LayoutReject)
+  := do
+  let num_insns := Slice.len insns
+  let is_start ← alloc.vec.from_elem core.clone.CloneBool false num_insns
+  let (_, index_mut_back) ←
+    alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Bool)
+      is_start 0#usize
+  let is_start1 := index_mut_back true
+  let (r, is_start2) ← layout.mark_entries entries num_insns is_start1
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue _ =>
+    let (r1, is_start3) ← layout.mark_call_targets insns is_start2
+    let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+    match cf1 with
+    | core.ops.control_flow.ControlFlow.Continue _ =>
+      let s := alloc.vec.Vec.deref is_start3
+      let starts ← layout.collect_starts s
+      let s1 := alloc.vec.Vec.deref starts
+      let pc_to_func ← layout.assign_functions s1 num_insns
+      let s2 := alloc.vec.Vec.deref starts
+      let s3 := alloc.vec.Vec.deref is_start3
+      let (r2, reachable) ← layout.scan_all insns s2 s3 is_start
+      let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+      match cf2 with
+      | core.ops.control_flow.ControlFlow.Continue _ =>
+        ok (core.result.Result.Ok { starts, pc_to_func, reachable })
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          layout.Layout (core.convert.FromSame layout.LayoutReject) residual
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        layout.Layout (core.convert.FromSame layout.LayoutReject) residual
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      layout.Layout (core.convert.FromSame layout.LayoutReject) residual
+
 /-- [async_ebpf_verified::validate::Config]
     Source: '../../src/verified/validate.rs', lines 40:0-50:1
     Visibility: public -/
