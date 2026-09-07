@@ -510,14 +510,22 @@ pub(crate) struct CrossSectionCallSite {
 ///
 /// Linear is not the same as cheap at the ceiling. On the largest object
 /// `link_elf` admits — 128 sections of 65,534 slots, 64 MiB of code, needing
-/// no relocations at all — a shape built to make every mask bit propagate
-/// separately costs this function 2.1 s and 219 MB, and `analyze_program`
-/// around it 4.0 s and 868 MB. That is on the non-preemptible load path, and
+/// no relocations at all — 128 call chains of 21,844 links, each carrying one
+/// live bit from its tail to its head, cost this function 1.4 s and 376 MB on
+/// a first run and `analyze_program` around it 1.2–3.6 s and 846 MB (release,
+/// one machine; the range is that machine's noise). The memory is about 45
+/// bytes per slot: the decoded instruction (12), its function (4), the
+/// callee (4), the predecessor and call-site lists (16), the table, the
+/// queue flag and the stack (7), plus the per-function bounds and list heads
+/// (12 per function). About half of that is what the verified
+/// solver's fixed layout costs over a hand-packed one — the instructions
+/// decoded once rather than per visit, and lists sized by the slot count
+/// rather than the edge count — and it buys a solve that is about 25% faster
+/// once the pages are mapped. That is on the non-preemptible load path, and
 /// the analysis is most of what loading such an object costs. It is far below
-/// what the per-function solve charged (11.7 s and 301 MB for this function on
-/// the same input, and superlinearly worse as the object grows), but it is not
-/// nothing, and a caller that admits objects this large should know the shape
-/// of the bill.
+/// what the per-function solve charged (superlinear in the object, tens of
+/// seconds at this size), but it is not nothing, and a caller that admits
+/// objects this large should know the shape of the bill.
 pub(crate) fn program_live_in(
   sections: &[LiveInSection<'_>],
   cross_section_calls: &[CrossSectionCallSite],
