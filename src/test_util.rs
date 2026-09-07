@@ -269,7 +269,7 @@ pub mod region_analysis {
   #[derive(Clone, Copy)]
   pub struct FunctionSignature(PointerSignature);
 
-  /// Result returned by the whole-section analyzer.
+  /// Result returned by [`analyze_section`].
   pub struct SectionAnalysis {
     /// Per-instruction-slot load region hint.
     pub hints: Vec<u8>,
@@ -309,7 +309,9 @@ pub mod region_analysis {
     FunctionSignature(PointerSignature::from_regs_for_testing(regs))
   }
 
-  /// Runs whole-section static region analysis.
+  /// Runs static region analysis over a whole section the way the loader
+  /// does: function by function, from every signature a call site hands
+  /// over, merged per slot.
   pub fn analyze_section(code: &[u8], data_lo: u64, data_hi: u64) -> SectionAnalysis {
     let result = analyzer::analyze(code, data_lo, data_hi);
     SectionAnalysis {

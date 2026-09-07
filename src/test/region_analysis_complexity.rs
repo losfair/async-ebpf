@@ -10,12 +10,12 @@
 //! `Program::run`, and the compile is not preemption-interruptible (the
 //! SIGUSR1 handler only acts inside the JIT code zone).
 //!
-//! The spill map is now persistent ([`rpds::RedBlackTreeMap`]): `State` clones
-//! are O(1) under structural sharing, inserts are O(log n), `meet_from` adopts
-//! the incoming map wholesale while a state is still top, and
-//! `invalidate_stack_write` range-scans the tree instead of scanning the whole
-//! map. This test runs the canonical hostile shape end to end and bounds the
-//! wall time. The budget is ~75× the measured time of the fixed code, so a
+//! The spill table is now bounded (`verified::region::Spills`, at most
+//! `MAX_TRACKED_SLOTS` entries): a `State` is a fixed-size copy, an insert
+//! scans at most that many entries, `meet_from` adopts the incoming table
+//! wholesale while a state is still top, and `invalidate_stack_write` scans
+//! the table rather than any structure the program's size. This test runs the
+//! canonical hostile shape end to end and bounds the wall time. The budget is ~75× the measured time of the fixed code, so a
 //! loaded CI machine does not flake it, while any reintroduction of the
 //! per-instruction full-state clone (the Θ(n²) mechanism) misses it by ~8×.
 //!

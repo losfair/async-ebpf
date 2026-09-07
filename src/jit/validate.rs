@@ -1,313 +1,33 @@
 //! What the loader accepts, and the exact words it uses to refuse.
 //!
-//! # Two layers, deliberately overlapping
+//! The decisions are made by [`crate::verified::validate`], the verified core
+//! whose Lean proofs (see `lean/README.md`) establish, among other things, that
+//! an accepted program never writes R10 outside the store forms. This module
+//! is the runtime's adapter around it: it folds the embedder's helper callback
+//! into the list of known indices the core takes, and renders each [`Reject`]
+//! as the message embedders match on.
 //!
-//! Load-time checking is split in two. The split is worth knowing about because
-//! the *composition* is what callers observe — which layer speaks first decides
-//! the message.
+//! # Messages are interface
 //!
-//! * [`check_operand_filter`] is per-opcode data: a table of register bounds,
-//!   offset bounds and immediate bounds, with a handful of enumerated sets. It
-//!   knows nothing about the program around the instruction.
-//! * [`validate`] is the whole-program layer — jump targets, `lddw` pairing,
-//!   call targets, helper indices — plus a second, coarser pass over registers.
-//!
-//! The two overlap on purpose. R10 is the frame pointer, frame-relative
-//! addressing emits `[r10 + k]` with no runtime bounds check, and "the guest
-//! never assigned R10" is the one premise the backend cannot re-derive for
-//! itself. It should not rest on a single line in a single function. So both
-//! layers refuse a write to R10, by different routes.
-//!
-//! # Order of operations
-//!
-//! For one instruction the checks run strictly in this order:
-//!
-//! 1. the opcode match — an unknown opcode, and the per-opcode structural rules
-//!    (endian immediates, `lddw` pairing, jump targets, call targets, atomic
-//!    selectors);
-//! 2. `src > 10`;
-//! 3. `dst > 9`, unless the instruction is a store and `dst == 10`;
-//! 4. the operand filter table.
-//!
-//! Any reordering changes which message a doubly-invalid instruction produces,
-//! and `program.rs` surfaces those verbatim. The recorded decision sweeps at the
-//! bottom of this file fold every rejection message into a digest character for
-//! character, so a reordering shows up as a changed golden rather than passing
-//! unnoticed.
-//!
-//! # Surprising rules
-//!
-//! A few rules below are surprising, and each is labelled where it lives. Where
-//! the reason behind one is not recoverable, the comment says so rather than
-//! inventing one — the `div`/`mod` offset bound that no backend reads, and the
-//! 32-bit atomic immediate that is range-bounded where the 64-bit one is
-//! enumerated, are the two of those.
-//!
-//! Others are noted at their site: the `>=` at `MAX_INSTS`, the dead `lddw`
-//! source bound, the unreachable "Invalid instruction opcode" arm, and the
-//! 32-bit wrapping arithmetic in the local call target.
+//! The wording below is compared by callers, so it is part of the contract.
+//! Note `{:2X}` in the operand-filter messages: uppercase, minimum width two,
+//! *space* padded — so opcode `0x05` renders as `" 5"`, not `"05"`. The
+//! recorded decision sweeps at the bottom of this file fold every rejection
+//! message into a digest character for character, so a wording change, or a
+//! reordering of the checks in the core that changes which rule speaks first,
+//! shows up as a changed golden rather than passing unnoticed.
 //!
 //! # The empty program
 //!
-//! [`validate`] accepts a zero-length program: its loop does not run and its
-//! sub-program check finds no local call, so there is nothing here to object to.
-//! The refusal belongs one layer up, in `Translator::load`, which will not
+//! [`validate`] accepts a zero-length program: the core's loop does not run and
+//! its sub-program check finds no local call, so there is nothing to object
+//! to. The refusal belongs one layer up, in `Translator::load`, which will not
 //! assemble an empty program. See
 //! `tests::decisions::the_empty_program_is_refused_by_the_loader_not_the_validator`.
 
-#[cfg(test)]
-use super::abi;
-use super::isa::{cls, opcode, AluOp, AluWidth, Insn, Op};
+use super::isa::{cls, Insn};
 use super::Config;
-
-// ---------------------------------------------------------------------------
-// Layer 1: the per-opcode operand filter
-// ---------------------------------------------------------------------------
-
-/// Which operand values one opcode admits: the register, offset and immediate
-/// ranges accepted for one opcode.
-///
-/// A field an opcode does not use is bounded `0..=0` — "reserved, must be zero"
-/// — rather than left unconstrained. Every bound is written out explicitly at
-/// each use below, and there is deliberately no zero-valued `Default`: silently
-/// defaulting a bound to "reserved" or to "anything" are both mistakes this
-/// table must not be able to make quietly.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-struct Filter {
-  /// Inclusive bounds on the source register nibble.
-  src: (u8, u8),
-  /// Inclusive bounds on the destination register nibble.
-  dst: (u8, u8),
-  /// Inclusive bounds on the offset, used when [`Filter::offset_enum`] is empty.
-  offset: (i16, i16),
-  /// The only legal offsets, when non-empty. Takes precedence over the bounds.
-  offset_enum: &'static [i16],
-  /// Inclusive bounds on the immediate, used when [`Filter::imm_enum`] is empty.
-  imm: (i32, i32),
-  /// The only legal immediates, when non-empty. Takes precedence.
-  imm_enum: &'static [i32],
-}
-
-const fn filter(src: (u8, u8), dst: (u8, u8), offset: (i16, i16), imm: (i32, i32)) -> Filter {
-  Filter {
-    src,
-    dst,
-    offset,
-    offset_enum: &[],
-    imm,
-    imm_enum: &[],
-  }
-}
-
-const ANY_OFF: (i16, i16) = (i16::MIN, i16::MAX);
-const NO_OFF: (i16, i16) = (0, 0);
-const ANY_IMM: (i32, i32) = (i32::MIN, i32::MAX);
-const NO_IMM: (i32, i32) = (0, 0);
-
-/// `add r_d, imm` and friends: no source register, any immediate.
-const ALU_IMM: Filter = filter((0, 0), (0, 9), NO_OFF, ANY_IMM);
-/// `add r_d, r_s`: no immediate. The source may be R10 — reading the frame
-/// pointer is allowed, only writing it is not.
-const ALU_REG: Filter = filter((0, 10), (0, 9), NO_OFF, NO_IMM);
-/// `div` and `mod`, the only ALU opcodes whose offset may be non-zero.
-///
-/// The eBPF ISA gives that offset bit to a signed flavour of the operation.
-/// This tree has no signed division or modulo — [`Op`] names no such opcode, and
-/// both JIT backends derive the operation from the ALU nibble without ever
-/// reading `inst.offset`. The `0..=1` bound is therefore slack: a `div` with
-/// offset 1 loads, and then executes as an unsigned division. The bound stays
-/// wide anyway, because tightening it to `0..=0` would start rejecting programs
-/// that load today — a breaking change for embedders, not a fix.
-const DIV_IMM: Filter = filter((0, 0), (0, 9), (0, 1), ANY_IMM);
-const DIV_REG: Filter = filter((0, 10), (0, 9), (0, 1), NO_IMM);
-/// `neg`: one operand, in the destination.
-const NEG: Filter = filter((0, 0), (0, 9), NO_OFF, NO_IMM);
-/// `le`/`be`/`bswap`. [`validate`] narrows this to exactly 16, 32 and 64 before
-/// the filter ever sees it, so the `0..=64` range here is slack that is never
-/// observable.
-const ENDIAN: Filter = filter((0, 0), (0, 9), NO_OFF, (0, 64));
-/// `movsx32`: the offset carries the source width being sign-extended from.
-/// Zero is a plain `mov`.
-const MOVSX32: Filter = Filter {
-  offset_enum: &[0, 8, 16],
-  ..ALU_REG
-};
-/// `movsx64`: as above, and 32 is additionally meaningful at 64-bit width.
-const MOVSX64: Filter = Filter {
-  offset_enum: &[0, 8, 16, 32],
-  ..ALU_REG
-};
-/// `ldx`, plain and sign-extending: reads `[src + offset]`, so the source may
-/// be the frame pointer but the destination may not.
-const LDX: Filter = filter((0, 10), (0, 9), ANY_OFF, NO_IMM);
-/// `st`: stores the immediate to `[dst + offset]`, so the *destination* is a
-/// memory base and R10 is legal there.
-const ST: Filter = filter((0, 0), (0, 10), ANY_OFF, ANY_IMM);
-/// `stx`: as `st`, and the stored value may itself be the frame pointer.
-const STX: Filter = filter((0, 10), (0, 10), ANY_OFF, NO_IMM);
-/// `lddw`. The `0..=6` source bound is the eBPF ISA's map-descriptor extension,
-/// which this tree does not implement: [`validate`] rejects any non-zero source
-/// first, so sources 1 through 6 are dead here and this bound never speaks.
-const LDDW: Filter = filter((0, 6), (0, 9), NO_OFF, ANY_IMM);
-/// The second slot of a `lddw`, carrying the high half of the immediate.
-/// Unreachable through [`validate`], which sees a bare opcode `0x00` as an
-/// unknown opcode and never looks it up here; the row exists so that every byte
-/// the encoder can emit is described rather than absent.
-const LDDW_HIGH: Filter = filter((0, 0), (0, 0), NO_OFF, ANY_IMM);
-/// `ja`: the displacement is in the offset.
-const JA: Filter = filter((0, 0), (0, 0), ANY_OFF, NO_IMM);
-/// `ja32`: the displacement is in the immediate, and the offset must be zero.
-const JA32: Filter = filter((0, 0), (0, 0), NO_OFF, ANY_IMM);
-/// Conditional jump against an immediate.
-const JMP_IMM: Filter = filter((0, 0), (0, 9), ANY_OFF, ANY_IMM);
-/// Conditional jump against a register.
-const JMP_REG: Filter = filter((0, 10), (0, 9), ANY_OFF, NO_IMM);
-/// `call`: source 0 is a helper, 1 is a section-local function, and 2 is
-/// admitted only for a linker-tagged cross-section local call. An untagged BTF
-/// call is refused by [`validate`] before reaching this filter.
-const CALL: Filter = filter((0, 2), (0, 0), NO_OFF, ANY_IMM);
-/// `exit` takes no operands at all.
-const EXIT: Filter = filter((0, 0), (0, 0), NO_OFF, NO_IMM);
-/// 32-bit atomic RMW. The source is bounded at R9, not R10: a fetching atomic
-/// writes its previous memory contents back into the *source* register, which
-/// would be the one write to the frame pointer neither layer otherwise refuses.
-/// The non-fetching forms do not write the source, so the bound is stricter than
-/// strictly necessary: this table is keyed by opcode alone and so cannot vary a
-/// bound with the immediate's FETCH bit, and refusing R10 for every form is the
-/// safe way to settle that.
-///
-/// Note the immediate is a plain `0..=255` range here, not the enumeration the
-/// 64-bit form gets: a 32-bit atomic with immediate `0x02` passes both this
-/// filter and [`check_atomic_selector`] (which masks with `0xf0`), even though
-/// `0x02` names no operation. That the two widths are bounded differently is
-/// deliberate and is left alone — tightening this one would refuse programs that
-/// load today — but no reason for the difference is recorded.
-const ATOMIC32: Filter = filter((0, 9), (0, 10), ANY_OFF, (0, 255));
-/// 64-bit atomic RMW, with the enumeration the 32-bit form lacks.
-const ATOMIC64: Filter = Filter {
-  imm_enum: &[0x00, 0x01, 0x40, 0x41, 0x50, 0x51, 0xa0, 0xa1, 0xe1, 0xf1],
-  ..filter((0, 9), (0, 10), ANY_OFF, NO_IMM)
-};
-
-/// The filter table, as data: which opcodes share each shape.
-///
-/// There is one row per *shape*, listing the opcodes that share it, and the
-/// grouping is presentation only: [`build_filters`] flattens it back to one
-/// independent entry per opcode, and every opcode ends up with exactly the
-/// bounds its row gives it. All 120 entries are accounted for by
-/// [`tests::the_filter_table_covers_exactly_the_defined_opcodes`], which is what
-/// catches an opcode gaining a decoder entry but no filter row.
-#[rustfmt::skip]
-const FILTER_GROUPS: &[(&[u8], Filter)] = &[
-  // ALU and ALU64: add, sub, mul, or, and, lsh, rsh, xor, mov, arsh.
-  (&[0x04, 0x14, 0x24, 0x44, 0x54, 0x64, 0x74, 0xa4, 0xb4, 0xc4,
-     0x07, 0x17, 0x27, 0x47, 0x57, 0x67, 0x77, 0xa7, 0xb7, 0xc7], ALU_IMM),
-  (&[0x0c, 0x1c, 0x2c, 0x4c, 0x5c, 0x6c, 0x7c, 0xac, 0xcc,
-     0x0f, 0x1f, 0x2f, 0x4f, 0x5f, 0x6f, 0x7f, 0xaf, 0xcf], ALU_REG),
-  // div and mod, the only ALU opcodes admitting a non-zero offset.
-  (&[0x34, 0x94, 0x37, 0x97], DIV_IMM),
-  (&[0x3c, 0x9c, 0x3f, 0x9f], DIV_REG),
-  (&[0x84, 0x87], NEG),
-  // le, bswap, be.
-  (&[0xd4, 0xd7, 0xdc], ENDIAN),
-  (&[0xbc], MOVSX32),
-  (&[0xbf], MOVSX64),
-  // ldx w/h/b/dw and the three sign-extending forms.
-  (&[0x61, 0x69, 0x71, 0x79, 0x81, 0x89, 0x91], LDX),
-  (&[0x62, 0x6a, 0x72, 0x7a], ST),
-  (&[0x63, 0x6b, 0x73, 0x7b], STX),
-  (&[0x18], LDDW),
-  (&[0x00], LDDW_HIGH),
-  (&[0x05], JA),
-  (&[0x06], JA32),
-  // Conditional jumps, JMP class then JMP32 class.
-  (&[0x15, 0x25, 0x35, 0x45, 0x55, 0x65, 0x75, 0xa5, 0xb5, 0xc5, 0xd5,
-     0x16, 0x26, 0x36, 0x46, 0x56, 0x66, 0x76, 0xa6, 0xb6, 0xc6, 0xd6], JMP_IMM),
-  (&[0x1d, 0x2d, 0x3d, 0x4d, 0x5d, 0x6d, 0x7d, 0xad, 0xbd, 0xcd, 0xdd,
-     0x1e, 0x2e, 0x3e, 0x4e, 0x5e, 0x6e, 0x7e, 0xae, 0xbe, 0xce, 0xde], JMP_REG),
-  (&[0x85], CALL),
-  (&[0x95], EXIT),
-  (&[0xc3], ATOMIC32),
-  (&[0xdb], ATOMIC64),
-];
-
-/// The table above, flattened to a direct lookup.
-const FILTERS: [Option<Filter>; 256] = build_filters();
-
-const fn build_filters() -> [Option<Filter>; 256] {
-  let mut table = [None; 256];
-  let mut group = 0;
-  while group < FILTER_GROUPS.len() {
-    let (opcodes, shape) = FILTER_GROUPS[group];
-    let mut k = 0;
-    while k < opcodes.len() {
-      table[opcodes[k] as usize] = Some(shape);
-      k += 1;
-    }
-    group += 1;
-  }
-  table
-}
-
-/// Applies the operand filter to one instruction.
-///
-/// The wording of these messages is interface, not diagnostics. Note `{:2X}`:
-/// uppercase, minimum width two, *space* padded — so opcode `0x05` renders as
-/// `" 5"`, not `"05"`. Callers compare these strings, so the padding is
-/// load-bearing.
-fn check_operand_filter(insn: &Insn) -> Result<(), String> {
-  let opcode = insn.opcode;
-  let Some(f) = FILTERS[opcode as usize] else {
-    // Unreachable in practice: `validate()`'s opcode `switch` refuses every
-    // byte this table lacks an entry for, and does so first. Kept because the
-    // keeps it, and because a future opcode added to `Op` but not to the table
-    // should say so rather than be waved through.
-    return Err(format!("Invalid instruction opcode {opcode:2X}."));
-  };
-
-  if insn.dst < f.dst.0 || insn.dst > f.dst.1 {
-    return Err(format!(
-      "Invalid destination register {} for opcode {opcode:2X}.",
-      insn.dst
-    ));
-  }
-  if insn.src < f.src.0 || insn.src > f.src.1 {
-    return Err(format!(
-      "Invalid source register {} for opcode {opcode:2X}.",
-      insn.src
-    ));
-  }
-
-  let imm_ok = if f.imm_enum.is_empty() {
-    insn.imm >= f.imm.0 && insn.imm <= f.imm.1
-  } else {
-    f.imm_enum.contains(&insn.imm)
-  };
-  if !imm_ok {
-    return Err(format!(
-      "Invalid immediate value {} for opcode {opcode:2X}.",
-      insn.imm
-    ));
-  }
-
-  let offset_ok = if f.offset_enum.is_empty() {
-    insn.offset >= f.offset.0 && insn.offset <= f.offset.1
-  } else {
-    f.offset_enum.contains(&insn.offset)
-  };
-  if !offset_ok {
-    return Err(format!(
-      "Invalid offset value {} for opcode {opcode:2X}.",
-      insn.offset
-    ));
-  }
-
-  Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Layer 2: whole-program validation
-// ---------------------------------------------------------------------------
+use crate::verified::validate::{self as core, Reject};
 
 /// Validates a decoded program, returning the rejection message on refusal.
 ///
@@ -324,350 +44,160 @@ pub(crate) fn validate_with_external_calls(
   insns: &[Insn],
   external_calls: &[bool],
 ) -> Result<(), String> {
-  // The bound is `>=`, not `>`: a program of exactly `MAX_INSTS`
-  // instructions is refused. `Translator::load` checks `>` before calling here,
-  // so the two together reproduce `>=` — but this must not depend on that, and
-  // stating it here is what makes the boundary testable in one place.
-  if insns.len() >= config.instruction_limit {
-    return Err(format!(
-      "too many instructions (max {})",
-      config.instruction_limit
-    ));
-  }
-
-  let num_insns = insns.len();
-  let mut i = 0usize;
-  while i < num_insns {
-    let insn = insns[i];
-    // Set for the store forms only. Its sole effect is to admit R10 as a
-    // destination in the register check below, because those are the opcodes
-    // whose destination is a memory base rather than a written register.
-    let mut store = false;
-    // `lddw` consumes the following slot as well.
-    let mut skip_next = false;
-
-    let Some(op) = insn.op() else {
-      return Err(format!("unknown opcode 0x{:02x} at PC {i}", insn.opcode));
-    };
-
-    match op {
-      // `neg` has no source operand; a non-zero source field is a malformed
-      // encoding rather than an unknown one, and gets its own message.
-      Op::Alu {
-        op: AluOp::Neg,
-        width,
-        ..
-      } => {
-        if insn.src != 0 {
-          let name = match width {
-            AluWidth::W32 => "neg",
-            AluWidth::W64 => "neg64",
-          };
-          return Err(format!("invalid src field for {name} op at PC {i}"));
-        }
-      }
-
-      // The byte width to convert is in the immediate, and only three widths
-      // exist. The operand filter's `0..=64` range never gets to disagree.
-      Op::End(_) => {
-        if insn.imm != 16 && insn.imm != 32 && insn.imm != 64 {
-          return Err(format!("invalid endian immediate at PC {i}"));
-        }
-      }
-
-      Op::LoadImm64 => {
-        if insn.src != 0 {
-          return Err(format!("invalid source register for LDDW at PC {i}"));
-        }
-        if i + 1 >= num_insns || insns[i + 1].opcode != 0 {
-          return Err(format!("incomplete lddw at PC {i}"));
-        }
-        // A local patch: the second half is pure immediate payload, so every
-        // other field of it must be zero. Without this the register and offset
-        // nibbles of the high word are unvalidated bits that no layer inspects,
-        // since the slot is skipped entirely below.
-        let high = insns[i + 1];
-        if high.dst != 0 || high.src != 0 || high.offset != 0 {
-          return Err(format!("invalid lddw second half at PC {}", i + 1));
-        }
-        skip_next = true;
-      }
-
-      Op::StoreImm { .. } | Op::StoreReg { .. } => store = true,
-
-      Op::Atomic { .. } => {
-        store = true;
-        check_atomic_selector(&insn, i)?;
-      }
-
-      Op::Ja { .. } | Op::Jmp { .. } => {
-        // `ja32` puts its displacement in the immediate; everything else uses
-        // the offset.
-        let displacement = if insn.opcode == opcode::JA32 {
-          insn.imm
-        } else {
-          insn.offset as i32
-        };
-        // A displacement of -1 targets the jump itself.
-        if displacement == -1 {
-          return Err(format!("infinite loop at PC {i}"));
-        }
-        let target = i as i64 + 1 + displacement as i64;
-        if target < 0 || target >= num_insns as i64 {
-          return Err(format!("jump out of bounds at PC {i}"));
-        }
-        // Opcode zero at the target means the high half of a `lddw` — or a
-        // stray zero word, which this reports the same way.
-        if insns[target as usize].opcode == 0 {
-          return Err(format!("jump to middle of lddw at PC {i}"));
-        }
-      }
-
-      Op::Call => check_call(
-        config,
-        &insn,
-        insns,
-        i,
-        external_calls.get(i).copied().unwrap_or(false),
-      )?,
-
-      // Nothing structural to check.
-      Op::Exit | Op::Alu { .. } | Op::Load { .. } => {}
+  let has_dispatcher = match (config.dispatcher, config.dispatcher_validate) {
+    (Some(_), Some(_)) => true,
+    // With no dispatcher registered there is nothing to ask, so a helper call
+    // cannot be validated. `async-ebpf` always registers one; never calls
+    // it, so that table is empty and every helper index is unknown.
+    (None, _) => false,
+    (Some(_), None) => {
+      debug_assert!(
+        false,
+        "Config::dispatcher without dispatcher_validate; a helper call \
+         a null function pointer"
+      );
+      false
     }
-
-    if insn.src > 10 {
-      return Err(format!("invalid source register at PC {i}"));
-    }
-    // R10 is the frame pointer and read-only. The store forms name it as a
-    // memory base rather than writing it, so they are the exception.
-    if insn.dst > 9 && !(store && insn.dst == 10) {
-      return Err(format!("invalid destination register at PC {i}"));
-    }
-
-    check_operand_filter(&insn)?;
-
-    i += 1 + usize::from(skip_next);
-  }
-
-  check_self_contained_sub_programs(insns)
+  };
+  let known_helpers = known_helpers(config, insns, has_dispatcher);
+  let core_config = core::Config {
+    instruction_limit: config.instruction_limit,
+    has_dispatcher,
+    accept_every_helper: false,
+  };
+  core::validate(&core_config, &known_helpers, insns, external_calls)
+    .map_err(|reject| render(config, insns, reject))
 }
 
-/// Checks the operation selector an atomic store carries in its immediate.
+/// The helper indices the embedder recognises among those the program calls.
 ///
-/// Ports the two nearly-identical `switch` blocks in `validate()`. Only the
-/// high nibble selects the operation; the low bits carry the FETCH flag, and
-/// anything else in them is ignored here (the operand filter is what bounds
-/// them, and only for the 64-bit form).
-///
-/// Both widths report an unrecognised selector the same way, naming the
-/// immediate that was not understood. The immediate is the whole content of the
-/// diagnosis — the opcode only says which width — so leaving it out would make
-/// the message useless for the reader trying to work out what they wrote.
-fn check_atomic_selector(insn: &Insn, pc: usize) -> Result<(), String> {
-  use super::isa::{alu, atomic};
+/// The core asks "is this index known?" of a list; the runtime asks the
+/// embedder's callback. Asking it once per helper call the program contains,
+/// under the same conditions the core will consult the answer — a `call` of
+/// kind 0 with a non-negative immediate — makes the two identical.
+fn known_helpers(config: &Config, insns: &[Insn], has_dispatcher: bool) -> Vec<u32> {
+  if !has_dispatcher {
+    return Vec::new();
+  }
+  let Some(check) = config.dispatcher_validate else {
+    return Vec::new();
+  };
+  let mut known = Vec::new();
+  for insn in insns {
+    if insn.opcode != super::isa::opcode::CALL || insn.src != 0 || insn.imm < 0 {
+      continue;
+    }
+    let index = insn.imm as u32;
+    if known.contains(&index) {
+      continue;
+    }
+    // Nothing here has a cookie to pass, and no validator in this tree reads
+    // it; a null pointer keeps the signature honest about that.
+    // SAFETY: the callback is supplied by the embedder alongside the
+    // dispatcher and is required to tolerate being asked about any index.
+    if unsafe { check(index, std::ptr::null()) } {
+      known.push(index);
+    }
+  }
+  known
+}
 
-  // Both faults name the immediate, because the immediate is the whole
-  // diagnosis: the selector lives there, and the opcode says only which width
-  // the access is. Naming the opcode instead tells the reader something they
-  // already know.
-  let selector = insn.imm as u32 as u8;
-  let unknown = || format!("invalid atomic operation {selector:#04x} at PC {pc}");
-  let needs_fetch =
-    || format!("atomic operation {selector:#04x} at PC {pc} requires the fetch flag");
-
-  let fetch = insn.imm & atomic::OP_FETCH != 0;
-  match (insn.imm & alu::MASK as i32) as u8 {
-    alu::ADD | alu::OR | alu::AND | alu::XOR => Ok(()),
-    // Exchange and compare-exchange only exist in fetching form: the whole
-    // point of them is the value they return.
-    op if op as i32 == atomic::OP_XCHG & !atomic::OP_FETCH
-      || op as i32 == atomic::OP_CMPXCHG & !atomic::OP_FETCH =>
-    {
-      if fetch {
-        Ok(())
+/// The message for one rejection, worded exactly as embedders expect.
+fn render(config: &Config, insns: &[Insn], reject: Reject) -> String {
+  let at = |pc: usize| insns[pc];
+  match reject {
+    Reject::TooManyInstructions => {
+      format!("too many instructions (max {})", config.instruction_limit)
+    }
+    Reject::UnknownOpcode(pc) => format!("unknown opcode 0x{:02x} at PC {pc}", at(pc).opcode),
+    // `neg` has no source operand; a non-zero source field is a malformed
+    // encoding rather than an unknown one, and gets its own message.
+    Reject::NegSrc(pc) => {
+      let name = if at(pc).class() == cls::ALU64 {
+        "neg64"
       } else {
-        Err(needs_fetch())
-      }
-    }
-    _ => Err(unknown()),
-  }
-}
-
-/// Checks one `call` instruction.
-///
-/// The source field is the call *kind*, not a register.
-fn check_call(
-  config: &Config,
-  insn: &Insn,
-  insns: &[Insn],
-  pc: usize,
-  cross_section: bool,
-) -> Result<(), String> {
-  let num_insns = insns.len();
-  if cross_section && insn.src != 2 {
-    return Err(format!(
-      "cross-section call metadata at PC {pc} does not describe a tagged call"
-    ));
-  }
-  match insn.src {
-    // Helper call: the immediate is an index the embedder must recognise.
-    0 => {
-      if insn.imm < 0 {
-        return Err(format!("invalid call immediate at PC {pc}"));
-      }
-      let known = match (config.dispatcher, config.dispatcher_validate) {
-        (Some(_), Some(check)) => {
-          // Nothing here has a cookie to pass, and
-          // no validator in this tree reads it; a null pointer keeps the
-          // signature honest about that.
-          // SAFETY: the callback is supplied by the embedder alongside the
-          // dispatcher and is required to tolerate being asked about any index.
-          unsafe { check(insn.imm as u32, std::ptr::null()) }
-        }
-        // With no dispatcher registered there is nothing to ask, so a helper
-        // call cannot be validated. `async-ebpf` always registers one; never calls
-        // it, so that table is empty and every helper index is unknown.
-        (None, _) => false,
-        (Some(_), None) => {
-          debug_assert!(
-            false,
-            "Config::dispatcher without dispatcher_validate; a helper call \
-             a null function pointer"
-          );
-          false
-        }
+        "neg"
       };
-      if !known {
-        return Err(format!(
-          "call to nonexistent function {} at PC {pc}",
-          insn.imm as u32
-        ));
-      }
+      format!("invalid src field for {name} op at PC {pc}")
     }
-
-    // Local call: the immediate is a relative instruction displacement.
-    1 => {
-      // The target is computed as `i + (imm + 1)` in 32-bit arithmetic, so an immediate of
-      // `INT32_MAX` wraps to `INT32_MIN` before the add. Wrapping arithmetic
-      // reproduces that; the result is far out of range either way, but the
-      // reported target number differs.
-      let target = (pc as i32).wrapping_add(insn.imm.wrapping_add(1));
-      if target < 0 || target >= num_insns as i32 {
-        return Err(format!(
-          "call to local function (at PC {pc}) is out of bounds (target: {target})"
-        ));
-      }
-      // Opcode zero at the target means the high half of an `lddw` — or a
-      // stray zero word, which this reports the same way. The jump arm
-      // rejects those targets outright (see `validate`); a call must too, or
-      // the callee would be compiled from the bare zero word at lazy-compile
-      // time, after the load-time boundary has already let it through.
-      if insns[target as usize].opcode == 0 {
-        return Err(format!("call to middle of lddw at PC {pc}"));
-      }
-      // Stack usage is then computed for the
-      // target; see the note in `validate` for why that cannot fail here.
+    Reject::EndianImm(pc) => format!("invalid endian immediate at PC {pc}"),
+    Reject::LddwSrc(pc) => format!("invalid source register for LDDW at PC {pc}"),
+    Reject::IncompleteLddw(pc) => format!("incomplete lddw at PC {pc}"),
+    // The core names the high half's own slot.
+    Reject::LddwSecondHalf(pc) => format!("invalid lddw second half at PC {pc}"),
+    // Both atomic faults name the immediate, because the immediate is the
+    // whole diagnosis: the selector lives there, and the opcode says only which
+    // width the access is.
+    Reject::AtomicUnknown(pc) => {
+      let selector = at(pc).imm as u32 as u8;
+      format!("invalid atomic operation {selector:#04x} at PC {pc}")
     }
-
-    2 if cross_section => {}
-
-    2 => {
-      return Err(format!(
-        "call to external function by BTF ID (at PC {pc}) is not supported"
-      ))
+    Reject::AtomicNeedsFetch(pc) => {
+      let selector = at(pc).imm as u32 as u8;
+      format!("atomic operation {selector:#04x} at PC {pc} requires the fetch flag")
     }
-
-    // The source nibble reaches 15, and the `src > 10` check has not run yet.
-    _ => return Err(format!("call (at PC {pc}) contains invalid type value")),
-  }
-  Ok(())
-}
-
-/// Rejects programs whose sub-programs are not self-contained.
-///
-/// Ports `check_for_self_contained_sub_programs`. A local call target is taken
-/// to start a sub-program, and a sub-program runs to the next start or to the
-/// end of the program. Within one sub-program every jump must land inside it,
-/// and the sub-program must end in `exit` or have an unconditional jump in one
-/// of its last two slots. The second-to-last form leaves unreachable padding;
-/// the final-slot form is the canonical layout compiler-generated BPF uses.
-///
-/// Two details that are easy to miss:
-///
-/// * The start-index array is `calloc`'d one longer than the number of local
-///   calls and only the call targets are written, so the extra slot stays zero.
-///   The effect — deliberate, given the sizing — is that index 0 is always a
-///   sub-program start, which is what makes the main program one.
-/// * The whole function is skipped when the program contains no local call at
-///   all. A straight-line program is therefore *not* required to terminate; it
-///   may run off the end of the instruction stream. That is the accepted behaviour and
-///   this reproduces it.
-fn check_self_contained_sub_programs(insns: &[Insn]) -> Result<(), String> {
-  let num_insns = insns.len();
-
-  let mut starts: Vec<usize> = insns
-    .iter()
-    .enumerate()
-    .filter(|(_, insn)| insn.is_local_call())
-    .map(|(i, insn)| {
-      // `validate` established this lands inside the program.
-      (i as u32).wrapping_add(1).wrapping_add(insn.imm as u32) as usize
-    })
-    .collect();
-  if starts.is_empty() {
-    return Ok(());
-  }
-  // The zeroed extra slot described above.
-  starts.push(0);
-  starts.sort_unstable();
-  starts.dedup();
-
-  for (n, &start) in starts.iter().enumerate() {
-    let end = starts.get(n + 1).copied().unwrap_or(num_insns);
-
-    for j in start..end {
-      let insn = insns[j];
-      if insn.class() != cls::JMP && insn.class() != cls::JMP32 {
-        continue;
-      }
-      // A call leaves and returns; an exit ends the sub-program. Neither is a
-      // jump within it. Note this catches helper calls too, by opcode alone.
-      if insn.opcode == opcode::CALL || insn.opcode == opcode::EXIT {
-        continue;
-      }
-      let displacement = if insn.opcode == opcode::JA32 {
-        insn.imm as i64
-      } else {
-        insn.offset as i64
-      };
-      let target = j as i64 + 1 + displacement;
-      if target < start as i64 || target > end as i64 - 1 {
-        return Err(format!("jump out of bounds at PC {j}"));
-      }
+    Reject::InfiniteLoop(pc) => format!("infinite loop at PC {pc}"),
+    Reject::JumpOutOfBounds(pc) => format!("jump out of bounds at PC {pc}"),
+    Reject::JumpIntoLddw(pc) => format!("jump to middle of lddw at PC {pc}"),
+    Reject::CrossSectionMetadata(pc) => {
+      format!("cross-section call metadata at PC {pc} does not describe a tagged call")
     }
-
-    // `end > start` always: the starts are distinct and sorted, every local
-    // call target is inside the program, and 0 is always present.
-    let ends_with_exit = insns[end - 1].opcode == opcode::EXIT;
-    let is_unconditional_jump =
-      |insn: Insn| insn.opcode == opcode::JA || insn.opcode == opcode::JA32;
-    let ends_with_jump = is_unconditional_jump(insns[end - 1])
-      || (end >= start + 2 && is_unconditional_jump(insns[end - 2]));
-    if !ends_with_exit && !ends_with_jump {
-      return Err(format!(
-        "sub-program does not end with EXIT or unconditional jump at PC {}",
-        end - 1
-      ));
+    Reject::HelperImm(pc) => format!("invalid call immediate at PC {pc}"),
+    Reject::UnknownHelper(pc) => {
+      format!(
+        "call to nonexistent function {} at PC {pc}",
+        at(pc).imm as u32
+      )
+    }
+    Reject::LocalCallOutOfBounds(pc) => {
+      // The target is quoted as `i + (imm + 1)` in 32-bit arithmetic, so an
+      // immediate of `INT32_MAX` wraps to `INT32_MIN` before the add. The core
+      // decided in exact arithmetic — the same decision, see its docs — and
+      // only the quoted number needs the wrap.
+      let target = (pc as i32).wrapping_add(at(pc).imm.wrapping_add(1));
+      format!("call to local function (at PC {pc}) is out of bounds (target: {target})")
+    }
+    Reject::CallIntoLddw(pc) => format!("call to middle of lddw at PC {pc}"),
+    Reject::BtfCall(pc) => {
+      format!("call to external function by BTF ID (at PC {pc}) is not supported")
+    }
+    Reject::CallType(pc) => format!("call (at PC {pc}) contains invalid type value"),
+    Reject::InvalidSrc(pc) => format!("invalid source register at PC {pc}"),
+    Reject::InvalidDst(pc) => format!("invalid destination register at PC {pc}"),
+    Reject::FilterOpcode(pc) => format!("Invalid instruction opcode {:2X}.", at(pc).opcode),
+    Reject::FilterDst(pc) => format!(
+      "Invalid destination register {} for opcode {:2X}.",
+      at(pc).dst,
+      at(pc).opcode
+    ),
+    Reject::FilterSrc(pc) => format!(
+      "Invalid source register {} for opcode {:2X}.",
+      at(pc).src,
+      at(pc).opcode
+    ),
+    Reject::FilterImm(pc) => format!(
+      "Invalid immediate value {} for opcode {:2X}.",
+      at(pc).imm,
+      at(pc).opcode
+    ),
+    Reject::FilterOffset(pc) => format!(
+      "Invalid offset value {} for opcode {:2X}.",
+      at(pc).offset,
+      at(pc).opcode
+    ),
+    Reject::SubProgramJump(pc) => format!("jump out of bounds at PC {pc}"),
+    // The core names the sub-program's last slot.
+    Reject::SubProgramEnd(pc) => {
+      format!("sub-program does not end with EXIT or unconditional jump at PC {pc}")
     }
   }
-
-  Ok(())
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::jit::isa::Insn;
+  use crate::jit::abi;
+  use crate::jit::isa::{opcode, Insn, Op};
 
   fn insn(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Insn {
     Insn {
@@ -688,29 +218,28 @@ mod tests {
     // The table has one entry per named opcode plus one for the `lddw` high
     // half, which is not an opcode at all. Any other shape means the table and
     // the decoder have drifted apart.
+    let mut entries = 0;
     for byte in 0u8..=255 {
-      let has_filter = FILTERS[byte as usize].is_some();
+      let has_filter = core::filter_for(byte).is_some();
       let is_defined = Op::from_opcode(byte).is_some();
       let expected = is_defined || byte == 0;
       assert_eq!(
         has_filter, expected,
         "opcode {byte:#04x}: filter present = {has_filter}, expected {expected}"
       );
+      entries += usize::from(has_filter);
     }
-    assert_eq!(
-      FILTERS.iter().filter(|f| f.is_some()).count(),
-      120,
-      "the filter table has exactly 120 entries"
-    );
+    assert_eq!(entries, 120, "the filter table has exactly 120 entries");
   }
 
   #[test]
   fn the_opcode_is_rendered_the_way_printf_renders_it() {
     // `%2X` is space padded, not zero padded. Getting this wrong produces
     // messages that differ by one character.
-    let err = check_operand_filter(&insn(opcode::JA, 0, 0, 0, 7)).unwrap_err();
+    let config = Config::default();
+    let err = validate(&config, &[insn(opcode::JA, 0, 0, 0, 7), exit()]).unwrap_err();
     assert_eq!(err, "Invalid immediate value 7 for opcode  5.");
-    let err = check_operand_filter(&insn(0xc3, 0, 0, 0, 999)).unwrap_err();
+    let err = validate(&config, &[insn(0xc3, 0, 0, 0, 999), exit()]).unwrap_err();
     assert_eq!(err, "Invalid immediate value 999 for opcode C3.");
   }
 

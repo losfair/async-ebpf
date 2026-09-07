@@ -22,6 +22,7 @@ mod pointer_cage;
 pub mod program;
 mod region_analysis;
 mod util;
+pub(crate) mod verified;
 
 #[cfg(test)]
 mod test;

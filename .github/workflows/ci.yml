@@ -245,6 +245,29 @@ jobs:
           fi
           awk -v coremark="$native_coremark" -v mhz="$CPU_MHZ" 'BEGIN { printf("native_coremark_per_mhz: %.9f\n", coremark / mhz) }'
 
+  lean-proofs:
+    name: Lean proofs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # Mathlib is a dependency of the Aeneas standard library; its oleans come
+      # from the Mathlib cache rather than being built here.
+      - name: Fetch Mathlib cache
+        working-directory: lean
+        run: lake exe cache get
+
+      - name: Check the proofs
+        working-directory: lean
+        run: lake build
+
   fuzz:
     name: Fuzz (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

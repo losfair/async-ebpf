@@ -27,23 +27,26 @@
 //! original dual-region probe.
 //!
 //! The analysis is a standard forward dataflow over the instruction-slot CFG
-//! with a per-register lattice and a meet at control-flow joins. Local calls
-//! add an edge to the callee entry (carrying `R10`/`R6-R9`), so callee stack
-//! accesses are analyzed too; argument-derived pointers (`R1-R5`) reach the
-//! callee as `Unknown`. Any slot still unreached keeps its registers `Uninit`
-//! and yields `UNKNOWN` hints — safe, just unoptimized.
+//! with a per-register lattice and a meet at control-flow joins, run one
+//! function at a time (`verified::fixpoint::solve`) from the signature the
+//! caller passes, with every state projected onto the slot's live-in
+//! registers. Any slot still unreached keeps its registers `Uninit` and
+//! yields `UNKNOWN` hints — safe, just unoptimized.
 
 use std::collections::HashMap;
 
-/// Routing hint values shared with the JIT (`JIT_REGION_*` in the backends).
-pub const REGION_UNKNOWN: u8 = 0;
-pub const REGION_STACK: u8 = 1;
-pub const REGION_DATA: u8 = 2;
-/// A displacement off an unmodified frame pointer that provably stays inside
-/// the guest stack. See [`frame_access`].
-pub const REGION_FRAME: u8 = 3;
-
-const NUM_REGS: usize = 11;
+use crate::verified::fixpoint;
+use crate::verified::isa::Insn;
+use crate::verified::region::{
+  self as core, entry_signature, mask_signature, signature_from_state,
+};
+pub(crate) use crate::verified::region::{
+  PointerSignature, RegMask, ALL_SIGNATURE_REGS, R10, REGION_UNKNOWN,
+};
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use crate::verified::region::{
+  RegKind, StackKind, NUM_REGS, REGION_DATA, REGION_FRAME, REGION_STACK,
+};
 
 // eBPF opcode encoding helpers.
 const EBPF_CLS_MASK: u8 = 0x07;
@@ -56,337 +59,25 @@ const EBPF_CLS_JMP: u8 = 0x05;
 const EBPF_CLS_JMP32: u8 = 0x06;
 const EBPF_CLS_ALU64: u8 = 0x07;
 
+#[cfg(test)]
 const EBPF_SRC_REG: u8 = 0x08;
-const EBPF_ALU_OP_MASK: u8 = 0xf0;
+#[cfg(test)]
 const EBPF_ALU_OP_ADD: u8 = 0x00;
-const EBPF_ALU_OP_SUB: u8 = 0x10;
+#[cfg(test)]
 const EBPF_ALU_OP_MOV: u8 = 0xb0;
 
-/// Operation selector inside an atomic instruction's `imm` field, and the
-/// CMPXCHG value. These mirror `EBPF_ALU_OP_MASK` and
-/// `EBPF_ATOMIC_OP_CMPXCHG & ~EBPF_ATOMIC_OP_FETCH` in the JIT backends; the
-/// comparison is written the same way the backends switch on `imm` so the
-/// analysis and the emitted code always agree on which ops are CMPXCHG.
-const EBPF_ATOMIC_OP_MASK: i32 = 0xf0;
-const EBPF_ATOMIC_OP_CMPXCHG: i32 = 0xf0;
-
+#[cfg(test)]
 const EBPF_OP_LDDW: u8 = EBPF_CLS_LD | 0x18; // LD | IMM | DW
+#[cfg(test)]
 const EBPF_OP_JA: u8 = EBPF_CLS_JMP; // JMP | JA (mode 0)
+#[cfg(test)]
 const EBPF_OP_JA32: u8 = EBPF_CLS_JMP32;
 const EBPF_OP_CALL: u8 = EBPF_CLS_JMP | 0x80; // JMP | CALL
 const EBPF_OP_EXIT: u8 = EBPF_CLS_JMP | 0x90; // JMP | EXIT
 
-/// Abstract value tracked per register. The lattice top is [`RegKind::Uninit`]
-/// (no information / unreachable); the meet of two distinct concrete kinds is
-/// [`RegKind::Unknown`] (bottom for routing purposes).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum RegKind {
-  Uninit,
-  Stack(StackKind),
-  Data,
-  Scalar,
-  Unknown,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum StackKind {
-  Current(Option<i32>),
-  Foreign,
-}
-
-impl RegKind {
-  /// Greatest-lower-bound used at control-flow joins.
-  fn meet(self, other: RegKind) -> RegKind {
-    match (self, other) {
-      (a, b) if a == b => a,
-      (RegKind::Uninit, b) => b,
-      (a, RegKind::Uninit) => a,
-      (RegKind::Stack(a), RegKind::Stack(b)) => match (a, b) {
-        (StackKind::Current(a), StackKind::Current(b)) => {
-          if a == b {
-            RegKind::Stack(StackKind::Current(a))
-          } else {
-            RegKind::Stack(StackKind::Current(None))
-          }
-        }
-        (StackKind::Foreign, StackKind::Foreign) => RegKind::Stack(StackKind::Foreign),
-        _ => RegKind::Stack(StackKind::Current(None)),
-      },
-      _ => RegKind::Unknown,
-    }
-  }
-
-  fn region(self) -> u8 {
-    match self {
-      RegKind::Stack(_) => REGION_STACK,
-      RegKind::Data => REGION_DATA,
-      _ => REGION_UNKNOWN,
-    }
-  }
-
-  fn is_pointer(self) -> bool {
-    matches!(self, RegKind::Stack(_) | RegKind::Data)
-  }
-
-  fn is_stack(self) -> bool {
-    matches!(self, RegKind::Stack(_))
-  }
-
-  fn foreign_for_call(self) -> Self {
-    match self {
-      RegKind::Stack(_) => RegKind::Stack(StackKind::Foreign),
-      other => other,
-    }
-  }
-
-  fn aliases_current_stack(self) -> bool {
-    !matches!(self, RegKind::Stack(StackKind::Foreign))
-  }
-}
-
-/// Index of the read-only frame pointer register `R10`.
-const R10: usize = 10;
-
-/// Abstract state at a program point: the kind of every register plus the kinds
-/// of values spilled to `R10`-relative stack slots (keyed by byte offset).
-/// Spill/fill tracking lets the analysis follow pointers that the compiler
-/// round-trips through the stack (e.g. argument spills), which is the dominant
-/// pattern in `-O2` BPF output. Absent register/slot entries are `Uninit` (top).
-/// The spill map is a persistent red-black tree rather than a plain map so
-/// that `State::clone` is O(1) (structural sharing) and every insert is
-/// O(log k). A straight-line function with `n` distinct store offsets would
-/// otherwise cost Θ(n²) time and retained memory: each instruction clones the
-/// whole map and every slot's state keeps its own merged copy. With a
-/// persistent map the retained states share their trees, so the analysis
-/// stays O(n log n) no matter how many offsets a hostile program invents.
-///
-/// Invalidation (an unpinnable stack write) is the same shape of trap at one
-/// remove: it maps *every* value to the same constant `Unknown`, so rewriting
-/// the map per event costs O(k). Instead each entry carries the state's
-/// invalidation epoch at write time, and an entry older than the state's
-/// current epoch reads as `Unknown`. Whole-map invalidation is then a single
-/// epoch bump, O(1), while a spill written after the bump keeps its kind —
-/// exactly what eager rewriting would produce.
-///
-/// The number of distinct spill offsets one state may track is capped at
-/// [`MAX_TRACKED_SLOTS`]. The map is pure precision, never soundness — a slot
-/// the cap refuses reads back as a scalar and falls back to the JIT's
-/// dual-region probe, the same path every untracked slot already takes — and
-/// the cap is what bounds a hostile function that invents distinct store
-/// offsets: time O(n · M · log M) and a retained node pool of O(n · log M)
-/// instead of Θ(n²) time and memory (measured worst case ≈ 0.1 s / 140 MB at
-/// M = 32 for a maximum-size program). Real code — including unoptimized
-/// builds — stays far below it: three measured objects (redis.sock and two
-/// zeroserve variants) peak at 13 distinct offsets per function.
-/// How many distinct `R10`-relative spill offsets one state may track.
-///
-/// See the [`State`] docs for the cost bound and the precision fallback; the
-/// value covers everything measured in real builds (max 13 per function,
-/// including unoptimized ones) with headroom, while keeping a hostile
-/// function's worst case at ~0.1 s / ~140 MB.
-const MAX_TRACKED_SLOTS: usize = 32;
-
-#[derive(Clone, PartialEq, Eq)]
-struct State {
-  regs: [RegKind; NUM_REGS],
-  /// Spill slots, keyed by `R10`-relative byte offset. The value is the kind
-  /// stored there together with the state's invalidation epoch at write time;
-  /// an entry is effectively `Unknown` when its epoch predates
-  /// [`State::invalid_epoch`].
-  slots: rpds::RedBlackTreeMap<i32, (u64, RegKind)>,
-  /// Bumped by [`State::invalidate_slots`]; every entry written before the
-  /// current value reads as `Unknown`.
-  invalid_epoch: u64,
-}
-
-impl State {
-  fn top() -> State {
-    State {
-      regs: [RegKind::Uninit; NUM_REGS],
-      slots: rpds::RedBlackTreeMap::new(),
-      invalid_epoch: 0,
-    }
-  }
-
-  /// The kind an entry written at `epoch` with value `kind` currently has.
-  fn effective_kind(&self, epoch: u64, kind: RegKind) -> RegKind {
-    if epoch >= self.invalid_epoch {
-      kind
-    } else {
-      RegKind::Unknown
-    }
-  }
-
-  /// Per-element meet with `other`; returns whether `self` changed.
-  fn meet_from(&mut self, other: &State, cap_warning_emitted: &mut bool) -> bool {
-    let mut changed = false;
-    for r in 0..NUM_REGS {
-      let merged = self.regs[r].meet(other.regs[r]);
-      if merged != self.regs[r] {
-        self.regs[r] = merged;
-        changed = true;
-      }
-    }
-    // Meet slots over the union of keys; an absent slot is Uninit (top).
-    if self.slots.is_empty() {
-      // Nothing tracked yet means every key of `other` meets Uninit (top)
-      // into itself, so adopt the incoming map wholesale. The clone is O(1)
-      // under structural sharing, which is what keeps straight-line analysis
-      // linear in the number of distinct spill offsets. The epoch is adopted
-      // with it: the entries' epochs are all consistent with `other`'s
-      // counter, and `self` having no entries means its own (possibly higher)
-      // epoch is irrelevant — it only ever matters for entries, and none
-      // survive.
-      if !other.slots.is_empty() {
-        self.slots = other.slots.clone();
-        self.invalid_epoch = other.invalid_epoch;
-        changed = true;
-      }
-    } else {
-      for (&off, &(other_epoch, other_kind)) in &other.slots {
-        let cur = self
-          .slots
-          .get(&off)
-          .map(|&(e, k)| self.effective_kind(e, k))
-          .unwrap_or(RegKind::Uninit);
-        let merged = cur.meet(other.effective_kind(other_epoch, other_kind));
-        if merged != cur {
-          // Cap the map: a key the cap refuses stays untracked (reads as
-          // Scalar), the same safe fallback as an absent key. Skipping the
-          // insert leaves `changed` false: the state's observable behavior
-          // is unchanged, so the fixpoint terminates as before.
-          if self.insert_slot(off, (self.invalid_epoch, merged), cap_warning_emitted) {
-            changed = true;
-          }
-        }
-      }
-    }
-    changed
-  }
-
-  /// Inserts one spill entry if it is already tracked or the cap has room.
-  /// Warns at most once per analysis when a new offset has to be refused.
-  fn insert_slot(
-    &mut self,
-    off: i32,
-    entry: (u64, RegKind),
-    cap_warning_emitted: &mut bool,
-  ) -> bool {
-    if self.slots.contains_key(&off) || self.slots.size() < MAX_TRACKED_SLOTS {
-      self.slots = self.slots.insert(off, entry);
-      return true;
-    }
-
-    if !*cap_warning_emitted {
-      tracing::warn!(
-        max_tracked_slots = MAX_TRACKED_SLOTS,
-        spill_offset = off,
-        "region analysis spill-slot tracking cap reached; additional offsets will use dynamic \
-         region routing"
-      );
-      *cap_warning_emitted = true;
-    }
-    false
-  }
-
-  /// Marks every tracked slot `Unknown` after a store that may alias the
-  /// stack at an offset we cannot pin down. Lazy: bumping the epoch makes
-  /// every entry written before it read as `Unknown`, so the map itself is
-  /// untouched — O(1) however large it is — and the imprecision still
-  /// survives control-flow joins, because the entries remain present.
-  fn invalidate_slots(&mut self) {
-    self.invalid_epoch += 1;
-  }
-
-  /// Invalidates tracked R10-relative spill slots overlapped by a stack write.
-  /// If the write address is not a known frame-relative range, invalidate all
-  /// tracked slots because any spill may have been overwritten.
-  fn invalidate_stack_write(&mut self, start: Option<i32>, width: usize) {
-    let Some(start) = start else {
-      self.invalidate_slots();
-      return;
-    };
-    let Some(end) = start.checked_add(width as i32) else {
-      self.invalidate_slots();
-      return;
-    };
-
-    // Only slots overlapping [start, start + width) can be affected, and
-    // overlapping slots are contiguous in offset order, so a range scan
-    // replaces a full-map scan: O(log k + overlaps) instead of O(k) per
-    // stack write. A hostile straight-line program of distinct-offset
-    // stores would otherwise still be quadratic, one full scan per store.
-    // The saturating bounds only widen the range at the extremes of i32;
-    // every candidate is still re-checked below.
-    let affected: Vec<i32> = self
-      .slots
-      .range((
-        std::ops::Bound::Included(start.saturating_sub(7)),
-        std::ops::Bound::Included(end.saturating_sub(1)),
-      ))
-      .filter_map(|(&slot_off, _)| {
-        let slot_start = slot_off;
-        let Some(slot_end) = slot_start.checked_add(8) else {
-          return Some(slot_off);
-        };
-        if start < slot_end && slot_start < end {
-          Some(slot_off)
-        } else {
-          None
-        }
-      })
-      .collect();
-    // Stamp the affected entries with the current epoch and `Unknown`, so
-    // they read as invalidated while entries outside the range keep their
-    // kinds.
-    for off in affected {
-      self.slots = self
-        .slots
-        .insert(off, (self.invalid_epoch, RegKind::Unknown));
-    }
-  }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) struct PointerSignature {
-  regs: [RegKind; NUM_REGS],
-}
-
 impl PointerSignature {
   pub(crate) fn entry() -> Self {
-    // The entry trampoline zeroes every eBPF register except `R1` (the ctx) and
-    // `R10` (the frame pointer), so everything else provably holds the scalar 0.
-    let mut regs = [RegKind::Scalar; NUM_REGS];
-    regs[1] = RegKind::Stack(StackKind::Current(None));
-    regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
-    Self { regs }
-  }
-
-  fn apply_to_state(self, state: &mut State) {
-    state.regs = self.regs;
-    state.regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
-  }
-
-  fn from_state(state: &State) -> Self {
-    let mut regs = state.regs;
-    for (reg, kind) in regs.iter_mut().enumerate() {
-      if reg != R10 {
-        *kind = kind.foreign_for_call();
-      }
-    }
-    regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
-    Self { regs }
-  }
-
-  /// Drops every register outside `mask`, i.e. every register the callee cannot
-  /// observe. See [`function_live_in`] for why that costs no precision.
-  fn masked(mut self, mask: RegMask) -> Self {
-    for (reg, kind) in self.regs.iter_mut().enumerate() {
-      if reg != R10 && mask & (1 << reg) == 0 {
-        *kind = RegKind::Unknown;
-      }
-    }
-    self
+    entry_signature()
   }
 
   #[cfg(any(test, feature = "testing"))]
@@ -395,12 +86,16 @@ impl PointerSignature {
   }
 }
 
+/// An instruction as the access-plan builder reads it: register numbers
+/// widened to indices. Control flow goes through `verified::isa::Insn`.
 #[derive(Clone, Copy)]
 struct Inst {
   opcode: u8,
   dst: usize,
   src: usize,
   offset: i16,
+  /// Read by the tests' whole-program successor reference only.
+  #[cfg_attr(not(test), allow(dead_code))]
   imm: i32,
 }
 
@@ -415,51 +110,19 @@ fn decode(slot: &[u8]) -> Inst {
 }
 
 fn access_width(opcode: u8) -> usize {
-  match opcode & 0x18 {
-    0x00 => 4, // W
-    0x08 => 2, // H
-    0x10 => 1, // B
-    0x18 => 8, // DW
-    _ => 8,
-  }
+  core::access_width(opcode) as usize
 }
 
-/// Whether `inst`, whose pointer operand is register `base`, is a frame access
-/// the JIT may emit with no bounds check at all.
-///
-/// This is the one hint that removes a runtime check rather than narrowing one,
-/// so the conditions are worth stating in full:
-///
-///  * **The base is `R10` itself**, not a register derived from it. A derived
-///    register holds a *guest* address at run time - the backend hands programs
-///    the guest frame pointer wherever they read `R10` as a value - so its
-///    displacement is not the one a native frame access would use.
-///  * **`R10` still holds the frame pointer.** No instruction can assign it and
-///    the loader refuses every program that tries, but an assignment would show
-///    up here as `Unknown`, so check rather than assume. This is the only part
-///    of the claim the backend cannot re-derive for itself.
-///  * **The access lies in `[R10 - frame_size, R10)`.** That window is inside
-///    the guest stack at every call depth the loader accepts.
-///
-/// Atomics are excluded: a fetching atomic writes its source register, so it is
-/// not purely an access, and the loader refuses the frame-pointer cases anyway.
-fn frame_access(state: &State, inst: &Inst, base: usize, frame_size: u16) -> bool {
-  if base != R10 || state.regs[R10] != RegKind::Stack(StackKind::Current(Some(0))) {
-    return false;
+/// Warns at most once per analysis when the spill-slot cap refuses an offset.
+fn warn_cap_reached(cap_warning_emitted: &mut bool) {
+  if !*cap_warning_emitted {
+    tracing::warn!(
+      max_tracked_slots = core::MAX_TRACKED_SLOTS,
+      "region analysis spill-slot tracking cap reached; additional offsets will use dynamic \
+       region routing"
+    );
+    *cap_warning_emitted = true;
   }
-  if inst.opcode & EBPF_CLS_MASK == EBPF_CLS_STX && inst.opcode & 0xe0 == 0xc0 {
-    return false;
-  }
-  let width = access_width(inst.opcode) as i32;
-  let offset = inst.offset as i32;
-  offset >= -(frame_size as i32) && offset <= -width
-}
-
-fn stack_access_start(base: RegKind, offset: i16) -> Option<i32> {
-  let RegKind::Stack(StackKind::Current(Some(base_off))) = base else {
-    return None;
-  };
-  base_off.checked_add(offset as i32)
 }
 
 /// Result of the region analysis for one code section.
@@ -483,7 +146,11 @@ pub(crate) struct FunctionRegionAnalysis {
   pub(crate) call_signatures: std::collections::HashMap<usize, PointerSignature>,
 }
 
-/// Analyzes the pointer region of every memory access in one code section.
+/// Analyzes every memory access of one code section the way the loader
+/// does: function by function, each from every masked signature some call
+/// site hands it, starting with the entry signature at slot 0. A slot's hint
+/// is the one its specializations agree on, `UNKNOWN` where they differ;
+/// `unresolved` is their union.
 ///
 /// `code` is the relocated bytecode, 8 bytes per slot, indexed the same way the
 /// JIT indexes it — `lddw` occupies two slots, and the second is not an
@@ -493,85 +160,85 @@ pub(crate) struct FunctionRegionAnalysis {
 pub fn analyze(code: &[u8], data_lo: u64, data_hi: u64) -> RegionAnalysis {
   let num_slots = code.len() / 8;
   let mut hints = vec![REGION_UNKNOWN; num_slots];
-  let mut unresolved = Vec::new();
+  let mut unresolved = std::collections::BTreeSet::new();
   if num_slots == 0 {
-    return RegionAnalysis { hints, unresolved };
+    return RegionAnalysis {
+      hints,
+      unresolved: Vec::new(),
+    };
   }
+  let insns = decode_section(code);
+  let layout = crate::function_analysis::analyze_functions(code)
+    .unwrap_or_else(|_| crate::function_analysis::FunctionLayout::unmasked(num_slots));
+  let bounds = |function: usize| -> (usize, usize) {
+    layout
+      .functions
+      .get(function)
+      .map_or((0, num_slots), |f| (f.start_pc, f.end_pc))
+  };
 
-  // Forward dataflow to a fixpoint over the instruction-slot CFG.
-  let mut states: Vec<State> = (0..num_slots).map(|_| State::top()).collect();
-  let mut reached = vec![false; num_slots];
-  // Entry: R1 holds ctx (points into the guest stack), R10 is the frame pointer,
-  // and the entry trampoline zeroed everything else.
-  states[0].regs = [RegKind::Scalar; NUM_REGS];
-  states[0].regs[1] = RegKind::Stack(StackKind::Current(None));
-  states[0].regs[R10] = RegKind::Stack(StackKind::Current(Some(0)));
-  reached[0] = true;
-
-  let mut worklist: Vec<usize> = vec![0];
-  let mut on_list = vec![false; num_slots];
-  on_list[0] = true;
-  let mut cap_warning_emitted = false;
-
-  while let Some(pc) = worklist.pop() {
-    on_list[pc] = false;
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    let lddw_addr = lddw_full_imm(code, pc, &inst);
-    let out = transfer(
-      &states[pc],
-      &inst,
-      lddw_addr,
+  let mut seen = vec![false; num_slots];
+  let mut done = std::collections::HashSet::new();
+  let mut pending = vec![(0usize, entry_signature())];
+  while let Some((function, signature)) = pending.pop() {
+    if !done.insert((function, signature)) {
+      continue;
+    }
+    let (start, end) = bounds(function);
+    let result = analyze_function(
+      code,
+      start,
+      end,
+      signature,
       data_lo,
       data_hi,
-      &mut cap_warning_emitted,
+      &layout,
+      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
     );
-
-    for succ in successors(pc, &inst, num_slots) {
-      let was_reached = reached[succ];
-      reached[succ] = true;
-      let changed = states[succ].meet_from(&out, &mut cap_warning_emitted);
-      if (!was_reached || changed) && !on_list[succ] {
-        on_list[succ] = true;
-        worklist.push(succ);
+    for pc in start..end {
+      let is_reached_access = result.hints[pc] != REGION_UNKNOWN || result.unresolved.contains(&pc);
+      if !is_reached_access {
+        continue;
+      }
+      if !seen[pc] {
+        seen[pc] = true;
+        hints[pc] = result.hints[pc];
+      } else if hints[pc] != result.hints[pc] {
+        hints[pc] = REGION_UNKNOWN;
+      }
+    }
+    unresolved.extend(result.unresolved);
+    for (pc, callee_signature) in result.call_signatures {
+      let inst = insns[pc];
+      if inst.src != 1 {
+        continue;
+      }
+      let target = (pc as i64 + 1 + inst.imm as i64) as usize;
+      if let Some(&callee) = layout.pc_to_func.get(target) {
+        pending.push((callee, callee_signature));
       }
     }
   }
 
-  // Classify every memory access from the converged entry state of its slot.
-  // Every access produces the same region-routing hint, independently of
-  // whether it reads or writes. Page protection enforces data permissions.
-  // The second slot of a `lddw` has opcode 0 and is skipped.
-  for pc in 0..num_slots {
-    if !reached[pc] {
-      continue;
-    }
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    let cls = inst.opcode & EBPF_CLS_MASK;
-    let base = match cls {
-      EBPF_CLS_LDX => inst.src,               // load: pointer is src
-      EBPF_CLS_ST | EBPF_CLS_STX => inst.dst, // store/atomic: pointer is dst
-      _ => continue,
-    };
-    let region = states[pc].regs[base].region();
-    let hint = if frame_access(
-      &states[pc],
-      &inst,
-      base,
-      crate::jit::abi::LOCAL_FUNCTION_STACK_SIZE,
-    ) {
-      REGION_FRAME
-    } else {
-      region
-    };
-    hints[pc] = hint;
-    if region == REGION_UNKNOWN {
-      unresolved.push(pc);
-    }
+  RegionAnalysis {
+    hints,
+    unresolved: unresolved.into_iter().collect(),
   }
-
-  RegionAnalysis { hints, unresolved }
 }
 
+/// Analyzes the function `[start_pc, end_pc)` of a section from the
+/// signature `incoming`.
+///
+/// The fixed point is `verified::fixpoint::solve`, over the function's slots
+/// decoded as the verified core reads them and the function's rows of the
+/// per-slot live-in table of `layout`; this decodes, warns once if the
+/// spill-slot cap bit, classifies every reached access from its settled
+/// state, computes the masked signature each local call hands its callee,
+/// and groups accesses into the plan. Only `hints` and `plan` are the
+/// section's size, because the JIT indexes them by absolute slot; the
+/// analysis itself costs the function's size. A layout whose live-in table
+/// does not cover the section (a fragment analyzed outside the loader)
+/// projects nothing.
 pub(crate) fn analyze_function(
   code: &[u8],
   start_pc: usize,
@@ -594,23 +261,34 @@ pub(crate) fn analyze_function(
       call_signatures,
     };
   }
+  let span = end_pc - start_pc;
+  let insns = Insn::decode_all(&code[start_pc * 8..end_pc * 8]).expect("whole slots decode");
 
-  let mut states: Vec<State> = (0..num_slots).map(|_| State::top()).collect();
-  let mut reached = vec![false; num_slots];
-  incoming.apply_to_state(&mut states[start_pc]);
-  reached[start_pc] = true;
+  let everything;
+  let live: &[RegMask] = if layout.slot_live_in.len() == num_slots {
+    &layout.slot_live_in[start_pc..end_pc]
+  } else {
+    everything = vec![ALL_SIGNATURE_REGS; span];
+    &everything
+  };
+  let fixpoint::Solution {
+    states,
+    reached,
+    refused,
+  } = fixpoint::solve(&insns, &incoming, live, data_lo, data_hi);
+  if refused {
+    warn_cap_reached(&mut false);
+  }
 
-  let mut worklist = vec![start_pc];
-  let mut on_list = vec![false; num_slots];
-  on_list[start_pc] = true;
-  let mut cap_warning_emitted = false;
-
-  while let Some(pc) = worklist.pop() {
-    on_list[pc] = false;
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    if inst.opcode == EBPF_OP_CALL && (inst.src == 1 || inst.src == 2) {
-      let mask = if inst.src == 1 {
-        let target = (pc as i64 + 1 + inst.imm as i64) as usize;
+  for pc in start_pc..end_pc {
+    let i = pc - start_pc;
+    if !reached[i] {
+      continue;
+    }
+    let insn = insns[i];
+    if insn.opcode == EBPF_OP_CALL && (insn.src == 1 || insn.src == 2) {
+      let mask = if insn.src == 1 {
+        let target = (pc as i64 + 1 + insn.imm as i64) as usize;
         layout
           .pc_to_func
           .get(target)
@@ -627,46 +305,12 @@ pub(crate) fn analyze_function(
           .copied()
           .unwrap_or(ALL_SIGNATURE_REGS)
       };
-      call_signatures.insert(pc, PointerSignature::from_state(&states[pc]).masked(mask));
+      call_signatures.insert(pc, mask_signature(&signature_from_state(&states[i]), mask));
     }
-    let lddw_addr = lddw_full_imm(code, pc, &inst);
-    let out = transfer(
-      &states[pc],
-      &inst,
-      lddw_addr,
-      data_lo,
-      data_hi,
-      &mut cap_warning_emitted,
-    );
-
-    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
-      let was_reached = reached[succ];
-      reached[succ] = true;
-      let changed = states[succ].meet_from(&out, &mut cap_warning_emitted);
-      if (!was_reached || changed) && !on_list[succ] {
-        on_list[succ] = true;
-        worklist.push(succ);
-      }
-    }
-  }
-
-  for pc in start_pc..end_pc {
-    if !reached[pc] {
+    let (is_access, hint, region) = core::classify(&states[i], &insn, frame_size);
+    if !is_access {
       continue;
     }
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    let cls = inst.opcode & EBPF_CLS_MASK;
-    let base = match cls {
-      EBPF_CLS_LDX => inst.src,
-      EBPF_CLS_ST | EBPF_CLS_STX => inst.dst,
-      _ => continue,
-    };
-    let region = states[pc].regs[base].region();
-    let hint = if frame_access(&states[pc], &inst, base, frame_size) {
-      REGION_FRAME
-    } else {
-      region
-    };
     hints[pc] = hint;
     if region == REGION_UNKNOWN {
       unresolved.push(pc);
@@ -674,104 +318,13 @@ pub(crate) fn analyze_function(
   }
 
   // Grouping runs last: it keys off the hints the loop above just settled.
-  let plan = build_access_plan(code, start_pc, end_pc, num_slots, &hints, &reached);
+  let plan = build_access_plan(code, &insns, start_pc, end_pc, num_slots, &hints, &reached);
 
   FunctionRegionAnalysis {
     hints,
     plan,
     unresolved,
     call_signatures,
-  }
-}
-
-/// Mask over the registers a [`PointerSignature`] can carry (`R0`-`R9`). `R10`
-/// is never included: it is the frame pointer, fixed to
-/// `Stack(Current(Some(0)))` at every function entry regardless of the caller.
-pub(crate) type RegMask = u16;
-
-/// Every register a signature can carry.
-pub(crate) const ALL_SIGNATURE_REGS: RegMask = 0x03ff;
-
-/// Registers a helper call reads (`R1`-`R5`) and the ones any call leaves
-/// clobbered (`R0`-`R5`), matching how [`transfer`] models `EBPF_OP_CALL`.
-const HELPER_ARG_REGS: RegMask = 0b011_1110;
-const CALL_CLOBBERED_REGS: RegMask = 0b011_1111;
-
-fn reg_bit(reg: usize) -> RegMask {
-  if reg < R10 {
-    1 << reg
-  } else {
-    0
-  }
-}
-
-/// Registers `inst` reads and writes.
-///
-/// `uses` comes from the instruction encoding - every register the opcode
-/// reads, whether or not [`transfer`] consults its kind. That is more than
-/// strictly necessary, but it stays sound if `transfer` later starts reading a
-/// register the instruction names.
-///
-/// `defs` must be a *subset* of what the instruction overwrites: a def kills
-/// liveness, so over-claiming one would drop a register the callee can still
-/// observe. Fetching atomics write `src` (and CMPXCHG writes `R0`) conditionally
-/// on the operation selector, so they claim no definition at all.
-fn uses_and_defs(inst: &Inst, callee_live_in: RegMask) -> (RegMask, RegMask) {
-  match inst.opcode & EBPF_CLS_MASK {
-    // Only LDDW reaches here; it materializes a constant into dst.
-    EBPF_CLS_LD => (0, reg_bit(inst.dst)),
-    EBPF_CLS_LDX => (reg_bit(inst.src), reg_bit(inst.dst)),
-    EBPF_CLS_ST => (reg_bit(inst.dst), 0),
-    EBPF_CLS_STX => {
-      let is_atomic = (inst.opcode & 0xe0) == 0xc0;
-      let mut uses = reg_bit(inst.dst) | reg_bit(inst.src);
-      if is_atomic {
-        uses |= reg_bit(0);
-      }
-      (uses, 0)
-    }
-    EBPF_CLS_ALU | EBPF_CLS_ALU64 => {
-      let src = if inst.opcode & EBPF_SRC_REG != 0 {
-        reg_bit(inst.src)
-      } else {
-        0
-      };
-      if inst.opcode & EBPF_ALU_OP_MASK == EBPF_ALU_OP_MOV {
-        (src, reg_bit(inst.dst))
-      } else {
-        (src | reg_bit(inst.dst), reg_bit(inst.dst))
-      }
-    }
-    EBPF_CLS_JMP | EBPF_CLS_JMP32 => {
-      if inst.opcode == EBPF_OP_EXIT {
-        // `exit` hands the callee's R0 back to its caller, but the caller
-        // models the result of any call as a fresh scalar (see `transfer`), so
-        // an incoming R0 kind is never observable through a return. Counting R0
-        // as a use here would make it live-in for every function with a path
-        // that does not assign it - which is exactly the incidental caller
-        // state this mask exists to drop.
-        (0, 0)
-      } else if inst.opcode == EBPF_OP_CALL {
-        match inst.src {
-          0 => (HELPER_ARG_REGS, CALL_CLOBBERED_REGS),
-          // A local callee sees the caller's whole register file: R1-R5 are
-          // passed, R6-R9 are preserved across the call by the caller's stub,
-          // and R0 survives it. So the call reads whatever the callee reads.
-          1 | 2 => (callee_live_in, CALL_CLOBBERED_REGS),
-          _ => (0, 0),
-        }
-      } else if inst.opcode == EBPF_OP_JA || inst.opcode == EBPF_OP_JA32 {
-        (0, 0)
-      } else {
-        let src = if inst.opcode & EBPF_SRC_REG != 0 {
-          reg_bit(inst.src)
-        } else {
-          0
-        };
-        (src | reg_bit(inst.dst), 0)
-      }
-    }
-    _ => (0, 0),
   }
 }
 
@@ -822,14 +375,15 @@ pub(crate) fn function_live_in(
     return ALL_SIGNATURE_REGS;
   }
 
+  let insns = decode_section(code);
+
   // Only reachable instructions can read anything; walking dead code would add
   // uses that no execution can perform.
   let mut reachable = vec![false; num_slots];
   let mut pending = vec![start_pc];
   reachable[start_pc] = true;
   while let Some(pc) = pending.pop() {
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+    for succ in successors_of(&insns, pc, start_pc, end_pc) {
       if !reachable[succ] {
         reachable[succ] = true;
         pending.push(succ);
@@ -854,8 +408,7 @@ pub(crate) fn function_live_in(
     if !reachable[pc] {
       continue;
     }
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
-    for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+    for succ in successors_of(&insns, pc, start_pc, end_pc) {
       edges[pc - start_pc].push(succ);
       predecessors[succ - start_pc].push(pc);
     }
@@ -866,7 +419,7 @@ pub(crate) fn function_live_in(
   // change re-queues only the predecessors it can affect.
   let mut work: Vec<usize> = (start_pc..end_pc).filter(|&pc| reachable[pc]).collect();
   while let Some(pc) = work.pop() {
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    let inst = insns[pc];
     let mut live_out = 0;
     for &succ in &edges[pc - start_pc] {
       live_out |= live[succ];
@@ -882,7 +435,7 @@ pub(crate) fn function_live_in(
     } else {
       0
     };
-    let (uses, defs) = uses_and_defs(&inst, callee);
+    let (uses, defs) = core::uses_and_defs(&inst, callee);
     let next = uses | (live_out & !defs);
     if next != live[pc] {
       live[pc] = next;
@@ -891,6 +444,15 @@ pub(crate) fn function_live_in(
   }
 
   live[start_pc]
+}
+
+/// What [`program_live_in`] solves: per section, one mask per function
+/// (the liveness of its entry slot, the mask its call sites apply) and one
+/// mask per slot (what `verified::fixpoint::solve` projects onto). An
+/// unreachable slot's mask is empty; the analysis never visits one.
+pub(crate) struct LiveIn {
+  pub(crate) masks: Vec<Vec<RegMask>>,
+  pub(crate) slots: Vec<Vec<RegMask>>,
 }
 
 /// One code section, already partitioned into local functions, as
@@ -948,23 +510,37 @@ pub(crate) struct CrossSectionCallSite {
 ///
 /// Linear is not the same as cheap at the ceiling. On the largest object
 /// `link_elf` admits — 128 sections of 65,534 slots, 64 MiB of code, needing
-/// no relocations at all — a shape built to make every mask bit propagate
-/// separately costs this function 2.1 s and 219 MB, and `analyze_program`
-/// around it 4.0 s and 868 MB. That is on the non-preemptible load path, and
+/// no relocations at all — 128 call chains of 21,844 links, each carrying one
+/// live bit from its tail to its head, cost this function 1.4 s and 376 MB on
+/// a first run and `analyze_program` around it 1.2–3.6 s and 846 MB (release,
+/// one machine; the range is that machine's noise). The memory is about 45
+/// bytes per slot: the decoded instruction (12), its function (4), the
+/// callee (4), the predecessor and call-site lists (16), the table, the
+/// queue flag and the stack (7), plus the per-function bounds and list heads
+/// (12 per function). About half of that is what the verified
+/// solver's fixed layout costs over a hand-packed one — the instructions
+/// decoded once rather than per visit, and lists sized by the slot count
+/// rather than the edge count — and it buys a solve that is about 25% faster
+/// once the pages are mapped. That is on the non-preemptible load path, and
 /// the analysis is most of what loading such an object costs. It is far below
-/// what the per-function solve charged (11.7 s and 301 MB for this function on
-/// the same input, and superlinearly worse as the object grows), but it is not
-/// nothing, and a caller that admits objects this large should know the shape
-/// of the bill.
+/// what the per-function solve charged (superlinear in the object, tens of
+/// seconds at this size), but it is not nothing, and a caller that admits
+/// objects this large should know the shape of the bill.
 pub(crate) fn program_live_in(
   sections: &[LiveInSection<'_>],
   cross_section_calls: &[CrossSectionCallSite],
-) -> Vec<Vec<RegMask>> {
-  let conservative = || -> Vec<Vec<RegMask>> {
-    sections
-      .iter()
-      .map(|section| vec![ALL_SIGNATURE_REGS; section.starts.len()])
-      .collect()
+) -> LiveIn {
+  let conservative = || -> LiveIn {
+    LiveIn {
+      masks: sections
+        .iter()
+        .map(|section| vec![ALL_SIGNATURE_REGS; section.starts.len()])
+        .collect(),
+      slots: sections
+        .iter()
+        .map(|section| vec![ALL_SIGNATURE_REGS; section.code.len() / 8])
+        .collect(),
+    }
   };
 
   // Slot and function ids run consecutively across sections, so one worklist
@@ -987,7 +563,7 @@ pub(crate) fn program_live_in(
   // a caller that ignores that cap gets the conservative summary, not a wrong
   // one. Same for a `starts` array that does not partition its section: every
   // walk below assumes `starts[i] < starts[i + 1] <= num_slots`.
-  if total_slots >= (u32::MAX - 1) as usize {
+  if total_slots >= (u32::MAX / 2) as usize {
     return conservative();
   }
   for section in sections {
@@ -1012,6 +588,19 @@ pub(crate) fn program_live_in(
     {
       return conservative();
     }
+    // The solver wakes a function's call sites when its entry slot grows, and
+    // it recognizes the entry through `pc_to_func`, so each entry must map to
+    // its own function (`Shape.entry_func` in `Liveness/Proofs.lean`). The
+    // layout guarantees this; refusing it here keeps the proof's hypotheses
+    // checked rather than assumed.
+    if section
+      .starts
+      .iter()
+      .enumerate()
+      .any(|(fi, &start)| section.pc_to_func[start] != fi)
+    {
+      return conservative();
+    }
   }
   if total_funcs == 0 {
     return conservative();
@@ -1027,32 +616,32 @@ pub(crate) fn program_live_in(
     (section.starts[fi], end)
   };
 
-  // Reachable slots only. This is a speedup, not a correctness requirement:
-  // liveness runs backward, and every successor of a reachable slot is itself
-  // reachable, so an unreachable slot's liveness can only ever flow to other
-  // unreachable slots and never reaches a function entry. Skipping them also
-  // keeps this identical to `function_live_in`, which filters the same way.
-  let mut reachable = vec![false; total_slots];
-  let mut stack: Vec<usize> = Vec::new();
+  // The whole program laid end to end, as `verified::liveness::solve` takes
+  // it: every section's slots decoded in order, each slot's function as a
+  // whole-program id, each function's bounds and its entry as whole-program
+  // slot ids, and each call site's callee. Building this is the adapter's
+  // whole job; the solve is the verified core's. The checks above are what
+  // `Liveness/Proofs.lean` assumes of these tables (`Shape`): every index in
+  // range, every entry inside its function, fewer than `2^31` slots.
+  let mut insns: Vec<Insn> = Vec::with_capacity(total_slots);
+  let mut slot_func: Vec<u32> = Vec::with_capacity(total_slots);
+  let mut func_start: Vec<u32> = Vec::with_capacity(total_funcs);
+  let mut func_end: Vec<u32> = Vec::with_capacity(total_funcs);
   for (si, section) in sections.iter().enumerate() {
     let num_slots = section.code.len() / 8;
-    let base = slot_base[si];
+    insns.extend(decode_section(section.code));
+    slot_func.extend(
+      section
+        .pc_to_func
+        .iter()
+        .map(|&function| (func_base[si] + function) as u32),
+    );
     for fi in 0..section.starts.len() {
       let (start, end) = bounds(si, fi);
-      reachable[base + start] = true;
-      stack.push(start);
-      while let Some(pc) = stack.pop() {
-        let inst = decode(&section.code[pc * 8..pc * 8 + 8]);
-        let mut succs = [0usize; 2];
-        let written = function_successors_into(pc, &inst, num_slots, start, end, &mut succs);
-        for &succ in &succs[..written] {
-          if !reachable[base + succ] {
-            reachable[base + succ] = true;
-            stack.push(succ);
-          }
-        }
-      }
+      func_start.push((slot_base[si] + start) as u32);
+      func_end.push((slot_base[si] + end) as u32);
     }
+    debug_assert_eq!(insns.len(), slot_base[si] + num_slots);
   }
 
   // Each call site's callee, indexed by global slot id. Dense rather than a
@@ -1065,9 +654,8 @@ pub(crate) fn program_live_in(
   // a call whose target this analysis cannot name, which reads everything. The
   // loader's own validation refuses the latter long before here, so it is a
   // backstop. Both sentinels are outside the id space: the bail above keeps
-  // `total_funcs <= total_slots < u32::MAX - 1`.
-  const NOT_A_CALL: u32 = u32::MAX;
-  const UNRESOLVED: u32 = u32::MAX - 1;
+  // `total_funcs <= total_slots < 2^31`.
+  use crate::verified::liveness::{NOT_A_CALL, UNRESOLVED};
   let mut callee_of = vec![NOT_A_CALL; total_slots];
   let mut cross_callee: HashMap<u32, u32> = HashMap::new();
   for call in cross_section_calls {
@@ -1093,10 +681,7 @@ pub(crate) fn program_live_in(
     let num_slots = section.code.len() / 8;
     let base = slot_base[si];
     for pc in 0..num_slots {
-      if !reachable[base + pc] {
-        continue;
-      }
-      let inst = decode(&section.code[pc * 8..pc * 8 + 8]);
+      let inst = insns[base + pc];
       if inst.opcode != EBPF_OP_CALL {
         continue;
       }
@@ -1120,516 +705,45 @@ pub(crate) fn program_live_in(
     }
   }
 
-  // The global slot each function starts at: a function's mask is exactly the
-  // liveness of that slot, which is what makes this one dataflow problem.
-  let mut func_start_slot = vec![0u32; total_funcs];
-  for (si, section) in sections.iter().enumerate() {
-    for (fi, &start) in section.starts.iter().enumerate() {
-      func_start_slot[func_base[si] + fi] = (slot_base[si] + start) as u32;
-    }
-  }
+  let live =
+    crate::verified::liveness::solve(&insns, &slot_func, &func_start, &func_end, &callee_of);
 
-  // Predecessors, and the call sites reading each function's entry, both as
-  // flat CSR arrays. Built once for the whole program: rebuilding a
-  // `Vec<Vec<_>>` per function per visit is the cost this solve exists to
-  // avoid.
-  let mut pred_offset = vec![0u32; total_slots + 1];
-  let mut caller_offset = vec![0u32; total_funcs + 1];
-  let for_each_edge = |mut on_pred: Box<dyn FnMut(usize, usize) + '_>,
-                       mut on_caller: Box<dyn FnMut(usize, usize) + '_>| {
-    for (si, section) in sections.iter().enumerate() {
-      let num_slots = section.code.len() / 8;
-      let base = slot_base[si];
-      for pc in 0..num_slots {
-        if !reachable[base + pc] {
-          continue;
-        }
-        let inst = decode(&section.code[pc * 8..pc * 8 + 8]);
-        let (start, end) = bounds(si, section.pc_to_func[pc]);
-        let mut succs = [0usize; 2];
-        let written = function_successors_into(pc, &inst, num_slots, start, end, &mut succs);
-        for &succ in &succs[..written] {
-          on_pred(base + succ, base + pc);
-        }
-        let callee = callee_of[base + pc];
-        if callee != NOT_A_CALL && callee != UNRESOLVED {
-          on_caller(callee as usize, base + pc);
-        }
-      }
-    }
-  };
-  for_each_edge(
-    Box::new(|succ, _| pred_offset[succ + 1] += 1),
-    Box::new(|callee, _| caller_offset[callee + 1] += 1),
-  );
-  for i in 0..total_slots {
-    pred_offset[i + 1] += pred_offset[i];
+  LiveIn {
+    masks: sections
+      .iter()
+      .enumerate()
+      .map(|(si, section)| {
+        (0..section.starts.len())
+          .map(|fi| live[func_start[func_base[si] + fi] as usize])
+          .collect()
+      })
+      .collect(),
+    slots: sections
+      .iter()
+      .enumerate()
+      .map(|(si, section)| live[slot_base[si]..slot_base[si] + section.code.len() / 8].to_vec())
+      .collect(),
   }
-  for i in 0..total_funcs {
-    caller_offset[i + 1] += caller_offset[i];
-  }
-  let mut pred_entries = vec![0u32; pred_offset[total_slots] as usize];
-  let mut caller_entries = vec![0u32; caller_offset[total_funcs] as usize];
-  {
-    let mut pred_cursor = pred_offset.clone();
-    let mut caller_cursor = caller_offset.clone();
-    for_each_edge(
-      Box::new(|succ, pred| {
-        pred_entries[pred_cursor[succ] as usize] = pred as u32;
-        pred_cursor[succ] += 1;
-      }),
-      Box::new(|callee, call_slot| {
-        caller_entries[caller_cursor[callee] as usize] = call_slot as u32;
-        caller_cursor[callee] += 1;
-      }),
-    );
-  }
-
-  let mut live = vec![0 as RegMask; total_slots];
-  let mut queued = vec![false; total_slots];
-  // Seeded in ascending program order so a LIFO worklist starts at the last
-  // slot and forward edges converge on the first visit. This is a constant
-  // factor either way, and not always the right one - descending seeding is
-  // about twice as fast on a call-heavy program at the size ceiling and about
-  // 20% slower on the call-chain shape the budget tests use.
-  let mut work: Vec<u32> = (0..total_slots as u32)
-    .filter(|&slot| reachable[slot as usize])
-    .collect();
-  for &slot in &work {
-    queued[slot as usize] = true;
-  }
-
-  while let Some(slot) = work.pop() {
-    let slot = slot as usize;
-    queued[slot] = false;
-    // `slot_base` is ascending, so the owning section is the last base at or
-    // below this slot. A section with no slots contributes none, and so is
-    // never selected.
-    let si = slot_base.partition_point(|&base| base <= slot) - 1;
-    let section = &sections[si];
-    let num_slots = section.code.len() / 8;
-    let pc = slot - slot_base[si];
-    let fi = section.pc_to_func[pc];
-    let (start, end) = bounds(si, fi);
-
-    let inst = decode(&section.code[pc * 8..pc * 8 + 8]);
-    let mut live_out = 0;
-    let mut succs = [0usize; 2];
-    let written = function_successors_into(pc, &inst, num_slots, start, end, &mut succs);
-    for &succ in &succs[..written] {
-      live_out |= live[slot_base[si] + succ];
-    }
-    let callee = match callee_of[slot] {
-      NOT_A_CALL => 0,
-      UNRESOLVED => ALL_SIGNATURE_REGS,
-      callee => live[func_start_slot[callee as usize] as usize],
-    };
-    let (uses, defs) = uses_and_defs(&inst, callee);
-    // Monotone: `uses` grows with the callee summary and `live_out` with the
-    // successors, both of which only ever gain bits. The union with the
-    // previous value is therefore a no-op today, and is kept because it is
-    // what makes termination independent of that property: without it, a
-    // future non-monotone change loops forever here, on the load path, rather
-    // than returning a slightly imprecise mask.
-    let computed = uses | (live_out & !defs);
-    debug_assert_eq!(live[slot] & !computed, 0);
-    let next = live[slot] | computed;
-    if next == live[slot] {
-      continue;
-    }
-    live[slot] = next;
-
-    let mut wake = |target: usize| {
-      if !queued[target] {
-        queued[target] = true;
-        work.push(target as u32);
-      }
-    };
-    for i in pred_offset[slot]..pred_offset[slot + 1] {
-      wake(pred_entries[i as usize] as usize);
-    }
-    // A function's mask is its entry slot's liveness, so growing that slot is
-    // what wakes its call sites - anywhere in the program.
-    if start == pc {
-      let func = func_base[si] + fi;
-      for i in caller_offset[func]..caller_offset[func + 1] {
-        wake(caller_entries[i as usize] as usize);
-      }
-    }
-  }
-
-  sections
-    .iter()
-    .enumerate()
-    .map(|(si, section)| {
-      (0..section.starts.len())
-        .map(|fi| live[func_start_slot[func_base[si] + fi] as usize])
-        .collect()
-    })
-    .collect()
 }
 
-/// Full 64-bit immediate of a `lddw` (low half in `inst`, high half in the next
-/// slot's imm field). Returns 0 for non-`lddw` instructions.
-fn lddw_full_imm(code: &[u8], pc: usize, inst: &Inst) -> u64 {
-  if inst.opcode != EBPF_OP_LDDW || (pc + 2) * 8 > code.len() {
-    return 0;
-  }
-  let hi = decode(&code[(pc + 1) * 8..(pc + 1) * 8 + 8]).imm;
-  (inst.imm as u32 as u64) | ((hi as u32 as u64) << 32)
-}
-
-/// Successor slots in the whole-program CFG, in which a local call also enters
-/// its callee. Slot indices, not byte offsets.
-///
-/// Only [`analyze`] treats the program as one CFG; every other consumer works a
-/// function at a time and wants [`function_successors_into`], which stops at
-/// the function's own range.
-#[cfg(any(test, feature = "testing"))]
-fn successors(pc: usize, inst: &Inst, num_slots: usize) -> Vec<usize> {
-  let fallthrough = if inst.opcode == EBPF_OP_LDDW {
-    pc + 2
-  } else {
-    pc + 1
-  };
-  let cls = inst.opcode & EBPF_CLS_MASK;
-  let mut out = Vec::new();
-  let mut push = |s: usize| {
-    if s < num_slots {
-      out.push(s);
-    }
-  };
-
-  if cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32 {
-    if inst.opcode == EBPF_OP_EXIT {
-      return out;
-    }
-    if inst.opcode == EBPF_OP_CALL {
-      match inst.src {
-        // Helper call: returns to the next instruction.
-        0 => push(fallthrough),
-        // Local eBPF call: returns to the next instruction and also enters the
-        // callee at pc+imm+1. The callee inherits the (clobbered) caller state,
-        // which preserves R10=Stack and the callee-saved R6-R9, so callee
-        // stack accesses remain analyzable; arg-derived accesses (R1-R5, now
-        // Unknown) are conservatively unresolved.
-        1 => {
-          push(fallthrough);
-          push((pc as i64 + 1 + inst.imm as i64) as usize);
-        }
-        // A linker-tagged cross-section local call returns here but its callee
-        // is represented outside this section's CFG.
-        2 => push(fallthrough),
-        // Other forms branch to exit; no fallthrough.
-        _ => {}
-      }
-      return out;
-    }
-    // JA32 is the only jump whose target is the 32-bit imm; every other jump
-    // (JA and all conditional JMP/JMP32 forms) uses the 16-bit offset. This
-    // matches how the JIT/linker resolve branch targets.
-    let target = if inst.opcode == EBPF_OP_JA32 {
-      pc as i64 + 1 + inst.imm as i64
-    } else {
-      pc as i64 + 1 + inst.offset as i64
-    } as usize;
-    push(target);
-    if inst.opcode != EBPF_OP_JA && inst.opcode != EBPF_OP_JA32 {
-      push(fallthrough); // conditional branch also falls through
-    }
-    return out;
-  }
-
-  push(fallthrough);
-  out
-}
-
-/// Writes `pc`'s in-function successor slots into `out` and returns how many
-/// were written.
-///
-/// Two is the ceiling: a conditional jump reaches its target and its
-/// fallthrough, and no encoding reaches more. A local call is not an edge here
-/// — its callee is a separate function with its own range — so every call form
-/// that returns contributes only the next slot.
-///
-/// Allocation-free because [`program_live_in`] walks this once per slot per
-/// worklist pop; [`function_successors`] is the `Vec`-returning wrapper, so the
-/// two cannot disagree.
-fn function_successors_into(
+/// The in-function successors of `pc`, as `verified::fixpoint::solve` walks
+/// them: the live-in table and the access plan are built on the same edges
+/// the region analysis runs over, by construction.
+fn successors_of(
+  insns: &[Insn],
   pc: usize,
-  inst: &Inst,
-  num_slots: usize,
   start_pc: usize,
   end_pc: usize,
-  out: &mut [usize; 2],
-) -> usize {
-  let mut raw = [0usize; 2];
-  let mut count = 0usize;
-  let mut push = |slot: usize| {
-    raw[count] = slot;
-    count += 1;
-  };
-
-  let cls = inst.opcode & EBPF_CLS_MASK;
-  if cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32 {
-    if inst.opcode == EBPF_OP_EXIT {
-      // Nothing follows an exit.
-    } else if inst.opcode == EBPF_OP_CALL {
-      match inst.src {
-        // Helper, section-local and cross-section calls all return to the
-        // next slot. Any other source branches to exit.
-        0 | 1 | 2 => push(pc + 1),
-        _ => {}
-      }
-    } else {
-      // JA32 is the only jump whose displacement is the 32-bit immediate.
-      let target = if inst.opcode == EBPF_OP_JA32 {
-        pc as i64 + 1 + inst.imm as i64
-      } else {
-        pc as i64 + 1 + inst.offset as i64
-      } as usize;
-      push(target);
-      if inst.opcode != EBPF_OP_JA && inst.opcode != EBPF_OP_JA32 {
-        push(pc + 1); // a conditional branch also falls through
-      }
-    }
-  } else if inst.opcode == EBPF_OP_LDDW {
-    // The second slot carries the immediate's high half, not an instruction.
-    push(pc + 2);
-  } else {
-    push(pc + 1);
-  }
-
-  let mut written = 0;
-  for &slot in &raw[..count] {
-    // The `as usize` above wraps a wild displacement to something enormous,
-    // which `< num_slots` rejects along with everything else out of range.
-    if slot < num_slots && slot >= start_pc && slot < end_pc {
-      out[written] = slot;
-      written += 1;
-    }
-  }
-  written
+) -> impl Iterator<Item = usize> {
+  let (count, first, second) = fixpoint::function_successors(insns, pc, start_pc, end_pc);
+  [first, second].into_iter().take(count)
 }
 
-fn function_successors(
-  pc: usize,
-  inst: &Inst,
-  num_slots: usize,
-  start_pc: usize,
-  end_pc: usize,
-) -> Vec<usize> {
-  let mut out = [0usize; 2];
-  let written = function_successors_into(pc, inst, num_slots, start_pc, end_pc, &mut out);
-  out[..written].to_vec()
-}
-
-/// Abstract transfer function: register/slot state after executing `inst`.
-fn transfer(
-  in_state: &State,
-  inst: &Inst,
-  lddw_addr: u64,
-  data_lo: u64,
-  data_hi: u64,
-  cap_warning_emitted: &mut bool,
-) -> State {
-  let mut s = in_state.clone();
-  let cls = inst.opcode & EBPF_CLS_MASK;
-
-  match cls {
-    EBPF_CLS_LD => {
-      // Only LDDW reaches here (LD|IMM|DW). It materializes a 64-bit constant;
-      // a relocated data pointer falls inside [data_lo, data_hi).
-      if inst.opcode == EBPF_OP_LDDW {
-        s.regs[inst.dst] = if lddw_addr >= data_lo && lddw_addr < data_hi {
-          RegKind::Data
-        } else {
-          RegKind::Scalar
-        };
-      } else {
-        s.regs[inst.dst] = RegKind::Unknown;
-      }
-    }
-    EBPF_CLS_LDX => {
-      // A value loaded from memory is a scalar for routing purposes. Treating
-      // it as Scalar (rather than Unknown) lets it serve as an index into a
-      // known pointer — `ptr + loaded_index` keeps the pointer's region — which
-      // is both common (e.g. `literal[i]`) and safe: using a loaded value
-      // directly as a pointer base still yields Scalar (unroutable), and the
-      // retained single-region bounds check backstops any mis-sized index.
-      //
-      // A fill off R10 recovers a spilled *pointer* only when a concrete
-      // Stack/Data kind is still tracked at that offset. An absent, scalar, or
-      // call-invalidated slot reads back as a scalar — e.g. a byte loaded from a
-      // stack buffer after a helper call, which must not poison later pointer
-      // arithmetic that uses it as an index.
-      s.regs[inst.dst] = if inst.src == R10 {
-        match s.slots.get(&(inst.offset as i32)) {
-          Some(&(e, k)) if e >= s.invalid_epoch && k.is_pointer() => k,
-          _ => RegKind::Scalar,
-        }
-      } else {
-        RegKind::Scalar
-      };
-    }
-    EBPF_CLS_ST | EBPF_CLS_STX => {
-      let is_atomic = cls == EBPF_CLS_STX && (inst.opcode & 0xe0) == 0xc0;
-      // Value being stored: ST writes an immediate (scalar); STX writes a reg.
-      let value = if cls == EBPF_CLS_ST {
-        RegKind::Scalar
-      } else {
-        s.regs[inst.src]
-      };
-      let width = access_width(inst.opcode);
-      let stack_base = if inst.dst == R10 {
-        RegKind::Stack(StackKind::Current(Some(0)))
-      } else {
-        s.regs[inst.dst]
-      };
-      if stack_base.is_stack() {
-        if stack_base.aliases_current_stack() {
-          let start = stack_access_start(stack_base, inst.offset);
-          s.invalidate_stack_write(start, width);
-        }
-        let stored = if is_atomic {
-          RegKind::Unknown
-        } else if value == RegKind::Uninit {
-          RegKind::Unknown
-        } else {
-          value
-        };
-        if !is_atomic && width == 8 {
-          if let Some(start) = stack_access_start(stack_base, inst.offset) {
-            // Cap the map at MAX_TRACKED_SLOTS distinct offsets: an already
-            // tracked slot always updates in place, a new one only while room
-            // remains. Refused slots stay untracked and read back as scalars —
-            // the same fallback as slots the analysis never saw.
-            s.insert_slot(start, (s.invalid_epoch, stored), cap_warning_emitted);
-          }
-        }
-      } else if s.regs[inst.dst] != RegKind::Data {
-        // A store through an unknown/scalar base may alias an untracked stack
-        // slot; conservatively invalidate all tracked slots.
-        s.invalidate_slots();
-      }
-      if is_atomic {
-        // An atomic fetch writes the previous value into src.
-        s.regs[inst.src] = RegKind::Unknown;
-        if inst.imm & EBPF_ATOMIC_OP_MASK == EBPF_ATOMIC_OP_CMPXCHG {
-          // CMPXCHG is the exception: it leaves src alone and writes the
-          // previous memory contents into R0 instead (x86-64 lowers it to
-          // `lock cmpxchg`, whose comparand is RAX; the arm64 backend mirrors
-          // that). The guest chooses those contents, so R0 must not keep the
-          // provenance it had before the instruction.
-          s.regs[0] = RegKind::Unknown;
-        }
-      }
-    }
-    EBPF_CLS_ALU => {
-      // 32-bit ALU result cannot be a valid 64-bit pointer.
-      s.regs[inst.dst] = RegKind::Scalar;
-    }
-    EBPF_CLS_ALU64 => {
-      let op = inst.opcode & EBPF_ALU_OP_MASK;
-      let is_reg = inst.opcode & EBPF_SRC_REG != 0;
-      match op {
-        EBPF_ALU_OP_MOV => {
-          s.regs[inst.dst] = if is_reg {
-            match s.regs[inst.src] {
-              RegKind::Uninit => RegKind::Unknown,
-              k => k,
-            }
-          } else {
-            RegKind::Scalar
-          };
-        }
-        EBPF_ALU_OP_ADD => {
-          s.regs[inst.dst] = if is_reg {
-            add_kinds(s.regs[inst.dst], s.regs[inst.src])
-          } else {
-            add_imm_kind(s.regs[inst.dst], inst.imm)
-          };
-        }
-        EBPF_ALU_OP_SUB => {
-          s.regs[inst.dst] = if is_reg {
-            sub_kinds(s.regs[inst.dst], s.regs[inst.src])
-          } else {
-            add_imm_kind(s.regs[inst.dst], inst.imm.wrapping_neg())
-          };
-        }
-        // All other 64-bit ALU ops (mul/div/and/or/xor/shifts/neg/mod/end)
-        // are conservatively scalars for routing purposes.
-        _ => s.regs[inst.dst] = RegKind::Scalar,
-      }
-    }
-    EBPF_CLS_JMP | EBPF_CLS_JMP32 => {
-      if inst.opcode == EBPF_OP_CALL {
-        // Helper/local call: R0 is the return value, R1-R5 are caller-saved and
-        // clobbered; R6-R10 are preserved. Keep tracked stack spill provenance
-        // across calls: generated code commonly spills stack/data pointers,
-        // calls a helper, then reloads those pointers for later buffer work.
-        // If a helper/callee actually overwrites a pointer spill, the emitted
-        // single-region bounds translation still protects the access; the worst
-        // case is a spurious fault from a stale region hint.
-        //
-        // The return value is treated as a scalar: helpers return handles,
-        // lengths, and status codes, so a returned value commonly indexes a
-        // pointer (`buf + helper_len`) and must keep that pointer's region.
-        // Using a returned value directly as a pointer base still yields Scalar
-        // (unroutable), and the single-region bounds check backstops any
-        // out-of-range index, so this stays safe.
-        s.regs[0] = RegKind::Scalar;
-        for r in 1..=5 {
-          s.regs[r] = RegKind::Unknown;
-        }
-      }
-    }
-    _ => {}
-  }
-
-  s
-}
-
-/// `ptr + scalar` preserves the pointer's region; `scalar + scalar` is scalar.
-fn add_kinds(a: RegKind, b: RegKind) -> RegKind {
-  match (a, b) {
-    (RegKind::Stack(_), RegKind::Scalar) | (RegKind::Scalar, RegKind::Stack(_)) => match (a, b) {
-      (RegKind::Stack(StackKind::Foreign), _) | (_, RegKind::Stack(StackKind::Foreign)) => {
-        RegKind::Stack(StackKind::Foreign)
-      }
-      _ => RegKind::Stack(StackKind::Current(None)),
-    },
-    (RegKind::Data, RegKind::Scalar) | (RegKind::Scalar, RegKind::Data) => RegKind::Data,
-    (RegKind::Scalar, RegKind::Scalar) => RegKind::Scalar,
-    _ => RegKind::Unknown,
-  }
-}
-
-/// `ptr - scalar` preserves the region; `ptr - ptr` (same region) is a scalar.
-fn sub_kinds(a: RegKind, b: RegKind) -> RegKind {
-  match (a, b) {
-    (RegKind::Stack(StackKind::Foreign), RegKind::Scalar) => RegKind::Stack(StackKind::Foreign),
-    (RegKind::Stack(_), RegKind::Scalar) => RegKind::Stack(StackKind::Current(None)),
-    (RegKind::Data, RegKind::Scalar) => RegKind::Data,
-    (RegKind::Stack(_), RegKind::Stack(_)) | (RegKind::Data, RegKind::Data) => RegKind::Scalar,
-    (RegKind::Scalar, RegKind::Scalar) => RegKind::Scalar,
-    _ => RegKind::Unknown,
-  }
-}
-
-/// Adding an immediate preserves region; for known stack aliases, also update
-/// the frame-relative offset.
-fn add_imm_kind(a: RegKind, imm: i32) -> RegKind {
-  match a {
-    RegKind::Stack(StackKind::Current(Some(off))) => {
-      RegKind::Stack(StackKind::Current(off.checked_add(imm)))
-    }
-    RegKind::Stack(StackKind::Current(None)) => RegKind::Stack(StackKind::Current(None)),
-    RegKind::Stack(StackKind::Foreign) => RegKind::Stack(StackKind::Foreign),
-    RegKind::Data => RegKind::Data,
-    RegKind::Scalar => RegKind::Scalar,
-    _ => RegKind::Unknown,
-  }
+/// The section's instructions as the verified core reads them. `code` is
+/// whole slots; a trailing partial slot is not an instruction.
+fn decode_section(code: &[u8]) -> Vec<Insn> {
+  let num_slots = code.len() / 8;
+  Insn::decode_all(&code[..num_slots * 8]).expect("whole slots decode")
 }
 
 /// One entry per instruction slot, handed to the JIT alongside the region hints
@@ -1719,27 +833,31 @@ fn written_registers(inst: &Inst) -> Vec<usize> {
 /// window would save nothing.
 fn build_access_plan(
   code: &[u8],
+  insns: &[Insn],
   start_pc: usize,
   end_pc: usize,
   num_slots: usize,
   hints: &[u8],
   reached: &[bool],
 ) -> Vec<PlanEntry> {
+  // `insns` and `reached` are the function's own, indexed from `start_pc`;
+  // `hints` and the plan are the section's, indexed by absolute slot.
+  let span = end_pc - start_pc;
   let mut plan = vec![PlanEntry::default(); num_slots];
 
   // Anything a branch can land on ends the previous group: the base would not
   // have been established on the path that jumped in. Calls end it too - a
   // local callee runs in the same host frame and would overwrite the parked
   // base, and a helper call can suspend the guest entirely.
-  let mut is_target = vec![false; num_slots];
-  for pc in start_pc..end_pc {
-    if !reached[pc] {
+  let mut is_target = vec![false; span];
+  for i in 0..span {
+    if !reached[i] {
       continue;
     }
-    let inst = decode(&code[pc * 8..pc * 8 + 8]);
+    let inst = insns[i];
     let cls = inst.opcode & EBPF_CLS_MASK;
     if (cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32) && inst.opcode != EBPF_OP_EXIT {
-      for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+      for succ in successors_of(insns, i, 0, span) {
         is_target[succ] = true;
       }
     }
@@ -1749,12 +867,12 @@ fn build_access_plan(
   let mut written: u16 = 0;
 
   for pc in start_pc..end_pc {
-    if !reached[pc] {
+    if !reached[pc - start_pc] {
       close_group(&mut open, &mut plan);
       written = 0;
       continue;
     }
-    if is_target[pc] {
+    if is_target[pc - start_pc] {
       close_group(&mut open, &mut plan);
       written = 0;
     }
@@ -2692,12 +1810,12 @@ mod tests {
     if start_pc >= end_pc || end_pc > num_slots {
       return ALL_SIGNATURE_REGS;
     }
+    let insns = decode_section(code);
     let mut reachable = vec![false; num_slots];
     let mut pending = vec![start_pc];
     reachable[start_pc] = true;
     while let Some(pc) = pending.pop() {
-      let inst = decode(&code[pc * 8..pc * 8 + 8]);
-      for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+      for succ in successors_of(&insns, pc, start_pc, end_pc) {
         if !reachable[succ] {
           reachable[succ] = true;
           pending.push(succ);
@@ -2711,9 +1829,9 @@ mod tests {
         if !reachable[pc] {
           continue;
         }
-        let inst = decode(&code[pc * 8..pc * 8 + 8]);
+        let inst = insns[pc];
         let mut live_out = 0;
-        for succ in function_successors(pc, &inst, num_slots, start_pc, end_pc) {
+        for succ in successors_of(&insns, pc, start_pc, end_pc) {
           live_out |= live[succ];
         }
         let callee = if inst.opcode == EBPF_OP_CALL {
@@ -2727,7 +1845,7 @@ mod tests {
         } else {
           0
         };
-        let (uses, defs) = uses_and_defs(&inst, callee);
+        let (uses, defs) = core::uses_and_defs(&inst, callee);
         let next = uses | (live_out & !defs);
         if next != live[pc] {
           live[pc] = next;
@@ -2945,7 +2063,7 @@ mod tests {
         .collect::<Vec<_>>();
 
       assert_eq!(
-        program_live_in(&sections, &cross_section_calls),
+        program_live_in(&sections, &cross_section_calls).masks,
         sweep_program_live_in(&sections, &cross_section_calls),
         "flat solver diverged from the per-function sweep on {codes:?} \
          starts {starts:?} cross calls {cross_section_calls:?}"
@@ -2957,19 +2075,83 @@ mod tests {
     );
   }
 
-  /// `function_successors_into` must agree with composing the whole-program
-  /// `successors` the way the per-function walk used to: override a local
-  /// call's edges with its fallthrough, then keep only what lands in
-  /// `[start_pc, end_pc)`.
+  /// Successor slots in the whole-program CFG, in which a local call also enters
+  /// its callee. Slot indices, not byte offsets.
+  ///
+  /// Nothing treats the program as one CFG any more; this is the reference
+  /// `function_successors_agree_with_composing_the_whole_program_walk`
+  /// composes with the function filter.
+  fn whole_program_successors(pc: usize, inst: &Inst, num_slots: usize) -> Vec<usize> {
+    let fallthrough = if inst.opcode == EBPF_OP_LDDW {
+      pc + 2
+    } else {
+      pc + 1
+    };
+    let cls = inst.opcode & EBPF_CLS_MASK;
+    let mut out = Vec::new();
+    let mut push = |s: usize| {
+      if s < num_slots {
+        out.push(s);
+      }
+    };
+
+    if cls == EBPF_CLS_JMP || cls == EBPF_CLS_JMP32 {
+      if inst.opcode == EBPF_OP_EXIT {
+        return out;
+      }
+      if inst.opcode == EBPF_OP_CALL {
+        match inst.src {
+          // Helper call: returns to the next instruction.
+          0 => push(fallthrough),
+          // Local eBPF call: returns to the next instruction and also enters the
+          // callee at pc+imm+1. The callee inherits the (clobbered) caller state,
+          // which preserves R10=Stack and the callee-saved R6-R9, so callee
+          // stack accesses remain analyzable; arg-derived accesses (R1-R5, now
+          // Unknown) are conservatively unresolved.
+          1 => {
+            push(fallthrough);
+            push((pc as i64 + 1 + inst.imm as i64) as usize);
+          }
+          // A linker-tagged cross-section local call returns here but its callee
+          // is represented outside this section's CFG.
+          2 => push(fallthrough),
+          // Other forms branch to exit; no fallthrough.
+          _ => {}
+        }
+        return out;
+      }
+      // JA32 is the only jump whose target is the 32-bit imm; every other jump
+      // (JA and all conditional JMP/JMP32 forms) uses the 16-bit offset. This
+      // matches how the JIT/linker resolve branch targets.
+      let target = if inst.opcode == EBPF_OP_JA32 {
+        pc as i64 + 1 + inst.imm as i64
+      } else {
+        pc as i64 + 1 + inst.offset as i64
+      } as usize;
+      push(target);
+      if inst.opcode != EBPF_OP_JA && inst.opcode != EBPF_OP_JA32 {
+        push(fallthrough); // conditional branch also falls through
+      }
+      return out;
+    }
+
+    push(fallthrough);
+    out
+  }
+
+  /// `verified::fixpoint::function_successors` must agree with composing the
+  /// whole-program `successors` the way the per-function walk used to:
+  /// override a local call's edges with its fallthrough, then keep only what
+  /// lands in `[start_pc, end_pc)`.
   ///
   /// The randomized differential above cannot see this. Its reference,
-  /// `sweep_program_live_in`, reaches `function_successors` — the same
-  /// `function_successors_into` the solver uses — so a successor bug appears
-  /// identically on both sides and cancels. That blindness is real: a mutation
-  /// giving `call` with `src == 3` a fallthrough edge passes the whole suite
-  /// without this test.
+  /// `sweep_program_live_in`, reaches the same successor function the solver
+  /// and the region analysis use, so a successor bug appears identically on
+  /// both sides and cancels. That blindness is real: a mutation giving `call`
+  /// with `src == 3` a fallthrough edge passes the whole suite without this
+  /// test.
   #[test]
-  fn function_successors_into_agrees_with_composing_the_whole_program_walk() {
+  fn function_successors_agree_with_composing_the_whole_program_walk() {
     fn expected(
       pc: usize,
       inst: &Inst,
@@ -2977,7 +2159,7 @@ mod tests {
       start_pc: usize,
       end_pc: usize,
     ) -> Vec<usize> {
-      let mut succs = successors(pc, inst, num_slots);
+      let mut succs = whole_program_successors(pc, inst, num_slots);
       // A local callee is a separate function, so the call contributes only
       // its return edge.
       if inst.opcode == EBPF_OP_CALL && inst.src == 1 {
@@ -2999,14 +2181,14 @@ mod tests {
         for &offset in &offsets {
           for &imm in &imms {
             for &(num_slots, start_pc, end_pc) in &ranges {
+              let raw = slot(opcode, 0, src, offset, imm);
+              let inst = decode(&raw);
+              let insns = vec![Insn::from_u64(u64::from_le_bytes(raw)); num_slots];
               for pc in start_pc..end_pc {
-                let inst = decode(&slot(opcode, 0, src, offset, imm));
-                let mut out = [0usize; 2];
-                let written =
-                  function_successors_into(pc, &inst, num_slots, start_pc, end_pc, &mut out);
+                let got: Vec<usize> = successors_of(&insns, pc, start_pc, end_pc).collect();
                 assert_eq!(
-                  &out[..written],
-                  expected(pc, &inst, num_slots, start_pc, end_pc).as_slice(),
+                  got,
+                  expected(pc, &inst, num_slots, start_pc, end_pc),
                   "opcode {opcode:#04x} src {src} offset {offset} imm {imm} \
                    pc {pc} in [{start_pc}, {end_pc}) of {num_slots}"
                 );
@@ -3037,7 +2219,7 @@ mod tests {
         pc_to_func: &[0, 0],
       }];
       assert_eq!(
-        program_live_in(&sections, &[]),
+        program_live_in(&sections, &[]).masks,
         vec![vec![ALL_SIGNATURE_REGS; starts.len()]],
         "starts {starts:?} was not refused"
       );
@@ -3081,7 +2263,7 @@ mod tests {
     }];
 
     assert_eq!(
-      program_live_in(&sections, &stray),
+      program_live_in(&sections, &stray).masks,
       vec![vec![0], vec![ALL_SIGNATURE_REGS]],
       "a stray call site rebound an unrelated section's call"
     );
@@ -3103,7 +2285,7 @@ mod tests {
     }];
 
     assert_eq!(
-      program_live_in(&sections, &[]),
+      program_live_in(&sections, &[]).masks,
       vec![vec![ALL_SIGNATURE_REGS]]
     );
   }

@@ -1,0 +1,14 @@
+name = "async-ebpf-proofs"
+defaultTargets = ["AsyncEbpf"]
+
+# The Aeneas standard library the generated code imports. Pinned to the commit
+# whose `charon-pin` names the Charon we extract with; bump both together via
+# `make setup-tools` (see README.md).
+[[require]]
+name = "aeneas"
+git = "https://github.com/AeneasVerif/aeneas"
+subDir = "backends/lean"
+rev = "8d58d14ad655b3d871af1038c203c3f524ab4df9"
+
+[[lean_lib]]
+name = "AsyncEbpf"
