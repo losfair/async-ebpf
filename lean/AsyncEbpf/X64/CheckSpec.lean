@@ -2077,7 +2077,8 @@ theorem live_step_AtomicFetchAlu_spec {cfg : x64_ir.Cfg} {op : Std.U8} {w64 : Bo
       = ok (.Ok (), post)) :
     AddrOk cfg pre base disp.val (atomicSize w64) ∧ pre.depth.val + 1 ≤ 16 ∧
     Writable src.val ∧
-    SetsTop pre post (fun k => k = src.val ∨ k = 0 ∨ k = 1 ∨ k = 10 ∨ k = 11) := by
+    SetsTop pre post (fun k => k = src.val ∨ k = 0 ∨ k = 1 ∨ k = 10 ∨ k = 11) ∧
+    (cfg.pointer_mask.val ≠ 0 → base.val ≠ 0 ∧ base.val ≠ 1) := by
   unfold x64_check.live_step at h
   simp only [hl, if_true] at h
   obtain ⟨i, hi, h1⟩ := bind_eq_ok h
@@ -2093,35 +2094,60 @@ theorem live_step_AtomicFetchAlu_spec {cfg : x64_ir.Cfg} {op : Std.U8} {w64 : Bo
       have hdepth : pre.depth.val + 1 ≤ 16 := by
         have := (depth_ok_spec hdb).mp hdt
         simpa using this
-      obtain ⟨⟨r1, s1⟩, hw1, h4⟩ := bind_eq_ok h3
-      obtain ⟨cf1, hcf1, h5⟩ := bind_eq_ok h4
-      rcases branch_continue hcf1 with ⟨u1, rfl, rfl⟩ | ⟨e1, rfl, rfl⟩
-      case inr => exact (no_break h5).elim
-      simp only at h5
-      obtain ⟨⟨r2, s2⟩, hw2, h6⟩ := bind_eq_ok h5
-      obtain ⟨cf2, hcf2, h7⟩ := bind_eq_ok h6
-      rcases branch_continue hcf2 with ⟨u2, rfl, rfl⟩ | ⟨e2, rfl, rfl⟩
-      case inr => exact (no_break h7).elim
-      simp only at h7
-      obtain ⟨⟨r3, s3⟩, hw3, h8⟩ := bind_eq_ok h7
-      obtain ⟨cf3, hcf3, h9⟩ := bind_eq_ok h8
-      rcases branch_continue hcf3 with ⟨u3, rfl, rfl⟩ | ⟨e3, rfl, rfl⟩
-      case inr => exact (no_break h9).elim
-      simp only at h9
-      obtain ⟨⟨r4, s4⟩, hw4, h10⟩ := bind_eq_ok h9
-      obtain ⟨cf4, hcf4, h11⟩ := bind_eq_ok h10
-      rcases branch_continue hcf4 with ⟨u4, rfl, rfl⟩ | ⟨e4, rfl, rfl⟩
-      case inr => exact (no_break h11).elim
-      simp only at h11
-      obtain ⟨hws, b1⟩ := (SetsTop.refl pre).write hw1
-      obtain ⟨-, b2⟩ := b1.write hw2
-      obtain ⟨-, b3⟩ := b2.write hw3
-      obtain ⟨-, b4⟩ := b3.write hw4
-      obtain ⟨-, b5⟩ := b4.write h11
-      refine ⟨ha.mp hbt, hdepth, hws, b5.mono (fun k => ?_)⟩
-      simp only [x64_ir.RAX, x64_ir.RCX, x64_ir.R10, x64_ir.R11]
-      norm_num
-      tauto
+      obtain ⟨bc, hbc, h3'⟩ := bind_eq_ok h3
+      split at h3'
+      · simp [x64_check.reject] at h3'
+      · rename_i hbcf
+        have hbcv : bc = false := by simpa using hbcf
+        have hbase : cfg.pointer_mask.val ≠ 0 → base.val ≠ 0 ∧ base.val ≠ 1 := by
+          intro hm
+          split at hbc
+          · rename_i hmask
+            split at hbc
+            · simp only [ok.injEq] at hbc
+              rw [← hbc] at hbcv
+              simp at hbcv
+            · rename_i hrax
+              simp only [ok.injEq] at hbc
+              rw [← hbc] at hbcv
+              refine ⟨?_, ?_⟩
+              · have := u8_ne hrax
+                simpa [x64_ir.RAX] using this
+              · intro hc
+                have hb1 : base = x64_ir.RCX := u8_eq_iff.mpr (by simpa [x64_ir.RCX] using hc)
+                simp [hb1] at hbcv
+          · rename_i hmask
+            simp only [bne_iff_ne, ne_eq, Decidable.not_not] at hmask
+            exact absurd (show cfg.pointer_mask.val = 0 by rw [hmask]; simp) hm
+        obtain ⟨⟨r1, s1⟩, hw1, h4⟩ := bind_eq_ok h3'
+        obtain ⟨cf1, hcf1, h5⟩ := bind_eq_ok h4
+        rcases branch_continue hcf1 with ⟨u1, rfl, rfl⟩ | ⟨e1, rfl, rfl⟩
+        case inr => exact (no_break h5).elim
+        simp only at h5
+        obtain ⟨⟨r2, s2⟩, hw2, h6⟩ := bind_eq_ok h5
+        obtain ⟨cf2, hcf2, h7⟩ := bind_eq_ok h6
+        rcases branch_continue hcf2 with ⟨u2, rfl, rfl⟩ | ⟨e2, rfl, rfl⟩
+        case inr => exact (no_break h7).elim
+        simp only at h7
+        obtain ⟨⟨r3, s3⟩, hw3, h8⟩ := bind_eq_ok h7
+        obtain ⟨cf3, hcf3, h9⟩ := bind_eq_ok h8
+        rcases branch_continue hcf3 with ⟨u3, rfl, rfl⟩ | ⟨e3, rfl, rfl⟩
+        case inr => exact (no_break h9).elim
+        simp only at h9
+        obtain ⟨⟨r4, s4⟩, hw4, h10⟩ := bind_eq_ok h9
+        obtain ⟨cf4, hcf4, h11⟩ := bind_eq_ok h10
+        rcases branch_continue hcf4 with ⟨u4, rfl, rfl⟩ | ⟨e4, rfl, rfl⟩
+        case inr => exact (no_break h11).elim
+        simp only at h11
+        obtain ⟨hws, b1⟩ := (SetsTop.refl pre).write hw1
+        obtain ⟨-, b2⟩ := b1.write hw2
+        obtain ⟨-, b3⟩ := b2.write hw3
+        obtain ⟨-, b4⟩ := b3.write hw4
+        obtain ⟨-, b5⟩ := b4.write h11
+        refine ⟨ha.mp hbt, hdepth, hws, b5.mono (fun k => ?_), hbase⟩
+        simp only [x64_ir.RAX, x64_ir.RCX, x64_ir.R10, x64_ir.R11]
+        norm_num
+        tauto
     · simp [x64_check.reject] at h3
   · simp [x64_check.reject] at h2
 

@@ -1274,7 +1274,7 @@ theorem macroOk_atomicFetchAlu {P : Params} {code : List x64_ir.PInsn} {p : Nat}
       pos code (.Local n) = some (p + j)) :
     MacroOk P code p (p + (atomicFetchAluList op w64 src base disp label).length) pre post [] := by
   obtain ⟨haddr, hdep, hwr, hS⟩ := live_step_AtomicFetchAlu_spec hlive hstep
-  have hS' : SetsTop pre post (afaWrites src) := hS
+  have hS' : SetsTop pre post (afaWrites src) := hS.1
   set actual := atomicFetchActual src base with hactdef
   -- the register the loop keeps the source in is never the base
   have hact : src = x64_ir.RAX → actual.val ≠ base.val := by
