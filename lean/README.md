@@ -320,10 +320,15 @@ the caller expects.
 
 `check_safe` (in `X64/Soundness.lean`): if `x64_check::check` accepts a
 macro list, then under the cage (`pointer_mask ≠ 0`), with the machine's
-frame size the configured one, the dispatcher address non-zero and off the
-function's own code, every execution of the list's expansion from an entry
-state satisfies both. `lower_safe` composes it with `lower`'s gate and the
-expansion: what `translate_range` returns is safe.
+frame size the configured one, the machine's dispatcher the configured one
+and off the function's own code, and the list ending in the trailer, every
+execution of the list's expansion from an entry state satisfies both. The
+trailer is a hypothesis because the checker does not insist on it by itself,
+while a helper call needs the dispatcher slot that lives in it: with no slot
+the macro's fallback path, which loads through the embedded helper table,
+becomes reachable. `lower_safe` composes `check_safe` with `lower`'s gate and
+the expansion — and discharges the trailer, which `lower` always emits: what
+`translate_range` returns is safe.
 
 The proof is macro by macro. `Abs.lean` says when an abstract state and a
 machine state agree (`Agree`: `Fp` means the frame register holds its entry
