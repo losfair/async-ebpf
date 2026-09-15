@@ -385,7 +385,8 @@ pub enum MInsn {
   /// the result is 0 or a native address whose `size`-byte window lies inside
   /// one guest region. `STACK` and `DATA` check that one region; any other
   /// hint probes both. Contract: `dst`, `scratch` and `r9` distinct from each
-  /// other and from `rsp`, `rbp` and the frame register; afterwards `dst`
+  /// other and from `rsp`, `rbp` and the frame register, and `size` between
+  /// one byte and [`MAX_GROUP_SPAN`]; afterwards `dst`
   /// holds a checked address of `size` bytes, `scratch` and `r9` anything,
   /// and the three spill slots anything.
   CheckedAddr {

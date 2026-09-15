@@ -15,3 +15,6 @@ import AsyncEbpf.Semantics.Machine
 import AsyncEbpf.Semantics.Soundness
 import AsyncEbpf.Semantics.Functions
 import AsyncEbpf.Semantics.Frames
+import AsyncEbpf.X64.Bytes
+import AsyncEbpf.X64.Machine
+import AsyncEbpf.X64.Contract

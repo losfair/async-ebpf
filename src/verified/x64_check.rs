@@ -547,6 +547,11 @@ fn live_step(cfg: &Cfg, insn: MInsn, index: usize, pc: u32, st: &mut State) -> R
       if dst == scratch || dst == R9 || scratch == R9 {
         return Err(reject(index, pc));
       }
+      // A failed check parks zero and a member then touches `[0 + delta]`,
+      // so the window has to fit the page the fault handler claims.
+      if size == 0 || size > MAX_GROUP_SPAN {
+        return Err(reject(index, pc));
+      }
       write(st, dst, index, pc)?;
       write(st, scratch, index, pc)?;
       set_tag(st, R9, Tag::Top);
