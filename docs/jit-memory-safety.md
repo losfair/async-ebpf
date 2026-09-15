@@ -140,31 +140,45 @@ configuration sweeps and the fuzz targets answer: none of them trips it.
 In `lean/AsyncEbpf/X64/`:
 
 - `Machine.lean` is an operational semantics of the primitive instruction
-  set extracted from `x64_ir.rs`: sixteen registers, the carry and zero
-  flags, byte-addressed memory, and a program counter over the primitive
-  list. Branch targets are labels, so no encoding is modelled. A call to an
-  address outside the function is an *external call*: it returns to the
-  pushed return address with `rsp`, `rbp`, `rbx`, `r12`-`r15` and the
-  read-only frame slots and descriptor preserved and everything else
-  arbitrary. That is the SysV contract for the dispatcher and the callbacks,
-  and this theorem's own conclusion for a lazily compiled callee.
+  set extracted from `x64_ir.rs`: sixteen registers, the four flags the
+  checks read, byte-addressed memory, and a program counter over the
+  primitive list. Branch targets are labels, so no encoding is modelled. A
+  call to an address outside the function is an *external call*: it
+  returns to the pushed return address with `rsp`, `rbp`, `rbx`,
+  `r12`-`r15` and the read-only frame slots and descriptor preserved and
+  everything else arbitrary. That is the SysV contract for the dispatcher
+  and the callbacks, and this theorem's own conclusion for a lazily
+  compiled callee.
 - `Contract.lean` states the entry contract and the allowed set: the
   descriptor at `[rbp - 8]` and the derived constants below it describe two
   disjoint guest regions with disjoint native backings, neither containing
-  the first page; the frame register holds the native address of an island
-  top; the native stack has a bounded reserve below `rsp`.
-- `Check.lean` proves the checker sound: if `check` accepts a macro list,
-  every execution of its expansion from the entry contract touches only
-  allowed addresses, and returns, if it returns, with the contract kept.
-- `Safety.lean` composes: `lower_ok_safe` says the code `lower` returns is
-  safe.
+  the first page; the frame register holds the native address of the
+  current frame's top, inside the stack's backing; the native stack has a
+  bounded window below `rsp`.
+- `CheckSpec.lean` turns `check = ok` into a chain of abstract states with
+  one rule application per macro; `Expand.lean` turns `expand` into a
+  concatenation of per-macro chunks with every label resolved; `Abs.lean`
+  and `Run.lean` say when an abstract state describes a machine state and
+  what every macro's expansion owes (`MacroOk`); `Simple.lean`,
+  `CheckedAddr.lean`, `Arith.lean` and `Calls.lean` prove it macro by macro.
+- `Soundness.lean` composes: `check_safe` says that if `check` accepts a
+  macro list then, under the cage and with a registered dispatcher whose
+  address is off the function's code, every execution of the list's
+  expansion from the entry contract touches only allowed addresses and
+  returns, if it returns, with the contract kept; `lower_safe` says the
+  same of what `lower` returns.
 
 The per-macro lemmas are where the emitter's old comments became theorems:
 the branchless check yields zero or an in-region address for both the
 frame-constants and the descriptor paths and for the two-region probe; the
-local call's floor test makes the callee's frame register an island top; the
-helper call's default path is dead when a dispatcher is registered; the
-division sequence's pushes balance.
+lazy call moves the frame register by one stride and restores it around
+the callee; the helper call's default path is dead when a dispatcher is
+registered and its retpoline returns through the address the call pushed;
+the division sequence's pushes balance; the fetching atomic's loop
+re-dereferences a base nothing has rewritten.
+
+The theorem is about one activation entered at the head of the list, which
+is how the runtime enters every function it translates.
 
 ## What is trusted
 
