@@ -103,7 +103,7 @@ theorem i32_eq_of_val {x : Std.I32} {n : Int} (h : x.val = n) : x = i32 n := by
 
 /-- `x64_ir::frame::derived_slot`: where the `i`th derived constant sits
 below the frame pointer. -/
-def derivedSlot (i : Nat) : Std.I32 := i32 (-136 + 8 * (i : Int))
+def derivedDisp (i : Nat) : Std.I32 := i32 (-136 + 8 * (i : Int))
 
 /-- `x64_expand::derived_base`. -/
 def derivedBase (stack : Bool) : Nat := if stack then 0 else 6
@@ -176,15 +176,15 @@ def chunkPrologue (usage : Std.U16) (skip : Bool) (label : Nat) :
 def chunkRegionFromFrame (dst scratch : Std.U8) (size : Std.U32) (stack : Bool) :
     List x64_ir.PInsn :=
   [ .Alu true .Mov dst scratch,
-    .AluRM .Sub scratch x64_ir.RBP (derivedSlot (derivedBase stack)),
-    .AluRM .Add dst x64_ir.RBP (derivedSlot (derivedBase stack + 1)) ] ++
+    .AluRM .Sub scratch x64_ir.RBP (derivedDisp (derivedBase stack)),
+    .AluRM .Add dst x64_ir.RBP (derivedDisp (derivedBase stack + 1)) ] ++
   (match widthSpan size with
    | some slot =>
      [ .Alu true .Xor x64_ir.R9 x64_ir.R9,
-       .AluRM .CmpMR scratch x64_ir.RBP (derivedSlot (derivedBase stack + 2 + slot)),
+       .AluRM .CmpMR scratch x64_ir.RBP (derivedDisp (derivedBase stack + 2 + slot)),
        .Cmov x64_ir.cc.B dst x64_ir.R9 ]
    | none =>
-     [ .Load 8#u8 false x64_ir.RBP x64_ir.R9 (derivedSlot (derivedBase stack + 2)),
+     [ .Load 8#u8 false x64_ir.RBP x64_ir.R9 (derivedDisp (derivedBase stack + 2)),
        .AluImm true .Sub x64_ir.R9 (i32 ((Std.UScalar.hcast .I32 size).val - 1)),
        .Alu true .Cmp scratch x64_ir.R9,
        .AluImm true .Mov scratch 0#i32,
@@ -660,7 +660,7 @@ theorem regionFromFrame_emits (dst scratch : Std.U8) (size : Std.U32) (stack : B
     rw [usize_add_eq hi0, hb]; simp [global_simps]
   refine Emits.bindPre (fun bslot hbs => ?_)
   have hbsv : bslot.val = -136 + 8 * (i0.val : Int) := derived_slot_val (by omega) hbs
-  have hbs' : bslot = derivedSlot (derivedBase stack) := by
+  have hbs' : bslot = derivedDisp (derivedBase stack) := by
     rw [← hi0v]; exact i32_eq_of_val hbsv
   subst hbs'
   refine Emits.bindPre (fun i1 hi1 => ?_)
@@ -668,7 +668,7 @@ theorem regionFromFrame_emits (dst scratch : Std.U8) (size : Std.U32) (stack : B
     rw [usize_add_eq hi1, hb]; simp [global_simps]
   refine Emits.bindPre (fun dslot hds => ?_)
   have hdsv : dslot.val = -136 + 8 * (i1.val : Int) := derived_slot_val (by omega) hds
-  have hds' : dslot = derivedSlot (derivedBase stack + 1) := by
+  have hds' : dslot = derivedDisp (derivedBase stack + 1) := by
     rw [← hi1v]; exact i32_eq_of_val hdsv
   subst hds'
   refine Emits.bindPre (fun i2 hi2 => ?_)
@@ -676,7 +676,7 @@ theorem regionFromFrame_emits (dst scratch : Std.U8) (size : Std.U32) (stack : B
     rw [usize_add_eq hi2, hb]; simp [global_simps]
   refine Emits.bindPre (fun sbase hsb => ?_)
   have hsbv : sbase.val = -136 + 8 * (i2.val : Int) := derived_slot_val (by omega) hsb
-  have hsb' : sbase = derivedSlot (derivedBase stack + 2) := by
+  have hsb' : sbase = derivedDisp (derivedBase stack + 2) := by
     rw [← hi2v]; exact i32_eq_of_val hsbv
   subst hsb'
   simp only [x64_expand.mov64, x64_expand.alu_rm, x64_expand.load64, x64_expand.cmovb,
@@ -701,7 +701,7 @@ theorem regionFromFrame_emits (dst scratch : Std.U8) (size : Std.U32) (stack : B
     have hsl : slot.val ≤ 3 := widthSpan_le (by rw [width_span_eq hspan]; rfl)
     refine Emits.bindPre (fun i4 hi4 => ?_)
     refine Emits.bindPre (fun sslot hss => ?_)
-    have hsslot : sslot = derivedSlot (derivedBase stack + 2 + slot.val) := by
+    have hsslot : sslot = derivedDisp (derivedBase stack + 2 + slot.val) := by
       refine i32_eq_of_val ?_
       rw [i32_add_eq hss, hsbv, hi2v, i32_mul_eq hi4,
         usize_hcast_i32_val slot (by omega)]

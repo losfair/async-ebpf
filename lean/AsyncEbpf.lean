@@ -23,3 +23,7 @@ import AsyncEbpf.X64.CheckSpec
 import AsyncEbpf.X64.Abs
 import AsyncEbpf.X64.Run
 import AsyncEbpf.X64.Simple
+import AsyncEbpf.X64.Expand
+import AsyncEbpf.X64.CheckedAddr
+import AsyncEbpf.X64.Arith
+import AsyncEbpf.X64.Calls
