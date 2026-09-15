@@ -445,7 +445,9 @@ pub enum MInsn {
     disp: i32,
   },
   /// The fetching forms of the above, emulated with a compare-exchange loop.
-  /// Writes `src`, `rax`, `rcx`, `r10` and `r11`; one push, balanced.
+  /// Writes `src`, `rax`, `rcx`, `r10` and `r11`; one push, balanced. Under
+  /// the cage `base` is neither `rax` nor `rcx`, which the loop rewrites
+  /// before it dereferences `base` again.
   AtomicFetchAlu {
     op: u8,
     w64: bool,

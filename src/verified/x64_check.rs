@@ -622,6 +622,13 @@ fn live_step(cfg: &Cfg, insn: MInsn, index: usize, pc: u32, st: &mut State) -> R
       if !addr_ok(cfg, st, base, disp, atomic_size(w64)) || !depth_ok(st, 1) {
         return Err(reject(index, pc));
       }
+      // The loop reloads through `base` after writing `rax` and `rcx`, so
+      // under the cage the base may be neither. (The lowering resolves every
+      // atomic into `r11`.)
+      let base_clobbered = cfg.pointer_mask != 0 && (base == RAX || base == RCX);
+      if base_clobbered {
+        return Err(reject(index, pc));
+      }
       write(st, src, index, pc)?;
       write(st, RAX, index, pc)?;
       write(st, RCX, index, pc)?;
@@ -821,6 +828,40 @@ mod tests {
       Ok(()) => panic!("expected a rejection"),
       Err(u) => u.index,
     }
+  }
+
+  #[test]
+  fn a_fetching_atomic_may_not_be_based_on_a_register_its_loop_rewrites() {
+    let fetch = |base: u8| MInsn::AtomicFetchAlu {
+      op: 0x01,
+      w64: true,
+      src: RDI,
+      base,
+      disp: 0,
+    };
+    accepts(
+      &cfg(),
+      &function(&[checked_addr(RDI, R11, RCX, 8), fetch(R11)]),
+    );
+    assert_eq!(
+      refused_at(
+        &cfg(),
+        &function(&[checked_addr(RDI, RAX, RCX, 8), fetch(RAX)])
+      ),
+      2
+    );
+    assert_eq!(
+      refused_at(
+        &cfg(),
+        &function(&[checked_addr(RDI, RCX, R11, 8), fetch(RCX)])
+      ),
+      2
+    );
+    // With the cage off nothing is promised about guest memory, so the base
+    // is unconstrained.
+    let mut off = cfg();
+    off.pointer_mask = 0;
+    accepts(&off, &function(&[fetch(RAX)]));
   }
 
   #[test]
