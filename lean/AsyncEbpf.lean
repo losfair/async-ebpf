@@ -20,3 +20,6 @@ import AsyncEbpf.X64.Machine
 import AsyncEbpf.X64.Contract
 import AsyncEbpf.X64.Tag
 import AsyncEbpf.X64.CheckSpec
+import AsyncEbpf.X64.Abs
+import AsyncEbpf.X64.Run
+import AsyncEbpf.X64.Simple

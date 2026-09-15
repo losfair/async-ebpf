@@ -110,35 +110,20 @@ structure DerivedBlock (P : Params) (m : Mem) (k : Nat) (gb gt nb : Word) : Prop
   span4 : load64 m (derivedSlot P (k + 4)) = (gt - 4#64) - gb
   span8 : load64 m (derivedSlot P (k + 5)) = (gt - 8#64) - gb
 
-/-- The state an emitted function is entered in.
 
-The register clauses and the memory clauses are what the entry trampolines in
-`program.rs` and the runtime's descriptor filling promise; the layout clauses
-are what the mappings promise. Both are trusted — they are the hypotheses of
-the theorem, not its conclusion. -/
-structure Entry (P : Params) (s : State) : Prop where
-  /-- Execution starts at the head of the list. -/
-  atStart : s.pc = 0
-  rsp : s.regs RSP = P.rsp0
-  rbp : s.regs RBP = P.rbp0
-  /-- `r15` is the native frame base. -/
-  fp : s.regs R15 = P.fp0
-  /-- `[rbp - 8]` is the descriptor's address. -/
-  descSlot : load64 s.mem (P.rbp0 - 8#64) = P.desc
-  /-- `[rbp - 40]` is the guest-to-native delta of the stack. -/
-  deltaSlot : load64 s.mem (P.rbp0 - 40#64) = P.snb - P.sgb
-  /-- Derived slots 0–5 describe the stack. -/
-  stackDerived : DerivedBlock P s.mem 0 P.sgb P.sgt P.snb
-  /-- Derived slots 6–11 describe the data region. -/
-  dataDerived : DerivedBlock P s.mem 6 P.dgb P.dgt P.dnb
-  descStackBottom : load64 s.mem (P.desc + 0#64) = P.sgb
-  descStackTop : load64 s.mem (P.desc + 8#64) = P.sgt
-  descStackNative : load64 s.mem (P.desc + 16#64) = P.snb
-  descDataBottom : load64 s.mem (P.desc + 24#64) = P.dgb
-  descDataTop : load64 s.mem (P.desc + 32#64) = P.dgt
-  descDataNative : load64 s.mem (P.desc + 40#64) = P.dnb
-  descGuestFloor : load64 s.mem (P.desc + 144#64) = P.guestFloor
-  descNativeFloor : load64 s.mem (P.desc + 152#64) = P.nativeFloor
+/-! ## The layout, the read-only memory, and the entry state
+
+`Entry` used to be one flat structure. It is now three: the clauses that
+mention only the parameters (`Layout`), the clauses about the bytes the
+generated code never writes (`RoMem`), and the four register clauses. Every
+clause it had is still here; the split is what lets the agreement relation of
+`AsyncEbpf/X64/Abs.lean` carry the two halves that survive a step —
+`Layout P` never changes, and `RoMem P s.mem` is what every macro must be
+shown to keep. -/
+
+/-- What the mappings promise about the parameters alone: each region is a
+range, no window wraps, and no two of the six windows meet. -/
+structure Layout (P : Params) : Prop where
   /-- Each guest region is a range. -/
   stackOrdered : P.sgb.toNat ≤ P.sgt.toNat
   dataOrdered : P.dgb.toNat ≤ P.dgt.toNat
@@ -178,6 +163,70 @@ structure Entry (P : Params) (s : State) : Prop where
   /-- The local-call floor leaves room for at least the current frame and one
   more stride below it. -/
   floorRoom : P.snb.toNat + P.frameSize + P.stride ≤ P.guestFloor.toNat
+  /-- Neither guest region is narrower than the widest window a check may
+  cover (`x64_ir::MAX_GROUP_SPAN`); the runtime refuses to map one that is.
+  A failed check parks zero, and the members of its group then touch the
+  first page, so the page and the region have to be the same size for the
+  two cases of a `Checked` base to be one statement. -/
+  stackWide : 4096 ≤ stackSpan P
+  dataWide : 4096 ≤ dataSpan P
+  /-- The frame scratch and the native stack window are ranges below `rbp0`
+  and `rsp0` in the arithmetic sense, not merely modulo `2 ^ 64`: the host
+  stack the trampoline was entered on is nowhere near address zero. -/
+  frameRoom : 160 ≤ P.rbp0.toNat
+  stackRoom : 128 ≤ P.rsp0.toNat
+  /-- The first page, which is where a failed check folds, meets neither the
+  frame scratch nor the descriptor. Without this a checked store through a
+  zero base could rewrite the descriptor the next check reads. -/
+  frameOffPage : RangesDisjoint 0#64 4096 (frameSlots P) 160
+  descOffPage : RangesDisjoint 0#64 4096 P.desc 200
+
+/-- The bytes below the frame pointer, and the descriptor, that the entry
+trampoline filled in and the generated code never writes: the descriptor's
+address at `[rbp - 8]`, the stack delta at `[rbp - 40]`, the twelve derived
+slots, and the eight descriptor fields a bounds check reads.
+
+This is the half of the entry contract that a macro has to be shown to keep,
+which is why it is a structure over a `Mem` rather than over a `State`: the
+four writable frame slots, the native stack and the guest regions are
+elsewhere, and a store to any of them leaves this alone. -/
+structure RoMem (P : Params) (m : Mem) : Prop where
+  /-- `[rbp - 8]` is the descriptor's address. -/
+  descSlot : load64 m (P.rbp0 - 8#64) = P.desc
+  /-- `[rbp - 40]` is the guest-to-native delta of the stack. -/
+  deltaSlot : load64 m (P.rbp0 - 40#64) = P.snb - P.sgb
+  /-- Derived slots 0–5 describe the stack. -/
+  stackDerived : DerivedBlock P m 0 P.sgb P.sgt P.snb
+  /-- Derived slots 6–11 describe the data region. -/
+  dataDerived : DerivedBlock P m 6 P.dgb P.dgt P.dnb
+  descStackBottom : load64 m (P.desc + 0#64) = P.sgb
+  descStackTop : load64 m (P.desc + 8#64) = P.sgt
+  descStackNative : load64 m (P.desc + 16#64) = P.snb
+  descDataBottom : load64 m (P.desc + 24#64) = P.dgb
+  descDataTop : load64 m (P.desc + 32#64) = P.dgt
+  descDataNative : load64 m (P.desc + 40#64) = P.dnb
+  descGuestFloor : load64 m (P.desc + 144#64) = P.guestFloor
+  descNativeFloor : load64 m (P.desc + 152#64) = P.nativeFloor
+
+/-- The state an emitted function is entered in.
+
+The register clauses and the memory clauses are what the entry trampolines in
+`program.rs` and the runtime's descriptor filling promise; the layout clauses
+are what the mappings promise. Both are trusted — they are the hypotheses of
+the theorem, not its conclusion. -/
+structure Entry (P : Params) (s : State) : Prop where
+  /-- Execution starts at the head of the list. -/
+  atStart : s.pc = 0
+  rsp : s.regs RSP = P.rsp0
+  rbp : s.regs RBP = P.rbp0
+  /-- `r15` is the native frame base. -/
+  fp : s.regs R15 = P.fp0
+  /-- What the trampoline wrote below the frame pointer and into the
+  descriptor. -/
+  ro : RoMem P s.mem
+  /-- What the mappings promise. -/
+  layout : Layout P
+
 
 /-! ## What is to be proved of an emitted function -/
 
