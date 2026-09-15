@@ -35,3 +35,7 @@ pub mod liveness;
 pub mod region;
 pub mod stack;
 pub mod validate;
+pub mod x64_check;
+pub mod x64_expand;
+pub mod x64_ir;
+pub mod x64_lower;
