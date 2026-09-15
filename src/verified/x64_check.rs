@@ -410,12 +410,31 @@ fn label_step(
   Ok(())
 }
 
+/// Whether a prologue may stand here: any dead state; a skippable one at
+/// depth one with the frame register intact; a plain one at depth zero.
+fn prologue_ok(skip: bool, st: &State) -> bool {
+  if !st.alive {
+    return true;
+  }
+  if skip {
+    if st.depth != 1 {
+      return false;
+    }
+    return frame_intact(st);
+  }
+  if st.depth == 0 {
+    true
+  } else {
+    false
+  }
+}
+
 /// The prologue. Reached from a dead state — the start of the range, or the
 /// slot after a `jmp` or an epilogue — it pushes the one slot the body runs
 /// at. A skippable one is also fallen into from the instruction before it,
 /// which has already pushed that slot and jumps over the push.
 fn prologue_step(skip: bool, index: usize, pc: u32, st: &mut State) -> Result<(), Unsafe> {
-  let ok = !st.alive || (skip && st.depth == 1 && frame_intact(st)) || (!skip && st.depth == 0);
+  let ok = prologue_ok(skip, st);
   if !ok {
     return Err(reject(index, pc));
   }

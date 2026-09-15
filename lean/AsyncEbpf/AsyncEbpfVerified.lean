@@ -6362,40 +6362,36 @@ def x64_check.label_step
          ok (core.result.Result.Ok (), st1)
   else ok (core.result.Result.Ok (), st)
 
+/-- [async_ebpf_verified::x64_check::prologue_ok]:
+    Source: '../../src/verified/x64_check.rs', lines 415:0-430:1 -/
+def x64_check.prologue_ok
+  (skip : Bool) (st : x64_check.State) : Result Bool := do
+  if st.alive
+  then
+    if skip
+    then if st.depth != 1#u32
+         then ok false
+         else x64_check.frame_intact st
+    else if st.depth = 0#u32
+         then ok true
+         else ok false
+  else ok true
+
 /-- [async_ebpf_verified::x64_check::prologue_step]:
-    Source: '../../src/verified/x64_check.rs', lines 417:0-424:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 436:0-443:1 -/
 def x64_check.prologue_step
   (skip : Bool) (index : Std.Usize) (pc : Std.U32) (st : x64_check.State) :
   Result ((core.result.Result Unit x64_check.Unsafe) × x64_check.State)
   := do
-  let (b, ok1) ←
-    if st.alive
-    then
-      do
-      let b1 ←
-        if skip
-        then
-          if st.depth = 1#u32
-          then
-            do
-            let b2 ← x64_check.frame_intact st
-            if b2
-            then ok true
-            else ok false
-          else ok false
-        else ok (st.depth = 0#u32)
-      ok (true, b1)
-    else ok (false, true)
+  let ok1 ← x64_check.prologue_ok skip st
   if ok1
-  then
-    let st1 ← x64_check.enter { st with alive := b }
-    ok (core.result.Result.Ok (), st1)
-  else
-    let u ← x64_check.reject index pc
-    ok (core.result.Result.Err u, { st with alive := b })
+  then let st1 ← x64_check.enter st
+       ok (core.result.Result.Ok (), st1)
+  else let u ← x64_check.reject index pc
+       ok (core.result.Result.Err u, st)
 
 /-- [async_ebpf_verified::x64_check::branch_step]:
-    Source: '../../src/verified/x64_check.rs', lines 429:0-453:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 448:0-472:1 -/
 def x64_check.branch_step
   (labels : x64_check.Labels) (target : x64_ir.Target) (unconditional : Bool)
   (index : Std.Usize) (pc : Std.U32) (st : x64_check.State) :
@@ -6441,7 +6437,7 @@ def x64_check.branch_step
          ok (core.result.Result.Err u, st)
 
 /-- [async_ebpf_verified::x64_check::retpoline_step]:
-    Source: '../../src/verified/x64_check.rs', lines 457:0-463:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 476:0-482:1 -/
 def x64_check.retpoline_step
   (code : Slice x64_ir.MInsn) (index : Std.Usize) (pc : Std.U32)
   (st : x64_check.State) :
@@ -6454,7 +6450,7 @@ def x64_check.retpoline_step
        ok (core.result.Result.Err u, st)
 
 /-- [async_ebpf_verified::x64_check::data_step]:
-    Source: '../../src/verified/x64_check.rs', lines 468:0-473:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 487:0-492:1 -/
 def x64_check.data_step
   (code : Slice x64_ir.MInsn) (index : Std.Usize) (pc : Std.U32)
   (behind : Std.Usize) :
@@ -6517,7 +6513,7 @@ def x64_check.data_step
 @[global_simps, irreducible] def x64_ir.RSI : Std.U8 := 6#u8
 
 /-- [async_ebpf_verified::x64_check::clobber_call]:
-    Source: '../../src/verified/x64_check.rs', lines 656:0-667:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 675:0-686:1 -/
 def x64_check.clobber_call
   (st : x64_check.State) : Result x64_check.State := do
   let st1 ← x64_check.set_tag st x64_ir.RAX x64_check.Tag.Top
@@ -6532,7 +6528,7 @@ def x64_check.clobber_call
   ok { st9 with group := x64_check.Tag.Top }
 
 /-- [async_ebpf_verified::x64_check::live_step]:
-    Source: '../../src/verified/x64_check.rs', lines 478:0-651:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 497:0-670:1 -/
 def x64_check.live_step
   (cfg : x64_ir.Cfg) (insn : x64_ir.MInsn) (index : Std.Usize) (pc : Std.U32)
   (st : x64_check.State) :
@@ -6814,7 +6810,7 @@ def x64_check.live_step
   else ok (core.result.Result.Ok (), st)
 
 /-- [async_ebpf_verified::x64_check::step]:
-    Source: '../../src/verified/x64_check.rs', lines 672:0-691:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 691:0-710:1 -/
 def x64_check.step
   (cfg : x64_ir.Cfg) (labels : x64_check.Labels) (code : Slice x64_ir.MInsn)
   (index : Std.Usize) (pc : Std.U32) (st : x64_check.State) :
@@ -6867,7 +6863,7 @@ def x64_check.step
     ok (r, st)
 
 /-- [async_ebpf_verified::x64_check::check]: loop body 0:
-    Source: '../../src/verified/x64_check.rs', lines 706:2-720:1
+    Source: '../../src/verified/x64_check.rs', lines 725:2-739:1
     Visibility: public -/
 @[rust_loop_body]
 def x64_check.check_loop.body
@@ -6907,7 +6903,7 @@ def x64_check.check_loop.body
     else ok (done (core.result.Result.Ok ()))
 
 /-- [async_ebpf_verified::x64_check::check]: loop 0:
-    Source: '../../src/verified/x64_check.rs', lines 706:2-720:1
+    Source: '../../src/verified/x64_check.rs', lines 725:2-739:1
     Visibility: public -/
 @[rust_loop]
 def x64_check.check_loop
@@ -6922,7 +6918,7 @@ def x64_check.check_loop
     (st, pc, i)
 
 /-- [async_ebpf_verified::x64_check::check]:
-    Source: '../../src/verified/x64_check.rs', lines 700:0-720:1
+    Source: '../../src/verified/x64_check.rs', lines 719:0-739:1
     Visibility: public -/
 def x64_check.check
   (cfg : x64_ir.Cfg) (code : Slice x64_ir.MInsn) :
@@ -8666,7 +8662,7 @@ def x64_ir.AluRM.Insts.CoreMarkerCopy : core.marker.Copy x64_ir.AluRM := {
 @[global_simps, irreducible] def x64_ir.MAX_LEAS : Std.U32 := 65536#u32
 
 /-- [async_ebpf_verified::x64_lower::Reject]
-    Source: '../../src/verified/x64_lower.rs', lines 48:0-81:1
+    Source: '../../src/verified/x64_lower.rs', lines 48:0-83:1
     Visibility: public -/
 @[discriminant isize]
 inductive x64_lower.Reject where
@@ -8707,7 +8703,7 @@ def x64_lower.Reject.Insts.CoreMarkerCopy : core.marker.Copy x64_lower.Reject
 }
 
 /-- [async_ebpf_verified::x64_lower::Fixups]
-    Source: '../../src/verified/x64_lower.rs', lines 86:0-92:1
+    Source: '../../src/verified/x64_lower.rs', lines 88:0-94:1
     Visibility: public -/
 structure x64_lower.Fixups where
   jumps : Std.U32
@@ -8715,14 +8711,14 @@ structure x64_lower.Fixups where
   leas : Std.U32
 
 /-- [async_ebpf_verified::x64_lower::{impl core::clone::Clone for async_ebpf_verified::x64_lower::Fixups}::clone]:
-    Source: '../../src/verified/x64_lower.rs', lines 84:15-84:20
+    Source: '../../src/verified/x64_lower.rs', lines 86:15-86:20
     Visibility: public -/
 def x64_lower.Fixups.Insts.CoreCloneClone.clone
   (self : x64_lower.Fixups) : Result x64_lower.Fixups := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::x64_lower::{impl core::clone::Clone for async_ebpf_verified::x64_lower::Fixups}]
-    Source: '../../src/verified/x64_lower.rs', lines 84:15-84:20 -/
+    Source: '../../src/verified/x64_lower.rs', lines 86:15-86:20 -/
 @[reducible]
 def x64_lower.Fixups.Insts.CoreCloneClone : core.clone.Clone x64_lower.Fixups
   := {
@@ -8730,7 +8726,7 @@ def x64_lower.Fixups.Insts.CoreCloneClone : core.clone.Clone x64_lower.Fixups
 }
 
 /-- Trait implementation: [async_ebpf_verified::x64_lower::{impl core::marker::Copy for async_ebpf_verified::x64_lower::Fixups}]
-    Source: '../../src/verified/x64_lower.rs', lines 84:9-84:13 -/
+    Source: '../../src/verified/x64_lower.rs', lines 86:9-86:13 -/
 @[reducible]
 def x64_lower.Fixups.Insts.CoreMarkerCopy : core.marker.Copy x64_lower.Fixups
   := {
@@ -8738,35 +8734,35 @@ def x64_lower.Fixups.Insts.CoreMarkerCopy : core.marker.Copy x64_lower.Fixups
 }
 
 /-- [async_ebpf_verified::x64_lower::Addr]
-    Source: '../../src/verified/x64_lower.rs', lines 98:0-101:1
+    Source: '../../src/verified/x64_lower.rs', lines 100:0-103:1
     Visibility: public -/
 structure x64_lower.Addr where
   reg : Std.U8
   disp : Std.I32
 
 /-- [async_ebpf_verified::x64_lower::{impl core::clone::Clone for async_ebpf_verified::x64_lower::Addr}::clone]:
-    Source: '../../src/verified/x64_lower.rs', lines 96:15-96:20
+    Source: '../../src/verified/x64_lower.rs', lines 98:15-98:20
     Visibility: public -/
 def x64_lower.Addr.Insts.CoreCloneClone.clone
   (self : x64_lower.Addr) : Result x64_lower.Addr := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::x64_lower::{impl core::clone::Clone for async_ebpf_verified::x64_lower::Addr}]
-    Source: '../../src/verified/x64_lower.rs', lines 96:15-96:20 -/
+    Source: '../../src/verified/x64_lower.rs', lines 98:15-98:20 -/
 @[reducible]
 def x64_lower.Addr.Insts.CoreCloneClone : core.clone.Clone x64_lower.Addr := {
   clone := x64_lower.Addr.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [async_ebpf_verified::x64_lower::{impl core::marker::Copy for async_ebpf_verified::x64_lower::Addr}]
-    Source: '../../src/verified/x64_lower.rs', lines 96:9-96:13 -/
+    Source: '../../src/verified/x64_lower.rs', lines 98:9-98:13 -/
 @[reducible]
 def x64_lower.Addr.Insts.CoreMarkerCopy : core.marker.Copy x64_lower.Addr := {
   cloneInst := x64_lower.Addr.Insts.CoreCloneClone
 }
 
 /-- [async_ebpf_verified::x64_lower::Lowering]
-    Source: '../../src/verified/x64_lower.rs', lines 114:0-124:1
+    Source: '../../src/verified/x64_lower.rs', lines 116:0-126:1
     Visibility: public -/
 structure x64_lower.Lowering where
   jumps : Std.U32
@@ -8780,29 +8776,29 @@ structure x64_lower.Lowering where
   group_written : Std.U16
 
 /-- [async_ebpf_verified::x64_lower::and_imm]:
-    Source: '../../src/verified/x64_lower.rs', lines 1102:0-1109:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1104:0-1111:1 -/
 def x64_lower.and_imm
   (w64 : Bool) (dst : Std.U8) (imm : Std.I32) : Result x64_ir.MInsn := do
   ok (x64_ir.MInsn.AluImm w64 x64_ir.AluRI.And dst imm)
 
 /-- [async_ebpf_verified::x64_lower::X64_ALU_XOR]
-    Source: '../../src/verified/x64_lower.rs', lines 1632:0-1632:29 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1634:0-1634:29 -/
 @[global_simps, irreducible] def x64_lower.X64_ALU_XOR : Std.U8 := 49#u8
 
 /-- [async_ebpf_verified::x64_lower::X64_ALU_AND]
-    Source: '../../src/verified/x64_lower.rs', lines 1631:0-1631:29 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1633:0-1633:29 -/
 @[global_simps, irreducible] def x64_lower.X64_ALU_AND : Std.U8 := 33#u8
 
 /-- [async_ebpf_verified::x64_lower::X64_ALU_OR]
-    Source: '../../src/verified/x64_lower.rs', lines 1630:0-1630:28 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1632:0-1632:28 -/
 @[global_simps, irreducible] def x64_lower.X64_ALU_OR : Std.U8 := 9#u8
 
 /-- [async_ebpf_verified::x64_lower::X64_ALU_ADD]
-    Source: '../../src/verified/x64_lower.rs', lines 1629:0-1629:29 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1631:0-1631:29 -/
 @[global_simps, irreducible] def x64_lower.X64_ALU_ADD : Std.U8 := 1#u8
 
 /-- [async_ebpf_verified::x64_lower::atomic_alu_opcode]:
-    Source: '../../src/verified/x64_lower.rs', lines 1664:0-1672:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1666:0-1674:1 -/
 def x64_lower.atomic_alu_opcode (op : isa.AtomicOp) : Result Std.U8 := do
   match op with
   | isa.AtomicOp.Add => ok x64_lower.X64_ALU_ADD
@@ -8813,12 +8809,12 @@ def x64_lower.atomic_alu_opcode (op : isa.AtomicOp) : Result Std.U8 := do
   | isa.AtomicOp.Cmpxchg => ok 0#u8
 
 /-- [async_ebpf_verified::x64_lower::no_fixups]:
-    Source: '../../src/verified/x64_lower.rs', lines 304:0-310:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 306:0-312:1 -/
 def x64_lower.no_fixups : Result x64_lower.Fixups := do
   ok { jumps := 0#u32, loads := 0#u32, leas := 0#u32 }
 
 /-- [async_ebpf_verified::x64_lower::fixups_of]:
-    Source: '../../src/verified/x64_lower.rs', lines 313:0-357:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 315:0-359:1 -/
 def x64_lower.fixups_of (m : x64_ir.MInsn) : Result x64_lower.Fixups := do
   match m with
   | x64_ir.MInsn.PcLabel _ => x64_lower.no_fixups
@@ -8861,7 +8857,7 @@ def x64_lower.fixups_of (m : x64_ir.MInsn) : Result x64_lower.Fixups := do
   | x64_ir.MInsn.HelperTable => x64_lower.no_fixups
 
 /-- [async_ebpf_verified::x64_lower::push]:
-    Source: '../../src/verified/x64_lower.rs', lines 365:0-381:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 367:0-383:1 -/
 def x64_lower.push
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn)
   (m : x64_ir.MInsn) :
@@ -8960,7 +8956,7 @@ def x64_lower.push
           { st with jumps := i, loads := i2, leas := i1 }, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_atomic_alu]:
-    Source: '../../src/verified/x64_lower.rs', lines 1769:0-1805:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1771:0-1807:1 -/
 def x64_lower.lower_atomic_alu
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn)
   (selector : isa.AtomicOp) (imm : Std.I32) (is64 : Bool) (src : Std.U8)
@@ -8976,7 +8972,7 @@ def x64_lower.lower_atomic_alu
   else x64_lower.push st out (x64_ir.MInsn.AtomicAlu op is64 src base disp)
 
 /-- [async_ebpf_verified::x64_lower::lower_atomic_cmpxchg]:
-    Source: '../../src/verified/x64_lower.rs', lines 1745:0-1767:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1747:0-1769:1 -/
 def x64_lower.lower_atomic_cmpxchg
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn) (is64 : Bool)
   (src : Std.U8) (base : Std.U8) (disp : Std.I32) :
@@ -9000,7 +8996,7 @@ def x64_lower.lower_atomic_cmpxchg
     ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_atomic_xchg]:
-    Source: '../../src/verified/x64_lower.rs', lines 1720:0-1742:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1722:0-1744:1 -/
 def x64_lower.lower_atomic_xchg
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn) (is64 : Bool)
   (src : Std.U8) (base : Std.U8) (disp : Std.I32) :
@@ -9024,7 +9020,7 @@ def x64_lower.lower_atomic_xchg
     ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::atomic_selector]:
-    Source: '../../src/verified/x64_lower.rs', lines 1639:0-1660:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1641:0-1662:1 -/
 def x64_lower.atomic_selector
   (imm : Std.I32) : Result (Option isa.AtomicOp) := do
   let i ← lift (UScalar.hcast .I32 isa.ALU_MASK)
@@ -9049,7 +9045,7 @@ def x64_lower.atomic_selector
                else ok none
 
 /-- [async_ebpf_verified::x64_lower::width_bytes]:
-    Source: '../../src/verified/x64_lower.rs', lines 791:0-798:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 793:0-800:1 -/
 def x64_lower.width_bytes (width : isa.Width) : Result Std.U8 := do
   match width with
   | isa.Width.B => ok 1#u8
@@ -9058,7 +9054,7 @@ def x64_lower.width_bytes (width : isa.Width) : Result Std.U8 := do
   | isa.Width.DW => ok 8#u8
 
 /-- [async_ebpf_verified::x64_lower::lower_atomic]:
-    Source: '../../src/verified/x64_lower.rs', lines 1674:0-1717:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1676:0-1719:1 -/
 def x64_lower.lower_atomic
   (cfg : x64_ir.Cfg) (st : x64_lower.Lowering)
   (out : alloc.vec.Vec x64_ir.MInsn) (pc : Std.Usize) (insn : isa.Insn)
@@ -9135,7 +9131,7 @@ def x64_lower.lower_atomic
         x64_lower.lower_atomic_cmpxchg st out (i = 8#u8) src dst disp
 
 /-- [async_ebpf_verified::x64_lower::open_group]:
-    Source: '../../src/verified/x64_lower.rs', lines 1530:0-1537:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1532:0-1539:1 -/
 def x64_lower.open_group
   (st : x64_lower.Lowering) (pc : Std.Usize) (entry : x64_ir.PlanEntry)
   (base_ebpf : Std.U8) :
@@ -9155,7 +9151,7 @@ def x64_lower.open_group
     }
 
 /-- [async_ebpf_verified::x64_lower::leader_usable]:
-    Source: '../../src/verified/x64_lower.rs', lines 1491:0-1505:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1493:0-1507:1 -/
 def x64_lower.leader_usable
   (entry : x64_ir.PlanEntry) (base_ebpf : Std.U8) (offset : Std.I32)
   (width : Std.I32) :
@@ -9186,7 +9182,7 @@ def x64_lower.leader_usable
           else ok (entry.region != x64_ir.region.FRAME)
 
 /-- [async_ebpf_verified::x64_lower::takes_leader_path]:
-    Source: '../../src/verified/x64_lower.rs', lines 1522:0-1527:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1524:0-1529:1 -/
 def x64_lower.takes_leader_path
   (entry : x64_ir.PlanEntry) (base_ebpf : Std.U8) (offset : Std.I32)
   (width : Std.I32) :
@@ -9197,7 +9193,7 @@ def x64_lower.takes_leader_path
   else x64_lower.leader_usable entry base_ebpf offset width
 
 /-- [async_ebpf_verified::x64_lower::member_usable]:
-    Source: '../../src/verified/x64_lower.rs', lines 1474:0-1488:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1476:0-1490:1 -/
 def x64_lower.member_usable
   (st : x64_lower.Lowering) (entry : x64_ir.PlanEntry) (base_ebpf : Std.U8)
   (offset : Std.I32) (width : Std.I32) :
@@ -9234,7 +9230,7 @@ def x64_lower.member_usable
   else ok false
 
 /-- [async_ebpf_verified::x64_lower::takes_member_path]:
-    Source: '../../src/verified/x64_lower.rs', lines 1508:0-1519:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1510:0-1521:1 -/
 def x64_lower.takes_member_path
   (st : x64_lower.Lowering) (entry : x64_ir.PlanEntry) (base_ebpf : Std.U8)
   (offset : Std.I32) (width : Std.I32) :
@@ -9245,7 +9241,7 @@ def x64_lower.takes_member_path
   else x64_lower.member_usable st entry base_ebpf offset width
 
 /-- [async_ebpf_verified::x64_lower::plan_entry_at]:
-    Source: '../../src/verified/x64_lower.rs', lines 1462:0-1471:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1464:0-1473:1 -/
 def x64_lower.plan_entry_at
   (cfg : x64_ir.Cfg) (plan : Slice x64_ir.PlanEntry) (pc : Std.Usize) :
   Result (Option x64_ir.PlanEntry)
@@ -9261,7 +9257,7 @@ def x64_lower.plan_entry_at
   else ok none
 
 /-- [async_ebpf_verified::x64_lower::frame_access_ok]:
-    Source: '../../src/verified/x64_lower.rs', lines 1440:0-1459:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1442:0-1461:1 -/
 def x64_lower.frame_access_ok
   (cfg : x64_ir.Cfg) (hint : Std.U8) (base : Std.U8) (offset : Std.I32)
   (size : Std.I32) :
@@ -9288,7 +9284,7 @@ def x64_lower.frame_access_ok
   else ok false
 
 /-- [async_ebpf_verified::x64_lower::checked_address]:
-    Source: '../../src/verified/x64_lower.rs', lines 1541:0-1622:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1543:0-1624:1 -/
 def x64_lower.checked_address
   (cfg : x64_ir.Cfg) (plan : Slice x64_ir.PlanEntry) (st : x64_lower.Lowering)
   (out : alloc.vec.Vec x64_ir.MInsn) (pc : Std.Usize) (base : Std.U8)
@@ -9389,7 +9385,7 @@ def x64_lower.checked_address
               ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_store_imm]:
-    Source: '../../src/verified/x64_lower.rs', lines 1373:0-1432:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1375:0-1434:1 -/
 def x64_lower.lower_store_imm
   (cfg : x64_ir.Cfg) (plan : Slice x64_ir.PlanEntry) (st : x64_lower.Lowering)
   (out : alloc.vec.Vec x64_ir.MInsn) (pc : Std.Usize) (insn : isa.Insn)
@@ -9431,7 +9427,7 @@ def x64_lower.lower_store_imm
     ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_store_reg]:
-    Source: '../../src/verified/x64_lower.rs', lines 1325:0-1371:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1327:0-1373:1 -/
 def x64_lower.lower_store_reg
   (cfg : x64_ir.Cfg) (plan : Slice x64_ir.PlanEntry) (st : x64_lower.Lowering)
   (out : alloc.vec.Vec x64_ir.MInsn) (pc : Std.Usize) (insn : isa.Insn)
@@ -9474,7 +9470,7 @@ def x64_lower.lower_store_reg
     ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_load]:
-    Source: '../../src/verified/x64_lower.rs', lines 1285:0-1323:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1287:0-1325:1 -/
 def x64_lower.lower_load
   (cfg : x64_ir.Cfg) (plan : Slice x64_ir.PlanEntry) (st : x64_lower.Lowering)
   (out : alloc.vec.Vec x64_ir.MInsn) (pc : Std.Usize) (insn : isa.Insn)
@@ -9501,7 +9497,7 @@ def x64_lower.lower_load
     ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_lazy_local_call]:
-    Source: '../../src/verified/x64_lower.rs', lines 1260:0-1279:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1262:0-1281:1 -/
 def x64_lower.lower_lazy_local_call
   (cfg : x64_ir.Cfg) (resolver_ids : Slice Std.U32) (st : x64_lower.Lowering)
   (out : alloc.vec.Vec x64_ir.MInsn) (pc : Std.Usize) :
@@ -9522,7 +9518,7 @@ def x64_lower.lower_lazy_local_call
     ok (core.result.Result.Err x64_lower.Reject.UnexpectedInstruction, st, out)
 
 /-- [async_ebpf_verified::x64_lower::lower_helper_call]:
-    Source: '../../src/verified/x64_lower.rs', lines 1210:0-1258:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1212:0-1260:1 -/
 def x64_lower.lower_helper_call
   (cfg : x64_ir.Cfg) (st : x64_lower.Lowering)
   (out : alloc.vec.Vec x64_ir.MInsn) (insn : isa.Insn) :
@@ -9568,7 +9564,7 @@ def x64_lower.lower_helper_call
     ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::is_local_call]:
-    Source: '../../src/verified/x64_lower.rs', lines 218:0-229:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 220:0-231:1 -/
 def x64_lower.is_local_call
   (insns : Slice isa.Insn) (external_calls : Slice Bool) (pc : Std.Usize) :
   Result Bool
@@ -9598,7 +9594,7 @@ def x64_lower.is_local_call
     else Slice.index_usize external_calls pc
 
 /-- [async_ebpf_verified::x64_lower::lower_call]:
-    Source: '../../src/verified/x64_lower.rs', lines 1184:0-1208:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1186:0-1210:1 -/
 def x64_lower.lower_call
   (cfg : x64_ir.Cfg) (insns : Slice isa.Insn) (external_calls : Slice Bool)
   (resolver_ids : Slice Std.U32) (st : x64_lower.Lowering)
@@ -9615,7 +9611,7 @@ def x64_lower.lower_call
     else ok (core.result.Result.Ok (), st, out)
 
 /-- [async_ebpf_verified::x64_lower::is_set]:
-    Source: '../../src/verified/x64_lower.rs', lines 1133:0-1138:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1135:0-1140:1 -/
 def x64_lower.is_set (cond : isa.JmpOp) : Result Bool := do
   match cond with
   | isa.JmpOp.Eq => ok false
@@ -9631,7 +9627,7 @@ def x64_lower.is_set (cond : isa.JmpOp) : Result Bool := do
   | isa.JmpOp.Sle => ok false
 
 /-- [async_ebpf_verified::x64_lower::jump_cc]:
-    Source: '../../src/verified/x64_lower.rs', lines 1116:0-1130:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1118:0-1132:1 -/
 def x64_lower.jump_cc (cond : isa.JmpOp) : Result Std.U8 := do
   match cond with
   | isa.JmpOp.Eq => ok x64_ir.cc.E
@@ -9647,21 +9643,21 @@ def x64_lower.jump_cc (cond : isa.JmpOp) : Result Std.U8 := do
   | isa.JmpOp.Sle => ok x64_ir.cc.LE
 
 /-- [async_ebpf_verified::x64_lower::is_reg]:
-    Source: '../../src/verified/x64_lower.rs', lines 784:0-789:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 786:0-791:1 -/
 def x64_lower.is_reg (source : isa.Source) : Result Bool := do
   match source with
   | isa.Source.Imm => ok false
   | isa.Source.Reg => ok true
 
 /-- [async_ebpf_verified::x64_lower::is_w64]:
-    Source: '../../src/verified/x64_lower.rs', lines 777:0-782:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 779:0-784:1 -/
 def x64_lower.is_w64 (width : isa.AluWidth) : Result Bool := do
   match width with
   | isa.AluWidth.W32 => ok false
   | isa.AluWidth.W64 => ok true
 
 /-- [async_ebpf_verified::x64_lower::lower_jump]:
-    Source: '../../src/verified/x64_lower.rs', lines 1140:0-1178:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1142:0-1180:1 -/
 def x64_lower.lower_jump
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn)
   (insn : isa.Insn) (width : isa.AluWidth) (cond : isa.JmpOp)
@@ -9707,7 +9703,7 @@ def x64_lower.lower_jump
       ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_end_bswap]:
-    Source: '../../src/verified/x64_lower.rs', lines 1072:0-1100:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1074:0-1102:1 -/
 def x64_lower.lower_end_bswap
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn) (imm : Std.I32)
   (dst : Std.U8) :
@@ -9748,7 +9744,7 @@ def x64_lower.lower_end_bswap
       else ok (core.result.Result.Ok (), st, out)
 
 /-- [async_ebpf_verified::x64_lower::lower_end_be]:
-    Source: '../../src/verified/x64_lower.rs', lines 1054:0-1070:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1056:0-1072:1 -/
 def x64_lower.lower_end_be
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn) (imm : Std.I32)
   (dst : Std.U8) :
@@ -9777,7 +9773,7 @@ def x64_lower.lower_end_be
       else ok (core.result.Result.Ok (), st, out)
 
 /-- [async_ebpf_verified::x64_lower::lower_end_le]:
-    Source: '../../src/verified/x64_lower.rs', lines 1044:0-1052:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1046:0-1054:1 -/
 def x64_lower.lower_end_le
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn) (imm : Std.I32)
   (dst : Std.U8) :
@@ -9794,7 +9790,7 @@ def x64_lower.lower_end_le
     else ok (core.result.Result.Ok (), st, out)
 
 /-- [async_ebpf_verified::x64_lower::lower_end]:
-    Source: '../../src/verified/x64_lower.rs', lines 1029:0-1042:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 1031:0-1044:1 -/
 def x64_lower.lower_end
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn)
   (insn : isa.Insn) (kind : isa.EndKind) (dst : Std.U8) :
@@ -9807,7 +9803,7 @@ def x64_lower.lower_end
   | isa.EndKind.Bswap => x64_lower.lower_end_bswap st out insn.imm dst
 
 /-- [async_ebpf_verified::x64_lower::lower_shift]:
-    Source: '../../src/verified/x64_lower.rs', lines 991:0-1024:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 993:0-1026:1 -/
 def x64_lower.lower_shift
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn)
   (insn : isa.Insn) (op : x64_ir.ShiftOp) (w64 : Bool) (reg : Bool)
@@ -9832,7 +9828,7 @@ def x64_lower.lower_shift
   else x64_lower.push st out (x64_ir.MInsn.ShiftImm w64 op dst insn.imm)
 
 /-- [async_ebpf_verified::x64_lower::binary_ri]:
-    Source: '../../src/verified/x64_lower.rs', lines 833:0-841:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 835:0-843:1 -/
 def x64_lower.binary_ri (alu : isa.AluOp) : Result x64_ir.AluRI := do
   match alu with
   | isa.AluOp.Add => ok x64_ir.AluRI.Add
@@ -9850,7 +9846,7 @@ def x64_lower.binary_ri (alu : isa.AluOp) : Result x64_ir.AluRI := do
   | isa.AluOp.Arsh => ok x64_ir.AluRI.Add
 
 /-- [async_ebpf_verified::x64_lower::binary_rr]:
-    Source: '../../src/verified/x64_lower.rs', lines 821:0-830:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 823:0-832:1 -/
 def x64_lower.binary_rr (alu : isa.AluOp) : Result (Option x64_ir.AluRR) := do
   match alu with
   | isa.AluOp.Add => ok (some x64_ir.AluRR.Add)
@@ -9868,7 +9864,7 @@ def x64_lower.binary_rr (alu : isa.AluOp) : Result (Option x64_ir.AluRR) := do
   | isa.AluOp.Arsh => ok none
 
 /-- [async_ebpf_verified::x64_lower::shift_op]:
-    Source: '../../src/verified/x64_lower.rs', lines 811:0-818:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 813:0-820:1 -/
 def x64_lower.shift_op (alu : isa.AluOp) : Result (Option x64_ir.ShiftOp) := do
   match alu with
   | isa.AluOp.Add => ok none
@@ -9886,7 +9882,7 @@ def x64_lower.shift_op (alu : isa.AluOp) : Result (Option x64_ir.ShiftOp) := do
   | isa.AluOp.Arsh => ok (some x64_ir.ShiftOp.Sar)
 
 /-- [async_ebpf_verified::x64_lower::lower_alu_rest]:
-    Source: '../../src/verified/x64_lower.rs', lines 954:0-988:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 956:0-990:1 -/
 def x64_lower.lower_alu_rest
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn)
   (insn : isa.Insn) (alu : isa.AluOp) (w64 : Bool) (reg : Bool) (dst : Std.U8)
@@ -9909,7 +9905,7 @@ def x64_lower.lower_alu_rest
   | some op => x64_lower.lower_shift st out insn op w64 reg dst src
 
 /-- [async_ebpf_verified::x64_lower::movsx_width]:
-    Source: '../../src/verified/x64_lower.rs', lines 941:0-952:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 943:0-954:1 -/
 def x64_lower.movsx_width (w64 : Bool) (offset : Std.I16) : Result Std.U8 := do
   if offset = 8#i16
   then ok 8#u8
@@ -9923,7 +9919,7 @@ def x64_lower.movsx_width (w64 : Bool) (offset : Std.I16) : Result Std.U8 := do
          else ok 0#u8
 
 /-- [async_ebpf_verified::x64_lower::lower_mov]:
-    Source: '../../src/verified/x64_lower.rs', lines 882:0-937:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 884:0-939:1 -/
 def x64_lower.lower_mov
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn)
   (insn : isa.Insn) (w64 : Bool) (reg : Bool) (dst : Std.U8) (src : Std.U8) :
@@ -9946,7 +9942,7 @@ def x64_lower.lower_mov
         insn.imm)
 
 /-- [async_ebpf_verified::x64_lower::muldiv_kind]:
-    Source: '../../src/verified/x64_lower.rs', lines 801:0-808:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 803:0-810:1 -/
 def x64_lower.muldiv_kind
   (alu : isa.AluOp) : Result (Option x64_ir.MulDivKind) := do
   match alu with
@@ -9965,7 +9961,7 @@ def x64_lower.muldiv_kind
   | isa.AluOp.Arsh => ok none
 
 /-- [async_ebpf_verified::x64_lower::lower_alu]:
-    Source: '../../src/verified/x64_lower.rs', lines 843:0-878:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 845:0-880:1 -/
 def x64_lower.lower_alu
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn)
   (insn : isa.Insn) (width : isa.AluWidth) (alu : isa.AluOp)
@@ -10008,7 +10004,7 @@ def x64_lower.lower_alu
       1#i16) src dst insn.imm)
 
 /-- [async_ebpf_verified::x64_lower::load_imm64_value]:
-    Source: '../../src/verified/x64_lower.rs', lines 764:0-771:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 766:0-773:1 -/
 def x64_lower.load_imm64_value
   (insns : Slice isa.Insn) (insn : isa.Insn) (high_pc : Std.Usize) :
   Result Std.I64
@@ -10029,7 +10025,7 @@ def x64_lower.load_imm64_value
   ok (UScalar.hcast .I64 imm)
 
 /-- [async_ebpf_verified::x64_lower::lower_one]:
-    Source: '../../src/verified/x64_lower.rs', lines 671:0-758:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 673:0-760:1 -/
 def x64_lower.lower_one
   (cfg : x64_ir.Cfg) (insns : Slice isa.Insn) (external_calls : Slice Bool)
   (plan : Slice x64_ir.PlanEntry) (resolver_ids : Slice Std.U32)
@@ -10192,7 +10188,7 @@ def x64_lower.lower_one
         ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::branch_leaves_range]:
-    Source: '../../src/verified/x64_lower.rs', lines 559:0-568:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 561:0-570:1 -/
 def x64_lower.branch_leaves_range
   (insn : isa.Insn) (target_pc : Std.U32) (start_pc : Std.Usize)
   (end_pc : Std.Usize) :
@@ -10230,7 +10226,7 @@ def x64_lower.branch_leaves_range
     else ok false
 
 /-- [async_ebpf_verified::x64_lower::reads_src_as_value]:
-    Source: '../../src/verified/x64_lower.rs', lines 470:0-487:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 472:0-489:1 -/
 def x64_lower.reads_src_as_value (insn : isa.Insn) : Result Bool := do
   let «class» ← lift (insn.opcode &&& isa.CLS_MASK)
   if «class» = isa.CLS_ALU
@@ -10271,7 +10267,7 @@ def x64_lower.reads_src_as_value (insn : isa.Insn) : Result Bool := do
         else ok false
 
 /-- [async_ebpf_verified::x64_lower::needs_guest_fp]:
-    Source: '../../src/verified/x64_lower.rs', lines 547:0-556:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 549:0-558:1 -/
 def x64_lower.needs_guest_fp
   (cfg : x64_ir.Cfg) (insn : isa.Insn) : Result Bool := do
   let active ← x64_ir.Cfg.native_frame_base_active cfg
@@ -10283,7 +10279,7 @@ def x64_lower.needs_guest_fp
   else ok false
 
 /-- [async_ebpf_verified::x64_lower::is_func_entry]:
-    Source: '../../src/verified/x64_lower.rs', lines 210:0-215:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 212:0-217:1 -/
 def x64_lower.is_func_entry
   (entries : Slice Bool) (pc : Std.Usize) : Result Bool := do
   let i := Slice.len entries
@@ -10292,7 +10288,7 @@ def x64_lower.is_func_entry
   else Slice.index_usize entries pc
 
 /-- [async_ebpf_verified::x64_lower::prologue_needs_skip]:
-    Source: '../../src/verified/x64_lower.rs', lines 532:0-543:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 534:0-545:1 -/
 def x64_lower.prologue_needs_skip
   (insns : Slice isa.Insn) (entries : Slice Bool) (start_pc : Std.Usize)
   (pc : Std.Usize) :
@@ -10310,7 +10306,7 @@ def x64_lower.prologue_needs_skip
     else ok false
 
 /-- [async_ebpf_verified::x64_lower::written_registers_mask]:
-    Source: '../../src/verified/x64_lower.rs', lines 440:0-461:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 442:0-463:1 -/
 def x64_lower.written_registers_mask (insn : isa.Insn) : Result Std.U16 := do
   let «class» ← lift (insn.opcode &&& isa.CLS_MASK)
   if «class» = isa.CLS_LD
@@ -10351,13 +10347,13 @@ def x64_lower.written_registers_mask (insn : isa.Insn) : Result Std.U16 := do
               else ok 0#u16
 
 /-- [async_ebpf_verified::x64_lower::close_group]:
-    Source: '../../src/verified/x64_lower.rs', lines 406:0-409:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 408:0-411:1 -/
 def x64_lower.close_group
   (st : x64_lower.Lowering) : Result x64_lower.Lowering := do
   ok { st with group_open := false, group_written := 0#u16 }
 
 /-- [async_ebpf_verified::x64_lower::note_register_written]:
-    Source: '../../src/verified/x64_lower.rs', lines 414:0-422:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 416:0-424:1 -/
 def x64_lower.note_register_written
   (st : x64_lower.Lowering) (reg : Std.U8) : Result x64_lower.Lowering := do
   if st.group_open
@@ -10371,7 +10367,7 @@ def x64_lower.note_register_written
   else ok st
 
 /-- [async_ebpf_verified::x64_lower::note_written_mask]: loop body 0:
-    Source: '../../src/verified/x64_lower.rs', lines 427:2-432:3 -/
+    Source: '../../src/verified/x64_lower.rs', lines 429:2-434:3 -/
 @[rust_loop_body]
 def x64_lower.note_written_mask_loop.body
   (mask : Std.U16) (st : x64_lower.Lowering) (reg : Std.U8) :
@@ -10390,7 +10386,7 @@ def x64_lower.note_written_mask_loop.body
   else ok (done st)
 
 /-- [async_ebpf_verified::x64_lower::note_written_mask]: loop 0:
-    Source: '../../src/verified/x64_lower.rs', lines 427:2-432:3 -/
+    Source: '../../src/verified/x64_lower.rs', lines 429:2-434:3 -/
 @[rust_loop]
 def x64_lower.note_written_mask_loop
   (st : x64_lower.Lowering) (mask : Std.U16) (reg : Std.U8) :
@@ -10401,21 +10397,21 @@ def x64_lower.note_written_mask_loop
     (st, reg)
 
 /-- [async_ebpf_verified::x64_lower::note_written_mask]:
-    Source: '../../src/verified/x64_lower.rs', lines 425:0-433:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 427:0-435:1 -/
 @[reducible]
 def x64_lower.note_written_mask
   (st : x64_lower.Lowering) (mask : Std.U16) : Result x64_lower.Lowering := do
   x64_lower.note_written_mask_loop st mask 0#u8
 
 /-- [async_ebpf_verified::x64_lower::branch_delta]:
-    Source: '../../src/verified/x64_lower.rs', lines 293:0-298:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 295:0-300:1 -/
 def x64_lower.branch_delta (insn : isa.Insn) : Result Std.I64 := do
   if insn.opcode = isa.OP_JA32
   then ok (IScalar.cast .I64 insn.imm)
   else ok (IScalar.cast .I64 insn.offset)
 
 /-- [async_ebpf_verified::x64_lower::is_barrier]:
-    Source: '../../src/verified/x64_lower.rs', lines 248:0-253:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 250:0-255:1 -/
 def x64_lower.is_barrier
   (barrier : Slice Bool) (pc : Std.Usize) : Result Bool := do
   let i := Slice.len barrier
@@ -10424,7 +10420,7 @@ def x64_lower.is_barrier
   else Slice.index_usize barrier pc
 
 /-- [async_ebpf_verified::x64_lower::hint_at]:
-    Source: '../../src/verified/x64_lower.rs', lines 240:0-245:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 242:0-247:1 -/
 def x64_lower.hint_at
   (hints : Slice Std.U8) (pc : Std.Usize) : Result Std.U8 := do
   let i := Slice.len hints
@@ -10433,7 +10429,7 @@ def x64_lower.hint_at
   else Slice.index_usize hints pc
 
 /-- [async_ebpf_verified::x64_lower::stack_usage_at]:
-    Source: '../../src/verified/x64_lower.rs', lines 232:0-237:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 234:0-239:1 -/
 def x64_lower.stack_usage_at
   (stack_usage : Slice Std.U16) (pc : Std.Usize) : Result Std.U16 := do
   let i := Slice.len stack_usage
@@ -10442,7 +10438,7 @@ def x64_lower.stack_usage_at
   else Slice.index_usize stack_usage pc
 
 /-- [async_ebpf_verified::x64_lower::lower_slot]:
-    Source: '../../src/verified/x64_lower.rs', lines 575:0-668:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 577:0-670:1 -/
 def x64_lower.lower_slot
   (cfg : x64_ir.Cfg) (insns : Slice isa.Insn) (entries : Slice Bool)
   (external_calls : Slice Bool) (stack_usage : Slice Std.U16)
@@ -10814,7 +10810,7 @@ def x64_lower.lower_slot
           ok (r1, st2, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_body]: loop body 0:
-    Source: '../../src/verified/x64_lower.rs', lines 509:2-528:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 511:2-530:1 -/
 @[rust_loop_body]
 def x64_lower.lower_body_loop.body
   (cfg : x64_ir.Cfg) (insns : Slice isa.Insn) (entries : Slice Bool)
@@ -10844,7 +10840,7 @@ def x64_lower.lower_body_loop.body
   else ok (done (core.result.Result.Ok (), st, out))
 
 /-- [async_ebpf_verified::x64_lower::lower_body]: loop 0:
-    Source: '../../src/verified/x64_lower.rs', lines 509:2-528:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 511:2-530:1 -/
 @[rust_loop]
 def x64_lower.lower_body_loop
   (cfg : x64_ir.Cfg) (insns : Slice isa.Insn) (entries : Slice Bool)
@@ -10863,7 +10859,7 @@ def x64_lower.lower_body_loop
     (st, out, i)
 
 /-- [async_ebpf_verified::x64_lower::lower_body]:
-    Source: '../../src/verified/x64_lower.rs', lines 493:0-528:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 495:0-530:1 -/
 @[reducible]
 def x64_lower.lower_body
   (cfg : x64_ir.Cfg) (insns : Slice isa.Insn) (entries : Slice Bool)
@@ -10879,7 +10875,7 @@ def x64_lower.lower_body
     plan resolver_ids start_pc end_pc barrier st out start_pc
 
 /-- [async_ebpf_verified::x64_lower::push_trailer]:
-    Source: '../../src/verified/x64_lower.rs', lines 394:0-399:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 396:0-401:1 -/
 def x64_lower.push_trailer
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn) :
   Result ((core.result.Result Unit x64_lower.Reject) × x64_lower.Lowering ×
@@ -10916,7 +10912,7 @@ def x64_lower.push_trailer
     ok (r1, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::lower_trailer]:
-    Source: '../../src/verified/x64_lower.rs', lines 386:0-392:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 388:0-394:1 -/
 def x64_lower.lower_trailer
   (st : x64_lower.Lowering) (out : alloc.vec.Vec x64_ir.MInsn) :
   Result ((core.result.Result Unit x64_lower.Reject) × x64_lower.Lowering ×
@@ -10929,7 +10925,7 @@ def x64_lower.lower_trailer
     ok (core.result.Result.Err x64_lower.Reject.TrailerFailed, st1, out1)
 
 /-- [async_ebpf_verified::x64_lower::mark_barriers]: loop body 0:
-    Source: '../../src/verified/x64_lower.rs', lines 266:2-288:3 -/
+    Source: '../../src/verified/x64_lower.rs', lines 268:2-290:3 -/
 @[rust_loop_body]
 def x64_lower.mark_barriers_loop.body
   (insns : Slice isa.Insn) (entries : Slice Bool) (end_pc : Std.Usize)
@@ -11028,7 +11024,7 @@ def x64_lower.mark_barriers_loop.body
   else ok (done barrier)
 
 /-- [async_ebpf_verified::x64_lower::mark_barriers]: loop 0:
-    Source: '../../src/verified/x64_lower.rs', lines 266:2-288:3 -/
+    Source: '../../src/verified/x64_lower.rs', lines 268:2-290:3 -/
 @[rust_loop]
 def x64_lower.mark_barriers_loop
   (insns : Slice isa.Insn) (entries : Slice Bool) (end_pc : Std.Usize)
@@ -11041,7 +11037,7 @@ def x64_lower.mark_barriers_loop
     (barrier, i)
 
 /-- [async_ebpf_verified::x64_lower::mark_barriers]:
-    Source: '../../src/verified/x64_lower.rs', lines 257:0-289:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 259:0-291:1 -/
 def x64_lower.mark_barriers
   (insns : Slice isa.Insn) (entries : Slice Bool) (start_pc : Std.Usize)
   (end_pc : Std.Usize) (barrier : alloc.vec.Vec Bool) :
@@ -11051,7 +11047,7 @@ def x64_lower.mark_barriers
   x64_lower.mark_barriers_loop insns entries end_pc barrier num_insns start_pc
 
 /-- [async_ebpf_verified::x64_lower::check_range]:
-    Source: '../../src/verified/x64_lower.rs', lines 188:0-207:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 190:0-209:1 -/
 def x64_lower.check_range
   (insns : Slice isa.Insn) (entries : Slice Bool) (start_pc : Std.Usize)
   (end_pc : Std.Usize) :
@@ -11088,7 +11084,7 @@ def x64_lower.check_range
         else ok (core.result.Result.Err x64_lower.Reject.RangeStartNotEntry)
 
 /-- [async_ebpf_verified::x64_lower::gate]:
-    Source: '../../src/verified/x64_lower.rs', lines 177:0-182:1 -/
+    Source: '../../src/verified/x64_lower.rs', lines 179:0-184:1 -/
 def x64_lower.gate
   (cfg : x64_ir.Cfg) (out : alloc.vec.Vec x64_ir.MInsn) :
   Result (core.result.Result Unit x64_lower.Reject)
@@ -11101,7 +11097,7 @@ def x64_lower.gate
     ok (core.result.Result.Err (x64_lower.Reject.Unsafe u.pc))
 
 /-- [async_ebpf_verified::x64_lower::lower]:
-    Source: '../../src/verified/x64_lower.rs', lines 127:0-173:1
+    Source: '../../src/verified/x64_lower.rs', lines 129:0-175:1
     Visibility: public -/
 def x64_lower.lower
   (cfg : x64_ir.Cfg) (insns : Slice isa.Insn) (entries : Slice Bool)
