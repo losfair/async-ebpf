@@ -484,8 +484,8 @@ is absorbed by its successors), and that it visits exactly the slots
 
 The x86_64 theorem is about what `check` accepts; that `lower` never builds
 a list `check` refuses is a precision property, answered today by the
-goldens, the configuration sweeps and the fuzz targets rather than by a
-proof. Proving it — `lower = ok` without the gate implies `check = ok` — is
+goldens, the configuration and randomised sweeps and the runtime tests
+rather than by a proof. Proving it — `lower = ok` without the gate implies `check = ok` — is
 the natural next step, and would make the gate dead code. The aarch64
 backend is untouched: it emits through typed encoders already, so the same
 split applies with less restructuring, and the machine model is the new

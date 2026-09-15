@@ -133,7 +133,9 @@ The rules are the contracts on `MInsn`. In short:
 fails. That gate is the theorem's hook: what the backend returns is checked
 code, by construction. Whether the gate ever fires on real emitter output is
 a separate question, a precision one, and is what the goldens, the
-configuration sweeps and the fuzz targets answer: none of them trips it.
+configuration sweeps, the randomised emitter sweeps and the runtime tests
+answer: none of them trips it. The fuzz targets under `fuzz/` exercise the
+same path and would report a refusal as a compile failure.
 
 ## What is proved
 
