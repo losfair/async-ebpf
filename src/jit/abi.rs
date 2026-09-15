@@ -167,6 +167,59 @@ pub const MAX_EXT_FUNCS: u32 = 64;
 /// Callee-saved eBPF registers `R6`-`R9`, in bytes.
 pub const NONVOLATILE_SIZE: u32 = 8 * 5;
 
+/// The verified core restates the constants the backend reads, so that
+/// `src/verified/` has no dependency outside itself. These assertions are the
+/// tie: a change on either side that the other does not follow fails to
+/// compile rather than rerouting an access at run time.
+mod verified_agreement {
+  use super::*;
+  use crate::verified::x64_ir as v;
+
+  const _: () = assert!(v::frame::FRAME_OFFSET == FRAME_OFFSET);
+  const _: () = assert!(v::frame::SPILL_OFFSET == SPILL_OFFSET);
+  const _: () = assert!(v::frame::ADDR_SPILL_OFFSET == ADDR_SPILL_OFFSET);
+  const _: () = assert!(v::frame::ACC_SPILL_OFFSET == ACC_SPILL_OFFSET);
+  const _: () = assert!(v::frame::FRAME_DELTA_OFFSET == FRAME_DELTA_OFFSET);
+  const _: () = assert!(v::frame::GROUP_BASE_OFFSET == GROUP_BASE_OFFSET);
+  const _: () = assert!(v::frame::FRAME_RESERVED == FRAME_RESERVED);
+  const _: () = assert!(v::frame::DERIVED_STACK_BASE == DERIVED_STACK_BASE);
+  const _: () = assert!(v::frame::DERIVED_DATA_BASE == DERIVED_DATA_BASE);
+  const _: () = assert!(v::frame::DERIVED_BOTTOM == DERIVED_BOTTOM);
+  const _: () = assert!(v::frame::DERIVED_DELTA == DERIVED_DELTA);
+  const _: () = assert!(v::frame::DERIVED_SPAN == DERIVED_SPAN);
+
+  const _: () = assert!(v::memory::STACK_GUEST_BOTTOM == memory::STACK_GUEST_BOTTOM);
+  const _: () = assert!(v::memory::STACK_GUEST_TOP == memory::STACK_GUEST_TOP);
+  const _: () = assert!(v::memory::STACK_NATIVE_BASE == memory::STACK_NATIVE_BASE);
+  const _: () = assert!(v::memory::DATA_GUEST_BOTTOM == memory::DATA_GUEST_BOTTOM);
+  const _: () = assert!(v::memory::DATA_GUEST_TOP == memory::DATA_GUEST_TOP);
+  const _: () = assert!(v::memory::DATA_NATIVE_BASE == memory::DATA_NATIVE_BASE);
+  const _: () = assert!(v::memory::LOCAL_CALL_GUEST_FLOOR == memory::LOCAL_CALL_GUEST_FLOOR);
+  const _: () = assert!(v::memory::LOCAL_CALL_NATIVE_FLOOR == memory::LOCAL_CALL_NATIVE_FLOOR);
+
+  const _: () = assert!(v::region::UNKNOWN == region::UNKNOWN);
+  const _: () = assert!(v::region::STACK == region::STACK);
+  const _: () = assert!(v::region::DATA == region::DATA);
+  const _: () = assert!(v::region::FRAME == region::FRAME);
+  const _: () = assert!(v::plan_role::NONE == plan_role::NONE);
+  const _: () = assert!(v::plan_role::LEADER == plan_role::LEADER);
+  const _: () = assert!(v::plan_role::MEMBER == plan_role::MEMBER);
+  const _: () = assert!(v::MAX_GROUP_SPAN == MAX_GROUP_SPAN);
+  const _: () = assert!(v::MAX_EXT_FUNCS == MAX_EXT_FUNCS);
+  const _: () = assert!(v::MAX_JUMPS as usize == super::super::patch::MAX_JUMPS);
+  const _: () = assert!(v::MAX_LOADS as usize == super::super::patch::MAX_LOADS);
+  const _: () = assert!(v::MAX_LEAS as usize == super::super::patch::MAX_LEAS);
+
+  /// The twelve derived slots are at the same displacements on both sides.
+  const _: () = {
+    let mut i = 0;
+    while i < DERIVED_SLOTS {
+      assert!(v::frame::derived_slot(i) == derived_slot(i));
+      i += 1;
+    }
+  };
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

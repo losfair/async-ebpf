@@ -15,9 +15,12 @@
 //!
 //! [`validate`]: crate::jit::validate
 
-pub use crate::verified::isa::{
-  AluOp, AluWidth, AtomicOp, EndKind, Insn, JmpOp, Op, Source, Width,
-};
+pub use crate::verified::isa::{AluOp, AtomicOp, EndKind, Insn, JmpOp, Op, Source, Width};
+
+/// Named only by the reference interpreter, which is test-only; the re-export
+/// is part of the ISA's surface either way.
+#[allow(unused_imports)]
+pub use crate::verified::isa::AluWidth;
 
 use crate::verified::isa as v;
 

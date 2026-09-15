@@ -140,7 +140,7 @@ pub mod frame {
   pub const GROUP_BASE_OFFSET: i32 = -144;
   pub const FRAME_RESERVED: i32 = 160;
   /// The frame displacement of derived slot `i` (twelve slots, `-136..-48`).
-  pub fn derived_slot(i: usize) -> i32 {
+  pub const fn derived_slot(i: usize) -> i32 {
     -136 + (i as i32) * 8
   }
   pub const DERIVED_STACK_BASE: usize = 0;
@@ -285,7 +285,10 @@ pub enum MInsn {
   /// previous instruction may fall into. Contract: from a dead state (or the
   /// start of the range) the native stack depth becomes one; a live state
   /// falling into a skippable prologue must already be at depth one.
-  Prologue { usage: u16, skip: bool },
+  Prologue {
+    usage: u16,
+    skip: bool,
+  },
 
   /// `add rsp, 8 ; ret`. Contract: depth one, the frame pointer register
   /// untouched; the state after it is dead.
@@ -293,22 +296,57 @@ pub enum MInsn {
 
   /// Register-only arithmetic. Contract: writes `dst` unless the op is a
   /// compare or test; never `rsp`, `rbp` or the frame register.
-  Alu { w64: bool, op: AluRR, src: u8, dst: u8 },
-  AluImm { w64: bool, op: AluRI, dst: u8, imm: i32 },
+  Alu {
+    w64: bool,
+    op: AluRR,
+    src: u8,
+    dst: u8,
+  },
+  AluImm {
+    w64: bool,
+    op: AluRI,
+    dst: u8,
+    imm: i32,
+  },
   /// `shift dst, imm8` (`0xc1 /ext`); the immediate is truncated to a byte.
-  ShiftImm { w64: bool, op: ShiftOp, dst: u8, imm: i32 },
+  ShiftImm {
+    w64: bool,
+    op: ShiftOp,
+    dst: u8,
+    imm: i32,
+  },
   /// `shift dst, cl` (`0xd3 /ext`).
-  ShiftCl { w64: bool, op: ShiftOp, dst: u8 },
-  Neg { w64: bool, dst: u8 },
+  ShiftCl {
+    w64: bool,
+    op: ShiftOp,
+    dst: u8,
+  },
+  Neg {
+    w64: bool,
+    dst: u8,
+  },
   /// `movsx`: `from` is 8, 16 or 32 source bits; `w64` selects the 64-bit
   /// destination form.
-  MovSx { from: u8, w64: bool, src: u8, dst: u8 },
+  MovSx {
+    from: u8,
+    w64: bool,
+    src: u8,
+    dst: u8,
+  },
   /// `bswap` (`0f c8+r`).
-  Bswap { w64: bool, dst: u8 },
+  Bswap {
+    w64: bool,
+    dst: u8,
+  },
   /// `rol r16, 8` (`66 c1 /0 08`), the 16-bit byte swap.
-  Rol16 { dst: u8 },
+  Rol16 {
+    dst: u8,
+  },
   /// A 64-bit immediate, through the sign-extended form where it fits.
-  LoadImm { dst: u8, imm: i64 },
+  LoadImm {
+    dst: u8,
+    imm: i64,
+  },
 
   /// Multiply, divide or modulo, with eBPF's division-by-zero and
   /// `INT_MIN / -1` fixed up. `reg` selects a register divisor (`src`) over
@@ -327,12 +365,19 @@ pub enum MInsn {
 
   /// Conditional branch (`0f 8x rel32`). Contract: depth one, frame register
   /// untouched, the target labelled.
-  Jcc { cc: u8, target: Target },
+  Jcc {
+    cc: u8,
+    target: Target,
+  },
   /// Unconditional branch (`e9 rel32`). Contract as [`MInsn::Jcc`]; dead after.
-  Jmp { target: Target },
+  Jmp {
+    target: Target,
+  },
 
   /// `mov dst, r15 ; sub dst, [rbp - 40]`: the guest value of eBPF `R10`.
-  GuestFp { dst: u8 },
+  GuestFp {
+    dst: u8,
+  },
 
   /// Resolve `[src + offset]`, `size` bytes wide, to a native address in
   /// `dst`, using `scratch` and `r9`, and the spill slots. `region` is a
@@ -353,43 +398,89 @@ pub enum MInsn {
   },
 
   /// `mov [rbp - 144], src`: park a group leader's translated base.
-  GroupBaseStore { src: u8 },
+  GroupBaseStore {
+    src: u8,
+  },
   /// `mov dst, [rbp - 144]`: read the parked base back for a member.
-  GroupBaseLoad { dst: u8 },
+  GroupBaseLoad {
+    dst: u8,
+  },
 
   /// A guest load `[base + disp]` into `dst`, zero- or sign-extending.
   /// Contract: `base` holds a checked address of `w` bytes with
   /// `0 <= disp` and `disp + size <= w`; or `base` is the frame register,
   /// the native frame base is live, and `[disp, disp + size)` lies in
   /// `[-stack_frame_size, 0)`; or the cage is off.
-  Load { size: Size, sx: bool, base: u8, dst: u8, disp: i32 },
+  Load {
+    size: Size,
+    sx: bool,
+    base: u8,
+    dst: u8,
+    disp: i32,
+  },
   /// A guest store of `src`. Address contract as [`MInsn::Load`].
-  Store { size: Size, src: u8, base: u8, disp: i32 },
+  Store {
+    size: Size,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
   /// A guest store of an immediate. Address contract as [`MInsn::Load`].
-  StoreImm { size: Size, base: u8, disp: i32, imm: i32 },
+  StoreImm {
+    size: Size,
+    base: u8,
+    disp: i32,
+    imm: i32,
+  },
 
   /// `lock op [base + disp], src` for add, or, and, xor (`op` is the x86
   /// register-form opcode). Address contract as [`MInsn::Load`] at the
   /// operation's width; writes nothing.
-  AtomicAlu { op: u8, w64: bool, src: u8, base: u8, disp: i32 },
+  AtomicAlu {
+    op: u8,
+    w64: bool,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
   /// The fetching forms of the above, emulated with a compare-exchange loop.
   /// Writes `src`, `rax`, `rcx`, `r10` and `r11`; one push, balanced.
-  AtomicFetchAlu { op: u8, w64: bool, src: u8, base: u8, disp: i32 },
+  AtomicFetchAlu {
+    op: u8,
+    w64: bool,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
   /// `xchg [base + disp], src`. Writes `src`.
-  AtomicXchg { w64: bool, src: u8, base: u8, disp: i32 },
+  AtomicXchg {
+    w64: bool,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
   /// `lock cmpxchg [base + disp], src`. Writes `rax`.
-  AtomicCmpxchg { w64: bool, src: u8, base: u8, disp: i32 },
+  AtomicCmpxchg {
+    w64: bool,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
 
   /// Call external helper `idx` through the dispatcher. Contract: the
   /// dispatcher is registered; writes every caller-saved register and every
   /// writable frame slot; two pushes deep.
-  HelperCall { idx: u32 },
+  HelperCall {
+    idx: u32,
+  },
 
   /// A lazily-resolved local call through resolver slot `id`. Contract:
   /// the callbacks are registered; writes the caller-saved registers and the
   /// writable frame slots; the frame register is moved down one stride for
   /// the callee and restored; thirteen pushes deep.
-  LazyLocalCall { id: u32 },
+  LazyLocalCall {
+    id: u32,
+  },
 
   /// The trailer, in this order and last: the retpoline the helper call
   /// goes through, the eight-byte dispatcher address, and the helper table.
@@ -426,68 +517,174 @@ pub enum PInsn {
 
   Push(u8),
   Pop(u8),
-  Alu { w64: bool, op: AluRR, src: u8, dst: u8 },
-  AluImm { w64: bool, op: AluRI, dst: u8, imm: i32 },
-  ShiftImm { w64: bool, op: ShiftOp, dst: u8, imm: i32 },
-  ShiftCl { w64: bool, op: ShiftOp, dst: u8 },
-  Neg { w64: bool, dst: u8 },
+  Alu {
+    w64: bool,
+    op: AluRR,
+    src: u8,
+    dst: u8,
+  },
+  AluImm {
+    w64: bool,
+    op: AluRI,
+    dst: u8,
+    imm: i32,
+  },
+  ShiftImm {
+    w64: bool,
+    op: ShiftOp,
+    dst: u8,
+    imm: i32,
+  },
+  ShiftCl {
+    w64: bool,
+    op: ShiftOp,
+    dst: u8,
+  },
+  Neg {
+    w64: bool,
+    dst: u8,
+  },
   /// `mul rcx` / `div rcx` / `idiv rcx`, at 32 or 64 bits.
-  MulDivRcx { w64: bool, kind: MulDivKind, signed: bool },
-  MovSx { from: u8, w64: bool, src: u8, dst: u8 },
-  Bswap { w64: bool, dst: u8 },
-  Rol16 { dst: u8 },
+  MulDivRcx {
+    w64: bool,
+    kind: MulDivKind,
+    signed: bool,
+  },
+  MovSx {
+    from: u8,
+    w64: bool,
+    src: u8,
+    dst: u8,
+  },
+  Bswap {
+    w64: bool,
+    dst: u8,
+  },
+  Rol16 {
+    dst: u8,
+  },
   /// `cmovcc dst, src` at 64 bits.
-  Cmov { cc: u8, dst: u8, src: u8 },
-  LoadImm { dst: u8, imm: i64 },
+  Cmov {
+    cc: u8,
+    dst: u8,
+    src: u8,
+  },
+  LoadImm {
+    dst: u8,
+    imm: i64,
+  },
   Pushfq,
   Popfq,
   Cqo,
   Cdq,
   /// `cmp rcx, -1` / `cmp ecx, -1` (`83 f9 ff`).
-  CmpRcxMinusOne { w64: bool },
+  CmpRcxMinusOne {
+    w64: bool,
+  },
   /// `cmp eax, imm32` (`3d imm32`).
-  CmpEaxImm { imm: u32 },
+  CmpEaxImm {
+    imm: u32,
+  },
 
   /// `[base + disp]` load into `dst`, zero-extending. `sx` sign-extends; the
   /// sign-extending 8-byte form encodes nothing.
-  Load { size: Size, sx: bool, base: u8, dst: u8, disp: i32 },
-  Store { size: Size, src: u8, base: u8, disp: i32 },
-  StoreImm { size: Size, base: u8, disp: i32, imm: i32 },
+  Load {
+    size: Size,
+    sx: bool,
+    base: u8,
+    dst: u8,
+    disp: i32,
+  },
+  Store {
+    size: Size,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
+  StoreImm {
+    size: Size,
+    base: u8,
+    disp: i32,
+    imm: i32,
+  },
   /// `op reg, [base + disp]` at 64 bits, for the bounds-check forms.
-  AluRM { op: AluRM, reg: u8, base: u8, disp: i32 },
+  AluRM {
+    op: AluRM,
+    reg: u8,
+    base: u8,
+    disp: i32,
+  },
   /// `mov qword [rsp], imm32`.
-  StoreRspImm { imm: u32 },
+  StoreRspImm {
+    imm: u32,
+  },
   /// `mov [rsp], rax`.
   StoreRspRax,
 
-  LockAlu { op: u8, w64: bool, src: u8, base: u8, disp: i32 },
-  LockCmpxchg { w64: bool, src: u8, base: u8, disp: i32 },
-  Xchg { w64: bool, src: u8, base: u8, disp: i32 },
+  LockAlu {
+    op: u8,
+    w64: bool,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
+  LockCmpxchg {
+    w64: bool,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
+  Xchg {
+    w64: bool,
+    src: u8,
+    base: u8,
+    disp: i32,
+  },
 
   /// `0f cc rel32`, a recorded fixup.
-  Jcc { cc: u8, target: PTarget },
+  Jcc {
+    cc: u8,
+    target: PTarget,
+  },
   /// `e9 rel32`, a recorded fixup.
-  Jmp { target: PTarget },
+  Jmp {
+    target: PTarget,
+  },
   /// `eb rel8` followed by three bytes of padding, a recorded fixup.
-  JmpNear { target: PTarget },
+  JmpNear {
+    target: PTarget,
+  },
   /// `e8 rel32`, a recorded fixup.
-  Call { target: PTarget },
+  Call {
+    target: PTarget,
+  },
   /// `7x rel8`, resolved directly to a local label.
-  Jcc8 { cc: u8, target: u32 },
+  Jcc8 {
+    cc: u8,
+    target: u32,
+  },
   /// `eb rel8`, resolved directly to a local label.
-  Jmp8 { target: u32 },
+  Jmp8 {
+    target: u32,
+  },
   Ret,
   Pause,
   Ud2,
   /// `call rax` / `call reg`.
   CallReg(u8),
   /// `mov dst, [rip + dispatcher slot]`.
-  RipLoadDispatcher { dst: u8 },
+  RipLoadDispatcher {
+    dst: u8,
+  },
   /// `lea dst, [rip + helper table]`.
-  RipLeaHelperTable { dst: u8 },
+  RipLeaHelperTable {
+    dst: u8,
+  },
 
   /// Eight bytes of data: the dispatcher address.
-  DispatcherSlot { addr: u64 },
+  DispatcherSlot {
+    addr: u64,
+  },
   /// Sixty-four null helper addresses.
   HelperTable,
 }
@@ -508,7 +705,9 @@ pub enum AluRM {
   Or,
 }
 
-/// Condition codes, as the low byte of the two-byte `jcc`/`cmovcc` opcode.
+/// Condition codes, spelled as the low byte of the two-byte near `jcc`
+/// opcode. The short `jcc` and `cmovcc` forms name the same conditions in the
+/// `0x7x` and `0x4x` rows, and the encoder derives them from the low nibble.
 pub mod cc {
   pub const B: u8 = 0x82;
   pub const AE: u8 = 0x83;

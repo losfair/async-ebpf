@@ -37,11 +37,6 @@
 //!
 //! Rejections name the macro and the eBPF slot it came from, and nothing
 //! else; rendering them is the caller's business.
-//!
-//! Every item here is reachable from [`check`], and [`check`] is reachable
-//! from `x64_lower::lower`; the allowance below is what keeps the module
-//! quiet until that call lands.
-#![allow(dead_code)]
 
 use super::x64_ir::*;
 

@@ -1,18 +1,20 @@
 //! The code buffer, the patch tables, and the open-access-group bookkeeping
-//! that the two backends share.
+//! the aarch64 backend uses.
 //!
-//! # Why the two backends share this and not the driver
+//! # Who uses this
 //!
-//! The two `translate_range` implementations have almost nothing in common past
-//! their preamble checks: aarch64 runs a barrier pre-pass x86_64 does not have,
-//! and the per-opcode work is entirely architecture-specific. What they do share
-//! is bookkeeping — where the next byte goes, which sites still need a fixup,
-//! whether an access group is open — and that is what lives here.
+//! The aarch64 backend, and [`Progress::into_error`], which both backends'
+//! wording lives in. x86_64 no longer uses any of it: it lowers to the macro
+//! instructions of `verified::x64_ir`, expands them to primitives, and encodes
+//! those in one pass with its own fixup table, so the buffer, the patch tables
+//! and the group state below are aarch64's alone. Its half of
+//! [`Progress::into_error`]'s wording is still read from here, because the two
+//! backends word the same three ceilings differently and that difference is
+//! part of the interface.
 //!
 //! The two loops have drifted apart before; the aarch64 jump-sentinel bug lived
-//! in exactly the gap between them. Unifying them is a real option, but it is a
-//! restructuring of both backends rather than a comment-level tidy, so for now
-//! each keeps its own loop and shares only the state below.
+//! in exactly the gap between them. Giving aarch64 the same three-layer split
+//! is the way that gap closes for good, and is the work this leaves undone.
 
 use super::TranslateError;
 
