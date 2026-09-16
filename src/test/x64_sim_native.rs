@@ -30,6 +30,12 @@
 //! * `Jcc8` and `Jmp8` forward over a few register-only primitives, and the
 //!   label forms and `Pause`, which emit nothing.
 //!
+//! Every shift, rotate, multiply and divide is followed by a `cmp` that
+//! defines all four flags. The architecture leaves some of theirs undefined
+//! and processors differ on them (`div` on an Intel core leaves the flags
+//! alone; on an AMD core it does not), which is why the Lean model reads
+//! them as arbitrary; the test compares only what the model promises.
+//!
 //! Not emitted: `Call`, `Ret`, `Ud2`, `CallReg`, the two RIP-relative forms
 //! and the trailer data, which either leave the list or halt.
 //!
@@ -493,6 +499,22 @@ fn size_of(g: &mut Rng) -> u8 {
   }
 }
 
+/// A `cmp` that defines all four flags and writes no register, emitted
+/// after every primitive whose flags the architecture leaves undefined — a
+/// shift, a rotate, a multiply or a divide. The Lean model reads those flags
+/// as arbitrary, and processors really do differ: an Intel core leaves
+/// `div`'s flags where they were, an AMD core does not. What the model
+/// promises is compared; what it does not is defined away before anything
+/// can observe it.
+fn settle_flags(g: &mut Rng, p: &mut Program) {
+  p.push(PInsn::AluImm {
+    w64: g.flip(),
+    op: AluRI::Cmp,
+    dst: g.areg(),
+    imm: imm32(g),
+  });
+}
+
 /// One primitive that touches neither memory nor the stack, for the bodies a
 /// `Jcc8` jumps over and for the bulk of every list.
 fn gen_reg_only(g: &mut Rng, p: &mut Program) {
@@ -524,6 +546,7 @@ fn gen_reg_only(g: &mut Rng, p: &mut Program) {
         dst,
         imm: (g.next() & 0xff) as i32,
       });
+      settle_flags(g, p);
     }
     3 => {
       let dst = g.wreg();
@@ -532,6 +555,7 @@ fn gen_reg_only(g: &mut Rng, p: &mut Program) {
         op: shift_op(g),
         dst,
       });
+      settle_flags(g, p);
     }
     4 => {
       let dst = g.wreg();
@@ -558,6 +582,7 @@ fn gen_reg_only(g: &mut Rng, p: &mut Program) {
     7 => {
       let dst = g.wreg();
       p.push(PInsn::Rol16 { dst });
+      settle_flags(g, p);
     }
     8 => {
       let dst = g.wreg();
@@ -631,6 +656,7 @@ fn gen_muldiv(g: &mut Rng, p: &mut Program) {
     }
   }
   p.push(PInsn::MulDivRcx { w64, kind, signed });
+  settle_flags(g, p);
 }
 
 /// A balanced stack bracket: a few pushes, a few register-only primitives, the

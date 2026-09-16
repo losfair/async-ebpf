@@ -481,10 +481,10 @@ shape the backend uses — through both the simulator and the processor
 compares registers, flags and the scratch page byte for byte. The
 refinement is what makes that a test of the model: a divergence between
 `Step` and the hardware would surface as a divergence between the
-simulator and the hardware. Where the model leaves a result arbitrary
-(the flags after a shift or a divide, the pair a divide writes) the
-simulator picks one value inside the model's, and the test compares that
-too.
+simulator and the hardware. Where the model leaves the flags arbitrary
+(after a shift, a rotate, a multiply or a divide) the test defines them
+with a `cmp` before anything can observe them: processors really differ
+there, and the model's promise is what is compared.
 
 ## What is trusted
 
