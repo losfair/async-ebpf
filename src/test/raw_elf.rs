@@ -4,10 +4,10 @@
 //! `compile_ebpf` cannot express what a few tests need — the register state the
 //! guest observes at entry, or one specific atomic encoding — so those tests
 //! hand-assemble a BPF relocatable ELF instead and load it through the normal
-//! public API. The object has one executable section named `test` and one
-//! allocated read-only section whose symbol `DATA_SYM` sits at offset 0, so a
-//! `lddw` carrying an `R_BPF_64_64` relocation against it yields a data-region
-//! pointer.
+//! public API. The object has one executable section named `test`, exporting
+//! the function `entry` at its first instruction, and one allocated read-only
+//! section whose symbol `DATA_SYM` sits at offset 0, so a `lddw` carrying an
+//! `R_BPF_64_64` relocation against it yields a data-region pointer.
 
 use std::{any::Any, sync::Arc};
 
@@ -23,6 +23,41 @@ const DATA_SYM: &str = "DATA_SYM";
 /// Symbol helper calls relocate against; resolved by name in the loader's
 /// registered helper tables.
 const HELPER_SYM: &str = "h";
+
+/// The exported function, and so the entrypoint, of every object
+/// [`build_elf`] produces: the code section's first instruction.
+pub(crate) const ENTRY_SYM: &str = "entry";
+
+/// Byte offset of symbol `symbol_index`'s 24-byte record inside an object
+/// [`build_elf`] produced, for tests that malform a symbol. The fields follow
+/// `Elf64_Sym`: `st_name` at 0, `st_info` at 4, `st_other` at 5, `st_shndx` at
+/// 6, `st_value` at 8 and `st_size` at 16.
+pub(crate) fn symbol_record_offset(elf: &[u8], symbol_index: u32) -> usize {
+  const SYMTAB_OFFSET_FIELD: usize = 24;
+  const SYMBOL_SIZE: usize = 24;
+  let shoff = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
+  let symtab_header = shoff + SEC_SYMTAB as usize * 64;
+  let symtab_offset = u64::from_le_bytes(
+    elf[symtab_header + SYMTAB_OFFSET_FIELD..symtab_header + SYMTAB_OFFSET_FIELD + 8]
+      .try_into()
+      .unwrap(),
+  ) as usize;
+  symtab_offset + symbol_index as usize * SYMBOL_SIZE
+}
+
+// Section header indices, in the order `build_elf` writes the headers.
+pub(crate) const SEC_TEXT: u32 = 1;
+const SEC_SYMTAB: u32 = 3;
+const SEC_STRTAB: u32 = 4;
+const SEC_RODATA: u16 = 5;
+const SEC_SHSTRTAB: u16 = 6;
+const SEC_COUNT: u16 = 7;
+
+// Symbol table indices: 0 is the mandatory null entry, then `DATA_SYM`, the
+// undefined helper symbol, and the exported entry function.
+pub(crate) const DATA_SYM_INDEX: u32 = 1;
+const HELPER_SYM_INDEX: u32 = 2;
+pub(crate) const ENTRY_SYM_INDEX: u32 = 3;
 
 /// One instruction slot, plus whether it carries a relocation against
 /// [`DATA_SYM`].
@@ -137,7 +172,7 @@ pub(crate) fn duplicate_code_section_header(elf: &[u8], extra: usize) -> Vec<u8>
   elf
 }
 
-/// Loads `code` as the program `test` and runs it to completion.
+/// Loads `code` and runs its exported `entry` function to completion.
 pub(crate) async fn run_raw(
   code: &[Insn],
   rodata: &[u8],
@@ -214,7 +249,7 @@ async fn run_raw_configured(
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      ENTRY_SYM,
       &mut resources,
       calldata,
       &PreemptionEnabled::new(t_env),
@@ -247,24 +282,15 @@ pub(crate) fn build_elf(code: &[Insn], rodata: &[u8]) -> Vec<u8> {
   let name_shstrtab = shname(".shstrtab", &mut shstrtab);
   let name_rodata = shname("rodata", &mut shstrtab);
 
-  // Section header indices, in the order the headers are written below.
-  const SEC_TEXT: u32 = 1;
-  const SEC_SYMTAB: u32 = 3;
-  const SEC_STRTAB: u32 = 4;
-  const SEC_RODATA: u16 = 5;
-  const SEC_SHSTRTAB: u16 = 6;
-  const SEC_COUNT: u16 = 7;
-
-  // Symbol table: index 0 is the mandatory null entry, index 1 is DATA_SYM,
-  // index 2 is the undefined helper symbol.
-  const DATA_SYM_INDEX: u32 = 1;
-  const HELPER_SYM_INDEX: u32 = 2;
   let mut strtab = vec![0u8];
   let data_sym_name = strtab.len() as u32;
   strtab.extend_from_slice(DATA_SYM.as_bytes());
   strtab.push(0);
   let helper_sym_name = strtab.len() as u32;
   strtab.extend_from_slice(HELPER_SYM.as_bytes());
+  strtab.push(0);
+  let entry_sym_name = strtab.len() as u32;
+  strtab.extend_from_slice(ENTRY_SYM.as_bytes());
   strtab.push(0);
 
   let mut symtab = vec![0u8; 24];
@@ -280,6 +306,13 @@ pub(crate) fn build_elf(code: &[Insn], rodata: &[u8]) -> Vec<u8> {
   symtab.extend_from_slice(&0u16.to_le_bytes()); // st_shndx: SHN_UNDEF
   symtab.extend_from_slice(&0u64.to_le_bytes());
   symtab.extend_from_slice(&0u64.to_le_bytes());
+  symtab.extend_from_slice(&entry_sym_name.to_le_bytes());
+  symtab.push(0x12); // st_info: GLOBAL / FUNC
+  symtab.push(0); // st_other
+  symtab.extend_from_slice(&(SEC_TEXT as u16).to_le_bytes());
+  symtab.extend_from_slice(&0u64.to_le_bytes()); // st_value
+  symtab.extend_from_slice(&((code.len() * 8) as u64).to_le_bytes()); // st_size
+  debug_assert_eq!(symtab.len(), (ENTRY_SYM_INDEX as usize + 1) * 24);
 
   let mut text = Vec::with_capacity(code.len() * 8);
   let mut rels = Vec::new();

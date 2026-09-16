@@ -14,7 +14,7 @@ run is invalid.
 Upstream CoreMark is a hosted C program: it parses command-line arguments, uses
 a port layer for timing and printing, and reports through stdout. The BPF
 benchmark cannot call libc or own the timing loop, so `coremark_entry.c`
-provides a single `coremark` section entrypoint.
+provides a single exported function, `entry`, as the entrypoint.
 
 The Rust example passes the iteration count through calldata, times execution on
 the host side, and receives the CRCs packed into the return value. The entrypoint

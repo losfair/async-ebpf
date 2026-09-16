@@ -186,7 +186,7 @@ fn run_preempted(code: &[Insn], rodata: &[u8], strict: bool) -> (Result<i64, Str
         .run(
           &timeslice,
           &TokioTimeslicer,
-          "test",
+          "entry",
           &mut resources,
           &[],
           &PreemptionEnabled::new(thread),
@@ -297,7 +297,7 @@ async fn the_pooled_guest_stack_is_scrubbed_between_invocations() {
       .run(
         &timeslice_config(),
         &TokioTimeslicer,
-        "test",
+        "entry",
         &mut resources,
         &[],
         &PreemptionEnabled::new(t_env),
@@ -374,7 +374,7 @@ async fn interleaved_programs_each_see_their_own_region_constants() {
       .run(
         &timeslice_config(),
         &TokioTimeslicer,
-        "test",
+        "entry",
         &mut resources,
         &[],
         &PreemptionEnabled::new(t_env),
@@ -422,7 +422,7 @@ impl ProgramEventListener for NestingListener {
         .run(
           &timeslice,
           &TokioTimeslicer,
-          "test",
+          "entry",
           &mut resources,
           &[],
           &PreemptionEnabled::new(env),
@@ -505,7 +505,7 @@ fn a_nested_invocation_leaves_the_outer_frame_intact() {
         .run(
           &timeslice,
           &TokioTimeslicer,
-          "test",
+          "entry",
           &mut resources,
           &[],
           &PreemptionEnabled::new(thread),
@@ -581,7 +581,7 @@ async fn access_groups_survive_helper_suspensions() {
     "#
   );
 
-  let mut opts = RunOpts::simple(vec![HELPERS], "test");
+  let mut opts = RunOpts::simple(vec![HELPERS], "entry");
   opts.allow_dynamic_regions = true;
   assert_eq!(run_one_program(opts, &code).await.unwrap(), expected);
 }

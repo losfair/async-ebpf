@@ -109,7 +109,7 @@ fn main() -> anyhow::Result<()> {
       throttle_duration: Duration::from_millis(1),
     },
     &TokioTimeslicer,
-    ".text",
+    "entry",
     &mut resources,
     &calldata,
     &preemption,

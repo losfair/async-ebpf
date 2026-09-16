@@ -26,7 +26,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         .run(
           &timeslice_config(),
           &TokioTimeslicer,
-          "test",
+          "entry",
           &mut [],
           b"",
           &preemption,
@@ -64,7 +64,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         .run(
           &timeslice_config(),
           &TokioTimeslicer,
-          "test",
+          "entry",
           &mut [],
           &calldata,
           &preemption,
@@ -84,7 +84,7 @@ fn criterion_benchmark(c: &mut Criterion) {
           .run(
             &timeslice_config(),
             &TokioTimeslicer,
-            "test",
+            "entry",
             &mut [],
             &calldata,
             &preemption,
@@ -145,7 +145,7 @@ fn criterion_benchmark(c: &mut Criterion) {
           .run(
             &timeslice_config(),
             &TokioTimeslicer,
-            "test",
+            "entry",
             &mut [],
             &calldata,
             &preemption,

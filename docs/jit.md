@@ -42,6 +42,14 @@ specialization:
 8. Allocate the native code arena as `PROT_NONE`.
 9. Store per-section metadata, but do not translate eBPF to native code.
 
+The entrypoints are the object's exported functions: its global (or weak)
+`STT_FUNC` symbols, which is what every non-`static` C function becomes. They
+may sit anywhere in any executable section, `.text` included, and section names
+mean nothing to the loader beyond diagnostics. An exported function is a
+function root like a cross-section call target: the layout pass starts a
+function at it, and the JIT compiles it with the entry signature below when the
+host runs it and with a call site's signature when guest code calls it.
+
 The backend and region analysis deliberately see the prefix and suffix as one
 affine DATA region. `Program::run` holds a shared lease and leaves every page
 read-only. `Program::run_mut` takes the non-blocking exclusive lease, changes
@@ -172,7 +180,8 @@ hint, unresolved access, or onward signature can depend on it; masking it costs
 no precision and keeps a callee from being split over the caller's incidental
 live state, which would otherwise compound down the call graph.
 
-For a section entrypoint, the initial signature is:
+For an entrypoint - an exported function the host enters directly - the
+initial signature is:
 
 - `R1 = Stack`, because calldata lives on the guest stack;
 - `R10 = Stack`;

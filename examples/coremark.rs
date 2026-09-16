@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
           throttle_duration: Duration::from_millis(1),
         },
         &TokioTimeslicer,
-        "coremark",
+        "entry",
         &mut [],
         &calldata,
         &preemption,

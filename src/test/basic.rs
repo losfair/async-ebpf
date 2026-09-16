@@ -42,7 +42,7 @@ async fn configurable_guest_stack_exposes_a_larger_writable_window() {
     .run(
       &crate::test_util::timeslice_config(),
       &crate::test_util::TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &0u64.to_ne_bytes(),
       &preemption,
@@ -144,7 +144,7 @@ async fn writable_globals_are_exclusive_and_persist() {
     prog.run_mut(
       &timeslice,
       &timeslicer,
-      "test",
+      "entry",
       &mut resources_a,
       &input_a,
       &preemption_a,
@@ -156,7 +156,7 @@ async fn writable_globals_are_exclusive_and_persist() {
           .run_mut(
             &timeslice,
             &timeslicer,
-            "test",
+            "entry",
             &mut [],
             &input_b,
             &preemption_b,
@@ -169,7 +169,7 @@ async fn writable_globals_are_exclusive_and_persist() {
           .run(
             &timeslice,
             &timeslicer,
-            "initial",
+            "read_initial",
             &mut [],
             &[],
             &preemption_b,
@@ -187,7 +187,7 @@ async fn writable_globals_are_exclusive_and_persist() {
     .run(
       &timeslice,
       &timeslicer,
-      "initial",
+      "read_initial",
       &mut [],
       &[],
       &PreemptionEnabled::new(prog.thread_env()),
@@ -239,7 +239,7 @@ async fn cancelling_a_writable_run_restores_protection_before_unlocking() {
   let mut run = Box::pin(program.run_mut(
     &timeslice,
     &TokioTimeslicer,
-    "hold",
+    "entry_hold",
     &mut resources,
     &[],
     &preemption,
@@ -255,7 +255,7 @@ async fn cancelling_a_writable_run_restores_protection_before_unlocking() {
       .run(
         &timeslice,
         &TokioTimeslicer,
-        "write",
+        "write_state",
         &mut [],
         &[],
         &preemption,
@@ -268,7 +268,7 @@ async fn cancelling_a_writable_run_restores_protection_before_unlocking() {
       .run_mut(
         &timeslice,
         &TokioTimeslicer,
-        "write",
+        "write_state",
         &mut [],
         &[],
         &preemption,
@@ -313,7 +313,7 @@ async fn helpers_mutate_data_only_through_the_writable_entry() {
     .run_mut(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -327,7 +327,7 @@ async fn helpers_mutate_data_only_through_the_writable_entry() {
       .run(
         &timeslice_config(),
         &TokioTimeslicer,
-        "test",
+        "entry",
         &mut [],
         &[],
         &PreemptionEnabled::new(t_env),
@@ -376,7 +376,7 @@ async fn mutable_data_and_rodata_keep_distinct_page_permissions() {
       .run(
         &timeslice,
         &TokioTimeslicer,
-        "write_state",
+        "entry_write_state",
         &mut [],
         &[],
         &preemption,
@@ -389,7 +389,7 @@ async fn mutable_data_and_rodata_keep_distinct_page_permissions() {
       .run_mut(
         &timeslice,
         &TokioTimeslicer,
-        "write_state",
+        "entry_write_state",
         &mut [],
         &[],
         &preemption,
@@ -403,7 +403,7 @@ async fn mutable_data_and_rodata_keep_distinct_page_permissions() {
       .run(
         &timeslice,
         &TokioTimeslicer,
-        "read",
+        "read_both",
         &mut [],
         &[],
         &preemption,
@@ -417,7 +417,7 @@ async fn mutable_data_and_rodata_keep_distinct_page_permissions() {
       .run_mut(
         &timeslice,
         &TokioTimeslicer,
-        "write_frozen",
+        "entry_write_frozen",
         &mut [],
         &[],
         &preemption,
@@ -431,7 +431,7 @@ async fn mutable_data_and_rodata_keep_distinct_page_permissions() {
 #[tracing_test::traced_test]
 async fn test_sync_and_async_call() {
   let ret = run_one_program(
-    RunOpts::simple(vec![HELPERS], "test"),
+    RunOpts::simple(vec![HELPERS], "entry"),
     r#"
   extern int return_5(void);
   extern int return_7_async(void);
@@ -453,7 +453,7 @@ async fn test_sync_and_async_call() {
 #[tokio::test]
 async fn an_async_completion_error_clears_the_active_jit_state() {
   let result = run_one_program(
-    RunOpts::simple(vec![FAILING_ASYNC_HELPERS], "test"),
+    RunOpts::simple(vec![FAILING_ASYNC_HELPERS], "entry"),
     r#"
     extern int fail_async(void);
     int __attribute__((section("test"))) entry(void) {
@@ -475,7 +475,7 @@ async fn test_calldata() {
   let ret = run_one_program(
     RunOpts {
       helpers: vec![HELPERS],
-      entrypoint: "test",
+      entrypoint: "entry",
       calldata: &v_100,
       resources: &mut [],
       allow_dynamic_regions: false,
@@ -495,7 +495,7 @@ async fn test_calldata() {
 #[tracing_test::traced_test]
 async fn test_noinline_local_function_calls() {
   let ret = run_one_program(
-    RunOpts::simple(vec![], "test"),
+    RunOpts::simple(vec![], "entry"),
     r#"
   static int __attribute__((noinline, section("test"))) add_seven(int x) {
     return x + 7;
@@ -576,7 +576,7 @@ async fn test_local_function_calls_across_elf_sections() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -619,7 +619,7 @@ async fn test_lazy_jit_compiles_entry_on_first_run() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -635,7 +635,7 @@ async fn test_lazy_jit_compiles_entry_on_first_run() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -687,7 +687,7 @@ async fn test_lazy_jit_compiles_local_functions_on_first_call() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -702,7 +702,7 @@ async fn test_lazy_jit_compiles_local_functions_on_first_call() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -755,7 +755,7 @@ async fn test_lazy_jit_specializes_callee_per_pointer_signature() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -783,7 +783,7 @@ async fn test_lazy_jit_specializes_callee_per_pointer_signature() {
 #[tracing_test::traced_test]
 async fn test_fault_write_rodata() {
   let ret = run_one_program(
-    RunOpts::simple(vec![HELPERS], "test"),
+    RunOpts::simple(vec![HELPERS], "entry"),
     r#"
   extern int return_5(const char *x);
   unsigned long long __attribute__((section("test"))) entry() {
@@ -805,7 +805,7 @@ async fn test_read_rodata_via_data_region() {
   // relocated data-section address. The region analysis routes it to the data
   // region, exercising the branchless single-region (data) JIT path.
   let ret = run_one_program(
-    RunOpts::simple(vec![], "test"),
+    RunOpts::simple(vec![], "entry"),
     r#"
   unsigned long long __attribute__((section("test"))) entry(void) {
     static const volatile char msg[] = "ABCD";
@@ -822,7 +822,7 @@ async fn test_read_rodata_via_data_region() {
 #[tracing_test::traced_test]
 async fn test_fault_read_past_stack() {
   let ret = run_one_program(
-    RunOpts::simple(vec![HELPERS], "test"),
+    RunOpts::simple(vec![HELPERS], "entry"),
     r#"
   unsigned long long __attribute__((section("test"))) entry(unsigned long long *bad) {
     return *bad;
@@ -865,7 +865,7 @@ async fn test_openbsd_repeated_memory_fault_stress() {
       .run(
         &timeslice_config(),
         &TokioTimeslicer,
-        "test",
+        "entry",
         &mut [],
         &[],
         &preemption,
@@ -882,7 +882,7 @@ async fn test_openbsd_repeated_memory_fault_stress() {
 #[tracing_test::traced_test]
 async fn test_fault_write_past_stack() {
   let ret = run_one_program(
-    RunOpts::simple(vec![HELPERS], "test"),
+    RunOpts::simple(vec![HELPERS], "entry"),
     r#"
   unsigned long long __attribute__((section("test"))) entry(unsigned long long *bad) {
     *bad = 1;
@@ -899,7 +899,7 @@ async fn test_fault_write_past_stack() {
 async fn test_fault_read_null_ptr() {
   // This program dereferences a helper-returned pointer, whose region cannot be
   // determined statically, so it opts out of strict region analysis.
-  let mut opts = RunOpts::simple(vec![HELPERS], "test");
+  let mut opts = RunOpts::simple(vec![HELPERS], "entry");
   opts.allow_dynamic_regions = true;
   let ret = run_one_program(
     opts,
@@ -961,7 +961,7 @@ async fn test_strict_region_validation_is_deferred_until_execution() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -977,7 +977,7 @@ async fn test_strict_region_validation_is_deferred_until_execution() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),
@@ -1002,7 +1002,7 @@ async fn test_reject_helper_returned_pointer() {
   }
   "#;
   assert_static_region_rejected(
-    run_one_program(RunOpts::simple(vec![HELPERS], "test"), code).await,
+    run_one_program(RunOpts::simple(vec![HELPERS], "entry"), code).await,
   );
 }
 
@@ -1018,9 +1018,9 @@ async fn test_reject_pointer_loaded_from_memory() {
     return **pp;
   }
   "#;
-  assert_static_region_rejected(run_one_program(RunOpts::simple(vec![], "test"), code).await);
+  assert_static_region_rejected(run_one_program(RunOpts::simple(vec![], "entry"), code).await);
 
-  let mut opts = RunOpts::simple(vec![], "test");
+  let mut opts = RunOpts::simple(vec![], "entry");
   opts.allow_dynamic_regions = true;
   let dynamic = run_one_program(opts, code).await;
   assert!(
@@ -1046,7 +1046,7 @@ async fn test_reject_pointer_selected_across_regions() {
   let ret = run_one_program(
     RunOpts {
       helpers: vec![],
-      entrypoint: "test",
+      entrypoint: "entry",
       calldata: &idx,
       resources: &mut [],
       allow_dynamic_regions: false,
@@ -1117,7 +1117,7 @@ async fn test_custom_code_size_limit() {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut [],
       &[],
       &PreemptionEnabled::new(t_env),

@@ -1350,7 +1350,9 @@ pub struct UnboundProgram {
   helpers: Arc<Vec<(u16, &'static str, Helper)>>,
   event_listener: Arc<dyn ProgramEventListener>,
   require_static_regions: bool,
-  entrypoints: HashMap<String, usize>,
+  /// The object's exported functions by name: its global function symbols,
+  /// wherever in the code sections they were placed.
+  entrypoints: HashMap<String, EntrypointTarget>,
   sections: RefCell<Vec<Section>>,
   resolvers: RefCell<HashMap<u32, ResolverInfo>>,
   /// Atomic because [`LazyCompileJob`]s allocate resolver ids on the worker
@@ -1413,6 +1415,13 @@ pub struct Program {
 #[derive(Copy, Clone)]
 struct Entrypoint {
   code_ptr: usize,
+}
+
+/// The function an entrypoint name resolves to.
+#[derive(Copy, Clone, Debug)]
+struct EntrypointTarget {
+  section_index: usize,
+  function_index: usize,
 }
 
 struct CodeArena {
@@ -1958,8 +1967,21 @@ impl Program {
     entry.clone().downcast().unwrap()
   }
 
-  pub fn has_section(&self, name: &str) -> bool {
+  /// Whether the program exports a function called `name`, i.e. whether
+  /// [`Program::run`] would find that entrypoint.
+  ///
+  /// Entrypoints are the object's global function symbols - every non-`static`
+  /// C function, in whatever section it was placed. `static` functions are
+  /// internal and cannot be invoked from the host.
+  pub fn has_entrypoint(&self, name: &str) -> bool {
     self.unbound.entrypoints.contains_key(name)
+  }
+
+  #[deprecated(
+    note = "entrypoints are named by function symbol, not by section; use `has_entrypoint`"
+  )]
+  pub fn has_section(&self, name: &str) -> bool {
+    self.has_entrypoint(name)
   }
 
   #[cfg(test)]
@@ -2083,10 +2105,15 @@ impl Program {
   async fn compile_entrypoint(
     &self,
     timeslicer: &impl Timeslicer,
-    section_index: usize,
+    target: EntrypointTarget,
   ) -> Result<Entrypoint, RuntimeError> {
     self
-      .compile_function(timeslicer, section_index, 0, PointerSignature::entry())
+      .compile_function(
+        timeslicer,
+        target.section_index,
+        target.function_index,
+        PointerSignature::entry(),
+      )
       .await
   }
 
@@ -2445,6 +2472,11 @@ impl Program {
 
   /// Runs the program entrypoint with immutable access to shared ELF data.
   ///
+  /// `entrypoint` names one of the object's exported functions: a global
+  /// function symbol, which is what every non-`static` C function becomes
+  /// regardless of the section it was placed in. `static` functions are not
+  /// entrypoints, and section names are not either.
+  ///
   /// Multiple immutable runs may interleave. A live [`Program::run_mut`]
   /// conflicts and produces an error immediately rather than waiting.
   #[allow(clippy::await_holding_lock)] // the read lease intentionally spans the full async run
@@ -2536,10 +2568,10 @@ impl Program {
       ));
     }
 
-    let Some(section_index) = self.unbound.entrypoints.get(entrypoint).copied() else {
+    let Some(target) = self.unbound.entrypoints.get(entrypoint).copied() else {
       return Err(RuntimeError::InvalidArgument("entrypoint not found"));
     };
-    let entrypoint = self.compile_entrypoint(timeslicer, section_index).await?;
+    let entrypoint = self.compile_entrypoint(timeslicer, target).await?;
     struct CoDropper<'a, Input, Yield, Return, DefaultStack: Stack>(
       ScopedCoroutine<'a, Input, Yield, Return, DefaultStack>,
     );
@@ -3484,6 +3516,10 @@ impl ProgramLoader {
       .enumerate()
       .map(|(index, code_section)| (code_section.elf_index, index))
       .collect();
+    // Function roots the container knows about and the code alone does not
+    // reveal: the targets of calls from other sections, and the exported
+    // functions the host may enter directly. Both delimit functions the same
+    // way a section-local call target does.
     let mut incoming_entries: HashMap<usize, Vec<usize>> = HashMap::new();
     for code_section in &linked_code.sections {
       for call in &code_section.cross_section_calls {
@@ -3491,6 +3527,12 @@ impl ProgramLoader {
           .entry(call.target_section_index)
           .or_default()
           .push(call.target_pc);
+      }
+      for function in &code_section.exported_functions {
+        incoming_entries
+          .entry(code_section.elf_index)
+          .or_default()
+          .push(function.pc);
       }
     }
 
@@ -3596,7 +3638,33 @@ impl ProgramLoader {
         elf_to_runtime_section[&code_section.elf_index],
         section_index
       );
-      entrypoints.insert(code_section.name.clone(), section_index);
+      for function in &code_section.exported_functions {
+        // Every exported pc was handed to `analyze_program` as an entry, so
+        // it opens a function; like the cross-section check below, this is a
+        // backstop against the two drifting apart rather than what admits it.
+        let function_index = layout.pc_to_func.get(function.pc).copied();
+        let opens_function =
+          function_index.is_some_and(|index| layout.functions[index].start_pc == function.pc);
+        if !opens_function {
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "exported function {} at PC {} in section {} does not begin a function",
+            function.name, function.pc, code_section.name
+          )));
+        }
+        let previous = entrypoints.insert(
+          function.name.clone(),
+          EntrypointTarget {
+            section_index,
+            function_index: function_index.expect("checked above"),
+          },
+        );
+        if previous.is_some() {
+          return Err(RuntimeError::InvalidArgumentOwned(format!(
+            "more than one exported function is named {}",
+            function.name
+          )));
+        }
+      }
       let functions = (0..layout.functions.len())
         .map(|_| FunctionState::default())
         .collect();

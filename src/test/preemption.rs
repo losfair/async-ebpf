@@ -239,7 +239,7 @@ fn test_openbsd_preemption_thread_lifecycle_stress() {
           .run(
             &timeslice,
             &TokioTimeslicer,
-            "test",
+            "entry",
             &mut [],
             &[],
             &preemption,
@@ -301,7 +301,7 @@ fn run_preempted_program(
         .run(
           &timeslice,
           &TokioTimeslicer,
-          "test",
+          "entry",
           &mut resources,
           &[],
           &preemption,
@@ -348,7 +348,7 @@ fn run_preempted_local_call_program(
         .run(
           &timeslice,
           &TokioTimeslicer,
-          "test",
+          "entry",
           &mut resources,
           &[],
           &preemption,

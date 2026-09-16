@@ -733,6 +733,12 @@ fn build_elf(code: &[Insn], external_symbols: &[&'static str]) -> Vec<u8> {
     }
   }
 
+  // The exported function `test` at the code section's first instruction: the
+  // entrypoint `run_program` invokes. It follows the external symbols so the
+  // relocations above keep their 1-based indices into that list.
+  let entry_name_offset = strtab.len() as u32;
+  strtab.extend_from_slice(b"test\0");
+
   let mut symtab = vec![0u8; 24];
   for name_offset in symbol_name_offsets {
     symtab.extend_from_slice(&name_offset.to_le_bytes());
@@ -742,6 +748,12 @@ fn build_elf(code: &[Insn], external_symbols: &[&'static str]) -> Vec<u8> {
     symtab.extend_from_slice(&0u64.to_le_bytes());
     symtab.extend_from_slice(&0u64.to_le_bytes());
   }
+  symtab.extend_from_slice(&entry_name_offset.to_le_bytes());
+  symtab.push(0x12); // GLOBAL / FUNC
+  symtab.push(0);
+  symtab.extend_from_slice(&1u16.to_le_bytes()); // st_shndx: the `test` section
+  symtab.extend_from_slice(&0u64.to_le_bytes());
+  symtab.extend_from_slice(&(text.len() as u64).to_le_bytes());
 
   let mut elf = vec![0u8; 64];
   let text_offset = append_aligned(&mut elf, &text, 8);

@@ -22,7 +22,8 @@
 
 ## Testing Guidelines
 - Tests are in `src/test/` and use `#[tokio::test]` plus `tracing-test`.
-- The eBPF compile pipeline shells out to LLVM tools. Ensure `clang`, `llvm-link`, `opt`, `llc`, and `llvm-objcopy` are available in PATH.
+- The eBPF compile pipeline shells out to LLVM tools. Ensure `clang`, `llvm-link`, `opt`, and `llc` are available in PATH.
+- Entrypoints are the object's exported (non-`static`) functions, named by symbol. Test fixtures need no section attributes; where they use them it is to control which functions share a section.
 - Prefer adding tests alongside existing patterns in `src/test/basic.rs`.
 
 ## Commit & Pull Request Guidelines

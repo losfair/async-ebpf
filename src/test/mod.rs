@@ -3,6 +3,7 @@ mod atomics;
 mod audit_escape;
 mod basic;
 mod entry_isolation;
+mod entrypoints;
 mod frame_addressing;
 mod guarded_stack_frames;
 mod lazy_local_call;

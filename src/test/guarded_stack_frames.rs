@@ -47,7 +47,7 @@ async fn run(program: &Program, calldata: &[u8]) -> Result<i64, Error> {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut resources,
       calldata,
       &PreemptionEnabled::new(thread),

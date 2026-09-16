@@ -14,6 +14,10 @@ const SHF_ALLOC: u64 = 1 << 1;
 const SHF_WRITE: u64 = 1;
 const SHF_EXECINSTR: u64 = 1 << 2;
 
+const STT_FUNC: u8 = 2;
+const STB_GLOBAL: u8 = 1;
+const STB_WEAK: u8 = 2;
+
 const R_BPF_64_64: u32 = 1;
 const R_BPF_64_ABS64: u32 = 2;
 const R_BPF_64_32: u32 = 10;
@@ -183,6 +187,16 @@ const MAX_REL_SECTIONS: usize = 1024;
 const MAX_TOTAL_CODE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RELOCATIONS: usize = 1024 * 1024;
 
+/// Ceiling on the exported functions (the entrypoints) of one object.
+///
+/// Every exported function's name is retained as an owned `HashMap` key, and
+/// names may each run to `MAX_STRING_LEN` while sharing one string table
+/// (every suffix of a table is a valid name), so the symbol count is what
+/// bounds the memory the names claim: this cap times `MAX_STRING_LEN` is the
+/// same 64 MiB ceiling as `MAX_TOTAL_CODE_BYTES`. A compiler emits one symbol
+/// per non-static function, so real objects sit far below it.
+const MAX_EXPORTED_FUNCTIONS: usize = 16 * 1024;
+
 /// Ceilings on the string-table index built by [`StrTabIndex`].
 ///
 /// The NUL ceiling bounds the memory the index may claim (a hostile table of
@@ -296,6 +310,18 @@ pub(crate) struct CrossSectionCall {
   pub(crate) target_pc: usize,
 }
 
+/// A function the object exports: a global (or weak) `STT_FUNC` symbol defined
+/// in an executable section. These are the program's entrypoints.
+///
+/// Non-static C functions become exactly these symbols, whatever section they
+/// were placed in; `static` functions are `STB_LOCAL` and stay internal.
+#[derive(Clone, Debug)]
+pub(crate) struct ExportedFunction {
+  pub(crate) name: String,
+  /// Instruction index within the owning section.
+  pub(crate) pc: usize,
+}
+
 /// One executable ELF section after relocation.
 pub(crate) struct LinkedCodeSection {
   pub(crate) elf_index: usize,
@@ -303,6 +329,8 @@ pub(crate) struct LinkedCodeSection {
   pub(crate) code_vaddr: usize,
   pub(crate) len: usize,
   pub(crate) cross_section_calls: Vec<CrossSectionCall>,
+  /// The functions this section exports, by ascending `pc`.
+  pub(crate) exported_functions: Vec<ExportedFunction>,
 }
 
 /// The executable sections and the cross-section calls between them.
@@ -315,6 +343,10 @@ pub(crate) struct LinkedCode {
 /// Calls within one section retain ordinary PC-relative immediates. Calls to a
 /// different section are tagged for the runtime and returned as explicit
 /// metadata; no synthetic whole-program instruction address space is created.
+///
+/// The layout also names the object's exported functions - its global function
+/// symbols - which the runtime exposes as entrypoints. Section names carry no
+/// meaning beyond diagnostics: `.text` is as good a home for code as any.
 pub fn link_elf(
   input: &mut [u8],
   immutable_vbase: usize,
@@ -411,6 +443,7 @@ pub fn link_elf(
       code_vaddr: immutable_vbase + cs.sh_offset as usize,
       len: section_size,
       cross_section_calls: Vec::new(),
+      exported_functions: Vec::new(),
     });
     code_section_indexes.insert(cs_index);
     // The ceiling counts headers, not unique names: entrypoints are deduplicated
@@ -421,6 +454,50 @@ pub fn link_elf(
         "too many code sections in one object",
       ));
     }
+  }
+
+  // The exported functions: every global or weak function symbol that lives in
+  // one of the code sections above. Undefined symbols (helper imports) have
+  // `SHN_UNDEF` as their section and reserved indices (`SHN_ABS` and friends)
+  // never name a header, so both fall out of the membership test.
+  let mut exported_by_section: HashMap<usize, Vec<ExportedFunction>> = HashMap::new();
+  let mut exported_names: HashSet<String> = HashSet::new();
+  for sym in symtab.iter() {
+    if sym.st_symtype() != STT_FUNC {
+      continue;
+    }
+    let bind = sym.st_bind();
+    if bind != STB_GLOBAL && bind != STB_WEAK {
+      continue;
+    }
+    let section_index = sym.st_shndx as usize;
+    if !code_section_indexes.contains(&section_index) {
+      continue;
+    }
+    let name = sym_strtab.get(sym.st_name as usize)?;
+    let section = sht.get(section_index)?;
+    if !sym.st_value.is_multiple_of(8) || sym.st_value >= section.sh_size {
+      return Err(LinkerError::InvalidElf(
+        "function symbol is unaligned or outside its code section",
+      ));
+    }
+    if !exported_names.insert(name.to_string()) {
+      return Err(LinkerError::InvalidElf(
+        "more than one exported function shares a name",
+      ));
+    }
+    if exported_names.len() > MAX_EXPORTED_FUNCTIONS {
+      return Err(LinkerError::InvalidElf(
+        "too many exported functions in one object",
+      ));
+    }
+    exported_by_section
+      .entry(section_index)
+      .or_default()
+      .push(ExportedFunction {
+        name: name.to_string(),
+        pc: (sym.st_value / 8) as usize,
+      });
   }
 
   let mut insn_rewrites: Vec<(usize, u64)> = vec![];
@@ -657,6 +734,11 @@ pub fn link_elf(
     section.cross_section_calls = cross_section_calls
       .remove(&section.elf_index)
       .unwrap_or_default();
+    let mut exported = exported_by_section
+      .remove(&section.elf_index)
+      .unwrap_or_default();
+    exported.sort_by_key(|function| function.pc);
+    section.exported_functions = exported;
   }
 
   Ok(LinkedCode {

@@ -40,6 +40,10 @@ impl Timeslicer for TokioTimeslicer {
 }
 
 /// Compiles C source to an eBPF ELF object using LLVM tools.
+///
+/// The object is loaded as `llc` emits it: functions without a section
+/// attribute stay in `.text`, and every non-`static` function is an
+/// entrypoint under its own name.
 pub async fn compile_ebpf(src: Vec<u8>) -> anyhow::Result<Vec<u8>> {
   let mut clang = Command::new("clang")
     .arg("-target")
@@ -107,36 +111,14 @@ pub async fn compile_ebpf(src: Vec<u8>) -> anyhow::Result<Vec<u8>> {
     let _ = tokio::io::copy(&mut opt_stdout, &mut llc_stdin).await;
   });
 
-  let mut llvm_objcopy = Command::new("llvm-objcopy")
-    .arg("--remove-section")
-    .arg(".text")
-    .arg("-")
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::inherit())
-    .kill_on_drop(true)
-    .spawn()?;
-  let mut llc_stdout = llc.stdout.take().unwrap();
-  let mut llvm_objcopy_stdin = llvm_objcopy.stdin.take().unwrap();
-  tokio::spawn(async move {
-    let _ = tokio::io::copy(&mut llc_stdout, &mut llvm_objcopy_stdin).await;
-  });
-
-  let (clang_out, llvm_link_out, opt_out, llc_out, output) = tokio::join!(
+  let (clang_out, llvm_link_out, opt_out, output) = tokio::join!(
     clang.wait(),
     llvm_link.wait(),
     opt.wait(),
-    llc.wait(),
-    llvm_objcopy.wait_with_output()
+    llc.wait_with_output()
   );
   let output = output?;
-  let exit_status_list = [
-    clang_out?,
-    llvm_link_out?,
-    opt_out?,
-    llc_out?,
-    output.status,
-  ];
+  let exit_status_list = [clang_out?, llvm_link_out?, opt_out?, output.status];
   if exit_status_list.iter().any(|x| !x.success()) {
     anyhow::bail!("one or more commands failed");
   }

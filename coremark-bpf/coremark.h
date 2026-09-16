@@ -16,10 +16,6 @@
 #define CORE_DEBUG 0
 #endif
 
-#if defined(__clang__)
-#pragma clang section text = "coremark"
-#endif
-
 #define MEM_STATIC 0
 #define MEM_MALLOC 1
 #define MEM_STACK 2

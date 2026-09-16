@@ -74,7 +74,7 @@ async fn run(program: &Program, calldata: &[u8]) -> Result<i64, Error> {
     .run(
       &timeslice_config(),
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut resources,
       calldata,
       &PreemptionEnabled::new(t_env),
@@ -456,7 +456,7 @@ async fn count_events(code: &[Insn], timeslice: TimesliceConfig) -> (Program, us
     .run(
       &timeslice,
       &TokioTimeslicer,
-      "test",
+      "entry",
       &mut resources,
       &[],
       &PreemptionEnabled::new(t_env),
@@ -705,7 +705,7 @@ async fn lazy_compilation_runs_on_the_blocking_executor() {
     .run(
       &timeslice_config(),
       &timeslicer,
-      "test",
+      "entry",
       &mut resources,
       &[],
       &PreemptionEnabled::new(t_env),
@@ -770,7 +770,7 @@ async fn an_inline_run_blocking_compiles_on_the_current_thread() {
     .run(
       &timeslice_config(),
       &timeslicer,
-      "test",
+      "entry",
       &mut resources,
       &[],
       &PreemptionEnabled::new(t_env),
@@ -835,7 +835,7 @@ async fn interleaved_runs_share_one_in_flight_compilation() {
   let run_a = program.run(
     &timeslice,
     &SlowCompileTimeslicer,
-    "test",
+    "entry",
     &mut resources_a,
     &[],
     &preemption,
@@ -843,7 +843,7 @@ async fn interleaved_runs_share_one_in_flight_compilation() {
   let run_b = program.run(
     &timeslice,
     &SlowCompileTimeslicer,
-    "test",
+    "entry",
     &mut resources_b,
     &[],
     &preemption,
