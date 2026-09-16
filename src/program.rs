@@ -38,6 +38,7 @@ use crate::{
   region_analysis::PointerSignature,
   util::nonnull_bytes_overlap,
   verified::stack::{island_access, local_call_floor, root_frame_offset, FrameLayout},
+  verified::x64_layout::{derived_block, layout_ok, NativeLayout},
 };
 
 /// Native stack left below the deepest admitted JIT frame for the entry
@@ -972,6 +973,17 @@ impl ExecContext {
 /// which is what `jit::abi::span_slot_index` indexes with.
 const ACCESS_WIDTHS: [usize; 4] = [1, 2, 4, 8];
 
+/// [`derived_block`] spells the four widths out rather than reading them from
+/// a table, because the Lean `DerivedBlock` it mirrors names `span1`, `span2`,
+/// `span4` and `span8` one by one. Tie the two together here, so that a change
+/// to the table is a compile error instead of four silently wrong constants.
+const _: () = {
+  assert!(ACCESS_WIDTHS[0] == 1);
+  assert!(ACCESS_WIDTHS[1] == 2);
+  assert!(ACCESS_WIDTHS[2] == 4);
+  assert!(ACCESS_WIDTHS[3] == 8);
+};
+
 #[repr(C)]
 struct JitMemory {
   stack_guest_bottom: usize,
@@ -1060,12 +1072,15 @@ impl JitMemory {
         self.data_native_base,
       ),
     ] {
-      self.derived[slot] = bottom;
-      self.derived[slot + 1] = native_base.wrapping_sub(bottom);
-      for (i, width) in ACCESS_WIDTHS.iter().enumerate() {
-        self.derived[slot + 2 + i] = (top - width) - bottom;
+      // The six constants come from the verified core, which computes them in
+      // the order `DerivedBlock` reads them back in
+      // `lean/AsyncEbpf/X64/Contract.lean`. Byte for byte what the two lines of
+      // `wrapping_sub` and `(top - width) - bottom` used to compute here.
+      let block = derived_block(bottom as u64, top as u64, native_base as u64);
+      for (i, value) in block.iter().enumerate() {
+        self.derived[slot + i] = *value as usize;
       }
-      slot += 2 + ACCESS_WIDTHS.len();
+      slot += block.len();
     }
     debug_assert_eq!(slot, self.derived.len());
   }
@@ -2590,6 +2605,11 @@ impl Program {
       if page_size <= 0 {
         return Err(RuntimeError::PlatformError("failed to query page size"));
       }
+      // The coroutine stack's whole mapping, guard page included: `stackLo`
+      // and `stackHi` of the x86_64 contract's `Layout`. Read before the
+      // coroutine borrows the stack mutably.
+      let native_stack_lo = ctx.native_stack.limit().get();
+      let native_stack_hi = ctx.native_stack.base().get();
       let native_usable_bottom = ctx
         .native_stack
         .limit()
@@ -2619,6 +2639,39 @@ impl Program {
       memory.fill_derived();
       let memory = memory;
       let memory_ptr = &memory as *const JitMemory as usize;
+
+      // `Layout P` in `lean/AsyncEbpf/X64/Contract.lean` is a hypothesis of
+      // `check_safe`: the theorem says the emitted code only touches the
+      // windows it was given *provided* those windows are laid out as
+      // `program.rs` claims to lay them out. Nothing in the proof establishes
+      // that, so check it here, on the very numbers the trampoline is about to
+      // receive - `memory_ptr` is the descriptor address it is handed, and the
+      // six region fields are the ones `fill_derived` just turned into the
+      // twelve frame constants. A few dozen comparisons once per invocation
+      // setup, against an invocation that may run for a whole timeslice.
+      let native_layout = NativeLayout {
+        stack_guest_bottom: memory.stack_guest_bottom as u64,
+        stack_guest_top: memory.stack_guest_top as u64,
+        stack_native_base: memory.stack_native_base as u64,
+        data_guest_bottom: memory.data_guest_bottom as u64,
+        data_guest_top: memory.data_guest_top as u64,
+        data_native_base: memory.data_native_base as u64,
+        descriptor: memory_ptr as u64,
+        native_stack_lo: native_stack_lo as u64,
+        native_stack_hi: native_stack_hi as u64,
+        guest_floor: memory.local_call_guest_floor as u64,
+        native_floor: memory.local_call_native_floor as u64,
+        frame_size: guest_frame as u64,
+        frame_stride: stack_layout.frame_stride as u64,
+      };
+      if !layout_ok(&native_layout) {
+        return Err(RuntimeError::PlatformError(
+          "this invocation's memory layout does not satisfy the entry contract the \
+           generated code is compiled against: the guest regions, their native \
+           backings, the coroutine stack and the memory descriptor must be \
+           ordered, page-wide and pairwise disjoint",
+        ));
+      }
 
       let mut co = CoDropper(Coroutine::with_stack(
         &mut ctx.native_stack,

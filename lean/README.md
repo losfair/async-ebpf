@@ -1,16 +1,21 @@
 # Lean proofs
 
-Machine-checked statements about the runtime's analysis passes: the load-time
-validator and the function layout. The code the proofs describe is the code
-the runtime runs:
+Machine-checked statements about the runtime's analysis passes — the
+load-time validator, the function layout, the region analysis — and about
+the x86_64 backend: the native code it emits is memory-safe. The code the
+proofs describe is the code the runtime runs:
 
 ```
 src/verified/                   the verified core: isa.rs, validate.rs, layout.rs,
-  │                             stack.rs, region.rs
+  │                             stack.rs, region.rs, fixpoint.rs, liveness.rs,
+  │                             x64_ir.rs, x64_lower.rs, x64_check.rs, x64_expand.rs,
+  │                             x64_encode.rs, x64_decode.rs, x64_layout.rs, x64_sim.rs
   │  compiled into the runtime as crate::verified (jit::isa re-exports it,
   │  jit::validate and function_analysis call it and render the rejection,
   │  program computes the frame geometry with it, region_analysis drives
-  │  its transfer function to a fixed point)
+  │  its transfer function to a fixed point, jit::emit::x86_64 lowers,
+  │  checks, expands and assembles with it, program checks the layout
+  │  with it before entering generated code)
   │
   │  also the library of lean/verified/Cargo.toml, a stand-alone crate
   │  charon cargo --preset=aeneas ; aeneas -backend lean
@@ -32,7 +37,29 @@ lean/AsyncEbpf/AsyncEbpfVerified.lean   generated, do not edit
   ├─ AsyncEbpf/Semantics/Machine.lean    an operational semantics of eBPF
   ├─ AsyncEbpf/Semantics/Soundness.lean  accepted programs never go wrong
   ├─ AsyncEbpf/Semantics/Functions.lean  control never leaves a function
-  └─ AsyncEbpf/Semantics/Frames.lean     unchecked frame accesses stay mapped
+  ├─ AsyncEbpf/Semantics/Frames.lean     unchecked frame accesses stay mapped
+  ├─ AsyncEbpf/X64/Bytes.lean            byte-addressed memory
+  ├─ AsyncEbpf/X64/Machine.lean          an operational semantics of the x86_64 primitives
+  ├─ AsyncEbpf/X64/Contract.lean         the entry contract, the allowed set, Safe
+  ├─ AsyncEbpf/X64/Tag.lean              reading the checker's abstract state
+  ├─ AsyncEbpf/X64/CheckSpec.lean        the checker's walk as a chain; its rules inverted
+  ├─ AsyncEbpf/X64/Abs.lean              agreement between abstract and machine states
+  ├─ AsyncEbpf/X64/Run.lean              runs inside a region; the per-macro contract
+  ├─ AsyncEbpf/X64/Simple.lean           the one- and two-primitive macros
+  ├─ AsyncEbpf/X64/CheckedAddr.lean      the branchless bounds check
+  ├─ AsyncEbpf/X64/Arith.lean            division fix-ups, the fetching atomic loop
+  ├─ AsyncEbpf/X64/Calls.lean            the helper call and the lazy local call
+  ├─ AsyncEbpf/X64/Expand.lean           the expansion as chunks, every label resolved
+  ├─ AsyncEbpf/X64/Soundness.lean        check = ok → Contract (memory safety)
+  ├─ AsyncEbpf/X64/Compose.lean          a checked callee gives its caller ExternalReturn
+  ├─ AsyncEbpf/X64/LayoutCheck.lean      layout_ok = true → Layout (the runtime's check)
+  ├─ AsyncEbpf/X64/Encode.lean           the byte table as a list; size_of and offsets
+  ├─ AsyncEbpf/X64/Assemble.lean         the decoder over the encoder: machinery, 17 families
+  ├─ AsyncEbpf/X64/RoundtripReg.lean     … the 13 register and branch families
+  ├─ AsyncEbpf/X64/RoundtripMem.lean     … the 12 memory and trailer families
+  ├─ AsyncEbpf/X64/Roundtrip.lean        decodesTo_all: every primitive decodes back
+  ├─ AsyncEbpf/X64/AssembleSpec.lean     assemble places every displacement, refuses the rest
+  └─ AsyncEbpf/X64/SimRefines.lean       the executable simulator is a run of the model
 ```
 
 Every analysis pass that gains a proof moves into `src/verified/`; the crate
@@ -262,8 +289,220 @@ intrusive predecessor and call-site lists. Then:
 The hypotheses (`Shape`) are what `program_live_in` builds: every index in
 range, every function's entry inside it, fewer than `2^31` slots.
 
+### The x86_64 backend
+
+`docs/jit-memory-safety.md` says what memory safety of the emitted code
+means and why the backend was restructured for it. In short: the emitter's
+decisions live in `src/verified/x64_lower.rs`, which builds a list of
+*macro* instructions (`x64_ir::MInsn`); `src/verified/x64_check.rs`
+refuses the list unless an abstract walk over it — a tag per native
+register, the native stack depth, the parked group base, liveness — admits
+every guest access; `src/verified/x64_expand.rs` turns each macro into its
+fixed sequence of *primitive* instructions (`x64_ir::PInsn`, one per x86
+instruction); and `src/jit/emit/x86_64.rs` keeps only the encoder from
+primitives to bytes and the branch fixups. `lower` runs `check` on what it
+built, so what the backend returns is checked code by construction.
+
+`X64/Machine.lean` is an operational semantics of the primitive
+instruction set: sixteen registers, the four flags the checks read, a
+byte-addressed memory, a program counter over the primitive list, branches
+to labels rather than offsets. A call to an address outside the function is
+an *external call*: it returns to the pushed return address with `rsp`,
+`rbp`, `r15`, the read-only frame slots and the descriptor preserved and
+everything else arbitrary — `rbx` and `r12`–`r14` among it, and guest memory
+wherever the runtime mapped it. That is what the runtime promises of the
+dispatcher and the callbacks, and it is no stronger than this theorem's own
+conclusion for a lazily compiled callee, which is what lets the two compose. Shifts, multiplies, divides and `rol` leave the flags
+arbitrary and the divide leaves `rax`/`rdx` arbitrary: over-approximations,
+so every real execution is a modelled one.
+
+`X64/Contract.lean` states the entry contract (`Entry`: the descriptor at
+`[rbp - 8]`, the delta at `[rbp - 40]`, the twelve derived slots, the
+descriptor's fields, the frame register at the native frame base) and the
+layout facts (`Layout`: the two guest regions and their native backings are
+ranges, disjoint from each other, from the first page, from the frame
+scratch, from the native stack window and from the descriptor; the frame
+window lies inside the stack's backing; each region is at least a page
+wide), and the property: `Safe P code` says every access any reachable step
+makes is inside `Allowed P` — the frame scratch, the native stack window,
+the two native backings, the first page (where a failed check lands, and
+which the fault handler claims), and the descriptor; `SafeStores P code`
+says every range a step *writes* (`stores`, the writing part of `accesses`)
+is inside the smaller `WritableAllowed P` — the native stack below the
+entry `rsp`, the four writable frame slots, the two native backings and the
+first page; and `Returns P code` says a `ret` at the entry `rsp` leaves
+`rsp`, `rbp` and the frame register as the caller expects. `Contract` is
+all three. The stores half is what a caller needs of its callee and `Safe`
+does not give: `romem_kept` reads off it that the read-only frame slots and
+the descriptor come back untouched, which is half of what the caller
+assumed through `ExternalReturn`.
+
+`check_safe` (in `X64/Soundness.lean`): if `x64_check::check` accepts a
+macro list, then under the cage (`pointer_mask ≠ 0`), with the machine's
+frame size the configured one, the machine's dispatcher the configured one
+and off the function's own code, and the list ending in the trailer, every
+execution of the list's expansion from an entry state satisfies both. The
+trailer is a hypothesis because the checker does not insist on it by itself,
+while a helper call needs the dispatcher slot that lives in it: with no slot
+the macro's fallback path, which loads through the embedded helper table,
+becomes reachable. `lower_safe` composes `check_safe` with `lower`'s gate and
+the expansion — and discharges the trailer, which `lower` always emits: what
+`translate_range` returns is safe.
+
+The proof is macro by macro. `Abs.lean` says when an abstract state and a
+machine state agree (`Agree`: `Fp` means the frame register holds its entry
+value; `Checked w` means zero or a native address whose `w`-byte window is
+inside one backing; `rsp` is `depth` words below its entry; `rbp` and the
+read-only slots are intact; the parked group base carries its tag).
+`Run.lean` states the contract every macro's expansion satisfies
+(`MacroOk`: from an agreeing state every step is safe, every range it
+writes is writable, `rsp` stays in the native stack window at every
+position, and control leaves the macro's primitives only to the next macro,
+agreeing with the checker's post-state, to a labelled slot in the entry
+state, or by returning under the contract). The `rsp` clause is what the
+whole-function `StackKept` is assembled from, and `romem_kept` needs it:
+without it nothing says a callee's own frame lies below this activation's
+frame scratch, because a register-only primitive can move `rsp` without
+touching memory. `Simple.lean`, `CheckedAddr.lean`, `Arith.lean` and
+`Calls.lean` prove it for each macro with the operands symbolic — the
+branchless check yields zero or an in-region address on both the
+frame-constants and the descriptor paths and for the two-region probe; the
+division's pushes balance; the fetching atomic's loop re-dereferences a
+base nothing has rewritten; the helper call's default-dispatcher path is
+dead when a dispatcher is registered and its retpoline returns through the
+address the call pushed; the lazy call restores the frame register it moved
+by one stride. `CheckSpec.lean` turns `check = ok` into a chain of abstract
+states with one rule application per macro; `Expand.lean` turns `expand`
+into a concatenation of per-macro chunks and resolves every label to a
+chunk start. `Soundness.lean` runs the machine invariant — the current
+state is inside some macro's chunk, reached from a boundary state agreeing
+with that macro's abstract pre-state — through every step.
+
+Two things are outside the statement, deliberately. Functional
+correctness, and information leaks: the native value of `R10` reaching the
+guest as a value is not a memory-safety property, and `audit_escape` in the
+Rust tests is what probes it.
+
+#### Across activations
+
+`check_safe` is about one activation entered at the head of the list,
+which is how the runtime enters every function it translates (one function
+per range; a multi-function range, which only the tests build, is covered
+for its first function). Where the activation calls *out* — the retpoline
+to the dispatcher, and the three `CallReg`s of the lazy local call — the
+model answers with `ExternalReturn`, an assumption about the callee: it
+returns to the pushed address with `rsp`, `rbp` and the frame register as
+they were, and leaves the caller's frame above the return address alone
+except for the four writable slots, the two guest backings and the first
+page. `X64/Compose.lean` discharges that assumption for the one callee that
+is another instance of the theorem. `callee_externalReturn`: a callee
+satisfying `Contract` and the stack window, entered the way the lazy call
+enters it — `CalleeOf P P'`: same machine, same descriptor, regions, floors,
+frame size, stride and native stack mapping; frame register one stride
+lower; entry `rsp` below the caller's, the two floor comparisons the
+sequence performs passed — delivers exactly `ExternalReturn` to its caller.
+`checked_callee_externalReturn` reads that off `check_safe` for a callee
+whose macro list the checker accepted, and `layout_callee` derives the
+callee's `Layout` from the caller's plus the floor checks, so nothing about
+the callee is assumed beyond what the caller was already given. The
+dispatcher, the resolver and the stack-exhausted callback remain trusted to
+honour `ExternalReturn`; they are host code.
+
+#### The layout the runtime checks
+
+`Layout P` is the hypothesis that says where the mappings are.
+`src/verified/x64_layout.rs` holds the thirteen numbers the descriptor and
+the mappings carry (`NativeLayout`) and `layout_ok`, twenty-one comparisons
+over them that `program.rs` runs on every invocation before it enters
+generated code, refusing the run with a `PlatformError` if any fails.
+`X64/LayoutCheck.lean` is the bridge: `layout_of_check` turns
+`layout_ok l = ok true`, plus the six per-activation facts only the entry
+trampoline can establish (the entry `rsp` and `rbp` inside the coroutine
+stack with the frame scratch between them, the frame register inside the
+guest stack's backing), into `Layout (paramsOf l …)`, every clause.
+`derived_block_spec` says the six bounds-check constants
+`JitMemory::fill_derived` computes through `derived_block` are the words
+`RoMem` reads back as a `DerivedBlock`. The trusted base shrinks
+accordingly: what remains trusted of the entry is the six register and
+slot facts, not the geometry.
+
+#### The bytes
+
+The encoder used to be the trusted table between primitives and bytes.
+`src/verified/x64_encode.rs` is now the whole of it — `encode_one`, the
+byte table; `size_of`; `offsets`, pass one; `assemble`, the two passes
+with the displacements written by the pass that emits the instruction, so
+that no fixup side table exists — and `src/verified/x64_decode.rs` is an
+independently written inverse, `decode_one`, that reads the bytes at one
+boundary back into the primitive, its length and its displacement.
+`src/jit/emit/x86_64.rs` only reports the assembler's two errors.
+
+`X64/Encode.lean` states every primitive's bytes as a list (`enc`) and
+proves `encode_one`, `size_of` and `offsets` against it. `X64/Assemble.lean`,
+`X64/RoundtripReg.lean` and `X64/RoundtripMem.lean` run the decoder over
+the encoder's output: `DecodesTo p` says that in a buffer whose earlier
+bytes are arbitrary, the bytes appended for `p` decode, at the offset they
+were appended, to `p`'s shape, to `size_of p` bytes and to displacement
+zero, and it is proved family by family with every operand symbolic —
+every register, width, condition code, immediate and displacement.
+`X64/Roundtrip.lean` closes it over the whole instruction set:
+`decodesTo_all`, every primitive that emits bytes, under the operand bounds
+(`RegsBounded`) the backend always meets, decodes back; the five that emit
+nothing encode to no bytes. `shape` is the four collisions the decoder's
+module doc lists — a `LoadImm` that fits thirty-two bits is a `mov` with an
+immediate, `mod` is `div` and `mul` is unsigned, `ShiftImm` and the narrow
+`StoreImm` truncate their immediate, a branch carries a placeholder target
+— and nothing else. `X64/AssembleSpec.lean` is the assembler:
+`assemble_spec` says a successful assembly is the encoder's concatenation
+with every branch and RIP-relative site carrying the displacement to where
+its label landed, that an unlabelled target can never assemble (the old
+fixup pass resolved it silently to the top of the function), and that a
+short branch that does not reach is refused rather than truncated.
+
+What this buys is a second table. The decoder's own bytes are the remaining
+trust: two tables written separately from the same manual agreeing on
+every encoding over every operand, rather than over a sweep. It says
+nothing about what the bytes mean to the processor; that is the machine
+model's axiomatisation, and the differential test below is its evidence.
+
+#### The model and the machine
+
+`Machine.lean` is a relation; nothing runs it. `src/verified/x64_sim.rs` is
+an executable simulator of the same primitives — sixteen registers, four
+flags, one byte buffer, a step and a bounded run — and
+`X64/SimRefines.lean` proves it is a run of the model: `step_refines` says
+every step the simulator takes on a list whose register operands are in
+range (`CodeOk`) is a `Step` of the model on the abstracted state, for all
+forty-six primitive shapes, and `run_refines` lifts it to `Reachable`.
+`src/test/x64_sim_native.rs` then runs twenty thousand random primitive
+lists — every register-only, memory, stack, divide and short-branch
+shape the backend uses — through both the simulator and the processor
+(assembled by `x64_encode`, entered through a small trampoline) and
+compares registers, flags and the scratch page byte for byte. The
+refinement is what makes that a test of the model: a divergence between
+`Step` and the hardware would surface as a divergence between the
+simulator and the hardware. Where the model leaves the flags arbitrary
+(after a shift, a rotate, a multiply or a divide) the test defines them
+with a `cmp` before anything can observe them: processors really differ
+there, and the model's promise is what is compared.
+
 ## What is trusted
 
+- **The x86 instruction set as the model reads it.** `X64/Machine.lean`
+  says what each primitive does and `x64_decode` says which bytes are which
+  primitive; that the processor agrees with both is what the differential
+  test in `src/test/x64_sim_native.rs` checks, not a theorem. The encoder
+  itself is no longer here: `decodesTo_all` and `assemble_spec` pin it to
+  the decoder's table, which is the byte-level trust that remains.
+- **The entry trampolines and the descriptor.** `RoMem` and the six
+  per-activation register facts are what the `global_asm!` trampolines and
+  `JitMemory` in `program.rs` establish; the geometry of `Layout` is no
+  longer assumed but checked by `layout_ok` on every invocation
+  (`layout_of_check`). Also the fault handler and the windows it claims,
+  the write-xor-execute discipline of the arena, the SysV convention, the
+  resolver (that it returns the address of checked code), the dispatcher
+  and the stack-exhausted callback (that they honour `ExternalReturn`; a
+  lazily compiled callee is proved to, `callee_externalReturn`).
 - **The adapters.** `jit::validate` folds the embedder's helper callback into
   the list of known indices the core consults, and renders each `Reject` as
   the message embedders match on; `function_analysis` decodes the section
@@ -274,8 +513,10 @@ range, every function's entry inside it, fewer than `2^31` slots.
   pin every message, so a change shows up as a golden diff.
 - **The JIT's floor test and native frame base.** `StackParams` states what
   the emitted code does with `R10`: starts it at the top of the highest
-  island and subtracts one stride per call. That the backends do so is
-  checked by their tests, not here.
+  island and subtracts one stride per call. On x86_64, `macroOk_lazyLocalCall`
+  shows the frame register moves by exactly one stride around the callee and
+  comes back; that the stride and the floor are the layout's is an adapter
+  fact. On aarch64 it is checked by the backend's tests, not here.
 - **The live-in adapter.** `program_live_in` lays the sections end to end
   and builds the per-slot function, per-function bounds and per-call callee
   tables `liveness::solve` reads; `Liveness/Proofs.lean` takes their shape
@@ -294,10 +535,11 @@ range, every function's entry inside it, fewer than `2^31` slots.
   conveniences in `src/verified/` (the wire codec, `Debug`, `Hash`) behind
   `cfg(not(feature = "extract"))`. Nothing the theorems mention is behind it.
 
-Nothing else: the proofs use no `sorry` and no `native_decide`, the generated
-file declares no axioms, and `#print axioms` on the theorems lists only Lean's
-`propext`, `Classical.choice` and `Quot.sound`. The byte-table facts are
-checked by running the decoder on all 256 bytes inside the kernel
+Nothing else: the proofs use no `sorry`, no `native_decide` and no
+`bv_decide` (whose certificate check adds a native-reflection axiom), the
+generated file declares no axioms, and `#print axioms` on the theorems lists
+only Lean's `propext`, `Classical.choice` and `Quot.sound`. The byte-table
+facts are checked by running the decoder on all 256 bytes inside the kernel
 (`decide +kernel`).
 
 ## Building
@@ -374,7 +616,16 @@ methods — goes behind `cfg(not(feature = "extract"))`.
 its loop: that it reaches a post-fixed point (every reached slot's transfer
 is absorbed by its successors), and that it visits exactly the slots
 `partition` marks reachable, are the natural next invariants, and the
-`Run` model in `Region/Masking.lean` is the shape they would take. The
-access-plan grouping in `region_analysis.rs` is advisory (the backends
-re-derive every condition before trusting it), so its safety is a property
-of the emitters, out of reach of this approach.
+`Run` model in `Region/Masking.lean` is the shape they would take.
+
+The x86_64 theorem is about what `check` accepts; that `lower` never builds
+a list `check` refuses is a precision property, answered today by the
+goldens, the configuration and randomised sweeps and the runtime tests
+rather than by a proof. Proving it — `lower = ok` without the gate implies
+`check = ok` — is the natural next step, and would make the gate dead code.
+What the model says a primitive does is checked against the hardware by
+the differential test, not proved; a proof would need a formal x86
+semantics to refine, and none is in the trusted base yet. The aarch64
+backend is untouched: it emits through typed encoders already, so the same
+split applies with less restructuring, and the machine model is the new
+work there.

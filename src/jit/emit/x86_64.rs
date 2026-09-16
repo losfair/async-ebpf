@@ -1,10 +1,27 @@
-//! The x86_64 backend.
+//! The x86_64 backend's adapter onto the verified core.
 //!
-//! Translates one function at a time, which always reaches
-//! `translate_range(..., whole_program = false, lazy_local_calls = true)`. The
-//! whole-program entry point, the interpreter and constant blinding are not
-//! reachable and are not implemented; where the code branches on those they are
-//! folded away with a comment saying so.
+//! Translating one function happens in four layers, none of which is here:
+//!
+//! ```text
+//!   eBPF program + hints + plan
+//!     │  verified::x64_lower::lower     the decisions
+//!     ▼
+//!   Vec<MInsn>   macro instructions
+//!     │  verified::x64_expand::expand   each macro's native sequence
+//!     ▼
+//!   Vec<PInsn>   one per x86 instruction
+//!     │  verified::x64_encode::assemble bytes, and the label resolution
+//!     ▼
+//!   bytes in the code arena
+//! ```
+//!
+//! All four are in the verified core, which `lean/AsyncEbpf/X64/` is about;
+//! see `docs/jit-memory-safety.md`. This module is the adapter around them: it
+//! builds the three descriptions they take from the [`Translator`], renders
+//! each [`Reject`] and each [`AsmError`] as the message embedders match on,
+//! and copies the assembled bytes into the caller's buffer. The table from
+//! primitives to bytes used to live here, and `verified::x64_decode` now
+//! inverts it; what is left has no decisions in it at all.
 //!
 //! # Changing what this emits
 //!
@@ -26,2211 +43,187 @@
 //!
 //! Everything after the instruction stream is emitted unconditionally, which is
 //! why even a two-instruction program is around 600 bytes.
+//!
+//! # Reporting order
+//!
+//! A function whose *lowering* fails is refused before the buffer is consulted,
+//! so a program that would never translate is no longer reported as
+//! `OutOfSpace` when the buffer is also too small. `OutOfSpace` is terminal for
+//! the whole program and a translation failure is terminal for one function, so
+//! the two are not interchangeable to the caller.
 
 use crate::jit::abi;
-use crate::jit::isa::{
-  cls, opcode, AluOp, AluWidth, AtomicOp, EndKind, Insn, JmpOp, Op, Source, Width,
-};
-use crate::jit::patch::{JitState, OpenGroup, PatchTarget, Progress, SpecialTarget};
-use crate::jit::{Config, PlanEntry, TranslateError, TranslationInputs, Translator};
+use crate::jit::{Config, TranslateError, TranslationInputs, Translator};
+
+use crate::verified::x64_encode::{assemble, AsmError};
+use crate::verified::x64_expand::expand;
+use crate::verified::x64_ir::{Cfg, PInsn};
+use crate::verified::x64_lower::{lower, Reject};
 
 // ---------------------------------------------------------------------------
-// Native registers
+// The adapter
 // ---------------------------------------------------------------------------
 
-const RAX: u8 = 0;
-const RCX: u8 = 1;
-const RDX: u8 = 2;
-const RBX: u8 = 3;
-const RSP: u8 = 4;
-/// Also names `RIP`, which shares this number in RIP-relative ModRM.
-const RBP: u8 = 5;
-const RSI: u8 = 6;
-const RDI: u8 = 7;
-const R8: u8 = 8;
-const R9: u8 = 9;
-const R10: u8 = 10;
-const R11: u8 = 11;
-const R12: u8 = 12;
-const R13: u8 = 13;
-const R14: u8 = 14;
-const R15: u8 = 15;
-
-/// Where the entry code parks the embedder's context pointer.
-const VOLATILE_CTXT: u8 = R11;
-/// eBPF `R4` maps here, and shifts need RCX; the helper-call sequence moves it
-/// out of the way.
-const RCX_ALT: u8 = R10;
-
-/// eBPF register to x86 register, SysV flavour.
-/// The Windows map differs and is not ported: this crate supports Unix targets
-/// only.
-/// The *structure* is kept — eBPF `R0`-`R5` land on caller-saved registers and
-/// `R6`-`R10` on callee-saved ones — because the helper-call sequence relies on
-/// it to know what it does not have to preserve.
-/// `R15` must stay mapped to eBPF `R10`: the frame-access fast path and the
-/// local-call frame adjustment both name it directly.
-const REGISTER_MAP: [u8; crate::jit::isa::NUM_REGS] = [
-  // Scratch registers.
-  RAX, RDI, RSI, RDX, R10, R8, // Non-volatile registers.
-  RBX, R12, R13, R14, R15,
-];
-
-/// The x86 register for an eBPF register.
-/// Wraps modularly rather than panicking, so a register number the
-/// validator should have rejected wraps rather than trapping in a release build
-///. Reproduced.
-fn map_register(r: u8) -> u8 {
-  REGISTER_MAP[(r as usize) % crate::jit::isa::NUM_REGS]
-}
-
-/// The eBPF register mapped to `native`, if any. The map is injective, so this
-/// is exact.
-fn unmap_register(native: u8) -> Option<u8> {
-  REGISTER_MAP
-    .iter()
-    .position(|&x| x == native)
-    .map(|i| i as u8)
-}
-
-/// Operand size, mirroring `enum operand_size`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum S {
-  S8,
-  S16,
-  S32,
-  S64,
-}
-
-impl S {
-  fn from_width(w: Width) -> S {
-    match w {
-      Width::B => S::S8,
-      Width::H => S::S16,
-      Width::W => S::S32,
-      Width::DW => S::S64,
-    }
-  }
-
-  /// Previously recomputed at every call site as
-  /// `size == S64 ? 8 : size == S32 ? 4 : size == S16 ? 2 : 1`.
-  fn bytes(self) -> i32 {
-    match self {
-      S::S8 => 1,
-      S::S16 => 2,
-      S::S32 => 4,
-      S::S64 => 8,
-    }
-  }
-}
-
-/// Where one guest region's bounds can be found.
-struct GuestRegion {
-  desc_bottom: i32,
-  desc_top: i32,
-  desc_native_base: i32,
-  slot_bottom: i32,
-  slot_delta: i32,
-  slot_span: i32,
-}
-
-const STACK_REGION: GuestRegion = GuestRegion {
-  desc_bottom: abi::memory::STACK_GUEST_BOTTOM,
-  desc_top: abi::memory::STACK_GUEST_TOP,
-  desc_native_base: abi::memory::STACK_NATIVE_BASE,
-  slot_bottom: abi::derived_slot(abi::DERIVED_STACK_BASE + abi::DERIVED_BOTTOM),
-  slot_delta: abi::derived_slot(abi::DERIVED_STACK_BASE + abi::DERIVED_DELTA),
-  slot_span: abi::derived_slot(abi::DERIVED_STACK_BASE + abi::DERIVED_SPAN),
-};
-
-const DATA_REGION: GuestRegion = GuestRegion {
-  desc_bottom: abi::memory::DATA_GUEST_BOTTOM,
-  desc_top: abi::memory::DATA_GUEST_TOP,
-  desc_native_base: abi::memory::DATA_NATIVE_BASE,
-  slot_bottom: abi::derived_slot(abi::DERIVED_DATA_BASE + abi::DERIVED_BOTTOM),
-  slot_delta: abi::derived_slot(abi::DERIVED_DATA_BASE + abi::DERIVED_DELTA),
-  slot_span: abi::derived_slot(abi::DERIVED_DATA_BASE + abi::DERIVED_SPAN),
-};
-
-/// x86 ALU opcodes used by the atomic forms.
-const X64_ALU_ADD: u8 = 0x01;
-const X64_ALU_OR: u8 = 0x09;
-const X64_ALU_AND: u8 = 0x21;
-const X64_ALU_XOR: u8 = 0x31;
-
-/// Entry point, which is
-/// `translate_range(..., whole_program = false, lazy_local_calls = true)`
-/// followed by `resolve_patchable_relatives`.
+/// Entry point: lower, expand, encode.
 pub fn translate_range(
   t: &Translator,
   inputs: &TranslationInputs<'_>,
   buffer: &mut [u8],
 ) -> Result<usize, TranslateError> {
-  let mut e = Emit {
-    st: JitState::new(buffer, t.insns().len()),
-    t,
-    cfg: t.config(),
-    inputs,
-    errmsg: None,
-  };
-  e.run()
+  let config = t.config();
+  let cfg = translation_config(config);
+  let insns = t.insns();
+
+  // The core reads the per-function guest stack charge out of a table, so fill
+  // in every entry the range can reach. A range the core will refuse is
+  // clamped here rather than indexed past the end.
+  let mut stack_usage = vec![0u16; insns.len()];
+  let last = inputs.end_pc.min(insns.len());
+  let mut i = inputs.start_pc;
+  while i < last {
+    if i == 0 || t.is_local_func_entry(i) {
+      stack_usage[i] = t.stack_usage_for(i);
+    }
+    i += 1;
+  }
+
+  let mut macros = Vec::new();
+  let lowered = lower(
+    &cfg,
+    insns,
+    t.local_func_entries(),
+    t.external_local_calls(),
+    &stack_usage,
+    inputs.hints,
+    inputs.plan,
+    inputs.resolver_ids,
+    inputs.start_pc,
+    inputs.end_pc,
+    &mut macros,
+  );
+  if let Err(reject) = lowered {
+    return Err(TranslateError::Failed(render(reject, inputs)));
+  }
+
+  let mut primitives = Vec::new();
+  expand(&cfg, &macros, &mut primitives);
+  encode(&primitives, buffer)
 }
 
-struct Emit<'buf, 'ctx, 'in_> {
-  st: JitState<'buf>,
-  t: &'ctx Translator,
-  cfg: &'ctx Config,
-  inputs: &'ctx TranslationInputs<'in_>,
-  /// Set alongside a [`Progress`] where the message needs information only
-  /// the detecting site has.
-  errmsg: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Primitive emission
-// ---------------------------------------------------------------------------
-
-impl Emit<'_, '_, '_> {
-  /// Once the translation has failed,
-  /// nothing more is written *and the offset does not advance*. The check is
-  /// here rather than in [`JitState`] because the shared state is also used by
-  /// the arm64 backend.
-  #[inline]
-  fn emit_n(&mut self, value: u64, n: usize) {
-    if !self.st.ok() {
-      return;
-    }
-    self.st.emit_bytes(value, n);
-  }
-
-  #[inline]
-  fn emit1(&mut self, x: u8) {
-    self.emit_n(x as u64, 1);
-  }
-
-  #[inline]
-  fn emit2(&mut self, x: u16) {
-    self.emit_n(x as u64, 2);
-  }
-
-  #[inline]
-  fn emit4(&mut self, x: u32) {
-    self.emit_n(x as u64, 4);
-  }
-
-  #[inline]
-  fn emit8(&mut self, x: u64) {
-    self.emit_n(x, 8);
-  }
-
-  #[inline]
-  fn offset(&self) -> u32 {
-    self.st.offset
-  }
-
-  /// Reserves four bytes for a jump displacement and records the fixup.
-  /// Returns where the displacement starts.
-  fn emit_jump_address_reloc(&mut self, target: PatchTarget) -> u32 {
-    let at = self.offset();
-    self.st.note_jump(at, target);
-    self.emit4(0);
-    at
-  }
-
-  fn emit_modrm(&mut self, md: u8, r: u8, m: u8) {
-    self.emit1((md & 0xc0) | ((r & 7) << 3) | (m & 7));
-  }
-
-  fn emit_modrm_reg2reg(&mut self, r: u8, m: u8) {
-    self.emit_modrm(0xc0, r, m);
-  }
-
-  /// ModRM plus displacement, with the zero-displacement shortcut.
-  /// Two irregular
-  /// cases matter:
-  /// * `RBP`/`R13` cannot encode a bare `[base]`, so they always get an
-  ///   explicit displacement even when it is zero;
-  /// * `R12` needs a SIB byte, emitted as `0x24`.
-  /// `RSP` and `R12` share the low three bits that ModRM encodes, and both
-  /// therefore need the SIB byte. No caller passes `RSP` as a base today — the
-  /// sequences that address the host stack emit their ModRM and SIB bytes
-  /// literally — so emitting it for `R12` alone happens to produce correct code;
-  /// it would misencode the moment one did.
-  fn emit_modrm_and_displacement(&mut self, reg: u8, rm: u8, d: i32) {
-    let rm = rm & 0xf;
-    let reg = reg & 0xf;
-
-    if d == 0 && rm != RSP && rm != RBP && rm != R12 && rm != R13 {
-      self.emit_modrm(0x00, reg, rm);
-      return;
-    }
-
-    let near_disp = (-128..=127).contains(&d);
-    let md = if near_disp { 0x40 } else { 0x80 };
-
-    self.emit_modrm(md, reg, rm);
-    if rm == R12 || rm == RSP {
-      self.emit1(0x24);
-    }
-
-    if near_disp {
-      self.emit1(d as u8);
-    } else {
-      self.emit4(d as u32);
-    }
-  }
-
-  fn emit_rex(&mut self, w: u8, r: u8, x: u8, b: u8) {
-    self.emit1(0x40 | (w << 3) | (r << 2) | (x << 1) | b);
-  }
-
-  /// REX carrying only the high bits of `src`/`dst`, skipped when no bit would
-  /// be set.
-  fn emit_basic_rex(&mut self, w: u8, src: u8, dst: u8) {
-    if w != 0 || (src & 8) != 0 || (dst & 8) != 0 {
-      self.emit_rex(w, u8::from(src & 8 != 0), 0, u8::from(dst & 8 != 0));
-    }
-  }
-
-  fn emit_push(&mut self, r: u8) {
-    self.emit_basic_rex(0, 0, r);
-    self.emit1(0x50 | (r & 7));
-  }
-
-  fn emit_pop(&mut self, r: u8) {
-    self.emit_basic_rex(0, 0, r);
-    self.emit1(0x58 | (r & 7));
-  }
-
-  fn emit_alu32(&mut self, op: u8, src: u8, dst: u8) {
-    self.emit_basic_rex(0, src, dst);
-    self.emit1(op);
-    self.emit_modrm_reg2reg(src, dst);
-  }
-
-  fn emit_alu32_imm32(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
-    self.emit_alu32(op, src, dst);
-    self.emit4(imm as u32);
-  }
-
-  fn emit_alu32_imm8(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
-    // The displacement is a signed byte, so the immediate is truncated here.
-    self.emit_alu32(op, src, dst);
-    self.emit1(imm as u8);
-  }
-
-  /// `and dst, 0xffffffff` — the zero-extension every 32-bit ALU op ends with.
-  fn emit_truncate_u32(&mut self, dst: u8) {
-    self.emit_alu32_imm32(0x81, 4, dst, u32::MAX as i32);
-  }
-
-  fn emit_alu64(&mut self, op: u8, src: u8, dst: u8) {
-    self.emit_basic_rex(1, src, dst);
-    self.emit1(op);
-    self.emit_modrm_reg2reg(src, dst);
-  }
-
-  fn emit_alu64_imm32(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
-    self.emit_alu64(op, src, dst);
-    self.emit4(imm as u32);
-  }
-
-  fn emit_alu64_imm8(&mut self, op: u8, src: u8, dst: u8, imm: i32) {
-    self.emit_alu64(op, src, dst);
-    self.emit1(imm as u8);
-  }
-
-  fn emit_mov(&mut self, src: u8, dst: u8) {
-    self.emit_alu64(0x89, src, dst);
-  }
-
-  fn emit_cmp_imm32(&mut self, dst: u8, imm: i32) {
-    self.emit_alu64_imm32(0x81, 7, dst, imm);
-  }
-
-  fn emit_cmp32_imm32(&mut self, dst: u8, imm: i32) {
-    self.emit_alu32_imm32(0x81, 7, dst, imm);
-  }
-
-  fn emit_cmp(&mut self, src: u8, dst: u8) {
-    self.emit_alu64(0x39, src, dst);
-  }
-
-  fn emit_cmp32(&mut self, src: u8, dst: u8) {
-    self.emit_alu32(0x39, src, dst);
-  }
-
-  fn emit_jcc(&mut self, code: u8, target: PatchTarget) -> u32 {
-    self.emit1(0x0f);
-    self.emit1(code);
-    self.emit_jump_address_reloc(target)
-  }
-
-  /// A near jump emits the two-byte `0xeb rel8` form but still reserves a
-  /// *four*-byte placeholder, so three bytes are wasted after every one. They
-  /// are never executed — the jump is unconditional and lands past them — so
-  /// this costs code size and nothing else. Narrowing the reservation would
-  /// shift the offset of everything after it, so it is a self-contained change
-  /// to make on its own and measure, not a tidy-up to fold into something else.
-  fn emit_jmp(&mut self, target: PatchTarget) -> u32 {
-    let near = matches!(
-      target,
-      PatchTarget::EbpfPc { near: true, .. } | PatchTarget::JitOffset { near: true, .. }
-    );
-    self.emit1(if near { 0xeb } else { 0xe9 });
-    self.emit_jump_address_reloc(target)
-  }
-
-  fn emit_call(&mut self, target: PatchTarget) -> u32 {
-    self.emit1(0xe8);
-    let call_src = self.offset();
-    self.emit_jump_address_reloc(target);
-    call_src
-  }
-
-  fn emit_ret(&mut self) {
-    self.emit1(0xc3);
-  }
-
-  fn emit_pause(&mut self) {
-    self.emit1(0xf3);
-    self.emit1(0x90);
-  }
-
-  /// Retargets every jump recorded at `jump_src` to the current offset.
-  /// Resolves one jump target.
-  fn emit_jump_target(&mut self, jump_src: u32) {
-    let here = self.offset();
-    self.st.retarget_jumps(
-      jump_src,
-      PatchTarget::JitOffset {
-        offset: here,
-        near: false,
-      },
-    );
-  }
-
-  /// `load [src + offset] -> dst`, zero-extending for the narrow widths.
-  fn emit_load(&mut self, size: S, src: u8, dst: u8, offset: i32) {
-    self.emit_basic_rex(u8::from(size == S::S64), dst, src);
-
-    match size {
-      S::S8 => {
-        self.emit1(0x0f);
-        self.emit1(0xb6);
-      }
-      S::S16 => {
-        self.emit1(0x0f);
-        self.emit1(0xb7);
-      }
-      S::S32 | S::S64 => self.emit1(0x8b),
-    }
-
-    self.emit_modrm_and_displacement(dst, src, offset);
-  }
-
-  /// `load [src + offset] -> dst`, sign-extending to 64 bits.
-  /// `S64` emits nothing at all (there is no `ldxdwsx` encoding,
-  /// so no caller reaches it).
-  fn emit_load_sx(&mut self, size: S, src: u8, dst: u8, offset: i32) {
-    match size {
-      S::S8 | S::S16 => {
-        self.emit_basic_rex(1, dst, src);
-        self.emit1(0x0f);
-        self.emit1(if size == S::S8 { 0xbe } else { 0xbf });
-        self.emit_modrm_and_displacement(dst, src, offset);
-      }
-      S::S32 => {
-        self.emit_basic_rex(1, dst, src);
-        self.emit1(0x63);
-        self.emit_modrm_and_displacement(dst, src, offset);
-      }
-      S::S64 => {}
-    }
-  }
-
-  /// Materialises a 64-bit immediate, preferring the sign-extended 32-bit form.
-  fn emit_load_imm(&mut self, dst: u8, imm: i64) {
-    if (i32::MIN as i64..=i32::MAX as i64).contains(&imm) {
-      self.emit_alu64_imm32(0xc7, 0, dst, imm as i32);
-    } else {
-      self.emit_basic_rex(1, 0, dst);
-      self.emit1(0xb8 | (dst & 7));
-      self.emit8(imm as u64);
-    }
-  }
-
-  /// `op reg, [base + offset]` at 64 bits, for the `0x2B`/`0x03`/`0x39`/`0x3B`/
-  /// `0x0B` forms the bounds check uses.
-  fn emit_alu64_mem(&mut self, op: u8, reg: u8, base: u8, offset: i32) {
-    self.emit_basic_rex(1, reg, base);
-    self.emit1(op);
-    self.emit_modrm_and_displacement(reg, base, offset);
-  }
-
-  /// `cmovcc dst, src` at 64 bits.
-  fn emit_cmov(&mut self, cc: u8, dst: u8, src: u8) {
-    self.emit_basic_rex(1, dst, src);
-    self.emit1(0x0f);
-    self.emit1(cc);
-    self.emit_modrm_reg2reg(dst, src);
-  }
-
-  /// `store src -> [dst + offset]`.
-  /// The `size == S8` term in the REX condition is what makes a byte store
-  /// through `SIL`/`DIL`/`SPL`/`BPL` name the right register: without a REX
-  /// prefix those encodings mean `AH`/`CH`/`DH`/`BH`.
-  fn emit_store(&mut self, size: S, src: u8, dst: u8, offset: i32) {
-    if size == S::S16 {
-      self.emit1(0x66);
-    }
-    let rexw = u8::from(size == S::S64);
-    if rexw != 0 || (src & 8) != 0 || (dst & 8) != 0 || size == S::S8 {
-      self.emit_rex(rexw, u8::from(src & 8 != 0), 0, u8::from(dst & 8 != 0));
-    }
-    self.emit1(if size == S::S8 { 0x88 } else { 0x89 });
-    self.emit_modrm_and_displacement(src, dst, offset);
-  }
-
-  /// `store imm -> [dst + offset]`.
-  fn emit_store_imm32(&mut self, size: S, dst: u8, offset: i32, imm: i32) {
-    if size == S::S16 {
-      self.emit1(0x66);
-    }
-    self.emit_basic_rex(u8::from(size == S::S64), 0, dst);
-    self.emit1(if size == S::S8 { 0xc6 } else { 0xc7 });
-    self.emit_modrm_and_displacement(0, dst, offset);
-    match size {
-      S::S32 | S::S64 => self.emit4(imm as u32),
-      S::S16 => self.emit2(imm as u16),
-      S::S8 => self.emit1(imm as u8),
-    }
-  }
-
-  /// `mov dst, [rip + target]`, with the displacement deferred.
-  fn emit_rip_relative_load(&mut self, dst: u8, target: PatchTarget) -> u32 {
-    self.emit_rex(1, 0, 0, 0);
-    self.emit1(0x8b);
-    self.emit_modrm(0, dst, 0x05);
-
-    let at = self.offset();
-    self.st.note_load(at, target);
-    self.emit4(0);
-    at
-  }
-
-  /// `lea dst, [rip + target]`, with the displacement deferred.
-  /// `R` comes from `dst` rather than being hardcoded. The only call site
-  /// passes `R10`, for which the bit is set either way, so this emits the same
-  /// bytes — but a hardcoded `R` is wrong for any register in the low eight.
-  fn emit_rip_relative_lea(&mut self, dst: u8, target: PatchTarget) {
-    self.emit_rex(1, u8::from(dst & 8 != 0), 0, 0);
-    self.emit1(0x8d);
-    self.emit_modrm(0, dst, 0x05);
-    let at = self.offset();
-    self.st.note_lea(at, target);
-    self.emit4(0);
-  }
-
-  fn emit_indirect_call_rax(&mut self) {
-    self.emit1(0xff);
-    self.emit1(0xd0);
-  }
-
-  fn emit_indirect_call_reg(&mut self, reg: u8) {
-    if reg & 8 != 0 {
-      self.emit1(0x41);
-    }
-    self.emit1(0xff);
-    self.emit1(0xd0 | (reg & 7));
+/// The facts about a [`Config`] the backend consults.
+fn translation_config(config: &Config) -> Cfg {
+  Cfg {
+    pointer_mask: config.pointer_mask,
+    native_frame_base: config.native_frame_base,
+    frame_constants: config.frame_constants,
+    stack_frame_size: config.stack_frame_size,
+    stack_frame_stride: config.stack_frame_stride,
+    dispatcher: match config.dispatcher {
+      Some(f) => f as usize as u64,
+      None => 0,
+    },
+    // The unset index is -1, so a `call -1` really does take the unwind path
+    // when no index is configured.
+    unwind_helper_index: match config.unwind_helper_index {
+      Some(i) => i as i32,
+      None => -1,
+    },
+    has_local_call_callbacks: config.local_call_resolver.is_some()
+      && config.local_call_stack_exhausted.is_some(),
+    local_call_resolver: match config.local_call_resolver {
+      Some(f) => f as usize as u64,
+      None => 0,
+    },
+    local_call_stack_exhausted: match config.local_call_stack_exhausted {
+      Some(f) => f as usize as u64,
+      None => 0,
+    },
   }
 }
 
-// ---------------------------------------------------------------------------
-// The pointer cage
-// ---------------------------------------------------------------------------
-
-impl Emit<'_, '_, '_> {
-  /// The same check as [`Self::emit_single_region_address_via_descriptor`],
-  /// reading the region's bounds from the frame constants the embedder derived
-  /// once per invocation.
-  fn emit_single_region_address_from_frame(
-    &mut self,
-    dst: u8,
-    scratch: u8,
-    size: i32,
-    bottom_slot: i32,
-    delta_slot: i32,
-    span_base: i32,
-  ) {
-    // off = guest - bottom, kept in a register for the comparison below.
-    self.emit_mov(dst, scratch);
-    self.emit_alu64_mem(0x2B, scratch, RBP, bottom_slot);
-
-    // Translate unconditionally; the CMOV below undoes it when out of range.
-    self.emit_alu64_mem(0x03, dst, RBP, delta_slot);
-
-    if let Some(slot) = width_span_slot(size) {
-      let zero = R9;
-      let span_slot = span_base + (slot as i32) * 8;
-
-      // Zero the fault address before the compare, which sets the flags.
-      self.emit_alu64(0x31, zero, zero);
-
-      // 0x39 is `CMP r/m64, r64`, so the memory operand is the left-hand side:
-      // CF is set iff span < off, i.e. iff out of range.
-      self.emit_alu64_mem(0x39, scratch, RBP, span_slot);
-      self.emit_cmov(0x42, dst, zero); // cmovb dst, 0
-    } else {
-      // An access group covers any width up to a page rather than one of the
-      // four the precomputed spans hold, so narrow the width-1 span instead.
-      let span = R9;
-      self.emit_load(S::S64, RBP, span, span_base);
-      self.emit_alu64_imm32(0x81, 5, span, size - 1);
-
-      // Both remaining registers are live across the compare, so the fault
-      // address is zeroed after it with a MOV, which leaves the flags alone.
-      self.emit_alu64(0x39, scratch, span);
-      self.emit_alu64_imm32(0xc7, 0, scratch, 0);
-      self.emit_cmov(0x42, dst, scratch);
+/// The message for one refusal, worded exactly as embedders expect.
+///
+/// The wording is compared by callers and folded into the recorded decision
+/// digests, so it is part of the contract rather than a diagnostic detail.
+fn render(reject: Reject, inputs: &TranslationInputs<'_>) -> String {
+  let start_pc = inputs.start_pc;
+  let end_pc = inputs.end_pc;
+  match reject {
+    Reject::InvalidRange => format!("Invalid function range [{start_pc}, {end_pc})"),
+    Reject::RangeStartNotEntry => {
+      format!("Function range start {start_pc} is not a local function entry")
     }
-  }
-
-  /// Bounds-check `[dst, dst+size)` against one guest region described by the
-  /// memory descriptor at `[RBP - 8]`, then translate `dst`. Branchless: a
-  /// final CMOV substitutes address 0 when out of range, so no mis-speculated
-  /// path performs a transient out-of-bounds access.
-  fn emit_single_region_address_via_descriptor(
-    &mut self,
-    dst: u8,
-    scratch: u8,
-    size: i32,
-    bottom_off: i32,
-    top_off: i32,
-    base_off: i32,
-  ) {
-    let span = R9;
-
-    self.emit_load(S::S64, RBP, scratch, abi::FRAME_OFFSET);
-
-    // off = dst - bottom; spill it, then translated = off + base (kept in dst).
-    self.emit_alu64_mem(0x2B, dst, scratch, bottom_off);
-    self.emit_store(S::S64, dst, RBP, abi::SPILL_OFFSET);
-    self.emit_alu64_mem(0x03, dst, scratch, base_off);
-
-    // span = (top - size) - bottom
-    self.emit_load(S::S64, scratch, span, top_off);
-    if size != 0 {
-      self.emit_alu64_imm32(0x81, 5, span, size);
+    Reject::RangeEndNotBoundary => {
+      format!("Function range end {end_pc} is not a local function boundary")
     }
-    self.emit_alu64_mem(0x2B, span, scratch, bottom_off);
-
-    // Zero the fault address before the compare, which sets the flags.
-    self.emit_alu64(0x31, scratch, scratch);
-
-    self.emit_alu64_mem(0x3B, span, RBP, abi::SPILL_OFFSET);
-    self.emit_cmov(0x42, dst, scratch);
-  }
-
-  fn emit_single_region_address(&mut self, dst: u8, scratch: u8, size: i32, region: &GuestRegion) {
-    if self.cfg.frame_constants {
-      self.emit_single_region_address_from_frame(
-        dst,
-        scratch,
-        size,
-        region.slot_bottom,
-        region.slot_delta,
-        region.slot_span,
-      );
-    } else {
-      self.emit_single_region_address_via_descriptor(
-        dst,
-        scratch,
-        size,
-        region.desc_bottom,
-        region.desc_top,
-        region.desc_native_base,
-      );
+    Reject::JumpOutOfRange { pc, target } => format!(
+      "jump target {target} at PC {pc} is outside the translation range [{start_pc}, {end_pc})"
+    ),
+    Reject::UnknownInstruction { pc, opcode } => {
+      format!("Unknown instruction at PC {pc}: opcode {opcode:02x}")
     }
-  }
-
-  /// Materialises the *guest* value of eBPF `R10` into `dst`.
-  /// Under a native frame base the register mapped to `R10` holds a host
-  /// address; a program that reads `R10` as a value must still see a guest one.
-  fn emit_guest_frame_pointer(&mut self, dst: u8) {
-    self.emit_mov(map_register(crate::jit::isa::REG_FP), dst);
-    self.emit_alu64_mem(0x2B, dst, RBP, abi::FRAME_DELTA_OFFSET);
-  }
-
-  /// True when `[base + offset]`, `size` bytes wide, is a frame access that
-  /// needs no bounds check at all.
-  /// This is the one place a runtime check is traded for a static argument, so
-  /// three of the four conditions are re-derived here rather than taken from
-  /// the hint.
-  fn emit_frame_access_ok(&self, region_hint: u8, base: u8, offset: i32, size: i32) -> bool {
-    if !self.cfg.native_frame_base_active() || region_hint != abi::region::FRAME {
-      return false;
+    // The trailing newline is part of this one.
+    Reject::UnknownAtomic { pc, imm } => {
+      format!("Error: unknown atomic opcode {imm} at PC {pc}\n")
     }
-    if base != map_register(crate::jit::isa::REG_FP) {
-      return false;
+    Reject::UnexpectedInstruction => {
+      "Unexpected instruction or missing local-call runtime callbacks during JIT compilation"
+        .to_string()
     }
-    // offset + size <= 0
-    if offset > -size {
-      return false;
-    }
-    if offset < -(self.cfg.stack_frame_size as i32) {
-      return false;
-    }
-    true
-  }
-
-  /// Resolves `[src + offset]` to a native address in `dst`, emitting whatever
-  /// check that needs.
-  #[allow(clippy::too_many_arguments)]
-  fn emit_masked_address_with_offset(
-    &mut self,
-    src: u8,
-    dst: u8,
-    scratch: u8,
-    offset: i32,
-    size: i32,
-    _store: bool,
-    region_hint: u8,
-  ) {
-    debug_assert_ne!(dst, scratch);
-
-    if self.cfg.native_frame_base_active() && src == map_register(crate::jit::isa::REG_FP) {
-      // Everything below works in guest space, so recover the guest frame
-      // pointer before starting.
-      self.emit_guest_frame_pointer(dst);
-    } else if src != dst {
-      self.emit_mov(src, dst);
-    }
-
-    if offset != 0 {
-      self.emit_alu64_imm32(0x81, 0, dst, offset);
-    }
-
-    if self.cfg.pointer_mask != 0 {
-      if region_hint == abi::region::STACK {
-        self.emit_single_region_address(dst, scratch, size, &STACK_REGION);
-        return;
-      }
-      if region_hint == abi::region::DATA {
-        self.emit_single_region_address(dst, scratch, size, &DATA_REGION);
-        return;
-      }
-
-      // Unknown region: probe both branchlessly. The two guest ranges are
-      // disjoint, so at most one candidate is non-zero and OR-ing them recovers
-      // the address (or 0, a guaranteed faulting access, when neither matches).
-      self.emit_store(S::S64, dst, RBP, abi::ADDR_SPILL_OFFSET);
-      self.emit_single_region_address(dst, scratch, size, &STACK_REGION);
-      self.emit_store(S::S64, dst, RBP, abi::ACC_SPILL_OFFSET);
-      self.emit_load(S::S64, RBP, dst, abi::ADDR_SPILL_OFFSET);
-      self.emit_single_region_address(dst, scratch, size, &DATA_REGION);
-      self.emit_alu64_mem(0x0B, dst, RBP, abi::ACC_SPILL_OFFSET);
-    }
-  }
-
-  /// The plan entry for `pc`, or `None` when there is no usable plan.
-  fn access_plan_entry(&self, pc: usize) -> Option<PlanEntry> {
-    self.inputs.plan_entry(self.cfg, pc).copied()
-  }
-
-  /// Resolves `[base + offset]` to a native address and returns the register it
-  /// was left in together with the displacement to use with it. Mirrors
-  /// `emit_checked_address`.
-  /// The access plan chooses between the group-member and group-leader paths,
-  /// and it is not taken on trust: every condition the backend can see for
-  /// itself is re-derived here, and any failure drops through to an ordinary
-  /// checked access. A plan that is wrong — or hostile — costs speed and
-  /// nothing else.
-  #[allow(clippy::too_many_arguments)]
-  fn emit_checked_address(
-    &mut self,
-    pc: usize,
-    base: u8,
-    offset: i32,
-    width: i32,
-    store: bool,
-    region_hint: u8,
-    addr_reg: u8,
-    scratch_reg: u8,
-  ) -> (u8, i32) {
-    if self.emit_frame_access_ok(region_hint, base, offset, width) {
-      return (base, offset);
-    }
-
-    if self.cfg.pointer_mask == 0 {
-      return (base, offset);
-    }
-
-    let plan = self.access_plan_entry(pc);
-    let base_ebpf = unmap_register(base);
-
-    if let Some(plan) = plan.filter(|p| p.role == abi::plan_role::MEMBER) {
-      // `group` is `Some` only while the backend has established that the
-      // leader ran and that nothing has redefined the base since:
-      // `note_register_written` closes the group outright when the base is
-      // overwritten, and the `written` mask below rejects the same access on its
-      // own. Both are tested here and on aarch64, so neither backend depends on
-      // which half of `OpenGroup` does the invalidating.
-      let usable = match (&self.st.group, base_ebpf) {
-        (Some(g), Some(base_ebpf)) => {
-          g.leader_pc == plan.leader_pc
-            && base_ebpf == g.base_reg
-            && g.written & (1u16 << base_ebpf) == 0
-            && plan.delta as u64 + width as u64 <= g.span as u64
-            && g.lo as i64 + plan.delta as i64 == offset as i64
-        }
-        _ => false,
-      };
-      if usable {
-        self.emit_load(S::S64, RBP, addr_reg, abi::GROUP_BASE_OFFSET);
-        return (addr_reg, plan.delta as i32);
-      }
-      // Fall through to a checked access. The group stays open: a member the
-      // backend declined does not invalidate the parked base for the ones
-      // after it.
-    }
-
-    if let Some(plan) = plan.filter(|p| p.role == abi::plan_role::LEADER) {
-      let usable = base_ebpf.is_some()
-        && plan.span > 0
-        && plan.span <= abi::MAX_GROUP_SPAN
-        && plan.delta as u64 + width as u64 <= plan.span as u64
-        && plan.lo as i64 + plan.delta as i64 == offset as i64
-        && plan.region != abi::region::FRAME;
-      if usable {
-        self.emit_masked_address_with_offset(
-          base,
-          addr_reg,
-          scratch_reg,
-          plan.lo,
-          plan.span as i32,
-          store,
-          plan.region,
-        );
-        self.emit_store(S::S64, addr_reg, RBP, abi::GROUP_BASE_OFFSET);
-        self.st.group = Some(OpenGroup {
-          leader_pc: pc as u32,
-          span: plan.span,
-          lo: plan.lo,
-          base_reg: base_ebpf.expect("checked above"),
-          region: plan.region,
-          written: 0,
-        });
-        return (addr_reg, plan.delta as i32);
-      }
-    }
-
-    self.emit_masked_address_with_offset(
-      base,
-      addr_reg,
-      scratch_reg,
-      offset,
-      width,
-      store,
-      region_hint,
-    );
-    (addr_reg, 0)
-  }
-
-  fn emit_masked_load(&mut self, size: S, src: u8, dst: u8, offset: i32, hint: u8, pc: usize) {
-    let width = size.bytes();
-    let (addr, disp) = self.emit_checked_address(pc, src, offset, width, false, hint, R11, RCX);
-    self.emit_load(size, addr, dst, disp);
-  }
-
-  fn emit_masked_load_sx(&mut self, size: S, src: u8, dst: u8, offset: i32, hint: u8, pc: usize) {
-    let width = size.bytes();
-    let (addr, disp) = self.emit_checked_address(pc, src, offset, width, false, hint, R11, RCX);
-    self.emit_load_sx(size, addr, dst, disp);
-  }
-
-  fn emit_masked_store(&mut self, size: S, src: u8, dst: u8, offset: i32, hint: u8, pc: usize) {
-    let width = size.bytes();
-    // A program storing R10 stores a pointer, and under a native frame base the
-    // register holds the host one. Recover the guest value — but only after the
-    // address is resolved below, which uses RCX as its scratch.
-    let store_guest_frame_pointer =
-      self.cfg.native_frame_base_active() && src == map_register(crate::jit::isa::REG_FP);
-    let (addr, disp) = self.emit_checked_address(pc, dst, offset, width, true, hint, R11, RCX);
-
-    let mut src = src;
-    if store_guest_frame_pointer {
-      self.emit_guest_frame_pointer(RCX);
-      src = RCX;
-    }
-    self.emit_store(size, src, addr, disp);
-  }
-
-  fn emit_masked_store_imm32(
-    &mut self,
-    size: S,
-    dst: u8,
-    offset: i32,
-    imm: i32,
-    hint: u8,
-    pc: usize,
-  ) {
-    let width = size.bytes();
-    // RCX carries the address here and R11 is the scratch, the other way round
-    // from the register forms, because the immediate still needs a register of
-    // its own once the address is resolved.
-    let (addr, disp) = self.emit_checked_address(pc, dst, offset, width, true, hint, RCX, R11);
-
-    if addr == dst {
-      // No translation was needed, so the guest displacement stands.
-      self.emit_store_imm32(size, addr, disp, imm);
-    } else {
-      self.emit_load_imm(R11, imm as i64);
-      self.emit_store(size, R11, addr, disp);
-    }
-  }
-}
-
-/// The span slot for an access `size` bytes wide, or `None` for a width the
-/// precomputed spans do not cover.
-/// The span-slot lookup returns 3 for anything that is not 1, 2 or 4; the
-/// caller guards with an explicit `size == 1 || ... || size == 8` test, so the
-/// `default` arm is only ever reached with 8. Returning `None` instead makes
-/// the guard and the lookup one decision.
-fn width_span_slot(size: i32) -> Option<usize> {
-  if size < 0 {
-    return None;
-  }
-  abi::span_slot_index(size as usize)
-}
-
-// ---------------------------------------------------------------------------
-// Calls
-// ---------------------------------------------------------------------------
-
-impl Emit<'_, '_, '_> {
-  /// The helper-call sequence
-  ///, SysV half only.
-  /// The generated code decides at *run* time which of two paths to take: if
-  /// the dispatcher slot holds an address, control goes there with the helper
-  /// index as a sixth argument; otherwise the helper is looked up in the
-  /// embedded table by index.
-  fn emit_dispatched_external_helper_call(&mut self, idx: u32) {
-    self.emit_rip_relative_load(RAX, PatchTarget::Special(SpecialTarget::ExternalDispatcher));
-
-    self.emit_cmp_imm32(RAX, 0);
-    // The target here is a placeholder; `emit_jump_target` rewrites it below.
-    let default_tgt = PatchTarget::EbpfPc { pc: 0, near: false };
-    let skip_default_dispatcher = self.emit_jcc(0x85, default_tgt);
-
-    // Default dispatcher: index into the embedded helper table.
-    self.emit_alu32(0xc7, 0, RAX);
-    self.emit4(idx);
-    self.emit_alu64_imm8(0xc1, 4, RAX, 3);
-
-    self.emit_rip_relative_lea(R10, PatchTarget::Special(SpecialTarget::LoadHelperTable));
-
-    self.emit_alu64(0x01, R10, RAX);
-    self.emit_load(S::S64, RAX, RAX, 0);
-
-    // A registered helper takes five arguments and a context, which is the
-    // sixth argument and goes in R9 on SysV.
-    self.emit_mov(VOLATILE_CTXT, R9);
-
-    let skip_external_dispatcher = self.emit_jmp(default_tgt);
-
-    // External dispatcher: six arguments, the last being the helper index.
-    self.emit_jump_target(skip_default_dispatcher);
-    self.emit_load_imm(R9, idx as u64 as i64);
-
-    // Control flow converges for the call.
-    self.emit_jump_target(skip_external_dispatcher);
-
-    self.emit_call(PatchTarget::Special(SpecialTarget::Retpoline));
-
-    // The result is in RAX.
-    //
-    // The registers backing eBPF R1-R5 are all caller-saved, and the helper
-    // path used them freely: the dispatcher, and whatever it suspended into,
-    // up to the whole run loop. The call convention clobbers them, so the
-    // guest may read anything here except host state - scrub them to zero.
-    for r in 1..=5 {
-      let r = map_register(r);
-      self.emit_alu64(X64_ALU_XOR, r, r);
-    }
-  }
-
-  /// A local call whose target has not been compiled yet: ask the resolver at
-  /// run time, then call what it returns.
-  fn emit_lazy_local_call(&mut self, call_pc: usize) {
-    // From one guard site to the next: four saved callee registers, the CALL
-    // return address, and the callee's 8-byte prologue slot.
-    const NATIVE_STACK_DELTA: usize = 4 * 8 + 8 + 8;
-    const _: () = assert!(NATIVE_STACK_DELTA <= abi::NATIVE_LOCAL_CALL_BUDGET);
-
-    let (resolver, stack_exhausted) = match (
-      self.cfg.local_call_resolver,
-      self.cfg.local_call_stack_exhausted,
-    ) {
-      (Some(resolver), Some(stack_exhausted)) if call_pc < self.inputs.resolver_ids.len() => {
-        (resolver, stack_exhausted)
-      }
-      _ => {
-        self.st.fail(Progress::UnexpectedInstruction);
-        return;
-      }
-    };
-    let id = self.inputs.resolver_ids[call_pc];
-
-    // R10 is already a native pointer into the per-invocation guest stack.
-    // Refuse the call unless subtracting one frame still leaves a complete
-    // one complete frame below the callee's R10. Independently reserve enough
-    // native coroutine stack for the persistent call frame and the
-    // non-returning exhaustion callback.
-    self.emit_load(S::S64, RBP, RCX, abi::FRAME_OFFSET);
-    self.emit_load(S::S64, RCX, RCX, abi::memory::LOCAL_CALL_GUEST_FLOOR);
-    self.emit_cmp(RCX, map_register(10));
-    let guest_exhausted = self.emit_jcc(
-      0x82, // JB: unsigned R10 < guest floor
-      PatchTarget::EbpfPc { pc: 0, near: false },
-    );
-
-    self.emit_load(S::S64, RBP, RCX, abi::FRAME_OFFSET);
-    self.emit_load(S::S64, RCX, RCX, abi::memory::LOCAL_CALL_NATIVE_FLOOR);
-    self.emit_cmp(RCX, RSP);
-    let native_exhausted = self.emit_jcc(
-      0x82, // JB: unsigned RSP < native floor
-      PatchTarget::EbpfPc { pc: 0, near: false },
-    );
-
-    // Every local function has the same fixed guest-frame charge. Keep R10
-    // independent of host stack bookkeeping across coroutine suspension.
-    self.emit_alu64_imm32(
-      0x81,
-      5,
-      map_register(10),
-      self.cfg.stack_frame_stride as i32,
-    );
-
-    self.emit_push(map_register(6));
-    self.emit_push(map_register(7));
-    self.emit_push(map_register(8));
-    self.emit_push(map_register(9));
-
-    // The resolver is a host call. Preserve the BPF argument registers across
-    // it so the lazily compiled callee sees the R1-R5 the original local call
-    // would have passed.
-    self.emit_push(map_register(1));
-    self.emit_push(map_register(2));
-    self.emit_push(map_register(3));
-    self.emit_push(map_register(4));
-    self.emit_push(map_register(5));
-    // Keep the host stack aligned for the resolver call. R11 is not a guest
-    // register and is restored only to keep this sequence balanced.
-    self.emit_push(VOLATILE_CTXT);
-
-    // BPF R0 is mapped to RAX, which is also the host return register, so the
-    // resolver's return value would otherwise be visible to the callee as a
-    // host code pointer. Pushed twice to keep the host stack 16-byte aligned.
-    self.emit_push(map_register(0));
-    self.emit_push(map_register(0));
-
-    self.emit_load_imm(RDI, id as u64 as i64);
-    self.emit_load_imm(RAX, resolver as usize as u64 as i64);
-    self.emit_indirect_call_rax();
-
-    // Stash the resolved callee address in RCX, which is not mapped to any eBPF
-    // register, and restore BPF R0.
-    self.emit_mov(RAX, RCX);
-    self.emit_pop(map_register(0));
-    self.emit_pop(map_register(0));
-
-    self.emit_pop(VOLATILE_CTXT);
-    self.emit_pop(map_register(5));
-    self.emit_pop(map_register(4));
-    self.emit_pop(map_register(3));
-    self.emit_pop(map_register(2));
-    self.emit_pop(map_register(1));
-
-    self.emit_indirect_call_reg(RCX);
-
-    self.emit_pop(map_register(9));
-    self.emit_pop(map_register(8));
-    self.emit_pop(map_register(7));
-    self.emit_pop(map_register(6));
-
-    self.emit_alu64_imm32(
-      0x81,
-      0,
-      map_register(10),
-      self.cfg.stack_frame_stride as i32,
-    );
-
-    let skip_exhausted = self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: false });
-    self.emit_jump_target(guest_exhausted);
-    self.emit_jump_target(native_exhausted);
-    self.emit_load_imm(RAX, stack_exhausted as usize as u64 as i64);
-    self.emit_indirect_call_rax();
-    // The callback is declared divergent. Trap if an invalid embedder returns.
-    self.emit1(0x0f);
-    self.emit1(0x0b); // UD2
-    self.emit_jump_target(skip_exhausted);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Atomics
-// ---------------------------------------------------------------------------
-
-impl Emit<'_, '_, '_> {
-  fn emit_atomic_alu(&mut self, opcode: u8, is_64bit: bool, src: u8, dst: u8, offset: i32) {
-    self.emit1(0xf0); // lock
-    self.emit_basic_rex(u8::from(is_64bit), src, dst);
-    self.emit1(opcode);
-    self.emit_modrm_and_displacement(src, dst, offset);
-  }
-
-  /// `lock cmpxchg [dst + offset], src`, which compares against RAX and leaves
-  /// the previous value there.
-  fn emit_atomic_cmp_exch_with_rax(&mut self, is_64bit: bool, src: u8, dst: u8, offset: i32) {
-    self.emit1(0xf0);
-    self.emit_basic_rex(u8::from(is_64bit), src, dst);
-    self.emit1(0x0f);
-    self.emit1(0xb1);
-    self.emit_modrm_and_displacement(src, dst, offset);
-  }
-
-  /// `xchg [dst + offset], src`, which is implicitly locked.
-  fn emit_atomic_exchange(&mut self, is_64bit: bool, src: u8, dst: u8, offset: i32) {
-    self.emit1(0xf0);
-    self.emit_basic_rex(u8::from(is_64bit), src, dst);
-    self.emit1(0x87);
-    self.emit_modrm_and_displacement(src, dst, offset);
-  }
-
-  /// x86 has no atomic fetch-and-and/or/xor, and no 64-bit fetch-add that also
-  /// yields the old value in the right place, so all four are emulated with a
-  /// compare-exchange loop.
-  fn emit_atomic_fetch_alu(&mut self, is_64bit: bool, opcode: u8, src: u8, dst: u8, offset: i32) {
-    // Compare-exchange overwrites RAX. If RAX is the source, keep the original
-    // in whichever of R10/R11 is not the destination.
-    let actual_src = if src == RAX {
-      if dst == R10 {
-        R11
-      } else {
-        R10
-      }
-    } else {
-      src
-    };
-
-    if src != RAX {
-      self.emit_push(RAX);
-    } else {
-      self.emit_push(actual_src);
-      self.emit_mov(src, actual_src);
-    }
-
-    self.emit_load(if is_64bit { S::S64 } else { S::S32 }, dst, RAX, offset);
-
-    let loop_start = self.offset();
-
-    self.emit_mov(RAX, RCX);
-    // Always the 64-bit form, even for the 32-bit variants: the compare-exchange
-    // below is what narrows the operation, and the high half of RCX is dead.
-    self.emit_alu64(opcode, actual_src, RCX);
-
-    self.emit_atomic_cmp_exch_with_rax(is_64bit, RCX, dst, offset);
-
-    // `jne loop_start`, whose displacement is computed from the position of the
-    // displacement byte itself.
-    self.emit1(0x75);
-    let rel = loop_start.wrapping_sub(self.offset()).wrapping_sub(1);
-    self.emit1(rel as u8);
-
-    if src != RAX {
-      self.emit_mov(RAX, src);
-      self.emit_pop(RAX);
-    } else {
-      self.emit_pop(actual_src);
+    // No full stop, unlike aarch64's wording of the same three.
+    Reject::TooManyJumps => "Too many jump instructions".to_string(),
+    Reject::TooManyLoads => "Too many load instructions".to_string(),
+    Reject::TooManyLeas => "Too many LEA calculations".to_string(),
+    Reject::TrailerFailed => "Failure to emit the function epilogue".to_string(),
+    Reject::Unsafe { pc } => {
+      format!("generated code failed the memory-safety check at PC {pc}")
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Multiply / divide / modulo
+// The encoder
 // ---------------------------------------------------------------------------
 
-impl Emit<'_, '_, '_> {
-  ///
-  /// eBPF and x86 disagree about division by zero (eBPF yields 0 for `div` and
-  /// the dividend for `mod`; x86 faults) and about `INT_MIN / -1` (eBPF wraps;
-  /// x86 faults), so most of what is emitted here is fixing that up.
-  fn emit_muldivmod(&mut self, op: u8, src: u8, dst: u8, imm: i32, offset: i16) {
-    let alu_op = op & 0xf0;
-    let mul = alu_op == 0x20;
-    let div = alu_op == 0x30;
-    let mod_ = alu_op == 0x90;
-    let is64 = (op & cls::MASK) == cls::ALU64;
-    let reg = (op & 0x08) == 0x08;
-    let is_signed = offset == 1;
-
-    // Short circuit for imm == 0.
-    if !reg && imm == 0 {
-      if div || mul {
-        self.emit_alu32(0x31, dst, dst);
-      } else {
-        // Modulo by zero yields the dividend, so this is a self-move — which
-        // emitted rather than elided.
-        self.emit_mov(dst, dst);
-      }
-      return;
-    }
-
-    if dst != RAX {
-      self.emit_push(RAX);
-    }
-    if dst != RDX {
-      self.emit_push(RDX);
-    }
-
-    // Divisor into RCX.
-    if !reg {
-      self.emit_load_imm(RCX, imm as i64);
-    } else {
-      self.emit_mov(src, RCX);
-    }
-
-    // Dividend into RAX.
-    self.emit_mov(dst, RAX);
-
-    if div || mod_ {
-      if is64 {
-        self.emit_alu64(0x85, RCX, RCX);
-      } else {
-        self.emit_alu32(0x85, RCX, RCX);
-      }
-
-      if mod_ {
-        self.emit_push(RAX);
-      }
-
-      self.emit1(0x9c); // pushfq
-
-      // Set the divisor to 1 if it is zero, so the divide does not fault; the
-      // saved flags say afterwards whether it was.
-      self.emit_load_imm(RDX, 1);
-      self.emit1(0x48);
-      self.emit1(0x0f);
-      self.emit1(0x44);
-      self.emit1(0xca); // cmove rcx, rdx
-
-      if is_signed {
-        if is64 {
-          self.emit1(0x48);
-          self.emit1(0x99); // cqo
-        } else {
-          self.emit1(0x99); // cdq
-        }
-      } else {
-        self.emit_alu32(0x31, RDX, RDX);
-      }
-    }
-
-    // INT_MIN / -1 faults on x86 but wraps per RFC 9669.
-    let mut overflow_jump_source = 0u32;
-    if (div || mod_) && is_signed {
-      if is64 {
-        self.emit1(0x48);
-        self.emit1(0x83);
-        self.emit1(0xf9);
-        self.emit1(0xff); // cmp rcx, -1
-      } else {
-        self.emit1(0x83);
-        self.emit1(0xf9);
-        self.emit1(0xff); // cmp ecx, -1
-      }
-      self.emit1(0x75); // jne
-      let jne_source = self.offset();
-      self.emit1(0x00);
-
-      if is64 {
-        self.emit1(0x49);
-        self.emit1(0xbb);
-        self.emit8(0x8000_0000_0000_0000); // mov r11, INT64_MIN
-        self.emit1(0x4c);
-        self.emit1(0x39);
-        self.emit1(0xd8); // cmp rax, r11
-      } else {
-        self.emit1(0x3d);
-        self.emit4(0x8000_0000); // cmp eax, INT32_MIN
-      }
-      self.emit1(0x75); // jne
-      let jne2_source = self.offset();
-      self.emit1(0x00);
-
-      if div {
-        // The result is INT_MIN, which is already in RAX.
-      } else {
-        self.emit_alu32(0x31, RDX, RDX);
-      }
-      self.emit1(0xeb); // jmp short, over the divide
-      overflow_jump_source = self.offset();
-      self.emit1(0x00);
-
-      let here = self.offset();
-      self.patch_rel8(jne_source, here);
-      self.patch_rel8(jne2_source, here);
-    }
-
-    if is64 {
-      self.emit_rex(1, 0, 0, 0);
-    }
-
-    // /4 = MUL, /6 = DIV, /7 = IDIV.
-    let modrm_reg = if mul {
-      4
-    } else if is_signed {
-      7
-    } else {
-      6
-    };
-    self.emit_alu32(0xf7, modrm_reg, RCX);
-
-    if (div || mod_) && is_signed && overflow_jump_source != 0 {
-      let here = self.offset();
-      self.patch_rel8(overflow_jump_source, here);
-    }
-
-    if div || mod_ {
-      self.emit1(0x9d); // popfq
-
-      if div {
-        // Zero flag set means the divisor was zero; substitute the eBPF result.
-        self.emit_load_imm(RCX, 0);
-        self.emit1(0x48);
-        self.emit1(0x0f);
-        self.emit1(0x44);
-        self.emit1(0xc1); // cmove rax, rcx
-      } else {
-        self.emit_pop(RCX);
-        self.emit1(0x48);
-        self.emit1(0x0f);
-        self.emit1(0x44);
-        self.emit1(0xd1); // cmove rdx, rcx
-      }
-    }
-
-    if dst != RDX {
-      if mod_ {
-        self.emit_mov(RDX, dst);
-      }
-      self.emit_pop(RDX);
-    }
-    if dst != RAX {
-      if div || mul {
-        self.emit_mov(RAX, dst);
-      }
-      self.emit_pop(RAX);
-    }
+/// Encodes a primitive list, writing it into `buffer`.
+///
+/// The table from primitives to bytes and the label resolution both live in
+/// [`verified::x64_encode`](crate::verified::x64_encode); all this adds is the
+/// wording of the two refusals. The bytes are built in full first and copied
+/// out once, so a buffer too small is one comparison rather than a partially
+/// written function.
+pub fn encode(code: &[PInsn], buffer: &mut [u8]) -> Result<usize, TranslateError> {
+  let mut bytes = Vec::new();
+  if let Err(e) = assemble(code, &mut bytes) {
+    return Err(TranslateError::Failed(asm_message(e)));
   }
+  if bytes.len() > buffer.len() {
+    return Err(TranslateError::OutOfSpace);
+  }
+  buffer[..bytes.len()].copy_from_slice(&bytes);
+  Ok(bytes.len())
+}
 
-  /// Back-patches a one-byte relative displacement written earlier.
-  /// Writing the buffer directly would be out of bounds when the
-  /// emit that reserved the byte had already run out of buffer. Going through
-  /// `patch_bytes` bounds-checks; the guard on `ok()` keeps the emitted bytes
-  /// identical in every case where the translation actually succeeds.
-  fn patch_rel8(&mut self, at: u32, target: u32) {
-    if !self.st.ok() {
-      return;
+/// The message for one assembly failure.
+///
+/// Both outcomes were the same failure before the assembler distinguished
+/// them — a near jump that did not reach, and a branch whose label the list
+/// never carried — and both keep the wording embedders match on.
+fn asm_message(e: AsmError) -> String {
+  match e {
+    AsmError::MissingLabel => {
+      "Could not patch the relative addresses in the JIT'd code".to_string()
     }
-    let rel = target.wrapping_sub(at).wrapping_sub(1);
-    self.st.patch_bytes(at, rel as u64, 1);
+    AsmError::RelocationOutOfRange => {
+      "Could not patch the relative addresses in the JIT'd code".to_string()
+    }
   }
 }
 
-// ---------------------------------------------------------------------------
-// Trailer: epilogue, retpoline, dispatcher slot, helper table
-// ---------------------------------------------------------------------------
-
-impl Emit<'_, '_, '_> {
-  /// The retpoline `call *%rax` stand-in, adapted from Intel's guidance.
-  fn emit_retpoline(&mut self) -> u32 {
-    let retpoline_target = self.offset();
-    let label1_call_offset = self.emit_call(PatchTarget::EbpfPc { pc: 0, near: false });
-
-    let capture_ret_spec = self.offset();
-    self.emit_pause();
-    self.emit_jmp(PatchTarget::JitOffset {
-      offset: capture_ret_spec,
-      near: false,
-    });
-
-    // label1: mov [rsp], rax ; ret
-    let label1 = self.offset();
-    self.emit1(0x48);
-    self.emit1(0x89);
-    self.emit1(0x04);
-    self.emit1(0x24);
-    self.emit_ret();
-
-    self.st.retarget_jumps(
-      label1_call_offset,
-      PatchTarget::JitOffset {
-        offset: label1,
-        near: false,
-      },
-    );
-
-    retpoline_target
-  }
-
-  /// The eight bytes holding the external dispatcher's address.
-  fn emit_dispatched_external_helper_address(&mut self) -> u32 {
-    let at = self.offset();
-    let addr = self.cfg.dispatcher.map_or(0u64, |f| f as usize as u64);
-    self.emit8(addr);
-    at
-  }
-
-  /// The table of registered helper addresses, indexed by helper number.
-  /// `async-ebpf` never registers individual helpers — it uses the dispatcher —
-  /// so every entry is null. The table is emitted anyway because the default
-  /// dispatch path indexes into it and the trailer's layout is part of the ABI
-  /// the runtime patches through.
-  fn emit_helper_table(&mut self) -> u32 {
-    let at = self.offset();
-    for _ in 0..abi::MAX_EXT_FUNCS {
-      self.emit8(0);
-    }
-    at
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Relocation
-// ---------------------------------------------------------------------------
-
-impl Emit<'_, '_, '_> {
-  /// Returns false
-  /// returns false, which the caller turns into a failure.
-  fn resolve(&mut self) -> bool {
-    let jumps = std::mem::take(&mut self.st.jumps);
-    for jump in &jumps {
-      let (target_loc, is_near) = match jump.target {
-        // Only Exit and Retpoline are reachable as special jump targets.
-        PatchTarget::Special(SpecialTarget::Exit) => (self.st.exit_loc, false),
-        PatchTarget::Special(SpecialTarget::Retpoline) => (self.st.retpoline_loc, false),
-        PatchTarget::Special(_) => return false,
-        PatchTarget::EbpfPc { pc, near } => (self.pc_loc(pc), near),
-        // Both fields were once held in one struct, preferring the JIT offset only
-        // when it is non-zero, falling back to `pc_locs[ebpf_target_pc]`. Every
-        // site that sets a JIT offset leaves the eBPF pc at 0, so a zero JIT
-        // offset means `pc_locs[0]`.
-        PatchTarget::JitOffset { offset, near } => {
-          if offset != 0 {
-            (offset, near)
-          } else {
-            (self.pc_loc(0), near)
-          }
-        }
-      };
-
-      if is_near {
-        let rel = target_loc as i64 - (jump.offset_loc as i64 + 1);
-        if !(-128..128).contains(&rel) {
-          return false;
-        }
-        self
-          .st
-          .patch_bytes(jump.offset_loc, rel as i8 as u8 as u64, 1);
-      } else {
-        let rel = target_loc.wrapping_sub(jump.offset_loc.wrapping_add(4));
-        self.st.patch_bytes(jump.offset_loc, rel as u64, 4);
-      }
-    }
-    self.st.jumps = jumps;
-
-    let local_calls = std::mem::take(&mut self.st.local_calls);
-    for call in &local_calls {
-      // Lazy local calls emit an indirect call instead, so this table is always
-      // empty on the path this backend is reached through. The loop is kept
-      // and so does this.
-      let target_loc = match call.target {
-        PatchTarget::EbpfPc { pc, .. } => self.pc_loc(pc),
-        _ => return false,
-      };
-      let rel = target_loc
-        .wrapping_sub(call.offset_loc.wrapping_add(4))
-        .wrapping_sub(self.st.prolog_size as u32);
-      self.st.patch_bytes(call.offset_loc, rel as u64, 4);
-    }
-    self.st.local_calls = local_calls;
-
-    let loads = std::mem::take(&mut self.st.loads);
-    for load in &loads {
-      // It is only possible to load from the external dispatcher's position.
-      let target_loc = match load.target {
-        PatchTarget::Special(SpecialTarget::ExternalDispatcher) => self.st.dispatcher_loc,
-        _ => return false,
-      };
-      let rel = target_loc.wrapping_sub(load.offset_loc.wrapping_add(4));
-      self.st.patch_bytes(load.offset_loc, rel as u64, 4);
-    }
-    self.st.loads = loads;
-
-    let leas = std::mem::take(&mut self.st.leas);
-    for lea in &leas {
-      // It is only possible to LEA from the helper table.
-      let target_loc = match lea.target {
-        PatchTarget::Special(SpecialTarget::LoadHelperTable) => self.st.helper_table_loc,
-        _ => return false,
-      };
-      let rel = target_loc.wrapping_sub(lea.offset_loc.wrapping_add(4));
-      self.st.patch_bytes(lea.offset_loc, rel as u64, 4);
-    }
-    self.st.leas = leas;
-
-    true
-  }
-
-  fn pc_loc(&self, pc: u32) -> u32 {
-    self.st.pc_locs.get(pc as usize).copied().unwrap_or(0)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// The driver
-// ---------------------------------------------------------------------------
-
-/// eBPF registers `inst` may overwrite.
-/// Naming too many registers only ends access groups early; naming too few
-/// would let a group keep addressing a base that has changed, so every class
-/// that writes anything is listed.
-fn written_registers_mask(inst: Insn) -> u16 {
-  match inst.opcode & cls::MASK {
-    cls::LD | cls::LDX | cls::ALU | cls::ALU64 => 1u16 << inst.dst,
-    cls::STX => {
-      // A fetching atomic writes its source register, and CMPXCHG writes R0.
-      // Plain stores write nothing.
-      if (inst.opcode & 0xe0) == 0xc0 {
-        (1u16 << inst.src) | 1
-      } else {
-        0
-      }
-    }
-    cls::JMP | cls::JMP32 => {
-      // A call clobbers R0-R5 either way; the group ends at the call anyway.
-      if inst.opcode == opcode::CALL {
-        0x3f
-      } else {
-        0
-      }
-    }
-    _ => 0,
-  }
-}
-
-/// True when `inst` reads its source register as a *value* rather than as a
-/// memory base or a mode selector.
-/// `STX` is deliberately absent even though it does read a value source:
-/// `emit_masked_store` handles it itself, because the address computation it
-/// performs first would clobber the scratch register the value would sit in.
-fn reads_src_as_value(inst: Insn) -> bool {
-  match inst.opcode & cls::MASK {
-    cls::ALU | cls::ALU64 => (inst.opcode & 0x08) == 0x08,
-    cls::JMP | cls::JMP32 => {
-      // CALL and EXIT put a mode selector in the source field rather than a
-      // register number, and JA has no source operand at all.
-      if inst.opcode == opcode::CALL
-        || inst.opcode == opcode::EXIT
-        || inst.opcode == opcode::JA
-        || inst.opcode == opcode::JA32
-      {
-        return false;
-      }
-      (inst.opcode & 0x08) == 0x08
-    }
-    _ => false,
-  }
-}
-
-impl Emit<'_, '_, '_> {
-  fn run(&mut self) -> Result<usize, TranslateError> {
-    let insns = self.t.insns();
-    let num_insts = insns.len();
-    let start_pc = self.inputs.start_pc;
-    let end_pc = self.inputs.end_pc;
-
-    if end_pc > num_insts || start_pc >= end_pc {
-      return Err(TranslateError::Failed(format!(
-        "Invalid function range [{start_pc}, {end_pc})"
-      )));
-    }
-
-    // In function-granular mode the emitted prologue/epilogue assume the range
-    // is exactly one local function: the prologue is only emitted at a function
-    // entry, but the EXIT/epilogue always pops a frame. A start that is not an
-    // entry, or an end that splits a function, would unbalance the host stack.
-    if !(start_pc == 0 || self.t.is_local_func_entry(start_pc)) {
-      return Err(TranslateError::Failed(format!(
-        "Function range start {start_pc} is not a local function entry"
-      )));
-    }
-    if end_pc != num_insts && !self.t.is_local_func_entry(end_pc) {
-      return Err(TranslateError::Failed(format!(
-        "Function range end {end_pc} is not a local function boundary"
-      )));
-    }
-
-    // The whole-program prologue is not emitted here: this entry point is
-    // always reached with `whole_program = false`, and the embedder's own entry
-    // code establishes the frame instead.
-
-    self.mark_barriers(start_pc, end_pc, num_insts);
-
-    if let Some(msg) = self.emit_instructions(start_pc, end_pc) {
-      return Err(TranslateError::Failed(msg));
-    }
-
-    if !self.st.ok() {
-      return Err(self.status_error());
-    }
-
-    // Epilogue: pop the guest stack usage this function pushed, and return.
-    self.st.exit_loc = self.offset();
-    self.emit_alu64_imm32(0x81, 0, RSP, 8);
-    self.emit_ret();
-
-    self.st.retpoline_loc = self.emit_retpoline();
-    self.st.dispatcher_loc = self.emit_dispatched_external_helper_address();
-    self.st.helper_table_loc = self.emit_helper_table();
-
-    // Everything above is emitted after the per-instruction error check, so an
-    // overflow here would otherwise be reported as success. That is not merely
-    // untidy: a patch site whose location was recorded just before the overflow
-    // is still in the jump table, and `resolve` would write four bytes at it.
-    if !self.st.ok() {
-      return Err(if self.st.status == Progress::NotEnoughSpace {
-        TranslateError::OutOfSpace
-      } else {
-        TranslateError::Failed("Failure to emit the function epilogue".to_string())
-      });
-    }
-
-    if !self.resolve() {
-      return Err(TranslateError::Failed(
-        "Could not patch the relative addresses in the JIT'd code".to_string(),
-      ));
-    }
-
-    Ok(self.offset() as usize)
-  }
-
-  /// Turns the recorded [`Progress`] into the error reported for it.
-  fn status_error(&self) -> TranslateError {
-    match self.st.status {
-      Progress::NotEnoughSpace => TranslateError::OutOfSpace,
-      // These two carry a message from the detecting site, because it names the
-      // instruction. The lazy local-call guard sets only the status, so this
-      // provides a fallback for it.
-      Progress::UnexpectedInstruction => {
-        TranslateError::Failed(self.errmsg.clone().unwrap_or_else(|| {
-          "Unexpected instruction or missing local-call runtime callbacks during JIT compilation"
-            .to_string()
-        }))
-      }
-      Progress::UnknownInstruction => {
-        TranslateError::Failed(self.errmsg.clone().unwrap_or_default())
-      }
-      other => other
-        .into_error(crate::jit::Target::X86_64)
-        .unwrap_or(TranslateError::Failed(String::new())),
-    }
-  }
-
-  /// Marks every instruction a branch can land on, which closes any access
-  /// group open across it.
-  fn mark_barriers(&mut self, start_pc: usize, end_pc: usize, num_insts: usize) {
-    for i in start_pc..end_pc {
-      let inst = self.t.insns()[i];
-
-      // A local function entry is reached by `call`, never by falling into it,
-      // so a group must not span one.
-      if self.t.is_local_func_entry(i) {
-        self.st.mark_barrier(i);
-      }
-
-      let class = inst.opcode & cls::MASK;
-      if class != cls::JMP && class != cls::JMP32 {
-        continue;
-      }
-      // Nothing falls through an EXIT, an unconditional jump or a call, so
-      // whatever follows is entered from somewhere else. The bound is written
-      // `group_barrier` has `num_insts + 1` slots, so the
-      // instruction one past the end has one too.
-      #[allow(clippy::int_plus_one)]
-      if i + 1 <= num_insts {
-        self.st.mark_barrier(i + 1);
-      }
-      if inst.opcode == opcode::CALL || inst.opcode == opcode::EXIT {
-        continue;
-      }
-      let delta = if inst.opcode == opcode::JA32 {
-        inst.imm as i64
-      } else {
-        inst.offset as i64
-      };
-      let target = i as i64 + 1 + delta;
-      if target >= 0 && target <= num_insts as i64 {
-        self.st.mark_barrier(target as usize);
-      }
-    }
-  }
-
-  /// The main loop. Returns `Some(message)` for the paths that report
-  /// immediately with an error rather than recording a status and breaking.
-  fn emit_instructions(&mut self, start_pc: usize, end_pc: usize) -> Option<String> {
-    let mut i = start_pc;
-    while i < end_pc {
-      if !self.st.ok() {
-        break;
-      }
-
-      let inst = self.t.insns()[i];
-
-      // A branch can land here, so no group can span it.
-      if self.st.is_barrier(i) {
-        self.st.close_group();
-      }
-
-      let dst = map_register(inst.dst);
-      let mut src = map_register(inst.src);
-
-      let region_hint = self.inputs.hint(i);
-
-      // Use i64 throughout to avoid signed overflow with large immediates.
-      let target_pc_64 = if inst.opcode == opcode::JA32 {
-        i as i64 + inst.imm as i64 + 1
-      } else {
-        i as i64 + inst.offset as i64 + 1
-      };
-      let target_pc = target_pc_64 as u32;
-
-      // A relative branch is resolved against `pc_locs[target_pc]`, and in
-      // function-granular mode only entries inside the range are ever written,
-      // so a target outside it would silently retarget the branch to the top of
-      // the emitted buffer.
-      let branch_cls = inst.opcode & cls::MASK;
-      if (branch_cls == cls::JMP || branch_cls == cls::JMP32)
-        && inst.opcode != opcode::CALL
-        && inst.opcode != opcode::EXIT
-        && ((target_pc as usize) < start_pc || target_pc as usize >= end_pc)
-      {
-        self.st.fail(Progress::UnexpectedInstruction);
-        self.errmsg = Some(format!(
-          "jump target {target_pc} at PC {i} is outside the translation range [{start_pc}, {end_pc})"
-        ));
-        break;
-      }
-
-      let tgt = PatchTarget::EbpfPc {
-        pc: target_pc,
-        near: false,
-      };
-
-      // If the previous instruction could fall through to this one and this one
-      // starts a local function, there has to be a way to jump around the code
-      // that manipulates the host stack.
-      let mut fallthrough_jump_source = None;
-      if i != start_pc && self.t.is_local_func_entry(i) {
-        let prev = self.t.insns()[i - 1];
-        if prev.has_fallthrough() {
-          fallthrough_jump_source = Some(self.emit_jmp(PatchTarget::EbpfPc { pc: 0, near: true }));
-        }
-      }
-
-      // The top of the host stack always holds the guest stack usage of the
-      // currently-executing eBPF function, so a function entry pushes its own.
-      // Adjusting by 8 keeps the 16-byte alignment, because the `call` that got
-      // here already pushed a return address.
-      if i == 0 || self.t.is_local_func_entry(i) {
-        let prolog_start = self.offset();
-        let stack_usage = self.t.stack_usage_for(i);
-        self.emit_alu64_imm32(0x81, 5, RSP, 8);
-        // `mov qword [rsp], stack_usage`, whose ModRM+SIB pair for an `[rsp]`
-        // base is emitted literally.
-        self.emit1(0x48);
-        self.emit1(0xC7);
-        self.emit1(0x04);
-        self.emit1(0x24);
-        self.emit4(stack_usage as u32);
-
-        // Only measure a prologue that was actually emitted. Once the buffer
-        // has run out, the emits above are no-ops and `size` is a partial
-        // count, so recording or checking it here turns an ordinary
-        // out-of-space into a debug-assertion panic. That is reachable from any
-        // multi-function range - `Translator::translate_all`, and the test and
-        // fuzz surface - though not from the production loader, which always
-        // translates exactly one function.
-        let size = (self.offset() - prolog_start) as usize;
-        if !self.st.ok() {
-          // Nothing to record; the caller will report the failure.
-        } else if self.st.prolog_size == 0 {
-          self.st.prolog_size = size;
-        } else {
-          debug_assert_eq!(self.st.prolog_size, size);
-        }
-      }
-
-      if let Some(source) = fallthrough_jump_source {
-        let here = self.offset();
-        self.st.retarget_jumps(
-          source,
-          PatchTarget::JitOffset {
-            offset: here,
-            near: true,
-          },
-        );
-      }
-      self.st.pc_locs[i] = self.offset();
-
-      // Under a native frame base the register mapped to eBPF R10 holds a host
-      // address, so an instruction reading R10 as a value must see the guest
-      // one. This has to come *after* `pc_locs[i]` is recorded: a branch landing
-      // here has to run the materialisation too.
-      if self.cfg.native_frame_base_active()
-        && inst.src == crate::jit::isa::REG_FP
-        && reads_src_as_value(inst)
-      {
-        self.emit_guest_frame_pointer(RCX);
-        src = RCX;
-      }
-
-      if let Some(msg) = self.emit_one(i, inst, dst, src, region_hint, tgt, &mut i) {
-        return Some(msg);
-      }
-
-      // A 32-bit ALU instruction zero-extends its result. The `end` family is
-      // excluded, which is why `le`/`be` do their own truncation.
-      if (inst.opcode & cls::MASK) == cls::ALU && (inst.opcode & 0xf0) != 0xd0 {
-        self.emit_truncate_u32(dst);
-      }
-
-      // After the instruction has used its operands, note what it overwrote: an
-      // access whose destination is its own base is still valid, but nothing
-      // addressing that base afterwards is.
-      let mask = written_registers_mask(inst);
-      for reg in 0..16u8 {
-        if mask & (1u16 << reg) != 0 {
-          self.st.note_register_written(reg);
-        }
-      }
-
-      i += 1;
-    }
-    None
-  }
-
-  /// One instruction. `pc_cursor` is the driver's loop variable, which `lddw`
-  /// advances past its second slot, which is data rather than an instruction.
-  #[allow(clippy::too_many_arguments)]
-  fn emit_one(
-    &mut self,
-    pc: usize,
-    inst: Insn,
-    dst: u8,
-    src: u8,
-    region_hint: u8,
-    tgt: PatchTarget,
-    pc_cursor: &mut usize,
-  ) -> Option<String> {
-    let op = match inst.op() {
-      Some(op) => op,
-      None => {
-        self.st.fail(Progress::UnknownInstruction);
-        self.errmsg = Some(format!(
-          "Unknown instruction at PC {pc}: opcode {:02x}",
-          inst.opcode
-        ));
-        return None;
-      }
-    };
-
-    match op {
-      // ------------------------------------------------------------------
-      // ALU
-      // ------------------------------------------------------------------
-      Op::Alu {
-        width,
-        op: alu,
-        source,
-      } => {
-        let w64 = width == AluWidth::W64;
-        match alu {
-          AluOp::Mul | AluOp::Div | AluOp::Mod => {
-            self.emit_muldivmod(inst.opcode, src, dst, inst.imm, inst.offset);
-          }
-          AluOp::Neg => {
-            if w64 {
-              self.emit_alu64(0xf7, 3, dst);
-            } else {
-              self.emit_alu32(0xf7, 3, dst);
-            }
-          }
-          AluOp::Mov => match (w64, source) {
-            (false, Source::Imm) => self.emit_alu32_imm32(0xc7, 0, dst, inst.imm),
-            (true, Source::Imm) => self.emit_load_imm(dst, inst.imm as i64),
-            (false, Source::Reg) => {
-              // MOVSX flavours selected by the offset field (RFC 9669).
-              if inst.offset == 8 {
-                // The explicit REX is what makes a byte source name SIL/DIL/SPL/
-                // BPL rather than AH/CH/DH/BH, so it is emitted even when no
-                // high-register bit is set.
-                self.emit_rex(0, u8::from(dst & 8 != 0), 0, u8::from(src & 8 != 0));
-                self.emit1(0x0f);
-                self.emit1(0xbe);
-                self.emit_modrm_reg2reg(dst, src);
-              } else if inst.offset == 16 {
-                self.emit_basic_rex(0, dst, src);
-                self.emit1(0x0f);
-                self.emit1(0xbf);
-                self.emit_modrm_reg2reg(dst, src);
-              } else {
-                self.emit_mov(src, dst);
-              }
-            }
-            (true, Source::Reg) => {
-              if inst.offset == 8 {
-                self.emit_basic_rex(1, dst, src);
-                self.emit1(0x0f);
-                self.emit1(0xbe);
-                self.emit_modrm_reg2reg(dst, src);
-              } else if inst.offset == 16 {
-                self.emit_basic_rex(1, dst, src);
-                self.emit1(0x0f);
-                self.emit1(0xbf);
-                self.emit_modrm_reg2reg(dst, src);
-              } else if inst.offset == 32 {
-                self.emit_basic_rex(1, dst, src);
-                self.emit1(0x63);
-                self.emit_modrm_reg2reg(dst, src);
-              } else {
-                self.emit_mov(src, dst);
-              }
-            }
-          },
-          AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => {
-            let ext = match alu {
-              AluOp::Lsh => 4,
-              AluOp::Rsh => 5,
-              _ => 7,
-            };
-            match source {
-              Source::Imm => {
-                if w64 {
-                  self.emit_alu64_imm8(0xc1, ext, dst, inst.imm);
-                } else {
-                  self.emit_alu32_imm8(0xc1, ext, dst, inst.imm);
-                }
-              }
-              Source::Reg => {
-                self.emit_mov(src, RCX);
-                if w64 {
-                  self.emit_alu64(0xd3, ext, dst);
-                } else {
-                  self.emit_alu32(0xd3, ext, dst);
-                }
-              }
-            }
-          }
-          AluOp::Add | AluOp::Sub | AluOp::Or | AluOp::And | AluOp::Xor => {
-            // (immediate extension, register-form opcode)
-            let (ext, reg_op) = match alu {
-              AluOp::Add => (0, 0x01),
-              AluOp::Sub => (5, 0x29),
-              AluOp::Or => (1, 0x09),
-              AluOp::And => (4, 0x21),
-              _ => (6, 0x31),
-            };
-            match source {
-              Source::Imm => {
-                if w64 {
-                  self.emit_alu64_imm32(0x81, ext, dst, inst.imm);
-                } else {
-                  self.emit_alu32_imm32(0x81, ext, dst, inst.imm);
-                }
-              }
-              Source::Reg => {
-                if w64 {
-                  self.emit_alu64(reg_op, src, dst);
-                } else {
-                  self.emit_alu32(reg_op, src, dst);
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // ------------------------------------------------------------------
-      // Byte order
-      // ------------------------------------------------------------------
-      Op::End(EndKind::Le) => {
-        // x86 is already little-endian, so this is a truncation and nothing
-        // else. An immediate other than 16 or 32 emits nothing at all.
-        if inst.imm == 16 {
-          self.emit_alu32_imm32(0x81, 4, dst, 0xffff);
-        } else if inst.imm == 32 {
-          self.emit_alu32_imm32(0x81, 4, dst, 0xffff_ffffu32 as i32);
-        }
-      }
-      Op::End(EndKind::Be) => {
-        if inst.imm == 16 {
-          self.emit1(0x66); // 16-bit override
-          self.emit_alu32_imm8(0xc1, 0, dst, 8); // rol
-          self.emit_alu32_imm32(0x81, 4, dst, 0xffff);
-        } else if inst.imm == 32 || inst.imm == 64 {
-          self.emit_basic_rex(u8::from(inst.imm == 64), 0, dst);
-          self.emit1(0x0f);
-          self.emit1(0xc8 | (dst & 7));
-        }
-      }
-      Op::End(EndKind::Bswap) => {
-        if inst.imm == 16 {
-          self.emit1(0x66);
-          self.emit_alu32_imm8(0xc1, 0, dst, 8);
-          self.emit_alu64_imm32(0x81, 4, dst, 0xffff);
-        } else if inst.imm == 32 {
-          self.emit_basic_rex(0, 0, dst);
-          self.emit1(0x0f);
-          self.emit1(0xc8 | (dst & 7));
-          // Zero-extend to 64 bits.
-          self.emit_alu32(0x89, dst, dst);
-        } else if inst.imm == 64 {
-          self.emit_basic_rex(1, 0, dst);
-          self.emit1(0x0f);
-          self.emit1(0xc8 | (dst & 7));
-        }
-      }
-
-      // ------------------------------------------------------------------
-      // Control flow
-      // ------------------------------------------------------------------
-      Op::Ja { .. } => {
-        self.emit_jmp(tgt);
-      }
-      Op::Jmp {
-        width,
-        op: cond,
-        source,
-      } => {
-        let w64 = width == AluWidth::W64;
-        let code = match cond {
-          JmpOp::Eq => 0x84,
-          JmpOp::Gt => 0x87,
-          JmpOp::Ge => 0x83,
-          JmpOp::Lt => 0x82,
-          JmpOp::Le => 0x86,
-          JmpOp::Set => 0x85,
-          JmpOp::Ne => 0x85,
-          JmpOp::Sgt => 0x8f,
-          JmpOp::Sge => 0x8d,
-          JmpOp::Slt => 0x8c,
-          JmpOp::Sle => 0x8e,
-        };
-        match (cond, source) {
-          (JmpOp::Set, Source::Imm) => {
-            if w64 {
-              self.emit_alu64_imm32(0xf7, 0, dst, inst.imm);
-            } else {
-              self.emit_alu32_imm32(0xf7, 0, dst, inst.imm);
-            }
-          }
-          (JmpOp::Set, Source::Reg) => {
-            if w64 {
-              self.emit_alu64(0x85, src, dst);
-            } else {
-              self.emit_alu32(0x85, src, dst);
-            }
-          }
-          (_, Source::Imm) => {
-            if w64 {
-              self.emit_cmp_imm32(dst, inst.imm);
-            } else {
-              self.emit_cmp32_imm32(dst, inst.imm);
-            }
-          }
-          (_, Source::Reg) => {
-            if w64 {
-              self.emit_cmp(src, dst);
-            } else {
-              self.emit_cmp32(src, dst);
-            }
-          }
-        }
-        self.emit_jcc(code, tgt);
-      }
-
-      Op::Call => {
-        // RCX is reserved for shifts, so the register mapped to eBPF R4 has to
-        // move out of the way before the host call.
-        if inst.src == 0 {
-          self.emit_mov(RCX_ALT, RCX);
-          self.emit_dispatched_external_helper_call(inst.imm as u32);
-          // The unwind index defaults to -1, so `None` here means a
-          // `call -1` really does take the unwind path.
-          let unwind = self.cfg.unwind_helper_index.map_or(-1i32, |i| i as i32);
-          if inst.imm == unwind {
-            self.emit_cmp_imm32(map_register(0), 0);
-            self.emit_jcc(0x84, PatchTarget::Special(SpecialTarget::Exit));
-          }
-        } else if self.t.is_local_call(pc) {
-          // This entry point always compiles local calls lazily; the eager
-          // `emit_local_call` is unreachable and is not ported.
-          self.emit_lazy_local_call(pc);
-        }
-        // A call that is neither a helper nor a local call emits nothing at
-        // all, so control would fall into the next instruction. (The aarch64
-        // backend branches to exit in the same position; the two disagree, and
-        // only unreachability makes that harmless.) Unreachable: the operand
-        // filter bounds `call`'s source to 0..=2, source 1 is a local call by
-        // definition, and `check_call` refuses a source-2 call unless the
-        // loader tagged it as a cross-section local call — which is exactly
-        // what makes `is_local_call` true for it.
-      }
-
-      Op::Exit => {
-        // Pop the guest stack usage this function pushed, then return.
-        self.emit_alu64_imm32(0x81, 0, RSP, 8);
-        self.emit_ret();
-      }
-
-      // ------------------------------------------------------------------
-      // Memory
-      // ------------------------------------------------------------------
-      Op::Load { width, signed } => {
-        let size = S::from_width(width);
-        if signed {
-          self.emit_masked_load_sx(size, src, dst, inst.offset as i32, region_hint, pc);
-        } else {
-          self.emit_masked_load(size, src, dst, inst.offset as i32, region_hint, pc);
-        }
-      }
-      Op::StoreImm { width } => {
-        self.emit_masked_store_imm32(
-          S::from_width(width),
-          dst,
-          inst.offset as i32,
-          inst.imm,
-          region_hint,
-          pc,
-        );
-      }
-      Op::StoreReg { width } => {
-        self.emit_masked_store(
-          S::from_width(width),
-          src,
-          dst,
-          inst.offset as i32,
-          region_hint,
-          pc,
-        );
-      }
-
-      Op::LoadImm64 => {
-        // The second slot is not an instruction but the high half of the
-        // immediate, so the driver's cursor skips it — the advance inside the
-        // `case`, which the `for` then increments again.
-        //
-        // A `lddw` in the last slot would send the high-half fetch
-        // one past the end of the program; the validator refuses that, so the
-        // zero fallback below is unreachable rather than a behaviour change.
-        *pc_cursor += 1;
-        let second = self.t.insns().get(*pc_cursor).copied().unwrap_or(Insn {
-          opcode: 0,
-          dst: 0,
-          src: 0,
-          offset: 0,
-          imm: 0,
-        });
-        let imm = (inst.imm as u32 as u64) | ((second.imm as u32 as u64) << 32);
-        self.emit_load_imm(dst, imm as i64);
-      }
-
-      Op::Atomic { width, .. } => {
-        // The atomic *selector* is not in the opcode — it is the immediate's
-        // high nibble, with the fetch flag in its low bit. `Op::from_opcode`
-        // therefore cannot fill it in, and `Insn::op_with_imm` is what does,
-        // masking the immediate's high nibble
-        // does. That masking is load-bearing: `imm = 0x02` names a plain atomic
-        // add and `imm = 0xe0` an exchange without the fetch flag, and the
-        // validator's filter for 32-bit atomics lets both through.
-        let is64 = width == Width::DW;
-        let mut atomic_dst = dst;
-        let mut atomic_offset = inst.offset as i32;
-        if self.cfg.pointer_mask != 0 {
-          // Atomics use the ordinary all-region runtime probe. Page protection
-          // decides whether the selected data backing is writable for this invocation.
-          self.emit_masked_address_with_offset(
-            dst,
-            R11,
-            RCX,
-            inst.offset as i32,
-            if is64 { 8 } else { 4 },
-            true,
-            abi::region::UNKNOWN,
-          );
-          atomic_dst = R11;
-          atomic_offset = 0;
-        }
-
-        let (selector, fetch) = match inst.op_with_imm() {
-          Some(Op::Atomic { op, fetch, .. }) => (op, fetch),
-          _ => {
-            // Returns immediately here, skipping the epilogue entirely.
-            return Some(format!(
-              "Error: unknown atomic opcode {} at PC {pc}\n",
-              inst.imm
-            ));
-          }
-        };
-
-        match selector {
-          AtomicOp::Add | AtomicOp::Or | AtomicOp::And | AtomicOp::Xor => {
-            let x64_op = match selector {
-              AtomicOp::Add => X64_ALU_ADD,
-              AtomicOp::Or => X64_ALU_OR,
-              AtomicOp::And => X64_ALU_AND,
-              _ => X64_ALU_XOR,
-            };
-            if fetch {
-              self.emit_atomic_fetch_alu(is64, x64_op, src, atomic_dst, atomic_offset);
-            } else {
-              self.emit_atomic_alu(x64_op, is64, src, atomic_dst, atomic_offset);
-            }
-          }
-          // The fetch flag is ignored for these two: both always yield the
-          // previous value, one in the source register and one in R0.
-          AtomicOp::Xchg => {
-            self.emit_atomic_exchange(is64, src, atomic_dst, atomic_offset);
-            if !is64 {
-              self.emit_truncate_u32(src);
-            }
-          }
-          AtomicOp::Cmpxchg => {
-            self.emit_atomic_cmp_exch_with_rax(is64, src, atomic_dst, atomic_offset);
-            if !is64 {
-              self.emit_truncate_u32(map_register(0));
-            }
-          }
-        }
-      }
-    }
-
-    None
-  }
-}
+/// From one local-call guard site to the next: four saved callee registers,
+/// the call return address, and the callee's eight-byte prologue slot.
+const NATIVE_STACK_DELTA: usize = 4 * 8 + 8 + 8;
+const _: () = assert!(NATIVE_STACK_DELTA <= abi::NATIVE_LOCAL_CALL_BUDGET);
 
 #[cfg(test)]
 mod tests {
@@ -2239,8 +232,10 @@ mod tests {
   use std::sync::Arc;
 
   use crate::jit::golden;
-  use crate::jit::isa::{alu, jmp, mode, opcode, size, src as srcbit, Insn};
-  use crate::jit::{Dispatcher, LocalCallResolver, LocalCallStackExhausted, Target};
+  use crate::jit::isa::{alu, cls, jmp, mode, opcode, size, src as srcbit, Insn};
+  use crate::jit::{Dispatcher, LocalCallResolver, LocalCallStackExhausted, PlanEntry, Target};
+  // The register map and its two lookups live with the instruction set.
+  use crate::verified::x64_ir::{map_register, unmap_register, R11, R15, R9, RCX, REGISTER_MAP};
 
   // -----------------------------------------------------------------------
   // Instructions
@@ -2663,20 +658,22 @@ mod tests {
   #[test]
   fn the_register_map_is_injective_and_pins_r10_to_r15() {
     let mut seen = std::collections::BTreeSet::new();
+    assert_eq!(REGISTER_MAP.len(), crate::jit::isa::NUM_REGS);
     for r in 0..crate::jit::isa::NUM_REGS as u8 {
       assert!(
         seen.insert(map_register(r)),
         "register map is not injective"
       );
-      assert_eq!(unmap_register(map_register(r)), Some(r));
+      assert_eq!(unmap_register(map_register(r)), r);
     }
     // The frame-access fast path and the local-call frame adjustment both name
     // R15 directly, so this mapping is load-bearing.
     assert_eq!(map_register(crate::jit::isa::REG_FP), R15);
-    // RCX and R11 are the scratch registers, so nothing may map to them.
-    assert_eq!(unmap_register(RCX), None);
-    assert_eq!(unmap_register(R11), None);
-    assert_eq!(unmap_register(R9), None);
+    // RCX and R11 are the scratch registers, so nothing may map to them; the
+    // core spells "no eBPF register" as 16.
+    assert_eq!(unmap_register(RCX), 16);
+    assert_eq!(unmap_register(R11), 16);
+    assert_eq!(unmap_register(R9), 16);
   }
 
   #[test]

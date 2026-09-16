@@ -19,3 +19,8 @@ mod runtime_state;
 mod signal_safety;
 mod spill_tracking_cap;
 mod stores;
+// Runs generated primitive lists on the CPU and compares them with the
+// executable model of `lean/AsyncEbpf/X64/Machine.lean`; it assembles x86_64
+// and needs an executable mapping, so it only exists on x86_64 Linux.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod x64_sim_native;

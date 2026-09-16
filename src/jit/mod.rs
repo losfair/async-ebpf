@@ -32,7 +32,8 @@
 //!   trampoline.
 //! * [`validate`](crate::jit::validate) — what `Translator::load` accepts.
 //! * [`stack`](crate::jit::stack) — per-local-function stack usage.
-//! * [`patch`](crate::jit::patch) — the code buffer and jump fixups.
+//! * [`patch`](crate::jit::patch) — the aarch64 backend's code buffer and
+//!   jump fixups.
 //! * [`emit`](crate::jit::emit) — the two backends.
 //! * `interp` — a reference interpreter, for tests only.
 
@@ -215,22 +216,9 @@ impl Config {
 /// nothing redefined the base register in between, and that the access lies
 /// inside the checked window. Any failure emits an ordinary checked access
 /// instead, so a plan that is wrong — or hostile — costs speed and nothing else.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct PlanEntry {
-  /// One of [`abi::plan_role`].
-  pub role: u8,
-  /// Region the leader checks against, as for the region hints.
-  pub region: u8,
-  /// This access's displacement from the window's low bound.
-  pub delta: u16,
-  /// Bytes the leader's check covers.
-  pub span: u32,
-  /// The low bound, as a displacement from the base register.
-  pub lo: i32,
-  /// The leader that established the base; leaders name themselves.
-  pub leader_pc: u32,
-}
+///
+/// The type lives in the verified core, because `x64_lower` is what reads it.
+pub use crate::verified::x64_ir::PlanEntry;
 
 /// What the analysis tells the JIT about one function, beyond the bytecode.
 ///
@@ -430,6 +418,17 @@ impl Translator {
   /// Whether the slot at `pc` begins a local function.
   pub fn is_local_func_entry(&self, pc: usize) -> bool {
     self.local_func_entries.get(pc).copied().unwrap_or(false)
+  }
+
+  /// Slots that begin a local function, indexed by absolute pc.
+  pub(crate) fn local_func_entries(&self) -> &[bool] {
+    &self.local_func_entries
+  }
+
+  /// Calls whose local-function target lives in another object section,
+  /// indexed by absolute pc.
+  pub(crate) fn external_local_calls(&self) -> &[bool] {
+    &self.external_local_calls
   }
 
   /// Whether `pc` is an intra- or cross-section local call.
