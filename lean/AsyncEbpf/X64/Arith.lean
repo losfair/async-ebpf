@@ -26,14 +26,26 @@ the one-primitive shape of `AsyncEbpf/X64/Simple.lean`:
   below its entry value, the read-only bytes and the parked group base intact,
   and every register outside `W` still holding a value its *pre*-state tag
   admits. `W` is the set a region may have clobbered, `d` the depth it is at.
-* `BlockOk P code b e pre Win Wout din dout` is `MacroOk`'s three clauses for
-  the sub-region `[b, e)`, stated over `Ctx` instead of `Agree`. It composes:
+* `BlockOk P code b e pre Win Wout din dout` is `MacroOk`'s clauses for the
+  sub-region `[b, e)`, stated over `Ctx` instead of `Agree`: what the region
+  may touch, what it may *write*, where `rsp` is at every position of it,
+  where control leaves it, and that it never returns. It composes:
   `blockOk_seq` puts two regions end to end, `blockOk_line` runs a
   straight-line list of primitives, and `blockOk_flat` runs a region of
   constant depth whose branches all land inside it — which is what a macro's
   internal `Jcc8`/`Jmp8` to its own locals is.
 * `macroOk_of_blockOk` turns a balanced block (`dout = din = pre.depth`) back
-  into a `MacroOk`, reading the post-state off `SetsTop`.
+  into a `MacroOk`, reading the post-state off `SetsTop` and the stack window
+  off the depth `BlockOk` carries, through `macroOk_rsp_of_window`.
+
+The two clauses `BlockOk` carries beyond safety cost the regions nothing new.
+The only primitives of either expansion that write are the pushes and the
+loop's `lock cmpxchg`: a push at depth `d + 1` writes the word `storeOk_stack`
+makes writable, and `LineOk` already asks for the `d + 1 ≤ 16` that needs;
+the compare-exchange writes through the same `GuestTag` its access goes
+through, which is why `GuestTag` reads the address rule as a fact about reads
+*and* writes. Everything else writes nothing. And the stack pointer is `rsp0 -
+8·d` at every position, with `d ≤ 16`, which is exactly what `Ctx` says.
 
 The division of labour is then: the pushes and pops are lines, the branchy
 middle is flat, and the address rule enters only through `GuestTag`, which is
@@ -256,10 +268,17 @@ theorem ctx_agree {P : Params} {pre post : x64_check.State} {S W : Nat → Prop}
 
 `BlockOk` is `MacroOk` over `Ctx`. The extra clause in front — what the region
 does when it is empty — is what makes `blockOk_seq` work for the conditional
-segments of an expansion, which are empty on one side of their condition. -/
+segments of an expansion, which are empty on one side of their condition.
 
-/-- The three clauses of `MacroOk` for the sub-region `[b, e)` of one macro's
-expansion, stated over `Ctx`. -/
+The `rsp` clause is stated as "some depth at most sixteen" rather than as the
+region's own `din`/`dout`, because that is what a walk *inside* the region
+gives — the pushes of a line have moved it — and it is the shape
+`macroOk_rsp_of_window` consumes. -/
+
+/-- The clauses of `MacroOk` for the sub-region `[b, e)` of one macro's
+expansion, stated over `Ctx`: what the region may touch, what it may *write*,
+where the stack pointer is at every position of it, where control leaves it,
+and that it never returns. -/
 def BlockOk (P : Params) (code : List x64_ir.PInsn) (b e : Nat) (pre : x64_check.State)
     (Win Wout : Nat → Prop) (din dout : Nat) : Prop :=
   b ≤ e ∧
@@ -268,6 +287,9 @@ def BlockOk (P : Params) (code : List x64_ir.PInsn) (b e : Nat) (pre : x64_check
     ∀ s' : State, Stays P code (Range b e) s s' →
       (∀ c, Step P code s' c → ∀ i, code[s'.pc]? = some i →
         ∀ bn ∈ accesses i s', AccessOk P bn.1 bn.2) ∧
+      (∀ c, Step P code s' c → ∀ i, code[s'.pc]? = some i →
+        ∀ bn ∈ stores i s', StoreOk P bn.1 bn.2) ∧
+      (∃ d : Nat, d ≤ 16 ∧ s'.regs RSP = P.rsp0 - BitVec.ofNat 64 (8 * d)) ∧
       (∀ s'', Step P code s' (.next s'') → ¬ Range b e s''.pc →
         s''.pc = e ∧ Ctx P pre Wout dout s'') ∧
       (∀ s'', ¬ Step P code s' (.returned s''))
@@ -277,8 +299,8 @@ theorem BlockOk.mono {P code b e pre Win Wout Wout' din dout}
     (h : BlockOk P code b e pre Win Wout din dout) (hW : ∀ r, Wout r → Wout' r) :
     BlockOk P code b e pre Win Wout' din dout := by
   refine ⟨h.1, fun s hs hc => ⟨fun hbe => ((h.2 s hs hc).1 hbe).mono hW, fun s' hsty => ?_⟩⟩
-  obtain ⟨h1, h2, h3⟩ := (h.2 s hs hc).2 s' hsty
-  exact ⟨h1, fun s'' hst hout => ⟨(h2 s'' hst hout).1, (h2 s'' hst hout).2.mono hW⟩, h3⟩
+  obtain ⟨h1, hw, hr, h2, h3⟩ := (h.2 s hs hc).2 s' hsty
+  exact ⟨h1, hw, hr, fun s'' hst hout => ⟨(h2 s'' hst hout).1, (h2 s'' hst hout).2.mono hW⟩, h3⟩
 
 /-- The empty region. -/
 theorem blockOk_nil {P code b pre Win Wout d} (hW : ∀ r, Win r → Wout r) :
@@ -314,22 +336,22 @@ theorem blockOk_seq {P code b m e pre W0 W1 W2 d0 d1 d2}
         rcases ih with ⟨hsty1, hin1⟩ | ⟨v, hv, hcv, hsty2⟩
         · rcases Classical.em (Range b m t'.pc) with hr | hr
           · exact Or.inl ⟨.step hsty1 hst hr, hr⟩
-          · obtain ⟨hpc, hct⟩ := ((h1 s hs hc).2 t hsty1).2.1 t' hst hr
+          · obtain ⟨hpc, hct⟩ := ((h1 s hs hc).2 t hsty1).2.2.2.1 t' hst hr
             refine Or.inr ⟨t', hpc, hct, .refl ?_⟩
             simp only [Range] at hin ⊢
             omega
         · have hge : m ≤ t'.pc := by
             by_contra hlt
             have hout : ¬ Range m e t'.pc := by simp only [Range, not_and, not_lt]; omega
-            have := ((h2 v hv hcv).2 t hsty2).2.1 t' hst hout
+            have := ((h2 v hv hcv).2 t hsty2).2.2.2.1 t' hst hout
             simp only [Range] at hin
             omega
           refine Or.inr ⟨v, hv, hcv, .step hsty2 hst ?_⟩
           simp only [Range] at hin ⊢
           omega
     rcases key s' hsty with ⟨hsty1, hin1⟩ | ⟨v, hv, hcv, hsty2⟩
-    · obtain ⟨g1, g2, g3⟩ := (h1 s hs hc).2 s' hsty1
-      refine ⟨g1, fun s'' hst hout => ?_, g3⟩
+    · obtain ⟨g1, gw, gr, g2, g3⟩ := (h1 s hs hc).2 s' hsty1
+      refine ⟨g1, gw, gr, fun s'' hst hout => ?_, g3⟩
       have hout1 : ¬ Range b m s''.pc := by
         simp only [Range, not_and, not_lt] at hout ⊢
         omega
@@ -338,8 +360,8 @@ theorem blockOk_seq {P code b m e pre W0 W1 W2 d0 d1 d2}
         simp only [Range, not_and, not_lt] at hout
         omega
       exact ⟨by omega, (h2 s'' (by omega) hct).1 hme'⟩
-    · obtain ⟨g1, g2, g3⟩ := (h2 v hv hcv).2 s' hsty2
-      refine ⟨g1, fun s'' hst hout => ?_, g3⟩
+    · obtain ⟨g1, gw, gr, g2, g3⟩ := (h2 v hv hcv).2 s' hsty2
+      refine ⟨g1, gw, gr, fun s'' hst hout => ?_, g3⟩
       have hout2 : ¬ Range m e s''.pc := by
         simp only [Range, not_and, not_lt] at hout ⊢
         omega
@@ -400,6 +422,8 @@ theorem blockOk_one {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : x64
     (hadv : ∀ t t' : State, t.pc = b → Step P code t (.next t') → t'.pc = b + 1)
     (hsafe : ∀ t : State, t.pc = b → Ctx P pre Win din t →
       ∀ bn ∈ accesses i t, AccessOk P bn.1 bn.2)
+    (hstore : ∀ t : State, t.pc = b → Ctx P pre Win din t →
+      ∀ bn ∈ stores i t, StoreOk P bn.1 bn.2)
     (hpost : ∀ t t' : State, t.pc = b → Ctx P pre Win din t → Step P code t (.next t') →
       Ctx P pre Wout dout t') :
     BlockOk P code b (b + 1) pre Win Wout din dout := by
@@ -409,11 +433,15 @@ theorem blockOk_one {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : x64
     intro t t' ht hst
     exact hadv t t' ht hst
   subst heq
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ⟨din, hcx.bound, hcx.rsp⟩, ?_, ?_⟩
   · intro c hst j hj bn hbn
     rw [hs, hc] at hj
     obtain rfl : j = i := by simpa using hj.symm
     exact hsafe s' hs hcx bn hbn
+  · intro c hst j hj bn hbn
+    rw [hs, hc] at hj
+    obtain rfl : j = i := by simpa using hj.symm
+    exact hstore s' hs hcx bn hbn
   · intro s'' hst _
     exact ⟨hadv s' s'' hs hst, hpost s' s'' hs hcx hst⟩
   · intro s'' hst
@@ -427,13 +455,16 @@ theorem blockOk_regOnly {P : Params} {code : List x64_ir.PInsn} {b : Nat}
     (hWin : ∀ r, Win r → Wout r) (hW4 : ¬ Wout RSP) (hW5 : ¬ Wout RBP) :
     BlockOk P code b (b + 1) pre Win Wout d d := by
   have hne : i ≠ .Ret := by rintro rfl; exact hi
-  refine blockOk_one hc hne ?_ ?_ ?_
+  refine blockOk_one hc hne ?_ ?_ ?_ ?_
   · intro t t' ht hst
     obtain ⟨u, hu, hpc, -, -⟩ := step_regOnly hi (by rw [ht]; exact hc) hst
     cases hu
     rw [hpc, ht]
   · intro t _ _ bn hbn
     rw [accesses_regOnly hi] at hbn
+    simp at hbn
+  · intro t _ _ bn hbn
+    rw [stores_regOnly hi] at hbn
     simp at hbn
   · intro t t' ht hct hst
     obtain ⟨u, hu, -, hmem, hregs⟩ := step_regOnly hi (by rw [ht]; exact hc) hst
@@ -453,7 +484,7 @@ theorem blockOk_push {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : x6
     {Win Wout : Nat → Prop} {d : Nat} {r : Std.U8} (hL : Layout P)
     (hc : code[b]? = some (.Push r)) (hd : d + 1 ≤ 16) (hWin : ∀ x, Win x → Wout x) :
     BlockOk P code b (b + 1) pre Win Wout d (d + 1) := by
-  refine blockOk_one hc (by simp) ?_ ?_ ?_
+  refine blockOk_one hc (by simp) ?_ ?_ ?_ ?_
   · intro t t' ht hst
     have hu := step_push (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at hu
@@ -464,6 +495,11 @@ theorem blockOk_push {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : x6
     subst hbn
     rw [hct.rsp, rsp_push]
     exact stack_slot_ok hL hd
+  · intro t ht hct bn hbn
+    simp only [stores_push, List.mem_singleton] at hbn
+    subst hbn
+    rw [hct.rsp, rsp_push]
+    exact storeOk_stack hL (by omega) hd
   · intro t t' ht hct hst
     have hu := step_push (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at hu
@@ -490,7 +526,7 @@ theorem blockOk_pushfq {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : 
     {Win Wout : Nat → Prop} {d : Nat} (hL : Layout P)
     (hc : code[b]? = some .Pushfq) (hd : d + 1 ≤ 16) (hWin : ∀ x, Win x → Wout x) :
     BlockOk P code b (b + 1) pre Win Wout d (d + 1) := by
-  refine blockOk_one hc (by simp) ?_ ?_ ?_
+  refine blockOk_one hc (by simp) ?_ ?_ ?_ ?_
   · intro t t' ht hst
     have hu := step_pushfq (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at hu
@@ -501,6 +537,11 @@ theorem blockOk_pushfq {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : 
     subst hbn
     rw [hct.rsp, rsp_push]
     exact stack_slot_ok hL hd
+  · intro t ht hct bn hbn
+    simp only [stores_pushfq, List.mem_singleton] at hbn
+    subst hbn
+    rw [hct.rsp, rsp_push]
+    exact storeOk_stack hL (by omega) hd
   · intro t t' ht hct hst
     have hu := step_pushfq (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at hu
@@ -529,7 +570,7 @@ theorem blockOk_pop {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : x64
     (hc : code[b]? = some (.Pop r)) (hd : d + 1 ≤ 16) (hWr : Wout r.val)
     (hWin : ∀ x, Win x → Wout x) (hW4 : ¬ Wout RSP) (hW5 : ¬ Wout RBP) :
     BlockOk P code b (b + 1) pre Win Wout (d + 1) d := by
-  refine blockOk_one hc (by simp) ?_ ?_ ?_
+  refine blockOk_one hc (by simp) ?_ ?_ ?_ ?_
   · intro t t' ht hst
     have hu := step_pop (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at hu
@@ -540,26 +581,32 @@ theorem blockOk_pop {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : x64
     subst hbn
     rw [hct.rsp]
     exact stack_slot_ok hL hd
+  · intro t _ _ bn hbn
+    rw [stores_pop] at hbn
+    simp at hbn
   · intro t t' ht hct hst
     have hu := step_pop (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at hu
     subst hu
+    -- The write set is what keeps the destination off `rsp`: `write` in the
+    -- checker refuses register four, so a `pop` the region takes never pops
+    -- into the stack pointer, and the popped value never wins over `rsp + 8`.
     have hne4 : r.val ≠ RSP := fun hx => hW4 (hx ▸ hWr)
     have hne5 : r.val ≠ RBP := fun hx => hW5 (hx ▸ hWr)
     refine ⟨?_, by omega, ?_, ?_, hct.ro, hct.group⟩
-    · show Function.update (Function.update t.regs r.val (load64 t.mem (t.regs RSP))) RSP
-        (t.regs RSP + 8#64) RSP = _
-      rw [Function.update_self, hct.rsp, rsp_pop]
-    · show Function.update (Function.update t.regs r.val (load64 t.mem (t.regs RSP))) RSP
-        (t.regs RSP + 8#64) RBP = _
-      rw [Function.update_of_ne (by simp [RBP, RSP]), Function.update_of_ne (Ne.symm hne5)]
+    · show Function.update (Function.update t.regs RSP (t.regs RSP + 8#64)) r.val
+        (load64 t.mem (t.regs RSP)) RSP = _
+      rw [Function.update_of_ne (Ne.symm hne4), Function.update_self, hct.rsp, rsp_pop]
+    · show Function.update (Function.update t.regs RSP (t.regs RSP + 8#64)) r.val
+        (load64 t.mem (t.regs RSP)) RBP = _
+      rw [Function.update_of_ne (Ne.symm hne5), Function.update_of_ne (by simp [RBP, RSP])]
       exact hct.rbp
     · intro x hx hWx
       show TagOk P (tagAt pre x)
-        (Function.update (Function.update t.regs r.val (load64 t.mem (t.regs RSP))) RSP
-          (t.regs RSP + 8#64) x)
-      rw [Function.update_of_ne hx,
-        Function.update_of_ne (show x ≠ r.val from fun hh => hWx (by rw [hh]; exact hWr))]
+        (Function.update (Function.update t.regs RSP (t.regs RSP + 8#64)) r.val
+          (load64 t.mem (t.regs RSP)) x)
+      rw [Function.update_of_ne (show x ≠ r.val from fun hh => hWx (by rw [hh]; exact hWr)),
+        Function.update_of_ne hx]
       exact hct.regs x hx (fun hh => hWx (hWin x hh))
 
 /-- `popfq`, which is a `pop` into the flags. -/
@@ -567,7 +614,7 @@ theorem blockOk_popfq {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : x
     {Win Wout : Nat → Prop} {d : Nat} (hL : Layout P)
     (hc : code[b]? = some .Popfq) (hd : d + 1 ≤ 16) (hWin : ∀ x, Win x → Wout x) :
     BlockOk P code b (b + 1) pre Win Wout (d + 1) d := by
-  refine blockOk_one hc (by simp) ?_ ?_ ?_
+  refine blockOk_one hc (by simp) ?_ ?_ ?_ ?_
   · intro t t' ht hst
     have hu := step_popfq (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at hu
@@ -578,6 +625,9 @@ theorem blockOk_popfq {P : Params} {code : List x64_ir.PInsn} {b : Nat} {pre : x
     subst hbn
     rw [hct.rsp]
     exact stack_slot_ok hL hd
+  · intro t _ _ bn hbn
+    rw [stores_popfq] at hbn
+    simp at hbn
   · intro t t' ht hct hst
     have hu := step_popfq (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at hu
@@ -705,10 +755,16 @@ speaks of the *pre*-state tag, so it holds of the base register at every
 position of the region that has not written it. -/
 
 /-- Whatever a register carrying this tag holds, the access through it is a
-guest access. This is what `addr_ok` establishes. -/
+guest access, and a *write* through it is one this activation may make. This
+is what `addr_ok` establishes: the three cases of the address rule are the
+three cases of `tagOk_checked_window`/`frame_access_ok` for the read and of
+`tagOk_checked_store`/`frame_store_ok` for the write, under the same
+side-conditions. -/
 def GuestTag (P : Params) (pre : x64_check.State) (base : Std.U8) (disp : Std.I32)
     (n : Nat) : Prop :=
-  ∀ v : Word, TagOk P (tagAt pre base.val) v → GuestOk P (v + BitVec.signExtend 64 disp.bv) n
+  ∀ v : Word, TagOk P (tagAt pre base.val) v →
+    GuestOk P (v + BitVec.signExtend 64 disp.bv) n ∧
+      StoreOk P (v + BitVec.signExtend 64 disp.bv) n
 
 /-- What a primitive of a constant-depth region has to be. -/
 def FlatOk (P : Params) (code : List x64_ir.PInsn) (pre : x64_check.State) (b e : Nat)
@@ -769,10 +825,26 @@ theorem blockOk_flat {P : Params} {code : List x64_ir.PInsn} {b e : Nat}
     · rw [accesses_load, if_neg (by simp)] at hbn
       simp only [List.mem_singleton] at hbn
       subst hbn
-      exact (hg (t.regs base.val) (hct.regs base.val hbrsp hbW)).access
+      exact (hg (t.regs base.val) (hct.regs base.val hbrsp hbW)).1.access
     · simp only [accesses_lockCmpxchg, List.mem_singleton] at hbn
       subst hbn
-      exact (hg (t.regs base.val) (hct.regs base.val hbrsp hbW)).access
+      exact (hg (t.regs base.val) (hct.regs base.val hbrsp hbW)).1.access
+  -- And what it writes: only the compare-exchange writes at all, and it
+  -- writes through the checked base the address rule already placed.
+  have hstore : ∀ t : State, Range b e t.pc → Ctx P pre W d t → ∀ i, code[t.pc]? = some i →
+      ∀ bn ∈ stores i t, StoreOk P bn.1 bn.2 := by
+    intro t hr hct i hi bn hbn
+    rcases flatOk_cases (hins t.pc hr.1 hr.2 i hi) with
+      ⟨hro, -⟩ | ⟨cc, n, rfl, -⟩ | ⟨n, rfl, -⟩ |
+      ⟨size, base, dst, disp, rfl, -, hbrsp, hbW, hg⟩ |
+      ⟨w64, src, base, disp, rfl, -, hbrsp, hbW, hg⟩
+    · rw [stores_regOnly hro] at hbn; simp at hbn
+    · rw [show stores (.Jcc8 cc n) t = [] from rfl] at hbn; simp at hbn
+    · rw [show stores (.Jmp8 n) t = [] from rfl] at hbn; simp at hbn
+    · rw [stores_load] at hbn; simp at hbn
+    · simp only [stores_lockCmpxchg, List.mem_singleton] at hbn
+      subst hbn
+      exact (hg (t.regs base.val) (hct.regs base.val hbrsp hbW)).2
   -- One step inside the region.
   have hone : ∀ t t' : State, Range b e t.pc → Ctx P pre W d t → Step P code t (.next t') →
       Ctx P pre W d t' ∧ b ≤ t'.pc ∧ t'.pc ≤ e := by
@@ -832,7 +904,7 @@ theorem blockOk_flat {P : Params} {code : List x64_ir.PInsn} {b e : Nat}
       simp only [Config.next.injEq] at hu
       subst hu
       have hgok : GuestOk P (addr t base disp) (opWidth w64) :=
-        hg (t.regs base.val) (hct.regs base.val hbrsp hbW)
+        (hg (t.regs base.val) (hct.regs base.val hbrsp hbW)).1
       simp only [cmpxchgStep]
       split
       · refine ⟨⟨hct.rsp, hct.bound, hct.rbp, hct.regs, ?_, ?_⟩,
@@ -857,7 +929,9 @@ theorem blockOk_flat {P : Params} {code : List x64_ir.PInsn} {b e : Nat}
     intro t t' ht hin hst _
     exact (hone t t' hin ht hst).1
   have hin' : Range b e s'.pc := hsty.inside_last
-  refine ⟨fun c hst i hi bn hbn => hsafe s' hin' hI i hi bn hbn, ?_, ?_⟩
+  refine ⟨fun c hst i hi bn hbn => hsafe s' hin' hI i hi bn hbn,
+    fun c hst i hi bn hbn => hstore s' hin' hI i hi bn hbn,
+    ⟨d, hI.bound, hI.rsp⟩, ?_, ?_⟩
   · intro s'' hst hout
     obtain ⟨hc2, h1, h2⟩ := hone s' s'' hin' hI hst
     simp only [Range, not_and, not_lt] at hout
@@ -878,19 +952,23 @@ theorem blockOk_flat {P : Params} {code : List x64_ir.PInsn} {b e : Nat}
 /-- A region that starts and ends at the depth the walk came in at, and whose
 registers the rule turned into `Top`, is one macro's contract. -/
 theorem macroOk_of_blockOk {P : Params} {code : List x64_ir.PInsn} {p q : Nat}
-    {pre post : x64_check.State} {Win Wout S : Nat → Prop}
+    {pre post : x64_check.State} {Win Wout S : Nat → Prop} (hL : Layout P)
     (hS : SetsTop pre post S) (hWS : ∀ r, Wout r → S r)
     (h : ∀ s₀ : State, Agree P pre s₀ →
       BlockOk P code p q pre Win Wout pre.depth.val pre.depth.val) :
     MacroOk P code p q pre post [] := by
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro s hs hag s' hsty c hst i hi bn hbn
     exact (((h s hag).2 s hs (agree_ctx hag Win)).2 s' hsty).1 c hst i hi bn hbn
   · intro s hs hag s' hsty s'' hst hout
-    obtain ⟨hpc, hct⟩ := (((h s hag).2 s hs (agree_ctx hag Win)).2 s' hsty).2.1 s'' hst hout
+    obtain ⟨hpc, hct⟩ := (((h s hag).2 s hs (agree_ctx hag Win)).2 s' hsty).2.2.2.1 s'' hst hout
     exact Or.inl ⟨hpc, ctx_agree hag hS hWS hct⟩
   · intro s hs hag s' hsty s'' hst
-    exact absurd hst ((((h s hag).2 s hs (agree_ctx hag Win)).2 s' hsty).2.2 s'')
+    exact absurd hst ((((h s hag).2 s hs (agree_ctx hag Win)).2 s' hsty).2.2.2.2 s'')
+  · intro s hs hag s' hsty c hst i hi bn hbn
+    exact (((h s hag).2 s hs (agree_ctx hag Win)).2 s' hsty).2.1 c hst i hi bn hbn
+  · exact macroOk_rsp_of_window hL (fun s hs hag s' hsty =>
+      (((h s hag).2 s hs (agree_ctx hag Win)).2 s' hsty).2.2.1)
 
 /-- Reading a three-way split of one macro's expansion off the list. -/
 theorem code_split {code : List x64_ir.PInsn} {p : Nat} {A M B : List x64_ir.PInsn}
@@ -1117,7 +1195,7 @@ private theorem macroOk_mulDivMod_main {P : Params} {code : List x64_ir.PInsn} {
       = p + (mulDivSetupList kind w64 reg signed src dst imm).length +
         (mulDivMidList kind w64 signed label).length + (mulDivFinishList kind dst).length from by
     simp only [List.length_append]; omega]
-  exact macroOk_of_blockOk hS (fun r h => h) (fun _ _ => hall)
+  exact macroOk_of_blockOk hL hS (fun r h => h) (fun _ _ => hall)
 
 /-- `MInsn.MulDivMod`: the multiply/divide/modulo macro.
 
@@ -1158,7 +1236,7 @@ theorem macroOk_mulDivMod {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg
           code[p]? = some i →
           MacroOk P code p (p + [i].length) pre post [] := by
         intro i hro hwrs hc
-        refine macroOk_of_blockOk (Win := mdWrites dst) hS' (fun r h => h) (fun _ _ => ?_)
+        refine macroOk_of_blockOk (Win := mdWrites dst) hL hS' (fun r h => h) (fun _ _ => ?_)
         have := blockOk_regOnly (P := P) (pre := pre) (Win := mdWrites dst)
           (Wout := mdWrites dst) (d := pre.depth.val) hro hc
           (by rw [hwrs]; intro r hr; simp at hr; exact Or.inl hr) (fun _ hx => hx) hW4 hW5
@@ -1199,9 +1277,11 @@ theorem guestTag_of_addrOk {P : Params} {cfg : x64_ir.Cfg} {pre : x64_check.Stat
   rcases h with hz | ⟨w, hw, h1, h2⟩ | ⟨hb, hfp, -, -, h1, h2⟩
   · exact absurd (i32_eq_iff_val.mpr (by simpa using hz)) hcage
   · rw [hw] at hv
-    exact tagOk_checked_window hL hv h1 (by omega) (hwid.1 base.val w hw)
+    exact ⟨tagOk_checked_window hL hv h1 (by omega) (hwid.1 base.val w hw),
+      tagOk_checked_store hL hv h1 (by omega) (hwid.1 base.val w hw)⟩
   · rw [hb, hfp] at hv
-    exact frame_access_ok hL hv (by rw [← hcfg]; exact h1) (by omega)
+    exact ⟨frame_access_ok hL hv (by rw [← hcfg]; exact h1) (by omega),
+      frame_store_ok hL hv (by rw [← hcfg]; exact h1) (by omega)⟩
 
 /-- `rsp` never carries a `Checked` tag that a macro could dereference
 through: the native stack window is clear of both guest backings, and a
@@ -1350,7 +1430,8 @@ theorem macroOk_atomicFetchAlu {P : Params} {code : List x64_ir.PInsn} {p : Nat}
   have hdB : dRun (pre.depth.val + 1) (atomicFetchTail src actual) = pre.depth.val := by
     simp only [atomicFetchTail]
     split_ifs <;> simp [dRun, dStep]
-  refine macroOk_of_blockOk (Win := afaMid src actual) hS' (fun r h => h) (fun s₀ hag => ?_)
+  refine macroOk_of_blockOk (Win := afaMid src actual) hL hS' (fun r h => h)
+    (fun s₀ hag => ?_)
   have hbsp : base.val ≠ RSP := by
     intro hb
     rcases haddr with hz | ⟨w, hwt, h1, h2⟩ | ⟨hfr, -, -, -, -, -⟩
