@@ -307,11 +307,18 @@ structure Run (P : Params) (code : List x64_ir.PInsn) (inside : Nat → Prop) (p
   returns : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code inside s s' →
     ∀ s'', Step P code s' (.returned s'') →
       s''.regs RSP = P.rsp0 + 8#64 ∧ s''.regs RBP = P.rbp0 ∧ s''.regs R15 = P.fp0
+  /-- Every range the region writes is one this activation may write. -/
+  stores : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code inside s s' →
+    ∀ c, Step P code s' c → ∀ i, code[s'.pc]? = some i →
+      ∀ bn ∈ X64.stores i s', StoreOk P bn.1 bn.2
+  /-- And the stack pointer stays in the native stack window throughout. -/
+  rsp : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code inside s s' →
+    (s'.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (s'.regs RSP).toNat + 128
 
 theorem Run.congr {P : Params} {code : List x64_ir.PInsn} {I J : Nat → Prop} {p : Nat}
     {pre : x64_check.State} {nx : List (Nat × x64_check.State)}
     (h : ∀ x, I x ↔ J x) (r : Run P code I p pre nx) : Run P code J p pre nx := by
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro s hs hag s' hst
     exact r.safe s hs hag s' (stays_iff (fun x => (h x).symm) hst)
   · intro s hs hag s' hst s'' hstep hout
@@ -319,12 +326,16 @@ theorem Run.congr {P : Params} {code : List x64_ir.PInsn} {I J : Nat → Prop} {
       (fun hc => hout ((h _).mp hc))
   · intro s hs hag s' hst
     exact r.returns s hs hag s' (stays_iff (fun x => (h x).symm) hst)
+  · intro s hs hag s' hst
+    exact r.stores s hs hag s' (stays_iff (fun x => (h x).symm) hst)
+  · intro s hs hag s' hst
+    exact r.rsp s hs hag s' (stays_iff (fun x => (h x).symm) hst)
 
 theorem Run.ofMacroOkIn {P : Params} {code : List x64_ir.PInsn} {inside : Nat → Prop}
     {p q : Nat} {pre post : x64_check.State} {exits : List (Nat × x64_check.State)}
     (h : MacroOkIn P code inside p q pre post exits) :
     Run P code inside p pre ((q, post) :: exits) := by
-  refine ⟨h.safe, ?_, h.returns⟩
+  refine ⟨h.safe, ?_, h.returns, h.stores, h.rsp⟩
   intro s hs hag s' hst s'' hstep hout
   rcases h.leave s hs hag s' hst s'' hstep hout with ⟨hpc, hag'⟩ | ⟨e, he, hpc, hag'⟩
   · exact ⟨(q, post), by simp, hpc, hag'⟩
@@ -334,7 +345,7 @@ theorem Run.ofMacroOk {P : Params} {code : List x64_ir.PInsn} {p q : Nat}
     {pre post : x64_check.State} {exits : List (Nat × x64_check.State)}
     (h : MacroOk P code p q pre post exits) :
     Run P code (Range p q) p pre ((q, post) :: exits) :=
-  Run.ofMacroOkIn ⟨h.safe, h.leave, h.returns⟩
+  Run.ofMacroOkIn ⟨h.safe, h.leave, h.returns, h.stores, h.rsp⟩
 
 
 
@@ -451,9 +462,9 @@ theorem stateOk_write {pre post : x64_check.State} {r : Nat} (h : StateOk pre)
 
 theorem stateOk_clobber {pre post : x64_check.State} (h : StateOk pre)
     (hS : ClobberCall pre post) : StateOk post := by
-  have h15 : ¬ CallerSaved 15 := by simp [CallerSaved]
+  have h15 : ¬ Clobbered 15 := by simp [Clobbered]
   refine ⟨by rw [hS.2.1 15 h15]; exact h.1, fun r w hw => ?_, fun w hw => ?_⟩
-  · by_cases hr : CallerSaved r
+  · by_cases hr : Clobbered r
     · rw [hS.1 r hr] at hw; simp at hw
     · rw [hS.2.1 r hr] at hw; exact h.2.1 r w hw
   · rw [hS.2.2.2.1] at hw; simp at hw
@@ -719,7 +730,28 @@ theorem epilogue_run {P : Params} {code : List x64_ir.PInsn} {p e : Nat}
       · simp at hbad
       · exact hne h1
       · exact hne h1
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case stores =>
+    intro s hs hag s' hsty c hstep ii hj bn hbn
+    rcases hinv s s' hs hag hsty with ⟨⟨k, hk, ht⟩, hat⟩ | ⟨ht, h1, -, -⟩
+    · rcases Nat.lt_or_ge k e with hlt | hge
+      · rw [ht, hlab k hlt] at hj
+        obtain rfl : ii = _ := by simpa using hj.symm
+        rw [stores_regOnly (i := x64_ir.PInsn.ExitLabel) trivial] at hbn
+        simp at hbn
+      · have hke : k = e := by omega
+        subst hke
+        rw [ht, hc0] at hj
+        obtain rfl : ii = _ := by simpa using hj.symm
+        simp at hbn
+    · rw [ht, hc1] at hj
+      obtain rfl : ii = _ := by simpa using hj.symm
+      simp at hbn
+  case rsp =>
+    intro s hs hag s' hsty
+    rcases hinv s s' hs hag hsty with ⟨⟨k, hk, ht⟩, hat⟩ | ⟨ht, h1, -, -⟩
+    · exact rsp_window_of_agree hL hat
+    · rw [h1]; omega
   · intro s hs hag s' hsty c hstep ii hj bn hbn
     rcases hinv s s' hs hag hsty with ⟨⟨k, hk, ht⟩, hat⟩ | ⟨ht, h1, -, -⟩
     · rcases Nat.lt_or_ge k e with hlt | hge
@@ -771,9 +803,23 @@ theorem epilogue_run {P : Params} {code : List x64_ir.PInsn} {p e : Nat}
 /-- A `PcLabel` entered by a branch: it was already the state every branch
 target is entered in, and it stays that state. -/
 theorem pcLabel_entered_run {P : Params} {code : List x64_ir.PInsn} {p : Nat} {slot : Std.U32}
-    (hc : code[p]? = some (.PcLabel slot)) :
+    (hL : Layout P) (hc : code[p]? = some (.PcLabel slot)) :
     Run P code (Range p (p + 1)) p enterState [(p + 1, enterState)] := by
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case stores =>
+    intro s hs hag s' hsty c hstep ii hj bn hbn
+    rw [stores_regOnly (i := ii) ?_] at hbn
+    · simp at hbn
+    · have heq := stays_regOnly (i := x64_ir.PInsn.PcLabel slot) trivial hc hsty
+      subst heq
+      rw [hs, hc] at hj
+      obtain rfl : ii = _ := by simpa using hj.symm
+      trivial
+  case rsp =>
+    intro s hs hag s' hsty
+    have heq := stays_regOnly (i := x64_ir.PInsn.PcLabel slot) trivial hc hsty
+    subst heq
+    exact rsp_window_of_agree hL hag
   · intro s hs hag s' hsty c hstep ii hj bn hbn
     have heq := stays_regOnly (i := x64_ir.PInsn.PcLabel slot) trivial hc hsty
     subst heq
@@ -802,7 +848,8 @@ theorem pcLabel_entered_run {P : Params} {code : List x64_ir.PInsn} {p : Nat} {s
 
 /-- An unconditional branch leaves its range at its target and nowhere else. -/
 theorem jmp_run {P : Params} {code : List x64_ir.PInsn} {p t : Nat} {pt : x64_ir.PTarget}
-    {pre : x64_check.State} (hd : pre.depth.val = 1) (hf : tagAt pre 15 = x64_check.Tag.Fp)
+    {pre : x64_check.State} (hL : Layout P)
+    (hd : pre.depth.val = 1) (hf : tagAt pre 15 = x64_check.Tag.Fp)
     (hc : code[p]? = some (.Jmp pt)) (hpos : pos code pt = some t) (hne : t ≠ p) :
     Run P code (Range p (p + 1)) p pre [(t, enterState)] := by
   have hstays : ∀ s s' : State, s.pc = p → Stays P code (Range p (p + 1)) s s' → s' = s := by
@@ -817,7 +864,17 @@ theorem jmp_run {P : Params} {code : List x64_ir.PInsn} {p t : Nat} {pt : x64_ir
     subst hi
     simp only [Range, not_and, not_lt]
     omega
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case stores =>
+    intro s hs hag s' hsty c hstep ii hj bn hbn
+    have heq := hstays s s' hs hsty; subst heq
+    rw [hs, hc] at hj
+    obtain rfl : ii = _ := by simpa using hj.symm
+    simp at hbn
+  case rsp =>
+    intro s hs hag s' hsty
+    have heq := hstays s s' hs hsty; subst heq
+    exact rsp_window_of_agree hL hag
   · intro s hs hag s' hsty c hstep ii hj bn hbn
     have heq := hstays s s' hs hsty; subst heq
     rw [hs, hc] at hj
@@ -854,7 +911,8 @@ theorem step_helperTable {P : Params} {code : List x64_ir.PInsn} {s : State} {c 
 /-- A macro of one primitive that halts and touches nothing: the trailer's two
 data macros. -/
 theorem halt_run {P : Params} {code : List x64_ir.PInsn} {p : Nat} {pre : x64_check.State}
-    {ii : x64_ir.PInsn} (hc : code[p]? = some ii) (hacc : ∀ s : State, accesses ii s = [])
+    {ii : x64_ir.PInsn} (hL : Layout P)
+    (hc : code[p]? = some ii) (hacc : ∀ s : State, accesses ii s = [])
     (hhalt : ∀ (s : State) (c : Config), code[s.pc]? = some ii → Step P code s c → c = .halt) :
     Run P code (Range p (p + 1)) p pre [] := by
   have hstays : ∀ s s' : State, s.pc = p → Stays P code (Range p (p + 1)) s s' → s' = s := by
@@ -862,7 +920,18 @@ theorem halt_run {P : Params} {code : List x64_ir.PInsn} {p : Nat} {pre : x64_ch
     refine stays_leaves ?_ hst
     intro u u' hu hstep
     exact absurd (hhalt u _ (by rw [hu]; exact hc) hstep) (by simp)
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case stores =>
+    intro s hs hag s' hsty c hstep jj hj bn hbn
+    have heq := hstays s s' hs hsty; subst heq
+    rw [hs, hc] at hj
+    obtain rfl : jj = _ := by simpa using hj.symm
+    rw [stores_regOnly_nil s' (hacc s')] at hbn
+    simp at hbn
+  case rsp =>
+    intro s hs hag s' hsty
+    have heq := hstays s s' hs hsty; subst heq
+    exact rsp_window_of_agree hL hag
   · intro s hs hag s' hsty c hstep jj hj bn hbn
     have heq := hstays s s' hs hsty; subst heq
     rw [hs, hc] at hj
@@ -1442,14 +1511,14 @@ theorem Walk.macro_run (W : Walk P cfg code) {j : Nat} (hj : j < code.val.length
     rcases hpre with ⟨rfl, hal⟩ | ⟨rfl, hE⟩
     · have halive := W.alive_succ hj hm hal (by simp) (by simp) (by simp)
       rcases label_step_spec hrule with ⟨hnt, -⟩ | ⟨htg, -, -⟩
-      · exact W.simple_run hj hnh hlen halive (macroOk_pcLabel_plain hc hnt hrule)
-      · exact W.simple_run hj hnh hlen halive (macroOk_pcLabel_target hal hc htg hrule)
+      · exact W.simple_run hj hnh hlen halive (macroOk_pcLabel_plain W.hL hc hnt hrule)
+      · exact W.simple_run hj hnh hlen halive (macroOk_pcLabel_target W.hL hal hc htg hrule)
     · have hent : W.a[j + 1]! = enterState := by
         rcases hE with ⟨slot', hs, he⟩ | ⟨hs, -⟩
         · exact he
         · exact absurd (Option.some.inj (hm.symm.trans hs)) (by simp)
       have halive : W.a[j + 1]!.alive = true := by rw [hent]; rfl
-      refine ⟨_, run_of_run hnh hlen (pcLabel_entered_run hc), ?_⟩
+      refine ⟨_, run_of_run hnh hlen (pcLabel_entered_run W.hL hc), ?_⟩
       intro e he
       simp only [List.mem_cons, List.not_mem_nil, or_false] at he
       subst he
@@ -1529,7 +1598,7 @@ theorem Walk.macro_run (W : Walk P cfg code) {j : Nat} (hj : j < code.val.length
       intro hc'
       exact hE.ne_of hm (by simp) (by simp)
         (chunkStart_inj W.hcage (by omega) (by omega) hc')
-    refine ⟨_, run_of_macroOk hnh hlen (macroOk_jcc hal hc hpos hne hrule), ?_⟩
+    refine ⟨_, run_of_macroOk hnh hlen (macroOk_jcc W.hL hal hc hpos hne hrule), ?_⟩
     intro e he
     simp only [List.mem_cons, List.not_mem_nil, or_false] at he
     rcases he with rfl | rfl
@@ -1549,7 +1618,7 @@ theorem Walk.macro_run (W : Walk P cfg code) {j : Nat} (hj : j < code.val.length
       intro hc'
       exact hE.ne_of hm (by simp) (by simp)
         (chunkStart_inj W.hcage (by omega) (by omega) hc')
-    refine ⟨_, run_of_run hnh hlen (jmp_run (by rw [hd]; rfl) hf hc hpos hne), ?_⟩
+    refine ⟨_, run_of_run hnh hlen (jmp_run W.hL (by rw [hd]; rfl) hf hc hpos hne), ?_⟩
     intro e he
     simp only [List.mem_cons, List.not_mem_nil, or_false] at he
     subst he
@@ -1563,56 +1632,56 @@ theorem Walk.macro_run (W : Walk P cfg code) {j : Nat} (hj : j < code.val.length
   | DispatcherSlot =>
     obtain ⟨hc, hlen⟩ := flat_dispatcherSlot cfg code.val j hm
     refine ⟨[], run_of_run (not_helperCall_of hm (by simp)) hlen
-      (halt_run hc (fun _ => rfl) (fun _ _ h hst => step_dispatcherSlot h hst)), by simp⟩
+      (halt_run W.hL hc (fun _ => rfl) (fun _ _ h hst => step_dispatcherSlot h hst)), by simp⟩
   | HelperTable =>
     obtain ⟨hc, hlen⟩ := flat_helperTable cfg code.val j hm
     refine ⟨[], run_of_run (not_helperCall_of hm (by simp)) hlen
-      (halt_run hc (fun _ => rfl) (fun _ _ h hst => step_helperTable h hst)), by simp⟩
+      (halt_run W.hL hc (fun _ => rfl) (fun _ _ h hst => step_helperTable h hst)), by simp⟩
   | Alu w64 op src dst =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_alu cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_alu hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_alu W.hL hal hc hrule)
   | AluImm w64 op dst imm =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_aluImm cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_aluImm hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_aluImm W.hL hal hc hrule)
   | ShiftImm w64 op dst imm =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_shiftImm cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_shiftImm hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_shiftImm W.hL hal hc hrule)
   | ShiftCl w64 op dst =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_shiftCl cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_shiftCl hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_shiftCl W.hL hal hc hrule)
   | Neg w64 dst =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_neg cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_neg hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_neg W.hL hal hc hrule)
   | MovSx from_ w64 src dst =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_movSx cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_movSx hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_movSx W.hL hal hc hrule)
   | Bswap w64 dst =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_bswap cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_bswap hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_bswap W.hL hal hc hrule)
   | Rol16 dst =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_rol16 cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_rol16 hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_rol16 W.hL hal hc hrule)
   | LoadImm dst imm =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hc, hlen⟩ := flat_loadImm cfg code.val j hm
     exact W.simple_run hj (not_helperCall_of hm (by simp)) hlen
-      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_loadImm hal hc hrule)
+      (W.alive_succ hj hm hal (by simp) (by simp) (by simp)) (macroOk_loadImm W.hL hal hc hrule)
   | GuestFp dst =>
     obtain ⟨rfl, hal⟩ := preAt_live hm (by simp) (by simp) hpre
     obtain ⟨hdrop, hlen, -⟩ := flat_guestFp cfg code.val j hm
@@ -1779,15 +1848,57 @@ theorem Walk.reach_of (W : Walk P cfg code) {s s' : State} (hE : Entry P s)
 
 /-- So the expansion of a list the checker accepted keeps the contract. -/
 theorem Walk.contract (W : Walk P cfg code) : Contract P (flat cfg code.val) := by
-  constructor
+  refine ⟨?_, ?_, ?_⟩
   · intro s hE s' hr c hstep i hi bn hbn
     obtain ⟨j, α, sb, hj, hpre, hsb, hag, hsty⟩ := W.reach_of hE hr
     obtain ⟨nx, hrun, -⟩ := W.macro_run hj hpre
     exact hrun.safe sb hsb hag s' hsty c hstep i hi bn hbn
+  · intro s hE s' hr c hstep i hi bn hbn
+    obtain ⟨j, α, sb, hj, hpre, hsb, hag, hsty⟩ := W.reach_of hE hr
+    obtain ⟨nx, hrun, -⟩ := W.macro_run hj hpre
+    exact hrun.stores sb hsb hag s' hsty c hstep i hi bn hbn
   · intro s hE s' hr s'' hstep
     obtain ⟨j, α, sb, hj, hpre, hsb, hag, hsty⟩ := W.reach_of hE hr
     obtain ⟨nx, hrun, -⟩ := W.macro_run hj hpre
     exact hrun.returns sb hsb hag s' hsty s'' hstep
+
+/-- The stack pointer never leaves the native stack window, at every reachable
+state and not only at the macro boundaries the checker's depth describes.
+This is `MacroOk.rsp` aggregated over the walk, and it is what `StackKept` and
+the composition theorem of `AsyncEbpf/X64/Compose.lean` are made of: the lower
+half is what puts a callee's own frame below this activation's, and no
+statement about accesses pins it, because a register-only primitive can move
+`rsp` without touching memory. -/
+def StackWindow (P : Params) (code : List x64_ir.PInsn) : Prop :=
+  ∀ s, Entry P s → ∀ s', Reachable P code s s' →
+    (s'.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (s'.regs RSP).toNat + 128
+
+/-- The window is below the entry `rsp` and above the first page, so it is
+`StackKept`: the native stack mapping starts above the first page
+(`nativeStackOffPage`) and holds the whole window (`nativeStackLo`). -/
+theorem stackKept_of_stackWindow {P : Params} {code : List x64_ir.PInsn} (hL : Layout P)
+    (h : StackWindow P code) : StackKept P code := by
+  intro s hE s' hr
+  obtain ⟨hle, hge⟩ := h s hE s' hr
+  refine ⟨?_, hle⟩
+  have hp := hL.nativeStackOffPage
+  have hlo := hL.nativeStackLo
+  have hhi := hL.nativeStackHi
+  have hfr := hL.frameRoom
+  simp only [RangesDisjoint, BitVec.toNat_ofNat] at hp
+  norm_num at hp
+  omega
+
+/-- And the stack pointer stays where `StackWindow` wants it: every macro's
+`rsp` clause puts it in the window `[rsp0 - 128, rsp0]`. -/
+theorem Walk.stackWindow (W : Walk P cfg code) : StackWindow P (flat cfg code.val) := by
+  intro s hE s' hr
+  obtain ⟨j, α, sb, hj, hpre, hsb, hag, hsty⟩ := W.reach_of hE hr
+  obtain ⟨nx, hrun, -⟩ := W.macro_run hj hpre
+  exact hrun.rsp sb hsb hag s' hsty
+
+theorem Walk.stackKept (W : Walk P cfg code) : StackKept P (flat cfg code.val) :=
+  stackKept_of_stackWindow W.hL W.stackWindow
 
 
 /-! ## The theorem
@@ -1814,10 +1925,28 @@ theorem check_safe {P : Params} {cfg : x64_ir.Cfg} {code : Slice x64_ir.MInsn}
     (hlen : (flat cfg code.val).length < 2 ^ 64)
     (hlabels : labelBase cfg code.val code.val.length < 2 ^ 32)
     (htrailer : HasTrailer code.val) :
-    Contract P (flat cfg code.val) := by
+    Contract P (flat cfg code.val) ∧ StackKept P (flat cfg code.val) ∧
+      StackWindow P (flat cfg code.val) := by
   obtain ⟨labels, hscan, a, pcs, -, -, hentry, -, -, hsteps, hdead⟩ := check_chain hcheck
-  exact Walk.contract ⟨labels, a, pcs, hscan, hentry, hsteps, hdead, htrailer, hL, hcage,
+  have W : Walk P cfg code := ⟨labels, a, pcs, hscan, hentry, hsteps, hdead, htrailer, hL, hcage,
     hcfg, hdisp, hdispCode, hlen, hlabels⟩
+  exact ⟨W.contract, W.stackKept, W.stackWindow⟩
+
+/-- The read-only bytes of the entry contract survive the whole activation:
+`romem_kept` of `AsyncEbpf/X64/Contract.lean`, fed by the two conclusions
+above. -/
+theorem check_romem_kept {P : Params} {cfg : x64_ir.Cfg} {code : Slice x64_ir.MInsn}
+    (hcheck : x64_check.check cfg code = ok (.Ok ()))
+    (hL : Layout P) (hcage : cfg.pointer_mask ≠ 0#i32) (hcfg : CfgOk P cfg)
+    (hdisp : P.dispatcher = BitVec.ofNat 64 cfg.dispatcher.val)
+    (hdispCode : ∀ j, j < (flat cfg code.val).length → P.dispatcher ≠ codeAddr P j)
+    (hlen : (flat cfg code.val).length < 2 ^ 64)
+    (hlabels : labelBase cfg code.val code.val.length < 2 ^ 32)
+    (htrailer : HasTrailer code.val) {s s' : State} (he : Entry P s)
+    (hr : Reachable P (flat cfg code.val) s s') : RoMem P s'.mem := by
+  obtain ⟨⟨-, hst, -⟩, hk, -⟩ :=
+    check_safe hcheck hL hcage hcfg hdisp hdispCode hlen hlabels htrailer
+  exact romem_kept hL hst hk he hr
 
 /-- The same, of what `x64_expand.expand` appends to an empty vector. -/
 theorem expand_safe {P : Params} {cfg : x64_ir.Cfg} {code : Slice x64_ir.MInsn}
@@ -1830,7 +1959,7 @@ theorem expand_safe {P : Params} {cfg : x64_ir.Cfg} {code : Slice x64_ir.MInsn}
     (hlen : out.val.length < 2 ^ 64)
     (hlabels : labelBase cfg code.val code.val.length < 2 ^ 32)
     (htrailer : HasTrailer code.val) :
-    Contract P out.val := by
+    Contract P out.val ∧ StackKept P out.val ∧ StackWindow P out.val := by
   have he : out.val = flat cfg code.val := by
     rw [expand_spec hexp, h0, List.nil_append]
   rw [he] at hdispCode hlen ⊢
@@ -2018,10 +2147,31 @@ theorem lower_safe {P : Params} {cfg : x64_ir.Cfg} {insns : Slice isa.Insn}
     (hdispCode : ∀ j, j < pir.val.length → P.dispatcher ≠ codeAddr P j)
     (hlen : pir.val.length < 2 ^ 64)
     (hlabels : labelBase cfg out.val out.val.length < 2 ^ 32) :
-    Contract P pir.val := by
+    Contract P pir.val ∧ StackKept P pir.val ∧ StackWindow P pir.val := by
   obtain ⟨hcheck, htr⟩ := lower_gate_trailer hlower
   exact expand_safe hcheck hexp h0 hL hcage hcfg hdisp hdispCode hlen
     (by simpa using hlabels) (by simpa using htr)
+
+/-- And so the read-only bytes of the entry contract survive a lowered,
+expanded function: what its caller assumed of it. -/
+theorem lower_romem_kept {P : Params} {cfg : x64_ir.Cfg} {insns : Slice isa.Insn}
+    {entries external_calls : Slice Bool} {stack_usage : Slice Std.U16}
+    {hints : Slice Std.U8} {plan : Slice x64_ir.PlanEntry} {resolver_ids : Slice Std.U32}
+    {start_pc end_pc : Std.Usize} {out0 out : alloc.vec.Vec x64_ir.MInsn}
+    {pout0 pir : alloc.vec.Vec x64_ir.PInsn}
+    (hlower : x64_lower.lower cfg insns entries external_calls stack_usage hints plan
+      resolver_ids start_pc end_pc out0 = ok (.Ok (), out))
+    (hexp : x64_expand.expand cfg (alloc.vec.Vec.deref out) pout0 = ok pir)
+    (h0 : pout0.val = [])
+    (hL : Layout P) (hcage : cfg.pointer_mask ≠ 0#i32) (hcfg : CfgOk P cfg)
+    (hdisp : P.dispatcher = BitVec.ofNat 64 cfg.dispatcher.val)
+    (hdispCode : ∀ j, j < pir.val.length → P.dispatcher ≠ codeAddr P j)
+    (hlen : pir.val.length < 2 ^ 64)
+    (hlabels : labelBase cfg out.val out.val.length < 2 ^ 32)
+    {s s' : State} (he : Entry P s) (hr : Reachable P pir.val s s') : RoMem P s'.mem := by
+  obtain ⟨⟨-, hst, -⟩, hk, -⟩ :=
+    lower_safe hlower hexp h0 hL hcage hcfg hdisp hdispCode hlen hlabels
+  exact romem_kept hL hst hk he hr
 
 end X64
 

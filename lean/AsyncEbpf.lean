@@ -28,4 +28,5 @@ import AsyncEbpf.X64.CheckedAddr
 import AsyncEbpf.X64.Arith
 import AsyncEbpf.X64.Calls
 import AsyncEbpf.X64.Soundness
+import AsyncEbpf.X64.Compose
 import AsyncEbpf.X64.LayoutCheck
