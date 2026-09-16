@@ -345,7 +345,7 @@ fn mem_size(w: u8, op16: bool) -> Size {
 }
 
 /// One decoded instruction, given where it started and where it ended.
-fn done(insn: PInsn, at: usize, end: usize, disp: i64) -> Option<Decoded> {
+fn finish(insn: PInsn, at: usize, end: usize, disp: i64) -> Option<Decoded> {
   Some(Decoded {
     insn,
     len: end - at,
@@ -495,7 +495,7 @@ fn decode_locked(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
     if second == 0xb1 {
       let m = decode_mem(bytes, p.at + 2, p.r, p.b);
       if m.ok {
-        done(
+        finish(
           PInsn::LockCmpxchg {
             w64,
             src: m.reg,
@@ -515,7 +515,7 @@ fn decode_locked(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
   } else if op == 0x87 {
     let m = decode_mem(bytes, p.at + 1, p.r, p.b);
     if m.ok {
-      done(
+      finish(
         PInsn::Xchg {
           w64,
           src: m.reg,
@@ -535,7 +535,7 @@ fn decode_locked(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
     // back as itself.
     let m = decode_mem(bytes, p.at + 1, p.r, p.b);
     if m.ok {
-      done(
+      finish(
         PInsn::LockAlu {
           op,
           w64,
@@ -560,11 +560,11 @@ fn decode_two_byte(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
   if second < 0 {
     None
   } else if second == 0x0b {
-    done(PInsn::Ud2, at, p.at + 2, 0)
+    finish(PInsn::Ud2, at, p.at + 2, 0)
   } else if second >= 0x40 && second <= 0x4f {
     let g = decode_reg2(bytes, p.at + 2, p.r, p.b);
     if g.ok {
-      done(
+      finish(
         PInsn::Cmov {
           cc: 0x80 | ((second as u8) & 0x0f),
           dst: g.reg,
@@ -579,7 +579,7 @@ fn decode_two_byte(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
     }
   } else if second >= 0x80 && second <= 0x8f {
     if have(bytes, p.at + 2, 4) {
-      done(
+      finish(
         PInsn::Jcc {
           cc: second as u8,
           target: PTarget::Local(0),
@@ -592,7 +592,7 @@ fn decode_two_byte(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
       None
     }
   } else if second >= 0xc8 && second <= 0xcf {
-    done(
+    finish(
       PInsn::Bswap {
         w64,
         dst: ((second as u8) & 7) | (p.b << 3),
@@ -605,7 +605,7 @@ fn decode_two_byte(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
     let size: Size = if second == 0xb6 { 1 } else { 2 };
     let m = decode_mem(bytes, p.at + 2, p.r, p.b);
     if m.ok {
-      done(
+      finish(
         PInsn::Load {
           size,
           sx: false,
@@ -625,7 +625,7 @@ fn decode_two_byte(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
     let size: Size = if second == 0xbe { 1 } else { 2 };
     let g = decode_reg2(bytes, p.at + 2, p.r, p.b);
     if g.ok {
-      done(
+      finish(
         PInsn::MovSx {
           from,
           w64,
@@ -639,7 +639,7 @@ fn decode_two_byte(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
     } else {
       let m = decode_mem(bytes, p.at + 2, p.r, p.b);
       if m.ok {
-        done(
+        finish(
           PInsn::Load {
             size,
             sx: true,
@@ -665,16 +665,16 @@ fn decode_one_byte(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> 
   if op >= 0x50 && op <= 0x5f {
     let r = (op & 7) | (p.b << 3);
     if op <= 0x57 {
-      done(PInsn::Push(r), at, p.at + 1, 0)
+      finish(PInsn::Push(r), at, p.at + 1, 0)
     } else {
-      done(PInsn::Pop(r), at, p.at + 1, 0)
+      finish(PInsn::Pop(r), at, p.at + 1, 0)
     }
   } else if op >= 0x70 && op <= 0x7f {
     let d = byte_at(bytes, p.at + 1);
     if d < 0 {
       None
     } else {
-      done(
+      finish(
         PInsn::Jcc8 {
           cc: 0x80 | (op & 0x0f),
           target: 0,
@@ -688,7 +688,7 @@ fn decode_one_byte(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> 
     // The only `b8+r` form the encoder writes is the 64-bit one.
     let room = have(bytes, p.at + 1, 8);
     if p.w == 1 && room {
-      done(
+      finish(
         PInsn::LoadImm {
           dst: (op & 7) | (p.b << 3),
           imm: read64(bytes, p.at + 1) as i64,
@@ -718,7 +718,7 @@ fn decode_alu(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
   let modrm = byte_at(bytes, p.at + 1);
   let sib = byte_at(bytes, p.at + 2);
   if g.ok && rr {
-    done(
+    finish(
       PInsn::Alu {
         w64,
         op: alu_rr_of(op),
@@ -732,7 +732,7 @@ fn decode_alu(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
   } else if op == 0x89 && modrm == 0x04 && sib == 0x24 {
     // `mov [rsp], rax`, whose ModRM and SIB bytes the encoder spells out.
     if p.w == 1 {
-      done(PInsn::StoreRspRax, at, p.at + 3, 0)
+      finish(PInsn::StoreRspRax, at, p.at + 3, 0)
     } else {
       None
     }
@@ -742,7 +742,7 @@ fn decode_alu(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
       None
     } else if op == 0x88 || op == 0x89 {
       let size: Size = if op == 0x88 { 1 } else { mem_size(p.w, p.op16) };
-      done(
+      finish(
         PInsn::Store {
           size,
           src: m.reg,
@@ -754,7 +754,7 @@ fn decode_alu(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
         0,
       )
     } else if rm {
-      done(
+      finish(
         PInsn::AluRM {
           op: alu_rm_of(op),
           reg: m.reg,
@@ -777,7 +777,7 @@ fn decode_move(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
   let room = have(bytes, p.at + 2, 4);
   if op == 0x8b && rip {
     if room {
-      done(
+      finish(
         PInsn::RipLoadDispatcher {
           dst: modrm_reg(bytes, p.at + 1, 0),
         },
@@ -790,7 +790,7 @@ fn decode_move(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
     }
   } else if op == 0x8d {
     if rip && room {
-      done(
+      finish(
         PInsn::RipLeaHelperTable {
           dst: modrm_reg(bytes, p.at + 1, p.r),
         },
@@ -804,7 +804,7 @@ fn decode_move(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
   } else if op == 0x8b {
     let m = decode_mem(bytes, p.at + 1, p.r, p.b);
     if m.ok {
-      done(
+      finish(
         PInsn::Load {
           size: mem_size(p.w, false),
           sx: false,
@@ -834,7 +834,7 @@ fn decode_store_imm(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded>
   if op == 0xc7 && g.ok {
     // A `LoadImm` whose immediate fits in 32 bits is these same bytes.
     if g.ext == 0 && room {
-      done(
+      finish(
         PInsn::AluImm {
           w64: p.w == 1,
           op: AluRI::Mov,
@@ -851,7 +851,7 @@ fn decode_store_imm(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded>
   } else if op == 0xc7 && modrm == 0x04 && sib == 0x24 {
     let wide = have(bytes, p.at + 3, 4);
     if p.w == 1 && wide {
-      done(
+      finish(
         PInsn::StoreRspImm {
           imm: read32(bytes, p.at + 3),
         },
@@ -884,7 +884,7 @@ fn decode_store_imm(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded>
       } else {
         read32(bytes, start) as i32
       };
-      done(
+      finish(
         PInsn::StoreImm {
           size,
           base: m.base,
@@ -905,7 +905,7 @@ fn decode_rest(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
   let w64 = p.w == 1;
   if op == 0x3d {
     if have(bytes, p.at + 1, 4) {
-      done(
+      finish(
         PInsn::CmpEaxImm {
           imm: read32(bytes, p.at + 1),
         },
@@ -919,7 +919,7 @@ fn decode_rest(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
   } else if op == 0x63 {
     let g = decode_reg2(bytes, p.at + 1, p.r, p.b);
     if g.ok {
-      done(
+      finish(
         PInsn::MovSx {
           from: 32,
           w64,
@@ -933,7 +933,7 @@ fn decode_rest(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
     } else {
       let m = decode_mem(bytes, p.at + 1, p.r, p.b);
       if m.ok {
-        done(
+        finish(
           PInsn::Load {
             size: 4,
             sx: true,
@@ -954,7 +954,7 @@ fn decode_rest(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
     let known = is_alu_ri_ext(g.ext);
     let room = have(bytes, p.at + 2, 4);
     if g.ok && known && room {
-      done(
+      finish(
         PInsn::AluImm {
           w64,
           op: alu_ri_of(g.ext),
@@ -973,35 +973,35 @@ fn decode_rest(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
     let modrm = byte_at(bytes, p.at + 1);
     let imm = byte_at(bytes, p.at + 2);
     if modrm == 0xf9 && imm == 0xff {
-      done(PInsn::CmpRcxMinusOne { w64 }, at, p.at + 3, 0)
+      finish(PInsn::CmpRcxMinusOne { w64 }, at, p.at + 3, 0)
     } else {
       None
     }
   } else if op == 0x90 {
     if p.rep {
-      done(PInsn::Pause, at, p.at + 1, 0)
+      finish(PInsn::Pause, at, p.at + 1, 0)
     } else {
       None
     }
   } else if op == 0x99 {
     if w64 {
-      done(PInsn::Cqo, at, p.at + 1, 0)
+      finish(PInsn::Cqo, at, p.at + 1, 0)
     } else {
-      done(PInsn::Cdq, at, p.at + 1, 0)
+      finish(PInsn::Cdq, at, p.at + 1, 0)
     }
   } else if op == 0x9c {
-    done(PInsn::Pushfq, at, p.at + 1, 0)
+    finish(PInsn::Pushfq, at, p.at + 1, 0)
   } else if op == 0x9d {
-    done(PInsn::Popfq, at, p.at + 1, 0)
+    finish(PInsn::Popfq, at, p.at + 1, 0)
   } else if op == 0xc1 {
     decode_shift(bytes, at, p)
   } else if op == 0xc3 {
-    done(PInsn::Ret, at, p.at + 1, 0)
+    finish(PInsn::Ret, at, p.at + 1, 0)
   } else if op == 0xd3 {
     let g = decode_reg2(bytes, p.at + 1, p.r, p.b);
     let known = is_shift_ext(g.ext);
     if g.ok && known {
-      done(
+      finish(
         PInsn::ShiftCl {
           w64,
           op: shift_of(g.ext),
@@ -1022,7 +1022,7 @@ fn decode_rest(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
       } else {
         PInsn::Jmp { target }
       };
-      done(insn, at, p.at + 5, sx32(read32(bytes, p.at + 1)))
+      finish(insn, at, p.at + 5, sx32(read32(bytes, p.at + 1)))
     } else {
       None
     }
@@ -1033,7 +1033,7 @@ fn decode_rest(bytes: &[u8], at: usize, p: &Pfx, op: u8) -> Option<Decoded> {
   } else if op == 0xff {
     let head = byte_at(bytes, p.at + 1);
     if head >= 0 && ((head as u8) & 0xf8) == 0xd0 {
-      done(
+      finish(
         PInsn::CallReg(((head as u8) & 7) | (p.b << 3)),
         at,
         p.at + 2,
@@ -1056,12 +1056,12 @@ fn decode_shift(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
   } else if p.op16 {
     // `rol r16, 8`, the only `66`-prefixed shift the encoder writes.
     if g.ext == 0 && imm == 8 {
-      done(PInsn::Rol16 { dst: g.rm }, at, p.at + 3, 0)
+      finish(PInsn::Rol16 { dst: g.rm }, at, p.at + 3, 0)
     } else {
       None
     }
   } else if is_shift_ext(g.ext) {
-    done(
+    finish(
       PInsn::ShiftImm {
         w64: p.w == 1,
         op: shift_of(g.ext),
@@ -1088,7 +1088,7 @@ fn decode_short_jmp(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
     let pad2 = byte_at(bytes, p.at + 4);
     let padded = pad0 == 0 && pad1 == 0 && pad2 == 0;
     if padded {
-      done(
+      finish(
         PInsn::JmpNear {
           target: PTarget::Local(0),
         },
@@ -1097,7 +1097,7 @@ fn decode_short_jmp(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
         sx8(d),
       )
     } else {
-      done(PInsn::Jmp8 { target: 0 }, at, p.at + 2, sx8(d))
+      finish(PInsn::Jmp8 { target: 0 }, at, p.at + 2, sx8(d))
     }
   }
 }
@@ -1110,7 +1110,7 @@ fn decode_unary(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
     None
   } else if g.ext == 0 {
     if have(bytes, p.at + 2, 4) {
-      done(
+      finish(
         PInsn::AluImm {
           w64,
           op: AluRI::Test,
@@ -1125,12 +1125,12 @@ fn decode_unary(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
       None
     }
   } else if g.ext == 3 {
-    done(PInsn::Neg { w64, dst: g.rm }, at, p.at + 2, 0)
+    finish(PInsn::Neg { w64, dst: g.rm }, at, p.at + 2, 0)
   } else if g.rm != 1 {
     // The multiply and divide forms name RCX and nothing else.
     None
   } else if g.ext == 4 {
-    done(
+    finish(
       PInsn::MulDivRcx {
         w64,
         kind: MulDivKind::Mul,
@@ -1141,7 +1141,7 @@ fn decode_unary(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
       0,
     )
   } else if g.ext == 6 || g.ext == 7 {
-    done(
+    finish(
       PInsn::MulDivRcx {
         w64,
         kind: MulDivKind::Div,
@@ -1162,15 +1162,15 @@ fn decode_unary(bytes: &[u8], at: usize, p: &Pfx) -> Option<Decoded> {
 
 /// Whether `n` zero bytes start at `at`.
 fn zeros(bytes: &[u8], at: usize, n: usize) -> bool {
-  let mut ok = have(bytes, at, n);
+  let mut all_zero = have(bytes, at, n);
   let mut i: usize = 0;
-  while ok && i < n {
+  while all_zero && i < n {
     if bytes[at + i] != 0 {
-      ok = false;
+      all_zero = false;
     }
     i += 1;
   }
-  ok
+  all_zero
 }
 
 /// The trailer's two data primitives, read as a last resort.

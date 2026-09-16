@@ -7467,9 +7467,9 @@ def x64_decode.mem_size (w : Std.U8) (op16 : Bool) : Result Std.U8 := do
        then ok 2#u8
        else ok 4#u8
 
-/-- [async_ebpf_verified::x64_decode::done]:
+/-- [async_ebpf_verified::x64_decode::finish]:
     Source: '../../src/verified/x64_decode.rs', lines 348:0-354:1 -/
-def x64_decode.done
+def x64_decode.finish
   (insn : x64_ir.PInsn) («at» : Std.Usize) («end» : Std.Usize)
   (disp : Std.I64) :
   Result (Option x64_decode.Decoded)
@@ -7638,21 +7638,21 @@ def x64_encode.HELPER_TABLE_LEN : Result Std.Usize := do
     Source: '../../src/verified/x64_decode.rs', lines 1167:2-1172:3 -/
 @[rust_loop_body]
 def x64_decode.zeros_loop.body
-  (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) (ok1 : Bool)
+  (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) (all_zero : Bool)
   (i : Std.Usize) :
   Result (ControlFlow (Bool × Std.Usize) Bool)
   := do
-  if ok1
+  if all_zero
   then
     if i < n
     then
       let i1 ← «at» + i
       let i2 ← Slice.index_usize bytes i1
-      let ok2 ← if i2 != 0#u8
-                  then ok false
-                  else ok true
+      let all_zero1 ← if i2 != 0#u8
+                        then ok false
+                        else ok true
       let i3 ← i + 1#usize
-      ok (cont (ok2, i3))
+      ok (cont (all_zero1, i3))
     else ok (done true)
   else ok (done false)
 
@@ -7660,13 +7660,14 @@ def x64_decode.zeros_loop.body
     Source: '../../src/verified/x64_decode.rs', lines 1167:2-1172:3 -/
 @[rust_loop]
 def x64_decode.zeros_loop
-  (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) (ok1 : Bool)
+  (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) (all_zero : Bool)
   (i : Std.Usize) :
   Result Bool
   := do
   loop
-    (fun (ok2, i1) => x64_decode.zeros_loop.body bytes «at» n ok2 i1)
-    (ok1, i)
+    (fun (all_zero1, i1) => x64_decode.zeros_loop.body bytes «at» n all_zero1
+      i1)
+    (all_zero, i)
 
 /-- [async_ebpf_verified::x64_decode::zeros]:
     Source: '../../src/verified/x64_decode.rs', lines 1164:0-1174:1 -/
@@ -7674,8 +7675,8 @@ def x64_decode.zeros
   (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) :
   Result Bool
   := do
-  let ok1 ← x64_decode.have bytes «at» n
-  x64_decode.zeros_loop bytes «at» n ok1 0#usize
+  let all_zero ← x64_decode.have bytes «at» n
+  x64_decode.zeros_loop bytes «at» n all_zero 0#usize
 
 /-- [async_ebpf_verified::x64_decode::decode_data]:
     Source: '../../src/verified/x64_decode.rs', lines 1177:0-1195:1 -/
@@ -7719,14 +7720,14 @@ def x64_decode.decode_unary
         let i2 ← x64_decode.read32 bytes i1
         let i3 ← lift (UScalar.hcast .I32 i2)
         let i4 ← p.at + 6#usize
-        x64_decode.done (x64_ir.PInsn.AluImm (p.w = 1#u8) x64_ir.AluRI.Test
+        x64_decode.finish (x64_ir.PInsn.AluImm (p.w = 1#u8) x64_ir.AluRI.Test
           g.rm i3) «at» i4 0#i64
       else ok none
     else
       if g.ext = 3#u8
       then
         let i1 ← p.at + 2#usize
-        x64_decode.done (x64_ir.PInsn.Neg (p.w = 1#u8) g.rm) «at» i1 0#i64
+        x64_decode.finish (x64_ir.PInsn.Neg (p.w = 1#u8) g.rm) «at» i1 0#i64
       else
         if g.rm != 1#u8
         then ok none
@@ -7734,19 +7735,19 @@ def x64_decode.decode_unary
           if g.ext = 4#u8
           then
             let i1 ← p.at + 2#usize
-            x64_decode.done (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
+            x64_decode.finish (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
               x64_ir.MulDivKind.Mul false) «at» i1 0#i64
           else
             if g.ext = 6#u8
             then
               let i1 ← p.at + 2#usize
-              x64_decode.done (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
+              x64_decode.finish (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
                 x64_ir.MulDivKind.Div (g.ext = 7#u8)) «at» i1 0#i64
             else
               if g.ext = 7#u8
               then
                 let i1 ← p.at + 2#usize
-                x64_decode.done (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
+                x64_decode.finish (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
                   x64_ir.MulDivKind.Div (g.ext = 7#u8)) «at» i1 0#i64
               else ok none
   else ok none
@@ -7778,11 +7779,11 @@ def x64_decode.decode_short_jmp
     then
       let i4 ← p.at + 5#usize
       let i5 ← x64_decode.sx8 d
-      x64_decode.done (x64_ir.PInsn.JmpNear (x64_ir.PTarget.Local 0#u32))
+      x64_decode.finish (x64_ir.PInsn.JmpNear (x64_ir.PTarget.Local 0#u32))
         «at» i4 i5
     else
       let i4 ← x64_decode.sx8 d
-      x64_decode.done (x64_ir.PInsn.Jmp8 0#u32) «at» i1 i4
+      x64_decode.finish (x64_ir.PInsn.Jmp8 0#u32) «at» i1 i4
 
 /-- [async_ebpf_verified::x64_decode::decode_shift]:
     Source: '../../src/verified/x64_decode.rs', lines 1051:0-1078:1 -/
@@ -7806,7 +7807,7 @@ def x64_decode.decode_shift
           if imm = 8#i32
           then
             let i2 ← p.at + 3#usize
-            x64_decode.done (x64_ir.PInsn.Rol16 g.rm) «at» i2 0#i64
+            x64_decode.finish (x64_ir.PInsn.Rol16 g.rm) «at» i2 0#i64
           else ok none
         else ok none
       else
@@ -7815,7 +7816,7 @@ def x64_decode.decode_shift
         then
           let so ← x64_decode.shift_of g.ext
           let i2 ← p.at + 3#usize
-          x64_decode.done (x64_ir.PInsn.ShiftImm (p.w = 1#u8) so g.rm imm)
+          x64_decode.finish (x64_ir.PInsn.ShiftImm (p.w = 1#u8) so g.rm imm)
             «at» i2 0#i64
         else ok none
   else ok none
@@ -7835,7 +7836,7 @@ def x64_decode.decode_rest
     then
       let i1 ← x64_decode.read32 bytes i
       let i2 ← p.at + 5#usize
-      x64_decode.done (x64_ir.PInsn.CmpEaxImm i1) «at» i2 0#i64
+      x64_decode.finish (x64_ir.PInsn.CmpEaxImm i1) «at» i2 0#i64
     else ok none
   else
     if op = 99#u8
@@ -7845,15 +7846,15 @@ def x64_decode.decode_rest
       if g.ok
       then
         let i1 ← p.at + 2#usize
-        x64_decode.done (x64_ir.PInsn.MovSx 32#u8 (p.w = 1#u8) g.rm g.reg)
-          «at» i1 0#i64
+        x64_decode.finish (x64_ir.PInsn.MovSx 32#u8 (p.w = 1#u8) g.rm 
+          g.reg) «at» i1 0#i64
       else
         let m ← x64_decode.decode_mem bytes i p.r p.b
         if m.ok
         then
           let i1 ← i + m.len
-          x64_decode.done (x64_ir.PInsn.Load 4#u8 true m.base m.reg m.disp)
-            «at» i1 0#i64
+          x64_decode.finish (x64_ir.PInsn.Load 4#u8 true m.base m.reg 
+            m.disp) «at» i1 0#i64
         else ok none
     else
       if op = 129#u8
@@ -7873,8 +7874,8 @@ def x64_decode.decode_rest
               let i2 ← x64_decode.read32 bytes i1
               let i3 ← lift (UScalar.hcast .I32 i2)
               let i4 ← p.at + 6#usize
-              x64_decode.done (x64_ir.PInsn.AluImm (p.w = 1#u8) ar g.rm i3)
-                «at» i4 0#i64
+              x64_decode.finish (x64_ir.PInsn.AluImm (p.w = 1#u8) ar 
+                g.rm i3) «at» i4 0#i64
             else ok none
           else ok none
         else ok none
@@ -7890,8 +7891,8 @@ def x64_decode.decode_rest
             if imm = 255#i32
             then
               let i2 ← p.at + 3#usize
-              x64_decode.done (x64_ir.PInsn.CmpRcxMinusOne (p.w = 1#u8)) «at»
-                i2 0#i64
+              x64_decode.finish (x64_ir.PInsn.CmpRcxMinusOne (p.w = 1#u8))
+                «at» i2 0#i64
             else ok none
           else ok none
         else
@@ -7900,7 +7901,7 @@ def x64_decode.decode_rest
             if p.rep
             then
               let i ← p.at + 1#usize
-              x64_decode.done x64_ir.PInsn.Pause «at» i 0#i64
+              x64_decode.finish x64_ir.PInsn.Pause «at» i 0#i64
             else ok none
           else
             if op = 153#u8
@@ -7908,20 +7909,20 @@ def x64_decode.decode_rest
               if p.w = 1#u8
               then
                 let i ← p.at + 1#usize
-                x64_decode.done x64_ir.PInsn.Cqo «at» i 0#i64
+                x64_decode.finish x64_ir.PInsn.Cqo «at» i 0#i64
               else
                 let i ← p.at + 1#usize
-                x64_decode.done x64_ir.PInsn.Cdq «at» i 0#i64
+                x64_decode.finish x64_ir.PInsn.Cdq «at» i 0#i64
             else
               if op = 156#u8
               then
                 let i ← p.at + 1#usize
-                x64_decode.done x64_ir.PInsn.Pushfq «at» i 0#i64
+                x64_decode.finish x64_ir.PInsn.Pushfq «at» i 0#i64
               else
                 if op = 157#u8
                 then
                   let i ← p.at + 1#usize
-                  x64_decode.done x64_ir.PInsn.Popfq «at» i 0#i64
+                  x64_decode.finish x64_ir.PInsn.Popfq «at» i 0#i64
                 else
                   if op = 193#u8
                   then x64_decode.decode_shift bytes «at» p
@@ -7929,7 +7930,7 @@ def x64_decode.decode_rest
                     if op = 195#u8
                     then
                       let i ← p.at + 1#usize
-                      x64_decode.done x64_ir.PInsn.Ret «at» i 0#i64
+                      x64_decode.finish x64_ir.PInsn.Ret «at» i 0#i64
                     else
                       if op = 211#u8
                       then
@@ -7942,8 +7943,8 @@ def x64_decode.decode_rest
                           then
                             let so ← x64_decode.shift_of g.ext
                             let i1 ← p.at + 2#usize
-                            x64_decode.done (x64_ir.PInsn.ShiftCl (p.w = 1#u8)
-                              so g.rm) «at» i1 0#i64
+                            x64_decode.finish (x64_ir.PInsn.ShiftCl (
+                              p.w = 1#u8) so g.rm) «at» i1 0#i64
                           else ok none
                         else ok none
                       else
@@ -7964,7 +7965,7 @@ def x64_decode.decode_rest
                             let i1 ← p.at + 5#usize
                             let i2 ← x64_decode.read32 bytes i
                             let i3 ← x64_decode.sx32 i2
-                            x64_decode.done insn «at» i1 i3
+                            x64_decode.finish insn «at» i1 i3
                           else ok none
                         else
                           if op = 233#u8
@@ -7984,7 +7985,7 @@ def x64_decode.decode_rest
                               let i1 ← p.at + 5#usize
                               let i2 ← x64_decode.read32 bytes i
                               let i3 ← x64_decode.sx32 i2
-                              x64_decode.done insn «at» i1 i3
+                              x64_decode.finish insn «at» i1 i3
                             else ok none
                           else
                             if op = 235#u8
@@ -8008,8 +8009,8 @@ def x64_decode.decode_rest
                                       let i5 ← p.b <<< 3#i32
                                       let i6 ← lift (i4 ||| i5)
                                       let i7 ← p.at + 2#usize
-                                      x64_decode.done (x64_ir.PInsn.CallReg i6)
-                                        «at» i7 0#i64
+                                      x64_decode.finish (x64_ir.PInsn.CallReg
+                                        i6) «at» i7 0#i64
                                     else ok none
                                   else ok none
                                 else ok none
@@ -8038,7 +8039,7 @@ def x64_decode.decode_store_imm
           let i2 ← x64_decode.read32 bytes i1
           let i3 ← lift (UScalar.hcast .I32 i2)
           let i4 ← p.at + 6#usize
-          x64_decode.done (x64_ir.PInsn.AluImm (p.w = 1#u8) x64_ir.AluRI.Mov
+          x64_decode.finish (x64_ir.PInsn.AluImm (p.w = 1#u8) x64_ir.AluRI.Mov
             g.rm i3) «at» i4 0#i64
         else ok none
       else ok none
@@ -8057,7 +8058,7 @@ def x64_decode.decode_store_imm
               then
                 let i3 ← x64_decode.read32 bytes i2
                 let i4 ← p.at + 7#usize
-                x64_decode.done (x64_ir.PInsn.StoreRspImm i3) «at» i4 0#i64
+                x64_decode.finish (x64_ir.PInsn.StoreRspImm i3) «at» i4 0#i64
               else ok none
             else ok none
           else
@@ -8103,7 +8104,7 @@ def x64_decode.decode_store_imm
                         let i2 ← x64_decode.read32 bytes start
                         ok (UScalar.hcast .I32 i2)
                   let i2 ← start + imm_len
-                  x64_decode.done (x64_ir.PInsn.StoreImm size m.base 
+                  x64_decode.finish (x64_ir.PInsn.StoreImm size m.base 
                     m.disp imm) «at» i2 0#i64
                 else ok none
             else ok none
@@ -8150,8 +8151,8 @@ def x64_decode.decode_store_imm
                       let i2 ← x64_decode.read32 bytes start
                       ok (UScalar.hcast .I32 i2)
                 let i2 ← start + imm_len
-                x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
-                  «at» i2 0#i64
+                x64_decode.finish (x64_ir.PInsn.StoreImm size m.base 
+                  m.disp imm) «at» i2 0#i64
               else ok none
           else ok none
       else
@@ -8197,7 +8198,7 @@ def x64_decode.decode_store_imm
                     let i2 ← x64_decode.read32 bytes start
                     ok (UScalar.hcast .I32 i2)
               let i2 ← start + imm_len
-              x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
+              x64_decode.finish (x64_ir.PInsn.StoreImm size m.base m.disp imm)
                 «at» i2 0#i64
             else ok none
         else ok none
@@ -8216,7 +8217,7 @@ def x64_decode.decode_store_imm
             then
               let i3 ← x64_decode.read32 bytes i2
               let i4 ← p.at + 7#usize
-              x64_decode.done (x64_ir.PInsn.StoreRspImm i3) «at» i4 0#i64
+              x64_decode.finish (x64_ir.PInsn.StoreRspImm i3) «at» i4 0#i64
             else ok none
           else ok none
         else
@@ -8262,8 +8263,8 @@ def x64_decode.decode_store_imm
                       let i2 ← x64_decode.read32 bytes start
                       ok (UScalar.hcast .I32 i2)
                 let i2 ← start + imm_len
-                x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
-                  «at» i2 0#i64
+                x64_decode.finish (x64_ir.PInsn.StoreImm size m.base 
+                  m.disp imm) «at» i2 0#i64
               else ok none
           else ok none
       else
@@ -8309,7 +8310,7 @@ def x64_decode.decode_store_imm
                     let i2 ← x64_decode.read32 bytes start
                     ok (UScalar.hcast .I32 i2)
               let i2 ← start + imm_len
-              x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
+              x64_decode.finish (x64_ir.PInsn.StoreImm size m.base m.disp imm)
                 «at» i2 0#i64
             else ok none
         else ok none
@@ -8356,7 +8357,7 @@ def x64_decode.decode_store_imm
                   let i2 ← x64_decode.read32 bytes start
                   ok (UScalar.hcast .I32 i2)
             let i2 ← start + imm_len
-            x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
+            x64_decode.finish (x64_ir.PInsn.StoreImm size m.base m.disp imm)
               «at» i2 0#i64
           else ok none
       else ok none
@@ -8382,7 +8383,7 @@ def x64_decode.decode_move
         let i3 ← p.at + 6#usize
         let i4 ← x64_decode.read32 bytes i1
         let i5 ← x64_decode.sx32 i4
-        x64_decode.done (x64_ir.PInsn.RipLoadDispatcher i2) «at» i3 i5
+        x64_decode.finish (x64_ir.PInsn.RipLoadDispatcher i2) «at» i3 i5
       else ok none
     else
       if op = 141#u8
@@ -8395,7 +8396,7 @@ def x64_decode.decode_move
           then
             let i2 ← x64_decode.mem_size p.w false
             let i3 ← i + m.len
-            x64_decode.done (x64_ir.PInsn.Load i2 false m.base m.reg 
+            x64_decode.finish (x64_ir.PInsn.Load i2 false m.base m.reg 
               m.disp) «at» i3 0#i64
           else ok none
         else x64_decode.decode_store_imm bytes «at» p op
@@ -8410,7 +8411,7 @@ def x64_decode.decode_move
           let i3 ← p.at + 6#usize
           let i4 ← x64_decode.read32 bytes i1
           let i5 ← x64_decode.sx32 i4
-          x64_decode.done (x64_ir.PInsn.RipLeaHelperTable i2) «at» i3 i5
+          x64_decode.finish (x64_ir.PInsn.RipLeaHelperTable i2) «at» i3 i5
         else ok none
       else ok none
     else
@@ -8421,8 +8422,8 @@ def x64_decode.decode_move
         then
           let i2 ← x64_decode.mem_size p.w false
           let i3 ← i + m.len
-          x64_decode.done (x64_ir.PInsn.Load i2 false m.base m.reg m.disp)
-            «at» i3 0#i64
+          x64_decode.finish (x64_ir.PInsn.Load i2 false m.base m.reg 
+            m.disp) «at» i3 0#i64
         else ok none
       else x64_decode.decode_store_imm bytes «at» p op
 
@@ -8445,7 +8446,7 @@ def x64_decode.decode_alu
     if rr
     then
       let ar ← x64_decode.alu_rr_of op
-      x64_decode.done (x64_ir.PInsn.Alu (p.w = 1#u8) ar g.reg g.rm) «at» i1
+      x64_decode.finish (x64_ir.PInsn.Alu (p.w = 1#u8) ar g.reg g.rm) «at» i1
         0#i64
     else
       if op = 137#u8
@@ -8457,7 +8458,7 @@ def x64_decode.decode_alu
             if p.w = 1#u8
             then
               let i2 ← p.at + 3#usize
-              x64_decode.done x64_ir.PInsn.StoreRspRax «at» i2 0#i64
+              x64_decode.finish x64_ir.PInsn.StoreRspRax «at» i2 0#i64
             else ok none
           else
             let m ← x64_decode.decode_mem bytes i p.r p.b
@@ -8470,7 +8471,7 @@ def x64_decode.decode_alu
                   then ok 1#u8
                   else x64_decode.mem_size p.w p.op16
                 let i2 ← i + m.len
-                x64_decode.done (x64_ir.PInsn.Store size m.reg m.base 
+                x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base 
                   m.disp) «at» i2 0#i64
               else
                 if op = 137#u8
@@ -8480,14 +8481,14 @@ def x64_decode.decode_alu
                     then ok 1#u8
                     else x64_decode.mem_size p.w p.op16
                   let i2 ← i + m.len
-                  x64_decode.done (x64_ir.PInsn.Store size m.reg m.base 
+                  x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base
                     m.disp) «at» i2 0#i64
                 else
                   if rm
                   then
                     let ar ← x64_decode.alu_rm_of op
                     let i2 ← i + m.len
-                    x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base 
+                    x64_decode.finish (x64_ir.PInsn.AluRM ar m.reg m.base
                       m.disp) «at» i2 0#i64
                   else ok none
             else ok none
@@ -8502,8 +8503,8 @@ def x64_decode.decode_alu
                 then ok 1#u8
                 else x64_decode.mem_size p.w p.op16
               let i2 ← i + m.len
-              x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
-                «at» i2 0#i64
+              x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base 
+                m.disp) «at» i2 0#i64
             else
               if op = 137#u8
               then
@@ -8512,14 +8513,14 @@ def x64_decode.decode_alu
                   then ok 1#u8
                   else x64_decode.mem_size p.w p.op16
                 let i2 ← i + m.len
-                x64_decode.done (x64_ir.PInsn.Store size m.reg m.base 
+                x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base 
                   m.disp) «at» i2 0#i64
               else
                 if rm
                 then
                   let ar ← x64_decode.alu_rm_of op
                   let i2 ← i + m.len
-                  x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base 
+                  x64_decode.finish (x64_ir.PInsn.AluRM ar m.reg m.base 
                     m.disp) «at» i2 0#i64
                 else ok none
           else ok none
@@ -8534,7 +8535,7 @@ def x64_decode.decode_alu
               then ok 1#u8
               else x64_decode.mem_size p.w p.op16
             let i2 ← i + m.len
-            x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+            x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base m.disp)
               «at» i2 0#i64
           else
             if op = 137#u8
@@ -8544,15 +8545,15 @@ def x64_decode.decode_alu
                 then ok 1#u8
                 else x64_decode.mem_size p.w p.op16
               let i2 ← i + m.len
-              x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
-                «at» i2 0#i64
+              x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base 
+                m.disp) «at» i2 0#i64
             else
               if rm
               then
                 let ar ← x64_decode.alu_rm_of op
                 let i2 ← i + m.len
-                x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base m.disp)
-                  «at» i2 0#i64
+                x64_decode.finish (x64_ir.PInsn.AluRM ar m.reg m.base 
+                  m.disp) «at» i2 0#i64
               else ok none
         else ok none
   else
@@ -8565,7 +8566,7 @@ def x64_decode.decode_alu
           if p.w = 1#u8
           then
             let i2 ← p.at + 3#usize
-            x64_decode.done x64_ir.PInsn.StoreRspRax «at» i2 0#i64
+            x64_decode.finish x64_ir.PInsn.StoreRspRax «at» i2 0#i64
           else ok none
         else
           let m ← x64_decode.decode_mem bytes i p.r p.b
@@ -8578,8 +8579,8 @@ def x64_decode.decode_alu
                 then ok 1#u8
                 else x64_decode.mem_size p.w p.op16
               let i2 ← i + m.len
-              x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
-                «at» i2 0#i64
+              x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base 
+                m.disp) «at» i2 0#i64
             else
               if op = 137#u8
               then
@@ -8588,14 +8589,14 @@ def x64_decode.decode_alu
                   then ok 1#u8
                   else x64_decode.mem_size p.w p.op16
                 let i2 ← i + m.len
-                x64_decode.done (x64_ir.PInsn.Store size m.reg m.base 
+                x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base 
                   m.disp) «at» i2 0#i64
               else
                 if rm
                 then
                   let ar ← x64_decode.alu_rm_of op
                   let i2 ← i + m.len
-                  x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base 
+                  x64_decode.finish (x64_ir.PInsn.AluRM ar m.reg m.base 
                     m.disp) «at» i2 0#i64
                 else ok none
           else ok none
@@ -8610,7 +8611,7 @@ def x64_decode.decode_alu
               then ok 1#u8
               else x64_decode.mem_size p.w p.op16
             let i2 ← i + m.len
-            x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+            x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base m.disp)
               «at» i2 0#i64
           else
             if op = 137#u8
@@ -8620,15 +8621,15 @@ def x64_decode.decode_alu
                 then ok 1#u8
                 else x64_decode.mem_size p.w p.op16
               let i2 ← i + m.len
-              x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
-                «at» i2 0#i64
+              x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base 
+                m.disp) «at» i2 0#i64
             else
               if rm
               then
                 let ar ← x64_decode.alu_rm_of op
                 let i2 ← i + m.len
-                x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base m.disp)
-                  «at» i2 0#i64
+                x64_decode.finish (x64_ir.PInsn.AluRM ar m.reg m.base 
+                  m.disp) «at» i2 0#i64
               else ok none
         else ok none
     else
@@ -8642,8 +8643,8 @@ def x64_decode.decode_alu
             then ok 1#u8
             else x64_decode.mem_size p.w p.op16
           let i2 ← i + m.len
-          x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp) «at»
-            i2 0#i64
+          x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base m.disp)
+            «at» i2 0#i64
         else
           if op = 137#u8
           then
@@ -8652,14 +8653,14 @@ def x64_decode.decode_alu
               then ok 1#u8
               else x64_decode.mem_size p.w p.op16
             let i2 ← i + m.len
-            x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+            x64_decode.finish (x64_ir.PInsn.Store size m.reg m.base m.disp)
               «at» i2 0#i64
           else
             if rm
             then
               let ar ← x64_decode.alu_rm_of op
               let i2 ← i + m.len
-              x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base m.disp)
+              x64_decode.finish (x64_ir.PInsn.AluRM ar m.reg m.base m.disp)
                 «at» i2 0#i64
             else ok none
       else ok none
@@ -8681,10 +8682,10 @@ def x64_decode.decode_one_byte
       if op <= 87#u8
       then
         let i2 ← p.at + 1#usize
-        x64_decode.done (x64_ir.PInsn.Push r) «at» i2 0#i64
+        x64_decode.finish (x64_ir.PInsn.Push r) «at» i2 0#i64
       else
         let i2 ← p.at + 1#usize
-        x64_decode.done (x64_ir.PInsn.Pop r) «at» i2 0#i64
+        x64_decode.finish (x64_ir.PInsn.Pop r) «at» i2 0#i64
     else
       if op >= 112#u8
       then
@@ -8699,7 +8700,7 @@ def x64_decode.decode_one_byte
             let i2 ← lift (128#u8 ||| i1)
             let i3 ← p.at + 2#usize
             let i4 ← x64_decode.sx8 d
-            x64_decode.done (x64_ir.PInsn.Jcc8 i2 0#u32) «at» i3 i4
+            x64_decode.finish (x64_ir.PInsn.Jcc8 i2 0#u32) «at» i3 i4
         else
           if op >= 184#u8
           then
@@ -8717,7 +8718,8 @@ def x64_decode.decode_one_byte
                   let i4 ← x64_decode.read64 bytes i
                   let i5 ← lift (UScalar.hcast .I64 i4)
                   let i6 ← p.at + 9#usize
-                  x64_decode.done (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
+                  x64_decode.finish (x64_ir.PInsn.LoadImm i3 i5) «at» i6
+                    0#i64
                 else ok none
               else ok none
             else
@@ -8771,7 +8773,7 @@ def x64_decode.decode_one_byte
                 let i4 ← x64_decode.read64 bytes i
                 let i5 ← lift (UScalar.hcast .I64 i4)
                 let i6 ← p.at + 9#usize
-                x64_decode.done (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
+                x64_decode.finish (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
               else ok none
             else ok none
           else
@@ -8822,7 +8824,7 @@ def x64_decode.decode_one_byte
           let i2 ← lift (128#u8 ||| i1)
           let i3 ← p.at + 2#usize
           let i4 ← x64_decode.sx8 d
-          x64_decode.done (x64_ir.PInsn.Jcc8 i2 0#u32) «at» i3 i4
+          x64_decode.finish (x64_ir.PInsn.Jcc8 i2 0#u32) «at» i3 i4
       else
         if op >= 184#u8
         then
@@ -8840,7 +8842,7 @@ def x64_decode.decode_one_byte
                 let i4 ← x64_decode.read64 bytes i
                 let i5 ← lift (UScalar.hcast .I64 i4)
                 let i6 ← p.at + 9#usize
-                x64_decode.done (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
+                x64_decode.finish (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
               else ok none
             else ok none
           else
@@ -8894,7 +8896,7 @@ def x64_decode.decode_one_byte
               let i4 ← x64_decode.read64 bytes i
               let i5 ← lift (UScalar.hcast .I64 i4)
               let i6 ← p.at + 9#usize
-              x64_decode.done (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
+              x64_decode.finish (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
             else ok none
           else ok none
         else
@@ -8946,7 +8948,7 @@ def x64_decode.decode_two_byte
     if second = 11#i32
     then
       let i1 ← p.at + 2#usize
-      x64_decode.done x64_ir.PInsn.Ud2 «at» i1 0#i64
+      x64_decode.finish x64_ir.PInsn.Ud2 «at» i1 0#i64
     else
       if second >= 64#i32
       then
@@ -8960,7 +8962,7 @@ def x64_decode.decode_two_byte
             let i3 ← lift (i2 &&& 15#u8)
             let i4 ← lift (128#u8 ||| i3)
             let i5 ← p.at + 3#usize
-            x64_decode.done (x64_ir.PInsn.Cmov i4 g.reg g.rm) «at» i5 0#i64
+            x64_decode.finish (x64_ir.PInsn.Cmov i4 g.reg g.rm) «at» i5 0#i64
           else ok none
         else
           if second >= 128#i32
@@ -8975,7 +8977,7 @@ def x64_decode.decode_two_byte
                 let i3 ← p.at + 6#usize
                 let i4 ← x64_decode.read32 bytes i1
                 let i5 ← x64_decode.sx32 i4
-                x64_decode.done (x64_ir.PInsn.Jcc i2 (x64_ir.PTarget.Local
+                x64_decode.finish (x64_ir.PInsn.Jcc i2 (x64_ir.PTarget.Local
                   0#u32)) «at» i3 i5
               else ok none
             else
@@ -8988,7 +8990,7 @@ def x64_decode.decode_two_byte
                   let i3 ← p.b <<< 3#i32
                   let i4 ← lift (i2 ||| i3)
                   let i5 ← p.at + 2#usize
-                  x64_decode.done (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at»
+                  x64_decode.finish (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at»
                     i5 0#i64
                 else
                   if second = 182#i32
@@ -9001,8 +9003,8 @@ def x64_decode.decode_two_byte
                     if m.ok
                     then
                       let i2 ← i1 + m.len
-                      x64_decode.done (x64_ir.PInsn.Load size false m.base
-                        m.reg m.disp) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.Load size false 
+                        m.base m.reg m.disp) «at» i2 0#i64
                     else ok none
                   else
                     if second = 183#i32
@@ -9016,7 +9018,7 @@ def x64_decode.decode_two_byte
                       if m.ok
                       then
                         let i2 ← i1 + m.len
-                        x64_decode.done (x64_ir.PInsn.Load size false 
+                        x64_decode.finish (x64_ir.PInsn.Load size false 
                           m.base m.reg m.disp) «at» i2 0#i64
                       else ok none
                     else
@@ -9035,14 +9037,14 @@ def x64_decode.decode_two_byte
                         if g.ok
                         then
                           let i2 ← p.at + 3#usize
-                          x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                             p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                         else
                           let m ← x64_decode.decode_mem bytes i1 p.r p.b
                           if m.ok
                           then
                             let i2 ← i1 + m.len
-                            x64_decode.done (x64_ir.PInsn.Load size true 
+                            x64_decode.finish (x64_ir.PInsn.Load size true
                               m.base m.reg m.disp) «at» i2 0#i64
                           else ok none
                       else
@@ -9061,14 +9063,14 @@ def x64_decode.decode_two_byte
                           if g.ok
                           then
                             let i2 ← p.at + 3#usize
-                            x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                            x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                               p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                           else
                             let m ← x64_decode.decode_mem bytes i1 p.r p.b
                             if m.ok
                             then
                               let i2 ← i1 + m.len
-                              x64_decode.done (x64_ir.PInsn.Load size true
+                              x64_decode.finish (x64_ir.PInsn.Load size true
                                 m.base m.reg m.disp) «at» i2 0#i64
                             else ok none
                         else ok none
@@ -9083,7 +9085,7 @@ def x64_decode.decode_two_byte
                   if m.ok
                   then
                     let i2 ← i1 + m.len
-                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    x64_decode.finish (x64_ir.PInsn.Load size false m.base
                       m.reg m.disp) «at» i2 0#i64
                   else ok none
                 else
@@ -9097,8 +9099,8 @@ def x64_decode.decode_two_byte
                     if m.ok
                     then
                       let i2 ← i1 + m.len
-                      x64_decode.done (x64_ir.PInsn.Load size false m.base
-                        m.reg m.disp) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.Load size false 
+                        m.base m.reg m.disp) «at» i2 0#i64
                     else ok none
                   else
                     if second = 190#i32
@@ -9116,14 +9118,14 @@ def x64_decode.decode_two_byte
                       if g.ok
                       then
                         let i2 ← p.at + 3#usize
-                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                        x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                           p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                       else
                         let m ← x64_decode.decode_mem bytes i1 p.r p.b
                         if m.ok
                         then
                           let i2 ← i1 + m.len
-                          x64_decode.done (x64_ir.PInsn.Load size true 
+                          x64_decode.finish (x64_ir.PInsn.Load size true 
                             m.base m.reg m.disp) «at» i2 0#i64
                         else ok none
                     else
@@ -9142,14 +9144,14 @@ def x64_decode.decode_two_byte
                         if g.ok
                         then
                           let i2 ← p.at + 3#usize
-                          x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                             p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                         else
                           let m ← x64_decode.decode_mem bytes i1 p.r p.b
                           if m.ok
                           then
                             let i2 ← i1 + m.len
-                            x64_decode.done (x64_ir.PInsn.Load size true 
+                            x64_decode.finish (x64_ir.PInsn.Load size true
                               m.base m.reg m.disp) «at» i2 0#i64
                           else ok none
                       else ok none
@@ -9163,8 +9165,8 @@ def x64_decode.decode_two_byte
                 let i3 ← p.b <<< 3#i32
                 let i4 ← lift (i2 ||| i3)
                 let i5 ← p.at + 2#usize
-                x64_decode.done (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at» i5
-                  0#i64
+                x64_decode.finish (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at»
+                  i5 0#i64
               else
                 if second = 182#i32
                 then
@@ -9176,7 +9178,7 @@ def x64_decode.decode_two_byte
                   if m.ok
                   then
                     let i2 ← i1 + m.len
-                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    x64_decode.finish (x64_ir.PInsn.Load size false m.base
                       m.reg m.disp) «at» i2 0#i64
                   else ok none
                 else
@@ -9190,8 +9192,8 @@ def x64_decode.decode_two_byte
                     if m.ok
                     then
                       let i2 ← i1 + m.len
-                      x64_decode.done (x64_ir.PInsn.Load size false m.base
-                        m.reg m.disp) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.Load size false 
+                        m.base m.reg m.disp) «at» i2 0#i64
                     else ok none
                   else
                     if second = 190#i32
@@ -9209,14 +9211,14 @@ def x64_decode.decode_two_byte
                       if g.ok
                       then
                         let i2 ← p.at + 3#usize
-                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                        x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                           p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                       else
                         let m ← x64_decode.decode_mem bytes i1 p.r p.b
                         if m.ok
                         then
                           let i2 ← i1 + m.len
-                          x64_decode.done (x64_ir.PInsn.Load size true 
+                          x64_decode.finish (x64_ir.PInsn.Load size true 
                             m.base m.reg m.disp) «at» i2 0#i64
                         else ok none
                     else
@@ -9235,14 +9237,14 @@ def x64_decode.decode_two_byte
                         if g.ok
                         then
                           let i2 ← p.at + 3#usize
-                          x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                             p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                         else
                           let m ← x64_decode.decode_mem bytes i1 p.r p.b
                           if m.ok
                           then
                             let i2 ← i1 + m.len
-                            x64_decode.done (x64_ir.PInsn.Load size true 
+                            x64_decode.finish (x64_ir.PInsn.Load size true
                               m.base m.reg m.disp) «at» i2 0#i64
                           else ok none
                       else ok none
@@ -9257,7 +9259,7 @@ def x64_decode.decode_two_byte
                 if m.ok
                 then
                   let i2 ← i1 + m.len
-                  x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                  x64_decode.finish (x64_ir.PInsn.Load size false m.base 
                     m.reg m.disp) «at» i2 0#i64
                 else ok none
               else
@@ -9271,7 +9273,7 @@ def x64_decode.decode_two_byte
                   if m.ok
                   then
                     let i2 ← i1 + m.len
-                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    x64_decode.finish (x64_ir.PInsn.Load size false m.base
                       m.reg m.disp) «at» i2 0#i64
                   else ok none
                 else
@@ -9289,14 +9291,14 @@ def x64_decode.decode_two_byte
                     if g.ok
                     then
                       let i2 ← p.at + 3#usize
-                      x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
-                        g.rm g.reg) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.MovSx «from» (
+                        p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                     else
                       let m ← x64_decode.decode_mem bytes i1 p.r p.b
                       if m.ok
                       then
                         let i2 ← i1 + m.len
-                        x64_decode.done (x64_ir.PInsn.Load size true 
+                        x64_decode.finish (x64_ir.PInsn.Load size true 
                           m.base m.reg m.disp) «at» i2 0#i64
                       else ok none
                   else
@@ -9315,14 +9317,14 @@ def x64_decode.decode_two_byte
                       if g.ok
                       then
                         let i2 ← p.at + 3#usize
-                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                        x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                           p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                       else
                         let m ← x64_decode.decode_mem bytes i1 p.r p.b
                         if m.ok
                         then
                           let i2 ← i1 + m.len
-                          x64_decode.done (x64_ir.PInsn.Load size true 
+                          x64_decode.finish (x64_ir.PInsn.Load size true 
                             m.base m.reg m.disp) «at» i2 0#i64
                         else ok none
                     else ok none
@@ -9339,7 +9341,7 @@ def x64_decode.decode_two_byte
               let i3 ← p.at + 6#usize
               let i4 ← x64_decode.read32 bytes i1
               let i5 ← x64_decode.sx32 i4
-              x64_decode.done (x64_ir.PInsn.Jcc i2 (x64_ir.PTarget.Local
+              x64_decode.finish (x64_ir.PInsn.Jcc i2 (x64_ir.PTarget.Local
                 0#u32)) «at» i3 i5
             else ok none
           else
@@ -9352,8 +9354,8 @@ def x64_decode.decode_two_byte
                 let i3 ← p.b <<< 3#i32
                 let i4 ← lift (i2 ||| i3)
                 let i5 ← p.at + 2#usize
-                x64_decode.done (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at» i5
-                  0#i64
+                x64_decode.finish (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at»
+                  i5 0#i64
               else
                 if second = 182#i32
                 then
@@ -9365,7 +9367,7 @@ def x64_decode.decode_two_byte
                   if m.ok
                   then
                     let i2 ← i1 + m.len
-                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    x64_decode.finish (x64_ir.PInsn.Load size false m.base
                       m.reg m.disp) «at» i2 0#i64
                   else ok none
                 else
@@ -9379,8 +9381,8 @@ def x64_decode.decode_two_byte
                     if m.ok
                     then
                       let i2 ← i1 + m.len
-                      x64_decode.done (x64_ir.PInsn.Load size false m.base
-                        m.reg m.disp) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.Load size false 
+                        m.base m.reg m.disp) «at» i2 0#i64
                     else ok none
                   else
                     if second = 190#i32
@@ -9398,14 +9400,14 @@ def x64_decode.decode_two_byte
                       if g.ok
                       then
                         let i2 ← p.at + 3#usize
-                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                        x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                           p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                       else
                         let m ← x64_decode.decode_mem bytes i1 p.r p.b
                         if m.ok
                         then
                           let i2 ← i1 + m.len
-                          x64_decode.done (x64_ir.PInsn.Load size true 
+                          x64_decode.finish (x64_ir.PInsn.Load size true 
                             m.base m.reg m.disp) «at» i2 0#i64
                         else ok none
                     else
@@ -9424,14 +9426,14 @@ def x64_decode.decode_two_byte
                         if g.ok
                         then
                           let i2 ← p.at + 3#usize
-                          x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                             p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                         else
                           let m ← x64_decode.decode_mem bytes i1 p.r p.b
                           if m.ok
                           then
                             let i2 ← i1 + m.len
-                            x64_decode.done (x64_ir.PInsn.Load size true 
+                            x64_decode.finish (x64_ir.PInsn.Load size true
                               m.base m.reg m.disp) «at» i2 0#i64
                           else ok none
                       else ok none
@@ -9446,7 +9448,7 @@ def x64_decode.decode_two_byte
                 if m.ok
                 then
                   let i2 ← i1 + m.len
-                  x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                  x64_decode.finish (x64_ir.PInsn.Load size false m.base 
                     m.reg m.disp) «at» i2 0#i64
                 else ok none
               else
@@ -9460,7 +9462,7 @@ def x64_decode.decode_two_byte
                   if m.ok
                   then
                     let i2 ← i1 + m.len
-                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    x64_decode.finish (x64_ir.PInsn.Load size false m.base
                       m.reg m.disp) «at» i2 0#i64
                   else ok none
                 else
@@ -9478,14 +9480,14 @@ def x64_decode.decode_two_byte
                     if g.ok
                     then
                       let i2 ← p.at + 3#usize
-                      x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
-                        g.rm g.reg) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.MovSx «from» (
+                        p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                     else
                       let m ← x64_decode.decode_mem bytes i1 p.r p.b
                       if m.ok
                       then
                         let i2 ← i1 + m.len
-                        x64_decode.done (x64_ir.PInsn.Load size true 
+                        x64_decode.finish (x64_ir.PInsn.Load size true 
                           m.base m.reg m.disp) «at» i2 0#i64
                       else ok none
                   else
@@ -9504,14 +9506,14 @@ def x64_decode.decode_two_byte
                       if g.ok
                       then
                         let i2 ← p.at + 3#usize
-                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                        x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                           p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                       else
                         let m ← x64_decode.decode_mem bytes i1 p.r p.b
                         if m.ok
                         then
                           let i2 ← i1 + m.len
-                          x64_decode.done (x64_ir.PInsn.Load size true 
+                          x64_decode.finish (x64_ir.PInsn.Load size true 
                             m.base m.reg m.disp) «at» i2 0#i64
                         else ok none
                     else ok none
@@ -9525,7 +9527,7 @@ def x64_decode.decode_two_byte
               let i3 ← p.b <<< 3#i32
               let i4 ← lift (i2 ||| i3)
               let i5 ← p.at + 2#usize
-              x64_decode.done (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at» i5
+              x64_decode.finish (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at» i5
                 0#i64
             else
               if second = 182#i32
@@ -9538,7 +9540,7 @@ def x64_decode.decode_two_byte
                 if m.ok
                 then
                   let i2 ← i1 + m.len
-                  x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                  x64_decode.finish (x64_ir.PInsn.Load size false m.base 
                     m.reg m.disp) «at» i2 0#i64
                 else ok none
               else
@@ -9552,7 +9554,7 @@ def x64_decode.decode_two_byte
                   if m.ok
                   then
                     let i2 ← i1 + m.len
-                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    x64_decode.finish (x64_ir.PInsn.Load size false m.base
                       m.reg m.disp) «at» i2 0#i64
                   else ok none
                 else
@@ -9570,14 +9572,14 @@ def x64_decode.decode_two_byte
                     if g.ok
                     then
                       let i2 ← p.at + 3#usize
-                      x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
-                        g.rm g.reg) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.MovSx «from» (
+                        p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                     else
                       let m ← x64_decode.decode_mem bytes i1 p.r p.b
                       if m.ok
                       then
                         let i2 ← i1 + m.len
-                        x64_decode.done (x64_ir.PInsn.Load size true 
+                        x64_decode.finish (x64_ir.PInsn.Load size true 
                           m.base m.reg m.disp) «at» i2 0#i64
                       else ok none
                   else
@@ -9596,14 +9598,14 @@ def x64_decode.decode_two_byte
                       if g.ok
                       then
                         let i2 ← p.at + 3#usize
-                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                        x64_decode.finish (x64_ir.PInsn.MovSx «from» (
                           p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                       else
                         let m ← x64_decode.decode_mem bytes i1 p.r p.b
                         if m.ok
                         then
                           let i2 ← i1 + m.len
-                          x64_decode.done (x64_ir.PInsn.Load size true 
+                          x64_decode.finish (x64_ir.PInsn.Load size true 
                             m.base m.reg m.disp) «at» i2 0#i64
                         else ok none
                     else ok none
@@ -9618,7 +9620,7 @@ def x64_decode.decode_two_byte
               if m.ok
               then
                 let i2 ← i1 + m.len
-                x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                x64_decode.finish (x64_ir.PInsn.Load size false m.base 
                   m.reg m.disp) «at» i2 0#i64
               else ok none
             else
@@ -9632,7 +9634,7 @@ def x64_decode.decode_two_byte
                 if m.ok
                 then
                   let i2 ← i1 + m.len
-                  x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                  x64_decode.finish (x64_ir.PInsn.Load size false m.base 
                     m.reg m.disp) «at» i2 0#i64
                 else ok none
               else
@@ -9650,15 +9652,15 @@ def x64_decode.decode_two_byte
                   if g.ok
                   then
                     let i2 ← p.at + 3#usize
-                    x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
+                    x64_decode.finish (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
                       g.rm g.reg) «at» i2 0#i64
                   else
                     let m ← x64_decode.decode_mem bytes i1 p.r p.b
                     if m.ok
                     then
                       let i2 ← i1 + m.len
-                      x64_decode.done (x64_ir.PInsn.Load size true m.base 
-                        m.reg m.disp) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.Load size true 
+                        m.base m.reg m.disp) «at» i2 0#i64
                     else ok none
                 else
                   if second = 191#i32
@@ -9675,14 +9677,14 @@ def x64_decode.decode_two_byte
                     if g.ok
                     then
                       let i2 ← p.at + 3#usize
-                      x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
-                        g.rm g.reg) «at» i2 0#i64
+                      x64_decode.finish (x64_ir.PInsn.MovSx «from» (
+                        p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
                     else
                       let m ← x64_decode.decode_mem bytes i1 p.r p.b
                       if m.ok
                       then
                         let i2 ← i1 + m.len
-                        x64_decode.done (x64_ir.PInsn.Load size true 
+                        x64_decode.finish (x64_ir.PInsn.Load size true 
                           m.base m.reg m.disp) «at» i2 0#i64
                       else ok none
                   else ok none
@@ -9705,7 +9707,7 @@ def x64_decode.decode_locked
       if m.ok
       then
         let i2 ← i1 + m.len
-        x64_decode.done (x64_ir.PInsn.LockCmpxchg (p.w = 1#u8) m.reg 
+        x64_decode.finish (x64_ir.PInsn.LockCmpxchg (p.w = 1#u8) m.reg 
           m.base m.disp) «at» i2 0#i64
       else ok none
     else ok none
@@ -9717,7 +9719,7 @@ def x64_decode.decode_locked
       if m.ok
       then
         let i1 ← i + m.len
-        x64_decode.done (x64_ir.PInsn.Xchg (p.w = 1#u8) m.reg m.base 
+        x64_decode.finish (x64_ir.PInsn.Xchg (p.w = 1#u8) m.reg m.base 
           m.disp) «at» i1 0#i64
       else ok none
     else
@@ -9726,8 +9728,8 @@ def x64_decode.decode_locked
       if m.ok
       then
         let i1 ← i + m.len
-        x64_decode.done (x64_ir.PInsn.LockAlu op (p.w = 1#u8) m.reg m.base
-          m.disp) «at» i1 0#i64
+        x64_decode.finish (x64_ir.PInsn.LockAlu op (p.w = 1#u8) m.reg 
+          m.base m.disp) «at» i1 0#i64
       else ok none
 
 /-- [async_ebpf_verified::x64_decode::decode_insn]:
@@ -16971,8 +16973,16 @@ def x64_sim.shift_result
   | x64_ir.ShiftOp.Shr => x64_sim.shr_at w64 v amt
   | x64_ir.ShiftOp.Sar => x64_sim.sar_at w64 v amt
 
+/-- [async_ebpf_verified::x64_sim::low_bit]:
+    Source: '../../src/verified/x64_sim.rs', lines 619:0-625:1 -/
+def x64_sim.low_bit (v : Std.U64) : Result Bool := do
+  let i ← lift (v &&& 1#u64)
+  if i = 1#u64
+  then ok true
+  else ok false
+
 /-- [async_ebpf_verified::x64_sim::shift_flags]:
-    Source: '../../src/verified/x64_sim.rs', lines 617:0-636:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 627:0-646:1 -/
 def x64_sim.shift_flags
   (w64 : Bool) (op : x64_ir.ShiftOp) (src : Std.U64) (res : Std.U64)
   (amt : Std.U32) :
@@ -16987,20 +16997,17 @@ def x64_sim.shift_flags
       do
       let i1 ← bits - amt
       let i2 ← x >>> i1
-      let i3 ← lift (i2 &&& 1#u64)
-      ok (i3 = 1#u64)
+      x64_sim.low_bit i2
     | x64_ir.ShiftOp.Shr =>
       do
       let i1 ← amt - 1#u32
       let i2 ← x >>> i1
-      let i3 ← lift (i2 &&& 1#u64)
-      ok (i3 = 1#u64)
+      x64_sim.low_bit i2
     | x64_ir.ShiftOp.Sar =>
       do
       let i1 ← amt - 1#u32
       let i2 ← x >>> i1
-      let i3 ← lift (i2 &&& 1#u64)
-      ok (i3 = 1#u64)
+      x64_sim.low_bit i2
   let of ←
     match op with
     | x64_ir.ShiftOp.Shl =>
@@ -17008,8 +17015,8 @@ def x64_sim.shift_flags
       let b ← x64_sim.msb w64 x
       let i1 ← bits - 2#u32
       let i2 ← x >>> i1
-      let i3 ← lift (i2 &&& 1#u64)
-      ok (b != (i3 = 1#u64))
+      let b1 ← x64_sim.low_bit i2
+      ok (b != b1)
     | x64_ir.ShiftOp.Shr => x64_sim.msb w64 x
     | x64_ir.ShiftOp.Sar => ok false
   let i1 ← lift (res &&& i)
@@ -17017,7 +17024,7 @@ def x64_sim.shift_flags
   ok { cf, zf := (i1 = 0#u64), sf := b, of }
 
 /-- [async_ebpf_verified::x64_sim::shift]:
-    Source: '../../src/verified/x64_sim.rs', lines 641:0-652:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 651:0-662:1 -/
 def x64_sim.shift
   (s : x64_sim.Sim) (w64 : Bool) (op : x64_ir.ShiftOp) (dst : Std.U8)
   (count : Std.U8) :
@@ -17039,7 +17046,7 @@ def x64_sim.shift
   ok (x64_sim.Outcome.Next, { s2 with pc := i1 })
 
 /-- [async_ebpf_verified::x64_sim::neg]:
-    Source: '../../src/verified/x64_sim.rs', lines 655:0-662:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 665:0-672:1 -/
 def x64_sim.neg
   (s : x64_sim.Sim) (w64 : Bool) (dst : Std.U8) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17054,7 +17061,7 @@ def x64_sim.neg
   ok (x64_sim.Outcome.Next, { s2 with pc := i2 })
 
 /-- [async_ebpf_verified::x64_sim::mul_rcx]:
-    Source: '../../src/verified/x64_sim.rs', lines 667:0-692:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 677:0-702:1 -/
 def x64_sim.mul_rcx
   (s : x64_sim.Sim) (w64 : Bool) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17093,7 +17100,7 @@ def x64_sim.mul_rcx
   ok (x64_sim.Outcome.Next, { s3 with pc := i })
 
 /-- [async_ebpf_verified::x64_sim::div_rcx]:
-    Source: '../../src/verified/x64_sim.rs', lines 698:0-764:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 708:0-774:1 -/
 def x64_sim.div_rcx
   (s : x64_sim.Sim) (w64 : Bool) (signed : Bool) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17217,7 +17224,7 @@ def x64_sim.div_rcx
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::movsx]:
-    Source: '../../src/verified/x64_sim.rs', lines 768:0-782:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 778:0-792:1 -/
 def x64_sim.movsx
   (s : x64_sim.Sim) (bits : Std.U8) (w64 : Bool) (src : Std.U8) (dst : Std.U8)
   :
@@ -17239,7 +17246,7 @@ def x64_sim.movsx
   ok (x64_sim.Outcome.Next, { s1 with pc := i1 })
 
 /-- [async_ebpf_verified::x64_sim::bswap_bytes]: loop body 0:
-    Source: '../../src/verified/x64_sim.rs', lines 788:2-792:3 -/
+    Source: '../../src/verified/x64_sim.rs', lines 798:2-802:3 -/
 @[rust_loop_body]
 def x64_sim.bswap_bytes_loop.body
   (bytes : Std.U32) (w : Std.U64) (acc : Std.U64) (i : Std.U32) :
@@ -17263,7 +17270,7 @@ def x64_sim.bswap_bytes_loop.body
   else ok (done acc)
 
 /-- [async_ebpf_verified::x64_sim::bswap_bytes]: loop 0:
-    Source: '../../src/verified/x64_sim.rs', lines 788:2-792:3 -/
+    Source: '../../src/verified/x64_sim.rs', lines 798:2-802:3 -/
 @[rust_loop]
 def x64_sim.bswap_bytes_loop
   (bytes : Std.U32) (w : Std.U64) (acc : Std.U64) (i : Std.U32) :
@@ -17274,13 +17281,13 @@ def x64_sim.bswap_bytes_loop
     (acc, i)
 
 /-- [async_ebpf_verified::x64_sim::bswap_bytes]:
-    Source: '../../src/verified/x64_sim.rs', lines 785:0-794:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 795:0-804:1 -/
 @[reducible]
 def x64_sim.bswap_bytes (bytes : Std.U32) (w : Std.U64) : Result Std.U64 := do
   x64_sim.bswap_bytes_loop bytes w 0#u64 0#u32
 
 /-- [async_ebpf_verified::x64_sim::bswap]:
-    Source: '../../src/verified/x64_sim.rs', lines 796:0-806:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 806:0-816:1 -/
 def x64_sim.bswap
   (s : x64_sim.Sim) (w64 : Bool) (dst : Std.U8) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17295,7 +17302,7 @@ def x64_sim.bswap
   ok (x64_sim.Outcome.Next, { s1 with pc := i })
 
 /-- [async_ebpf_verified::x64_sim::rol16]:
-    Source: '../../src/verified/x64_sim.rs', lines 812:0-820:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 822:0-830:1 -/
 def x64_sim.rol16
   (s : x64_sim.Sim) (dst : Std.U8) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17314,7 +17321,7 @@ def x64_sim.rol16
   ok (x64_sim.Outcome.Next, { s1 with cf := (i5 = 1#u64), pc := i6 })
 
 /-- [async_ebpf_verified::x64_sim::lock_op]:
-    Source: '../../src/verified/x64_sim.rs', lines 825:0-837:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 835:0-847:1 -/
 def x64_sim.lock_op
   (op : Std.U8) (a : Std.U64) (b : Std.U64) : Result Std.U64 := do
   if op = 1#u8
@@ -17330,7 +17337,7 @@ def x64_sim.lock_op
            else ok a
 
 /-- [async_ebpf_verified::x64_sim::lock_alu]:
-    Source: '../../src/verified/x64_sim.rs', lines 841:0-861:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 851:0-871:1 -/
 def x64_sim.lock_alu
   (s : x64_sim.Sim) (op : Std.U8) (w64 : Bool) (src : Std.U8) (base : Std.U8)
   (disp : Std.I32) :
@@ -17372,7 +17379,7 @@ def x64_sim.lock_alu
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::cmpxchg]:
-    Source: '../../src/verified/x64_sim.rs', lines 865:0-884:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 875:0-894:1 -/
 def x64_sim.cmpxchg
   (s : x64_sim.Sim) (w64 : Bool) (src : Std.U8) (base : Std.U8)
   (disp : Std.I32) :
@@ -17400,7 +17407,7 @@ def x64_sim.cmpxchg
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::xchg]:
-    Source: '../../src/verified/x64_sim.rs', lines 887:0-900:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 897:0-910:1 -/
 def x64_sim.xchg
   (s : x64_sim.Sim) (w64 : Bool) (src : Std.U8) (base : Std.U8)
   (disp : Std.I32) :
@@ -17419,7 +17426,7 @@ def x64_sim.xchg
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::alu_rm]:
-    Source: '../../src/verified/x64_sim.rs', lines 903:0-939:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 913:0-949:1 -/
 def x64_sim.alu_rm
   (s : x64_sim.Sim) (op : x64_ir.AluRM) (r : Std.U8) (base : Std.U8)
   (disp : Std.I32) :
@@ -17463,7 +17470,7 @@ def x64_sim.alu_rm
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::load]:
-    Source: '../../src/verified/x64_sim.rs', lines 943:0-966:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 953:0-976:1 -/
 def x64_sim.load
   (s : x64_sim.Sim) (size : Std.U8) (sx : Bool) (base : Std.U8) (dst : Std.U8)
   (disp : Std.I32) :
@@ -17504,7 +17511,7 @@ def x64_sim.load
       else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::store]:
-    Source: '../../src/verified/x64_sim.rs', lines 969:0-984:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 979:0-994:1 -/
 def x64_sim.store
   (s : x64_sim.Sim) (size : Std.U8) (src : Std.U8) (base : Std.U8)
   (disp : Std.I32) :
@@ -17524,7 +17531,7 @@ def x64_sim.store
     else ok (x64_sim.Outcome.Fault, s1)
 
 /-- [async_ebpf_verified::x64_sim::store_imm]:
-    Source: '../../src/verified/x64_sim.rs', lines 988:0-1002:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 998:0-1012:1 -/
 def x64_sim.store_imm
   (s : x64_sim.Sim) (size : Std.U8) (base : Std.U8) (disp : Std.I32)
   (imm : Std.I32) :
@@ -17544,7 +17551,7 @@ def x64_sim.store_imm
     else ok (x64_sim.Outcome.Fault, s1)
 
 /-- [async_ebpf_verified::x64_sim::push]:
-    Source: '../../src/verified/x64_sim.rs', lines 1005:0-1014:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1015:0-1024:1 -/
 def x64_sim.push
   (s : x64_sim.Sim) (v : Std.U64) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17559,7 +17566,7 @@ def x64_sim.push
   else ok (x64_sim.Outcome.Fault, s1)
 
 /-- [async_ebpf_verified::x64_sim::pop]:
-    Source: '../../src/verified/x64_sim.rs', lines 1018:0-1029:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1028:0-1039:1 -/
 def x64_sim.pop
   (s : x64_sim.Sim) (r : Std.U8) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17576,7 +17583,7 @@ def x64_sim.pop
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::ret]:
-    Source: '../../src/verified/x64_sim.rs', lines 1032:0-1048:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1042:0-1058:1 -/
 def x64_sim.ret
   (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17600,7 +17607,7 @@ def x64_sim.ret
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::call]:
-    Source: '../../src/verified/x64_sim.rs', lines 1051:0-1067:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1061:0-1077:1 -/
 def x64_sim.call
   (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) (t : x64_ir.PTarget) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17622,7 +17629,7 @@ def x64_sim.call
   else ok (x64_sim.Outcome.Unsupported, s)
 
 /-- [async_ebpf_verified::x64_sim::step_at]:
-    Source: '../../src/verified/x64_sim.rs', lines 1074:0-1298:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1084:0-1308:1 -/
 def x64_sim.step_at
   (code : Slice x64_ir.PInsn) (insn : x64_ir.PInsn) (s : x64_sim.Sim) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17802,7 +17809,7 @@ def x64_sim.step_at
   | x64_ir.PInsn.HelperTable => ok (x64_sim.Outcome.Halt, s)
 
 /-- [async_ebpf_verified::x64_sim::step]:
-    Source: '../../src/verified/x64_sim.rs', lines 1301:0-1308:1
+    Source: '../../src/verified/x64_sim.rs', lines 1311:0-1318:1
     Visibility: public -/
 def x64_sim.step
   (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) :
@@ -17815,7 +17822,7 @@ def x64_sim.step
   else ok (x64_sim.Outcome.Halt, s)
 
 /-- [async_ebpf_verified::x64_sim::run]: loop body 0:
-    Source: '../../src/verified/x64_sim.rs', lines 1317:2-1327:3
+    Source: '../../src/verified/x64_sim.rs', lines 1327:2-1337:3
     Visibility: public -/
 @[rust_loop_body]
 def x64_sim.run_loop.body
@@ -17841,7 +17848,7 @@ def x64_sim.run_loop.body
   else ok (done (out, s))
 
 /-- [async_ebpf_verified::x64_sim::run]: loop 0:
-    Source: '../../src/verified/x64_sim.rs', lines 1317:2-1327:3
+    Source: '../../src/verified/x64_sim.rs', lines 1327:2-1337:3
     Visibility: public -/
 @[rust_loop]
 def x64_sim.run_loop
@@ -17855,7 +17862,7 @@ def x64_sim.run_loop
     (s, i, out, done1)
 
 /-- [async_ebpf_verified::x64_sim::run]:
-    Source: '../../src/verified/x64_sim.rs', lines 1313:0-1329:1
+    Source: '../../src/verified/x64_sim.rs', lines 1323:0-1339:1
     Visibility: public -/
 @[reducible]
 def x64_sim.run

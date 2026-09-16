@@ -614,16 +614,26 @@ fn shift_result(w64: bool, op: ShiftOp, v: u64, amt: u32) -> u64 {
 /// The flags a shift by a *non-zero* masked count leaves. `cf` is the last bit
 /// shifted out; `of` is the one-bit formula read off the source, which is what
 /// the hardware computes whatever the count is.
+/// Bit zero of `v`, as a boolean. A comparison written as a value extracts
+/// as a proposition; a branch extracts as a boolean.
+fn low_bit(v: u64) -> bool {
+  if v & 1 == 1 {
+    true
+  } else {
+    false
+  }
+}
+
 fn shift_flags(w64: bool, op: ShiftOp, src: u64, res: u64, amt: u32) -> Flags {
   let bits = width_bits(w64);
   let x = src & width_mask(w64);
   let cf = match op {
-    ShiftOp::Shl => (x >> (bits - amt)) & 1 == 1,
-    ShiftOp::Shr => (x >> (amt - 1)) & 1 == 1,
-    ShiftOp::Sar => (x >> (amt - 1)) & 1 == 1,
+    ShiftOp::Shl => low_bit(x >> (bits - amt)),
+    ShiftOp::Shr => low_bit(x >> (amt - 1)),
+    ShiftOp::Sar => low_bit(x >> (amt - 1)),
   };
   let of = match op {
-    ShiftOp::Shl => msb(w64, x) != (((x >> (bits - 2)) & 1) == 1),
+    ShiftOp::Shl => msb(w64, x) != low_bit(x >> (bits - 2)),
     ShiftOp::Shr => msb(w64, x),
     ShiftOp::Sar => false,
   };
