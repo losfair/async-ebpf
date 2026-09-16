@@ -128,6 +128,27 @@ theorem live_guestFp {cfg : x64_ir.Cfg} {dst : Std.U8}
     x64_check.write pre dst index pcv = ok (.Ok (), post) := by
   unfold x64_check.live_step at h; rw [ha] at h; simpa using h
 
+/-! ## The `stores` clause
+
+Most macros write nothing at all, and `macroOk_no_stores` is their whole
+proof: show that every primitive of the range writes nothing and the clause
+follows. The ones that do write — the guest store, the atomics, the parked
+group base and the prologue's push — each have their own rule, and it is the
+rule that already placed the access in a region, read again through
+`StoreOk` instead of `AccessOk`. -/
+
+/-- The `stores` clause of a macro no primitive of which writes memory. -/
+theorem macroOk_no_stores {P : Params} {code : List x64_ir.PInsn} {p q : Nat}
+    {pre : x64_check.State}
+    (h : ∀ (u : State) (i : x64_ir.PInsn), Range p q u.pc → code[u.pc]? = some i →
+      stores i u = []) :
+    ∀ s : State, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+      ∀ c, Step P code s' c → ∀ i, code[s'.pc]? = some i →
+        ∀ bn ∈ stores i s', StoreOk P bn.1 bn.2 := by
+  intro s hs hag s' hsty c hstep i hi bn hbn
+  rw [h s' i hsty.inside_last hi] at hbn
+  simp at hbn
+
 /-! ## The macros of one register-only primitive -/
 
 /-- The walk inside a one-primitive region of a register-only macro never
@@ -145,10 +166,21 @@ theorem stays_regOnly {P : Params} {code : List x64_ir.PInsn} {p : Nat} {i : x64
 what the checker's `write` admitted. -/
 theorem macroOk_regOnly_write {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     {pre post : x64_check.State} {i : x64_ir.PInsn} {r : Std.U8} {index : Usize}
-    {pcv : Std.U32} (hi : RegOnly i) (hwr : writes i = [r.val]) (hc : code[p]? = some i)
+    {pcv : Std.U32} (hL : Layout P) (hi : RegOnly i) (hwr : writes i = [r.val])
+    (hc : code[p]? = some i)
     (hw : x64_check.write pre r index pcv = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] := by
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [stays_regOnly hi hc hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p := by simp only [Range] at hin; omega
+    rw [hu, hc] at hjj
+    obtain rfl : jj = _ := by simpa using hjj.symm
+    exact stores_regOnly hi u
   · intro s hs hag s' hstays c hstep j hj bn hbn
     have heq := stays_regOnly hi hc hstays
     subst heq
@@ -172,11 +204,21 @@ theorem macroOk_regOnly_write {P : Params} {code : List x64_ir.PInsn} {p : Nat}
 /-- A macro that expands to one register-only primitive the checker learns
 nothing from: a label, a `pause`, a compare or a test. -/
 theorem macroOk_regOnly_keep {P : Params} {code : List x64_ir.PInsn} {p : Nat}
-    {pre : x64_check.State} {i : x64_ir.PInsn} (hi : RegOnly i)
+    {pre : x64_check.State} {i : x64_ir.PInsn} (hL : Layout P) (hi : RegOnly i)
     (hc : code[p]? = some i)
     (hkeep : ∀ t t' : State, t.pc = p → Step P code t (.next t') → ∀ r, t'.regs r = t.regs r) :
     MacroOk P code p (p + 1) pre pre [] := by
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [stays_regOnly hi hc hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p := by simp only [Range] at hin; omega
+    rw [hu, hc] at hjj
+    obtain rfl : jj = _ := by simpa using hjj.symm
+    exact stores_regOnly hi u
   · intro s hs hag s' hstays c hstep j hj bn hbn
     have heq := stays_regOnly hi hc hstays
     subst heq
@@ -198,9 +240,20 @@ theorem macroOk_regOnly_keep {P : Params} {code : List x64_ir.PInsn} {p : Nat}
 
 /-- The common case of it: the primitive writes no register at all. -/
 theorem macroOk_regOnly_id {P : Params} {code : List x64_ir.PInsn} {p : Nat}
-    {pre : x64_check.State} {i : x64_ir.PInsn} (hi : RegOnly i) (hwr : writes i = [])
-    (hc : code[p]? = some i) : MacroOk P code p (p + 1) pre pre [] := by
-  refine ⟨?_, ?_, ?_⟩
+    {pre : x64_check.State} {i : x64_ir.PInsn} (hL : Layout P) (hi : RegOnly i)
+    (hwr : writes i = []) (hc : code[p]? = some i) :
+    MacroOk P code p (p + 1) pre pre [] := by
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [stays_regOnly hi hc hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p := by simp only [Range] at hin; omega
+    rw [hu, hc] at hjj
+    obtain rfl : jj = _ := by simpa using hjj.symm
+    exact stores_regOnly hi u
   · intro s hs hag s' hstays c hstep j hj bn hbn
     have heq := stays_regOnly hi hc hstays
     subst heq
@@ -222,15 +275,15 @@ theorem macroOk_regOnly_id {P : Params} {code : List x64_ir.PInsn} {p : Nat}
 
 /-- A local label of one macro's expansion. -/
 theorem macroOk_localLabel {P : Params} {code : List x64_ir.PInsn} {p : Nat}
-    {pre : x64_check.State} {n : Std.U32} (hc : code[p]? = some (.Local n)) :
+    {pre : x64_check.State} {n : Std.U32} (hL : Layout P) (hc : code[p]? = some (.Local n)) :
     MacroOk P code p (p + 1) pre pre [] :=
-  macroOk_regOnly_id (i := .Local n) trivial rfl hc
+  macroOk_regOnly_id (i := .Local n) hL trivial rfl hc
 
 /-- The exit label the trailer's epilogue carries. -/
 theorem macroOk_exitLabel {P : Params} {code : List x64_ir.PInsn} {p : Nat}
-    {pre : x64_check.State} (hc : code[p]? = some .ExitLabel) :
+    {pre : x64_check.State} (hL : Layout P) (hc : code[p]? = some .ExitLabel) :
     MacroOk P code p (p + 1) pre pre [] :=
-  macroOk_regOnly_id (i := .ExitLabel) trivial rfl hc
+  macroOk_regOnly_id (i := .ExitLabel) hL trivial rfl hc
 
 /-! ## The register macros
 
@@ -239,16 +292,16 @@ operands, and the checker's rule is `write` on the destination. -/
 
 theorem macroOk_alu {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {w64 : Bool} {op : x64_ir.AluRR} {src dst : Std.U8}
-    {index : Usize} {pcv : Std.U32} (ha : pre.alive = true)
+    {index : Usize} {pcv : Std.U32} (hL : Layout P) (ha : pre.alive = true)
     (hc : code[p]? = some (.Alu w64 op src dst))
     (h : x64_check.live_step cfg (.Alu w64 op src dst) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] := by
   rcases live_alu ha h with hw | ⟨hb, rfl⟩
-  · exact macroOk_regOnly_write (i := .Alu w64 op src dst) trivial rfl hc hw
+  · exact macroOk_regOnly_write (i := .Alu w64 op src dst) hL trivial rfl hc hw
   · -- A compare or a test writes nothing at all.
     have hop : op = .Cmp ∨ op = .Test := by
       cases op <;> simp [x64_check.alu_rr_writes] at hb ⊢
-    refine macroOk_regOnly_keep (i := .Alu w64 op src dst) trivial hc ?_
+    refine macroOk_regOnly_keep (i := .Alu w64 op src dst) hL trivial hc ?_
     intro t t' ht hst r
     have := step_alu (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at this
@@ -257,15 +310,15 @@ theorem macroOk_alu {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64
 
 theorem macroOk_aluImm {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {w64 : Bool} {op : x64_ir.AluRI} {dst : Std.U8}
-    {imm : Std.I32} {index : Usize} {pcv : Std.U32} (ha : pre.alive = true)
+    {imm : Std.I32} {index : Usize} {pcv : Std.U32} (hL : Layout P) (ha : pre.alive = true)
     (hc : code[p]? = some (.AluImm w64 op dst imm))
     (h : x64_check.live_step cfg (.AluImm w64 op dst imm) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] := by
   rcases live_aluImm ha h with hw | ⟨hb, rfl⟩
-  · exact macroOk_regOnly_write (i := .AluImm w64 op dst imm) trivial rfl hc hw
+  · exact macroOk_regOnly_write (i := .AluImm w64 op dst imm) hL trivial rfl hc hw
   · have hop : op = .Cmp ∨ op = .Test := by
       cases op <;> simp [x64_check.alu_ri_writes] at hb ⊢
-    refine macroOk_regOnly_keep (i := .AluImm w64 op dst imm) trivial hc ?_
+    refine macroOk_regOnly_keep (i := .AluImm w64 op dst imm) hL trivial hc ?_
     intro t t' ht hst r
     have := step_aluImm (by rw [ht]; exact hc) hst
     simp only [Config.next.injEq] at this
@@ -274,57 +327,57 @@ theorem macroOk_aluImm {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : 
 
 theorem macroOk_shiftImm {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {w64 : Bool} {op : x64_ir.ShiftOp} {dst : Std.U8}
-    {imm : Std.I32} {index : Usize} {pcv : Std.U32} (ha : pre.alive = true)
+    {imm : Std.I32} {index : Usize} {pcv : Std.U32} (hL : Layout P) (ha : pre.alive = true)
     (hc : code[p]? = some (.ShiftImm w64 op dst imm))
     (h : x64_check.live_step cfg (.ShiftImm w64 op dst imm) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] :=
-  macroOk_regOnly_write (i := .ShiftImm w64 op dst imm) trivial rfl hc (live_shiftImm ha h)
+  macroOk_regOnly_write (i := .ShiftImm w64 op dst imm) hL trivial rfl hc (live_shiftImm ha h)
 
 theorem macroOk_shiftCl {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {w64 : Bool} {op : x64_ir.ShiftOp} {dst : Std.U8}
-    {index : Usize} {pcv : Std.U32} (ha : pre.alive = true)
+    {index : Usize} {pcv : Std.U32} (hL : Layout P) (ha : pre.alive = true)
     (hc : code[p]? = some (.ShiftCl w64 op dst))
     (h : x64_check.live_step cfg (.ShiftCl w64 op dst) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] :=
-  macroOk_regOnly_write (i := .ShiftCl w64 op dst) trivial rfl hc (live_shiftCl ha h)
+  macroOk_regOnly_write (i := .ShiftCl w64 op dst) hL trivial rfl hc (live_shiftCl ha h)
 
 theorem macroOk_neg {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {w64 : Bool} {dst : Std.U8}
-    {index : Usize} {pcv : Std.U32} (ha : pre.alive = true)
+    {index : Usize} {pcv : Std.U32} (hL : Layout P) (ha : pre.alive = true)
     (hc : code[p]? = some (.Neg w64 dst))
     (h : x64_check.live_step cfg (.Neg w64 dst) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] :=
-  macroOk_regOnly_write (i := .Neg w64 dst) trivial rfl hc (live_neg ha h)
+  macroOk_regOnly_write (i := .Neg w64 dst) hL trivial rfl hc (live_neg ha h)
 
 theorem macroOk_movSx {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {from_ : Std.U8} {w64 : Bool} {src dst : Std.U8}
-    {index : Usize} {pcv : Std.U32} (ha : pre.alive = true)
+    {index : Usize} {pcv : Std.U32} (hL : Layout P) (ha : pre.alive = true)
     (hc : code[p]? = some (.MovSx from_ w64 src dst))
     (h : x64_check.live_step cfg (.MovSx from_ w64 src dst) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] :=
-  macroOk_regOnly_write (i := .MovSx from_ w64 src dst) trivial rfl hc (live_movSx ha h)
+  macroOk_regOnly_write (i := .MovSx from_ w64 src dst) hL trivial rfl hc (live_movSx ha h)
 
 theorem macroOk_bswap {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {w64 : Bool} {dst : Std.U8}
-    {index : Usize} {pcv : Std.U32} (ha : pre.alive = true)
+    {index : Usize} {pcv : Std.U32} (hL : Layout P) (ha : pre.alive = true)
     (hc : code[p]? = some (.Bswap w64 dst))
     (h : x64_check.live_step cfg (.Bswap w64 dst) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] :=
-  macroOk_regOnly_write (i := .Bswap w64 dst) trivial rfl hc (live_bswap ha h)
+  macroOk_regOnly_write (i := .Bswap w64 dst) hL trivial rfl hc (live_bswap ha h)
 
 theorem macroOk_rol16 {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {dst : Std.U8} {index : Usize} {pcv : Std.U32}
-    (ha : pre.alive = true) (hc : code[p]? = some (.Rol16 dst))
+    (hL : Layout P) (ha : pre.alive = true) (hc : code[p]? = some (.Rol16 dst))
     (h : x64_check.live_step cfg (.Rol16 dst) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] :=
-  macroOk_regOnly_write (i := .Rol16 dst) trivial rfl hc (live_rol16 ha h)
+  macroOk_regOnly_write (i := .Rol16 dst) hL trivial rfl hc (live_rol16 ha h)
 
 theorem macroOk_loadImm {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {dst : Std.U8} {imm : Std.I64} {index : Usize} {pcv : Std.U32}
-    (ha : pre.alive = true) (hc : code[p]? = some (.LoadImm dst imm))
+    (hL : Layout P) (ha : pre.alive = true) (hc : code[p]? = some (.LoadImm dst imm))
     (h : x64_check.live_step cfg (.LoadImm dst imm) index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] :=
-  macroOk_regOnly_write (i := .LoadImm dst imm) trivial rfl hc (live_loadImm ha h)
+  macroOk_regOnly_write (i := .LoadImm dst imm) hL trivial rfl hc (live_loadImm ha h)
 
 /-! ## The address rule
 
@@ -483,6 +536,27 @@ theorem guestOk_addr {P : Params} {cfg : x64_ir.Cfg} {pre : x64_check.State} {s 
     simp only [addr, hb]
     exact frame_access_ok hL hv (by rw [← hcfg]; exact h1) (by omega)
 
+/-- The same three cases for a store: every address the rules admit is one
+this activation may *write*. The parked zero lands on the first page, a
+checked base inside a guest backing, the frame fast path inside the stack's
+backing; all three are writable, and none of them is the read-only part of the
+frame scratch, the entry word or the descriptor. -/
+theorem storeOk_addr {P : Params} {cfg : x64_ir.Cfg} {pre : x64_check.State} {s : State}
+    {base : Std.U8} {disp : Std.I32} {size : Std.U32} {n : Nat}
+    (hL : Layout P) (hcfg : CfgOk P cfg) (hag : Agree P pre s) (hwid : WidthsOk pre)
+    (hmask : cfg.pointer_mask ≠ 0#i32) (hn : (n : Int) = (size.val : Int))
+    (h : x64_check.addr_ok cfg pre base disp size = ok true) :
+    StoreOk P (addr s base disp) n := by
+  rcases addr_ok_cases hmask h with ⟨w, hw, h1, h2⟩ | ⟨hb, hfp, h1, h2⟩
+  · have hlt : base.val < 16 := tagAt_range (by rw [hw]; simp)
+    have hv := hag.regs base.val hlt
+    rw [hw] at hv
+    exact tagOk_checked_store hL hv h1 (by omega) (hwid.1 base.val w hw)
+  · have hv := hag.regs 15 (by norm_num)
+    rw [hfp] at hv
+    simp only [addr, hb]
+    exact frame_store_ok hL hv (by rw [← hcfg]; exact h1) (by omega)
+
 /-! ## The macros of one guest access -/
 
 /-- Nothing but `ret` returns. -/
@@ -504,6 +578,8 @@ theorem macroOk_guestOne {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     (hn : (n : Int) = (size.val : Int))
     (hacc : ∀ (t : State) (bn : Word × Nat), bn ∈ accesses i t →
       bn.1 = addr t base disp ∧ bn.2 = n)
+    (hstr : ∀ (t : State) (bn : Word × Nat), bn ∈ stores i t →
+      bn.1 = addr t base disp ∧ bn.2 = n)
     (hadv : ∀ t t' : State, code[t.pc]? = some i → Step P code t (.next t') →
       t'.pc = t.pc + 1)
     (hpost : ∀ t t' : State, code[t.pc]? = some i → Agree P pre t →
@@ -514,7 +590,20 @@ theorem macroOk_guestOne {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     refine stays_single ?_ hst
     intro t t' ht hstep
     rw [hadv t t' (by rw [ht]; exact hc) hstep, ht]
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [hstays s s' hs hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    intro s hs hag s' hsty c hstep j hj bn hbn
+    have heq := hstays s s' hs hsty
+    subst heq
+    rw [hs, hc] at hj
+    obtain rfl : j = i := by simpa using hj.symm
+    obtain ⟨h1, h2⟩ := hstr s' bn hbn
+    rw [h1, h2]
+    exact storeOk_addr hL hcfg hag hwid hmask hn hok
   · intro s hs hag s' hsty c hstep j hj bn hbn
     have heq := hstays s s' hs hsty
     subst heq
@@ -688,7 +777,7 @@ theorem macroOk_load {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x6
     MacroOk P code p (p + 1) pre post [] := by
   obtain ⟨hok, hw⟩ := live_load ha h
   refine macroOk_guestOne (n := size.val) hL hcfg hwid hmask hc (by simp) hok (by simp)
-    ?_ ?_ ?_
+    ?_ (fun t bn hbn => absurd hbn (by simp)) ?_ ?_
   · intro t bn hbn
     rw [accesses_load] at hbn
     split at hbn <;> simp_all
@@ -715,7 +804,7 @@ theorem macroOk_store {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x
     MacroOk P code p (p + 1) pre post [] := by
   obtain ⟨hok, rfl⟩ := live_store ha h
   refine macroOk_guestOne (n := size.val) hL hcfg hwid hmask hc (by simp) hok (by simp)
-    ?_ ?_ ?_
+    ?_ (by intro t bn hbn; simp at hbn; simp [hbn]) ?_ ?_
   · intro t bn hbn; simp at hbn; simp [hbn]
   · intro t t' hcode hstep
     have hu := step_store hcode hstep
@@ -740,7 +829,7 @@ theorem macroOk_storeImm {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg 
     MacroOk P code p (p + 1) pre post [] := by
   obtain ⟨hok, rfl⟩ := live_storeImm ha h
   refine macroOk_guestOne (n := size.val) hL hcfg hwid hmask hc (by simp) hok (by simp)
-    ?_ ?_ ?_
+    ?_ (by intro t bn hbn; simp at hbn; simp [hbn]) ?_ ?_
   · intro t bn hbn; simp at hbn; simp [hbn]
   · intro t t' hcode hstep
     have hu := step_storeImm hcode hstep
@@ -769,7 +858,7 @@ theorem macroOk_atomicAlu {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg
     MacroOk P code p (p + 1) pre post [] := by
   obtain ⟨hok, rfl⟩ := live_atomicAlu ha h
   refine macroOk_guestOne (n := opWidth w64) hL hcfg hwid hmask hc (by simp) hok
-    (atomic_width w64) ?_ ?_ ?_
+    (atomic_width w64) ?_ (by intro t bn hbn; simp at hbn; simp [hbn]) ?_ ?_
   · intro t bn hbn; simp at hbn; simp [hbn]
   · intro t t' hcode hstep
     obtain ⟨f, hu⟩ := step_lockAlu hcode hstep
@@ -796,7 +885,7 @@ theorem macroOk_atomicXchg {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cf
   obtain ⟨hok, hw⟩ := live_atomicXchg ha h
   obtain ⟨-, -, -, -, -, hgrp, -, -⟩ := write_ok hw
   refine macroOk_guestOne (n := opWidth w64) hL hcfg hwid hmask hc (by simp) hok
-    (atomic_width w64) ?_ ?_ ?_
+    (atomic_width w64) ?_ (by intro t bn hbn; simp at hbn; simp [hbn]) ?_ ?_
   · intro t bn hbn; simp at hbn; simp [hbn]
   · intro t t' hcode hstep
     have hu := step_xchg hcode hstep
@@ -826,7 +915,7 @@ theorem macroOk_atomicCmpxchg {P : Params} {code : List x64_ir.PInsn} {p : Nat}
   obtain ⟨hok, hw⟩ := live_atomicCmpxchg ha h
   obtain ⟨-, -, -, -, -, hgrp, -, -⟩ := write_ok hw
   refine macroOk_guestOne (n := opWidth w64) hL hcfg hwid hmask hc (by simp) hok
-    (atomic_width w64) ?_ ?_ ?_
+    (atomic_width w64) ?_ (by intro t bn hbn; simp at hbn; simp [hbn]) ?_ ?_
   · intro t bn hbn; simp at hbn; simp [hbn]
   · intro t t' hcode hstep
     obtain ⟨f, hu⟩ := step_lockCmpxchg hcode hstep
@@ -899,7 +988,20 @@ theorem macroOk_groupBaseStore {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     simp only [Config.next.injEq] at hu
     subst hu
     rw [ht]
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [hstays s s' hs hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    intro s hs hag s' hsty c hstep j hj bn hbn
+    have heq := hstays s s' hs hsty; subst heq
+    rw [hs, hc] at hj
+    obtain rfl : j = _ := by simpa using hj.symm
+    simp only [stores_store, List.mem_singleton] at hbn
+    subst hbn
+    exact frame_slot_store (j := 144) hL hag rbp_val (by norm_num)
+      (by rw [groupBase_val]; norm_num) (by norm_num)
   · intro s hs hag s' hsty c hstep j hj bn hbn
     have heq := hstays s s' hs hsty; subst heq
     rw [hs, hc] at hj
@@ -989,7 +1091,17 @@ theorem macroOk_groupBaseLoad {P : Params} {code : List x64_ir.PInsn} {p : Nat}
       subst hu
       simp [wReg, ht]
     · simp at hbad
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [hstays s s' hs hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p := by simp only [Range] at hin; omega
+    rw [hu, hc] at hjj
+    obtain rfl : jj = _ := by simpa using hjj.symm
+    rfl
   · intro s hs hag s' hsty c hstep j hj bn hbn
     have heq := hstays s s' hs hsty; subst heq
     rw [hs, hc] at hj
@@ -1072,7 +1184,21 @@ theorem macroOk_guestFp {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg :
       exfalso
       simp only [Range, aluRMStep_pc, ht] at hin'
       omega
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rcases hinv s s' hs hag hsty with ⟨-, hat⟩ | ⟨-, hat⟩ <;>
+      exact rsp_window_of_agree hL hat
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p ∨ u.pc = p + 1 := by simp only [Range] at hin; omega
+    rcases hu with hu | hu
+    · rw [hu, hc0] at hjj
+      obtain rfl : jj = _ := by simpa using hjj.symm
+      rfl
+    · rw [hu, hc1] at hjj
+      obtain rfl : jj = _ := by simpa using hjj.symm
+      rfl
   · intro s hs hag s' hsty c hstep j hj bn hbn
     rcases hinv s s' hs hag hsty with ⟨ht, hat⟩ | ⟨ht, hat⟩
     · rw [ht, hc0] at hj
@@ -1151,25 +1277,35 @@ theorem label_target {labels : x64_check.Labels} {slot : Std.U32} {index : Usize
 /-- A label nothing branches to. -/
 theorem macroOk_pcLabel_plain {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     {labels : x64_check.Labels} {slot : Std.U32} {index : Usize} {pcv : Std.U32}
-    {pre post : x64_check.State} (hc : code[p]? = some (.PcLabel slot))
+    {pre post : x64_check.State} (hL : Layout P) (hc : code[p]? = some (.PcLabel slot))
     (hnt : x64_check.is_target labels slot = ok false)
     (h : x64_check.label_step labels slot index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] := by
   rw [label_notTarget hnt h]
-  exact macroOk_regOnly_id (i := .PcLabel slot) trivial rfl hc
+  exact macroOk_regOnly_id (i := .PcLabel slot) hL trivial rfl hc
 
 /-- A label a branch can land on: whatever the walk arrived with, the state
 after it is `enterState`, and the machine state agrees with it because the
 walk arrived at depth one with the frame register intact. -/
 theorem macroOk_pcLabel_target {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     {labels : x64_check.Labels} {slot : Std.U32} {index : Usize} {pcv : Std.U32}
-    {pre post : x64_check.State} (ha : pre.alive = true)
+    {pre post : x64_check.State} (hL : Layout P) (ha : pre.alive = true)
     (hc : code[p]? = some (.PcLabel slot))
     (htg : x64_check.is_target labels slot = ok true)
     (h : x64_check.label_step labels slot index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [] := by
   obtain ⟨hd, hf, rfl⟩ := label_target ha htg h
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [stays_regOnly (i := x64_ir.PInsn.PcLabel slot) trivial hc hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p := by simp only [Range] at hin; omega
+    rw [hu, hc] at hjj
+    obtain rfl : jj = _ := by simpa using hjj.symm
+    rfl
   · intro s hs hag s' hsty c hstep j hj bn hbn
     have heq := stays_regOnly (i := .PcLabel slot) trivial hc hsty; subst heq
     rw [hs, hc] at hj
@@ -1196,11 +1332,11 @@ theorem macroOk_pcLabel_target {P : Params} {code : List x64_ir.PInsn} {p : Nat}
 /-- The same label reached by a jump, which arrives in `enterState`. -/
 theorem macroOk_pcLabel_target_entered {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     {labels : x64_check.Labels} {slot : Std.U32} {index : Usize} {pcv : Std.U32}
-    {post : x64_check.State} (hc : code[p]? = some (.PcLabel slot))
+    {post : x64_check.State} (hL : Layout P) (hc : code[p]? = some (.PcLabel slot))
     (htg : x64_check.is_target labels slot = ok true)
     (h : x64_check.label_step labels slot index pcv enterState = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) enterState post [] :=
-  macroOk_pcLabel_target (by simp [enterState]) hc htg h
+  macroOk_pcLabel_target hL (by simp [enterState]) hc htg h
 
 theorem branch_live {labels : x64_check.Labels} {target : x64_ir.Target} {unc : Bool}
     {index : Usize} {pcv : Std.U32} {pre post : x64_check.State} (ha : pre.alive = true)
@@ -1261,7 +1397,7 @@ is what keeps the two exits of `leave` apart. -/
 theorem macroOk_jcc {P : Params} {code : List x64_ir.PInsn} {p t : Nat}
     {labels : x64_check.Labels} {target : x64_ir.Target} {pt : x64_ir.PTarget}
     {cc : Std.U8} {index : Usize} {pcv : Std.U32} {pre post : x64_check.State}
-    (ha : pre.alive = true) (hc : code[p]? = some (.Jcc cc pt))
+    (hL : Layout P) (ha : pre.alive = true) (hc : code[p]? = some (.Jcc cc pt))
     (hpos : pos code pt = some t) (hne : t ≠ p)
     (h : x64_check.branch_step labels target false index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [(t, enterState)] := by
@@ -1279,7 +1415,17 @@ theorem macroOk_jcc {P : Params} {code : List x64_ir.PInsn} {p t : Nat}
         first
           | (rw [hpos] at hi; simp only [Option.some.injEq] at hi; subst hi; omega)
           | omega
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [hstays s s' hs hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p := by simp only [Range] at hin; omega
+    rw [hu, hc] at hjj
+    obtain rfl : jj = _ := by simpa using hjj.symm
+    rfl
   · intro s hs hag s' hsty c hstep j hj bn hbn
     have heq := hstays s s' hs hsty; subst heq
     rw [hs, hc] at hj
@@ -1311,7 +1457,7 @@ theorem macroOk_jcc {P : Params} {code : List x64_ir.PInsn} {p t : Nat}
 theorem macroOk_jmp {P : Params} {code : List x64_ir.PInsn} {p t : Nat}
     {labels : x64_check.Labels} {target : x64_ir.Target} {pt : x64_ir.PTarget}
     {index : Usize} {pcv : Std.U32} {pre post : x64_check.State}
-    (ha : pre.alive = true) (hc : code[p]? = some (.Jmp pt))
+    (hL : Layout P) (ha : pre.alive = true) (hc : code[p]? = some (.Jmp pt))
     (hpos : pos code pt = some t) (hne : t ≠ p)
     (h : x64_check.branch_step labels target true index pcv pre = ok (.Ok (), post)) :
     MacroOk P code p (p + 1) pre post [(t, enterState)] := by
@@ -1328,7 +1474,17 @@ theorem macroOk_jmp {P : Params} {code : List x64_ir.PInsn} {p t : Nat}
     subst hi
     simp only [Range, not_and, not_lt]
     omega
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rw [hstays s s' hs hsty]
+    exact rsp_window_of_agree hL hag
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p := by simp only [Range] at hin; omega
+    rw [hu, hc] at hjj
+    obtain rfl : jj = _ := by simpa using hjj.symm
+    rfl
   · intro s hs hag s' hsty c hstep j hj bn hbn
     have heq := hstays s s' hs hsty; subst heq
     rw [hs, hc] at hj
@@ -1445,7 +1601,22 @@ theorem macroOk_epilogue {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg 
       · simp at hbad
       · exact hne h1
       · exact hne h1
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rcases hinv s s' hs hag hsty with ⟨-, hat⟩ | ⟨-, h1, -, -⟩
+    · exact rsp_window_of_agree hL hat
+    · exact rsp_window_of_rsp0 h1
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p ∨ u.pc = p + 1 := by simp only [Range] at hin; omega
+    rcases hu with hu | hu
+    · rw [hu, hc0] at hjj
+      obtain rfl : jj = _ := by simpa using hjj.symm
+      rfl
+    · rw [hu, hc1] at hjj
+      obtain rfl : jj = _ := by simpa using hjj.symm
+      rfl
   · intro s hs hag s' hsty c hstep j hj bn hbn
     rcases hinv s s' hs hag hsty with ⟨ht, hat⟩ | ⟨ht, h1, -, -⟩
     · rw [ht, hc0] at hj
@@ -1518,7 +1689,25 @@ theorem macroOk_epilogue_exit {P : Params} {code : List x64_ir.PInsn} {p : Nat}
       · simp at hbad
       · exact hne h1
       · exact hne h1
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rcases hinv s s' hs hag hsty with ⟨-, hat⟩ | ⟨-, h1, -, -⟩
+    · exact rsp_window_of_agree hL hat
+    · exact rsp_window_of_rsp0 h1
+  case stores =>
+    refine macroOk_no_stores (fun u jj hin hjj => ?_)
+    have hu : u.pc = p ∨ u.pc = p + 1 ∨ u.pc = p + 2 := by simp only [Range] at hin; omega
+    rcases hu with hu | hu | hu
+    · rw [hu, hcE] at hjj
+      obtain rfl : jj = _ := by simpa using hjj.symm
+      rfl
+    · rw [hu, hc0] at hjj
+      obtain rfl : jj = _ := by simpa using hjj.symm
+      rfl
+    · rw [hu, hc1] at hjj
+      obtain rfl : jj = _ := by simpa using hjj.symm
+      rfl
   · intro s hs hag s' hsty c hstep j hj bn hbn
     rcases hinv s s' hs hag hsty with ⟨ht | ht, hat⟩ | ⟨ht, h1, -, -⟩
     · rw [ht, hcE] at hj
@@ -1652,7 +1841,24 @@ theorem macroOk_prologue {P : Params} {code : List x64_ir.PInsn} {p : Nat}
       subst hu
       simp only [Range, ht] at hin'
       omega
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    rcases hinv s s' hs hag hsty with ⟨-, hat⟩ | ⟨-, h1, -, -, -⟩
+    · exact rsp_window_of_agree hL hat
+    · exact rsp_window_of_depth (d := 1) hL (by rw [h1, rsp0_slot]) (by norm_num)
+  case stores =>
+    intro s hs hag s' hsty c hstep j hj bn hbn
+    rcases hinv s s' hs hag hsty with ⟨ht, hat⟩ | ⟨ht, h1, -, -, -⟩
+    · rw [ht, hc0] at hj
+      obtain rfl : j = _ := by simpa using hj.symm
+      simp at hbn
+    · rw [ht, hc1] at hj
+      obtain rfl : j = _ := by simpa using hj.symm
+      simp only [stores_storeRspImm, List.mem_singleton] at hbn
+      subst hbn
+      rw [h1, rsp0_slot]
+      exact storeOk_stack hL (by norm_num) (by norm_num)
   · intro s hs hag s' hsty c hstep j hj bn hbn
     rcases hinv s s' hs hag hsty with ⟨ht, hat⟩ | ⟨ht, h1, -, -, -⟩
     · rw [ht, hc0] at hj
@@ -1692,7 +1898,7 @@ theorem macroOk_prologue {P : Params} {code : List x64_ir.PInsn} {p : Nat}
 push, which the previous instruction already made. -/
 theorem macroOk_prologue_skip {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     {pre post : x64_check.State} {imm : Std.U32} {l : Std.U32} {index : Usize}
-    {pcv : Std.U32} (_hL : Layout P) (ha : pre.alive = true)
+    {pcv : Std.U32} (hL : Layout P) (ha : pre.alive = true)
     (hc0 : code[p]? = some (.JmpNear (.Local l)))
     (_hc1 : code[p + 1]? = some (.AluImm true x64_ir.AluRI.Sub x64_ir.RSP 8#i32))
     (_hc2 : code[p + 2]? = some (.StoreRspImm imm))
@@ -1723,7 +1929,20 @@ theorem macroOk_prologue_skip {P : Params} {code : List x64_ir.PInsn} {p : Nat}
       cases hu
       simp only [Range, hpc, ht] at hin'
       omega
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?stores, ?rsp⟩
+  case rsp =>
+    intro s hs hag s' hsty
+    obtain ⟨-, h1, -, -, -⟩ := hinv s s' hs hag hsty
+    exact rsp_window_of_depth (d := 1) hL (by rw [h1, rsp0_slot]) (by norm_num)
+  case stores =>
+    intro s hs hag s' hsty c hstep j hj bn hbn
+    obtain ⟨ht | ht, -, -, -, -⟩ := hinv s s' hs hag hsty
+    · rw [ht, hc0] at hj
+      obtain rfl : j = _ := by simpa using hj.symm
+      simp at hbn
+    · rw [ht, hc3] at hj
+      obtain rfl : j = _ := by simpa using hj.symm
+      simp [stores] at hbn
   · intro s hs hag s' hsty c hstep j hj bn hbn
     obtain ⟨ht | ht, -, -, -, -⟩ := hinv s s' hs hag hsty
     · rw [ht, hc0] at hj

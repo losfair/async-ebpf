@@ -170,15 +170,21 @@ def EnterShaped (post : x64_check.State) : Prop :=
   (∀ k, tagAt post k = if k = 15 then x64_check.Tag.Fp else x64_check.Tag.Top) ∧
   post.depth = 1#u32 ∧ post.group = x64_check.Tag.Top ∧ post.alive = true
 
-/-- The registers a call may have written: the caller-saved ones. -/
-def CallerSaved (k : Nat) : Prop :=
-  k = 0 ∨ k = 1 ∨ k = 2 ∨ k = 6 ∨ k = 7 ∨ k = 8 ∨ k = 9 ∨ k = 10 ∨ k = 11
+/-- The registers a call may have written: the nine caller-saved ones, and
+`rbx`, `r12`, `r13`, `r14` as well. Those four are callee-saved under SysV,
+but the callee here can be a lazily compiled function, which is another
+instance of this theorem, and this theorem promises nothing of them: it keeps
+`rbp` and the frame register and nothing else (`ExternalReturn.calleeSaved`).
+So thirteen of the sixteen, everything but `rsp`, `rbp` and `r15`. -/
+def Clobbered (k : Nat) : Prop :=
+  k = 0 ∨ k = 1 ∨ k = 2 ∨ k = 3 ∨ k = 6 ∨ k = 7 ∨ k = 8 ∨ k = 9 ∨ k = 10 ∨ k = 11 ∨
+  k = 12 ∨ k = 13 ∨ k = 14
 
-/-- What a call leaves: the caller-saved registers and the parked group base
-are `Top`, everything else — the frame register included — is as it was. -/
+/-- What a call leaves: the clobbered registers and the parked group base are
+`Top`, everything else — the frame register included — is as it was. -/
 def ClobberCall (pre post : x64_check.State) : Prop :=
-  (∀ k, CallerSaved k → tagAt post k = x64_check.Tag.Top) ∧
-  (∀ k, ¬ CallerSaved k → tagAt post k = tagAt pre k) ∧
+  (∀ k, Clobbered k → tagAt post k = x64_check.Tag.Top) ∧
+  (∀ k, ¬ Clobbered k → tagAt post k = tagAt pre k) ∧
   post.depth = pre.depth ∧ post.group = x64_check.Tag.Top ∧ post.alive = pre.alive
 
 private theorem set_tag_fields {pre post : x64_check.State} {r : Std.U8} {t : x64_check.Tag}
@@ -436,8 +442,8 @@ theorem entry_state_spec {st : x64_check.State} (h : x64_check.entry_state = ok 
       simp [hk16]
     · exact tagAt_out _ (by omega)
 
-/-- A call leaves the caller-saved registers and the parked group base `Top`,
-and everything else — the frame register included — as it was. -/
+/-- A call leaves the thirteen clobbered registers and the parked group base
+`Top`, and everything else — `rbp` and the frame register — as it was. -/
 theorem clobber_call_spec {pre post : x64_check.State}
     (h : x64_check.clobber_call pre = ok post) : ClobberCall pre post := by
   unfold x64_check.clobber_call at h
@@ -450,21 +456,30 @@ theorem clobber_call_spec {pre post : x64_check.State}
   obtain ⟨s7, e7, h⟩ := bind_eq_ok h
   obtain ⟨s8, e8, h⟩ := bind_eq_ok h
   obtain ⟨s9, e9, h⟩ := bind_eq_ok h
+  obtain ⟨s10, e10, h⟩ := bind_eq_ok h
+  obtain ⟨s11, e11, h⟩ := bind_eq_ok h
+  obtain ⟨s12, e12, h⟩ := bind_eq_ok h
+  obtain ⟨s13, e13, h⟩ := bind_eq_ok h
   simp only [ok.injEq] at h
   subst h
-  have b1 := SetsTop.setTag (by simp [x64_ir.RAX]) (SetsTop.refl pre) e1
-  have b2 := SetsTop.setTag (by simp [x64_ir.RCX]) b1 e2
-  have b3 := SetsTop.setTag (by simp [x64_ir.RDX]) b2 e3
-  have b4 := SetsTop.setTag (by simp [x64_ir.RSI]) b3 e4
-  have b5 := SetsTop.setTag (by simp [x64_ir.RDI]) b4 e5
-  have b6 := SetsTop.setTag (by simp [x64_ir.R8]) b5 e6
-  have b7 := SetsTop.setTag (by simp [x64_ir.R9]) b6 e7
-  have b8 := SetsTop.setTag (by simp [x64_ir.R10]) b7 e8
-  have b9 := SetsTop.setTag (by simp [x64_ir.R11]) b8 e9
-  have hmono : SetsTop pre s9 CallerSaved := by
-    refine b9.mono (fun k => ?_)
-    simp only [CallerSaved, x64_ir.RAX, x64_ir.RCX, x64_ir.RDX, x64_ir.RSI, x64_ir.RDI,
-      x64_ir.R8, x64_ir.R9, x64_ir.R10, x64_ir.R11]
+  have b1 := SetsTop.setTag (by simp [x64_ir.RBX]) (SetsTop.refl pre) e1
+  have b2 := SetsTop.setTag (by simp [x64_ir.R12]) b1 e2
+  have b3 := SetsTop.setTag (by simp [x64_ir.R13]) b2 e3
+  have b4 := SetsTop.setTag (by simp [x64_ir.R14]) b3 e4
+  have b5 := SetsTop.setTag (by simp [x64_ir.RAX]) b4 e5
+  have b6 := SetsTop.setTag (by simp [x64_ir.RCX]) b5 e6
+  have b7 := SetsTop.setTag (by simp [x64_ir.RDX]) b6 e7
+  have b8 := SetsTop.setTag (by simp [x64_ir.RSI]) b7 e8
+  have b9 := SetsTop.setTag (by simp [x64_ir.RDI]) b8 e9
+  have b10 := SetsTop.setTag (by simp [x64_ir.R8]) b9 e10
+  have b11 := SetsTop.setTag (by simp [x64_ir.R9]) b10 e11
+  have b12 := SetsTop.setTag (by simp [x64_ir.R10]) b11 e12
+  have b13 := SetsTop.setTag (by simp [x64_ir.R11]) b12 e13
+  have hmono : SetsTop pre s13 Clobbered := by
+    refine b13.mono (fun k => ?_)
+    simp only [Clobbered, x64_ir.RAX, x64_ir.RCX, x64_ir.RDX, x64_ir.RBX, x64_ir.RSI,
+      x64_ir.RDI, x64_ir.R8, x64_ir.R9, x64_ir.R10, x64_ir.R11, x64_ir.R12, x64_ir.R13,
+      x64_ir.R14]
     norm_num
     tauto
   exact ⟨fun k hk => hmono.1 k hk, fun k hk => hmono.2.1 k hk, hmono.2.2.1, rfl, hmono.2.2.2.2⟩

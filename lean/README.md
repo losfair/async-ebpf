@@ -297,10 +297,11 @@ instruction set: sixteen registers, the four flags the checks read, a
 byte-addressed memory, a program counter over the primitive list, branches
 to labels rather than offsets. A call to an address outside the function is
 an *external call*: it returns to the pushed return address with `rsp`,
-`rbp`, `rbx`, `r12`–`r15`, the read-only frame slots and the descriptor
-preserved and everything else arbitrary, which is the SysV contract for the
-dispatcher and the callbacks and this theorem's own conclusion for a lazily
-compiled callee. Shifts, multiplies, divides and `rol` leave the flags
+`rbp`, `r15`, the read-only frame slots and the descriptor preserved and
+everything else arbitrary — `rbx` and `r12`–`r14` among it, and guest memory
+wherever the runtime mapped it. That is what the runtime promises of the
+dispatcher and the callbacks, and it is no stronger than this theorem's own
+conclusion for a lazily compiled callee, which is what lets the two compose. Shifts, multiplies, divides and `rol` leave the flags
 arbitrary and the divide leaves `rax`/`rdx` arbitrary: over-approximations,
 so every real execution is a modelled one.
 
@@ -314,9 +315,16 @@ window lies inside the stack's backing; each region is at least a page
 wide), and the property: `Safe P code` says every access any reachable step
 makes is inside `Allowed P` — the frame scratch, the native stack window,
 the two native backings, the first page (where a failed check lands, and
-which the fault handler claims), and the descriptor; `Returns P code` says
-a `ret` at the entry `rsp` leaves `rsp`, `rbp` and the frame register as
-the caller expects.
+which the fault handler claims), and the descriptor; `SafeStores P code`
+says every range a step *writes* (`stores`, the writing part of `accesses`)
+is inside the smaller `WritableAllowed P` — the native stack below the
+entry `rsp`, the four writable frame slots, the two native backings and the
+first page; and `Returns P code` says a `ret` at the entry `rsp` leaves
+`rsp`, `rbp` and the frame register as the caller expects. `Contract` is
+all three. The stores half is what a caller needs of its callee and `Safe`
+does not give: `romem_kept` reads off it that the read-only frame slots and
+the descriptor come back untouched, which is half of what the caller
+assumed through `ExternalReturn`.
 
 `check_safe` (in `X64/Soundness.lean`): if `x64_check::check` accepts a
 macro list, then under the cage (`pointer_mask ≠ 0`), with the machine's
@@ -336,10 +344,15 @@ value; `Checked w` means zero or a native address whose `w`-byte window is
 inside one backing; `rsp` is `depth` words below its entry; `rbp` and the
 read-only slots are intact; the parked group base carries its tag).
 `Run.lean` states the contract every macro's expansion satisfies
-(`MacroOk`: from an agreeing state every step is safe and control leaves
-the macro's primitives only to the next macro, agreeing with the checker's
-post-state, to a labelled slot in the entry state, or by returning under
-the contract). `Simple.lean`, `CheckedAddr.lean`, `Arith.lean` and
+(`MacroOk`: from an agreeing state every step is safe, every range it
+writes is writable, `rsp` stays in the native stack window at every
+position, and control leaves the macro's primitives only to the next macro,
+agreeing with the checker's post-state, to a labelled slot in the entry
+state, or by returning under the contract). The `rsp` clause is what the
+whole-function `StackKept` is assembled from, and `romem_kept` needs it:
+without it nothing says a callee's own frame lies below this activation's
+frame scratch, because a register-only primitive can move `rsp` without
+touching memory. `Simple.lean`, `CheckedAddr.lean`, `Arith.lean` and
 `Calls.lean` prove it for each macro with the operands symbolic — the
 branchless check yields zero or an in-region address on both the
 frame-constants and the descriptor paths and for the two-region probe; the

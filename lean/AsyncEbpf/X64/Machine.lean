@@ -22,8 +22,9 @@ bytes; that table is trusted, this is not.
 * Each instruction's effect on registers, flags and memory with the fine
   print that matters: a 32-bit form computes on the low half and zero-extends
   into the full register, shift amounts are masked, compares and tests write
-  no register, `push` moves `rsp` before it stores, `pop` reads before it
-  moves.
+  no register, `push` moves `rsp` before it stores, `pop` reads the word at
+  `rsp`, moves `rsp`, and only then writes its destination, so `pop rsp`
+  ends holding the popped word.
 * Calls out of the list. Every call the backend emits — the retpoline to the
   dispatcher, the lazy local-call resolver, a lazily compiled callee — leaves
   the code this list describes, and comes back under the SysV contract:
@@ -41,10 +42,13 @@ here, so a property proved of all of them holds of the real one.
   `cmpxchg`. So are `rax` and `rdx` after `MulDivRcx`: the fix-ups the
   emitter wraps around a division are a correctness question, not a safety
   one, and reading its results as arbitrary is the weaker assumption.
-* An external call may write every register except `rbx`, `rbp`, `r12`–`r15`
-  and `rsp` (which it returns as it found it plus the popped return address),
-  every flag, and every byte below the return address, sparing the four
-  writable frame slots' complement above it and the descriptor.
+* An external call may write every register except `rbp`, `r15` and `rsp`
+  (which it returns as it found it plus the popped return address), every
+  flag, every byte below the return address, the four writable frame slots,
+  the two guest regions and the first page; it spares the rest of the
+  caller's frame and the descriptor. `rbx` and `r12`–`r14` are *not* spared:
+  a lazily compiled callee is another instance of this theorem, and this
+  theorem does not promise them.
 * Non-memory faults — `ud2`, a divide by zero the emitter's fix-ups did not
   intercept, an alignment or lock violation — are not modelled: `Ud2` and the
   trailer data simply halt, and the rest cannot fault in this model. A fault
@@ -436,7 +440,49 @@ def accesses (i : x64_ir.PInsn) (s : State) : List (Word × Nat) :=
   | .Ret => [(s.regs RSP, 8)]
   | _ => []
 
-/-! ## Leaving the list -/
+/-- `stores i s` is the sublist of `accesses i s` the instruction *writes*.
+
+Memory safety as `Safe` states it says where the code may reach; it does not
+say what it may change, and that is what a caller has to know of its callee.
+Every primitive that writes memory is here — the two stack pushes, the four
+guest stores, the three atomics, the two `[rsp]` stores and the two calls'
+pushes — and every other primitive writes nothing, a `pop`, a `ret` and a
+`popfq` included: they read the word at `rsp` and move `rsp`, they do not
+rewrite the word. -/
+def stores (i : x64_ir.PInsn) (s : State) : List (Word × Nat) :=
+  match i with
+  | .Push _ => [(s.regs RSP - 8#64, 8)]
+  | .Pushfq => [(s.regs RSP - 8#64, 8)]
+  | .Store size _ base disp => [(addr s base disp, size.val)]
+  | .StoreImm size base disp _ => [(addr s base disp, size.val)]
+  | .LockAlu _ w64 _ base disp => [(addr s base disp, opWidth w64)]
+  | .LockCmpxchg w64 _ base disp => [(addr s base disp, opWidth w64)]
+  | .Xchg w64 _ base disp => [(addr s base disp, opWidth w64)]
+  | .StoreRspImm _ => [(s.regs RSP, 8)]
+  | .StoreRspRax => [(s.regs RSP, 8)]
+  | .Call _ => [(s.regs RSP - 8#64, 8)]
+  | .CallReg _ => [(s.regs RSP - 8#64, 8)]
+  | _ => []
+
+/-- Every write is an access, so `SafeStores` is a statement about a subset of
+what `Safe` is about. -/
+theorem stores_sub_accesses (i : x64_ir.PInsn) (s : State) :
+    ∀ bn ∈ stores i s, bn ∈ accesses i s := by
+  intro bn hbn
+  cases i <;> simp only [stores] at hbn <;> simp_all [accesses]
+
+/-! ## Leaving the list
+
+The two guest spans are here, rather than beside the rest of the layout in
+`AsyncEbpf/X64/Contract.lean`, because `ExternalReturn` names them: a callee
+may write guest memory wherever the runtime mapped it, and that is part of
+what it is allowed to have done. -/
+
+/-- Bytes the guest stack spans, and so bytes its native backing spans. -/
+def stackSpan (P : Params) : Nat := P.sgt.toNat - P.sgb.toNat
+
+/-- Bytes the guest data region spans, and so bytes its native backing spans. -/
+def dataSpan (P : Params) : Nat := P.dgt.toNat - P.dgb.toNat
 
 /-- The 8-byte frame slots an external call may write: the spill, the address
 spill, the accumulator spill and the parked group base. -/
@@ -446,26 +492,42 @@ def WritableSlot (P : Params) (a : Word) : Prop :=
 
 /-- What a callee outside this list may have done, on return.
 
-This is the SysV contract, narrowed by what the runtime promises of the three
-kinds of callee the backend reaches — the dispatcher through the retpoline,
-the lazy local-call resolver and its stack-exhausted twin, and a lazily
-compiled callee, which is another instance of this theorem. It returns to the
-address on top of the stack, pops it, keeps the callee-saved registers,
-leaves the caller's frame alone above the return address except for the four
-writable slots, and leaves the descriptor alone. Everything else — the
-caller-saved registers, the flags, the bytes below the return address — is
-arbitrary. -/
+This is what the runtime promises of the three kinds of callee the backend
+reaches — the dispatcher through the retpoline, the lazy local-call resolver
+and its stack-exhausted twin, and a lazily compiled callee, which is another
+instance of this theorem. It returns to the address on top of the stack, pops
+it, keeps `rbp` and the frame register, leaves the caller's frame alone above
+the return address except for the four writable slots, and leaves the
+descriptor alone. Everything else — the other thirteen registers, the flags,
+the bytes below the return address, the two guest regions and the first page
+— is arbitrary.
+
+It is weaker than the SysV contract in one place, deliberately: `rbx` and
+`r12`–`r14` are *not* preserved. A lazily compiled callee is this theorem's
+own conclusion, and this theorem promises only `rsp`, `rbp` and the frame
+register; the entry trampoline's own pushes are what restore the four for the
+host. And it is weaker than the old statement about memory in another:
+`frameKept` now spares the two guest regions and the first page, because a
+callee writes guest memory wherever the runtime mapped it, which need not be
+below the caller's stack pointer. -/
 structure ExternalReturn (P : Params) (code : List x64_ir.PInsn) (s s' : State) : Prop where
   /-- It returns to the pushed address, which is a position of this list. -/
   returnsHere : ∃ i : Nat, i < code.length ∧
     load64 s.mem (s.regs RSP) = codeAddr P i ∧ s'.pc = i
   /-- It pops that address. -/
   stackPopped : s'.regs RSP = s.regs RSP + 8#64
-  /-- `rbx`, `rbp`, `r12`–`r15` survive. -/
-  calleeSaved : ∀ r ∈ [RBX, RBP, R12, R13, R14, R15], s'.regs r = s.regs r
-  /-- Nothing above the return address changes but the four writable slots. -/
+  /-- `rbp` and `r15` survive, and only those two. A lazily compiled callee is
+  another instance of this theorem, and what it promises of `rbx`, `r12`–`r14`
+  is nothing: it clobbers them and its own caller restores them from the
+  pushes the entry trampoline made. -/
+  calleeSaved : ∀ r ∈ [RBP, R15], s'.regs r = s.regs r
+  /-- Nothing above the return address changes but the four writable slots and
+  the memory the runtime gave the guest: a callee writes its own stack, which
+  is below the return address, the four slots, the two guest regions wherever
+  they are mapped, and the page a failed check folds onto. -/
   frameKept : ∀ a : Word, (s.regs RSP).toNat + 8 ≤ a.toNat → ¬ WritableSlot P a →
-    s'.mem a = s.mem a
+    ¬ InRange P.snb (stackSpan P) a → ¬ InRange P.dnb (dataSpan P) a →
+    ¬ InRange 0#64 4096 a → s'.mem a = s.mem a
   /-- The descriptor is read-only. -/
   descKept : ∀ a : Word, P.desc.toNat ≤ a.toNat → a.toNat < P.desc.toNat + 200 →
     s'.mem a = s.mem a
@@ -492,12 +554,15 @@ inductive Step (P : Params) (code : List x64_ir.PInsn) : State → Config → Pr
       code[s.pc]? = some (.Push r) →
       Step P code s (.next { push s (s.regs r.val) with pc := s.pc + 1 })
 
-  /-- `pop` reads before it moves `rsp`, so `pop rsp` ends at `rsp + 8`. -/
+  /-- `pop` reads the word at `rsp`, then moves `rsp`, then writes the
+  destination, so `pop rsp` ends holding the *popped word*, not `rsp + 8`.
+  The backend never emits `pop rsp`; the model follows the hardware anyway,
+  which is what the differential test against a real machine checks. -/
   | pop (s : State) (r : Std.U8) :
       code[s.pc]? = some (.Pop r) →
       Step P code s (.next
-        { s with regs := Function.update (Function.update s.regs r.val
-                   (load64 s.mem (s.regs RSP))) RSP (s.regs RSP + 8#64),
+        { s with regs := Function.update (Function.update s.regs RSP (s.regs RSP + 8#64))
+                   r.val (load64 s.mem (s.regs RSP)),
                  pc := s.pc + 1 })
 
   | alu (s : State) (w64 : Bool) (op : x64_ir.AluRR) (src dst : Std.U8) :
@@ -794,8 +859,8 @@ theorem step_push {P code s c} {r}
 theorem step_pop {P code s c} {r}
     (hc : code[s.pc]? = some (.Pop r)) (h : Step P code s c) :
     c = .next { s with
-      regs := Function.update (Function.update s.regs r.val (load64 s.mem (s.regs RSP)))
-        RSP (s.regs RSP + 8#64), pc := s.pc + 1 } := by
+      regs := Function.update (Function.update s.regs RSP (s.regs RSP + 8#64))
+        r.val (load64 s.mem (s.regs RSP)), pc := s.pc + 1 } := by
   cases h <;> simp_all
 
 /-- A register-to-register ALU instruction changes no memory and advances by
@@ -843,6 +908,67 @@ so what a `ret` reads after a `call`. -/
 
 @[simp] theorem accesses_aluRM (op reg base disp s) :
     accesses (.AluRM op reg base disp) s = [(addr s base disp, 8)] := rfl
+
+/-! ### The writes, per variant
+
+The same shapes for `stores` that the block above gives for `accesses`: what
+each primitive a macro expands to writes, read off by `rfl`. -/
+
+@[simp] theorem stores_push (r s) : stores (.Push r) s = [(s.regs RSP - 8#64, 8)] := rfl
+
+@[simp] theorem stores_pushfq (s) : stores .Pushfq s = [(s.regs RSP - 8#64, 8)] := rfl
+
+@[simp] theorem stores_pop (r s) : stores (.Pop r) s = [] := rfl
+
+@[simp] theorem stores_popfq (s) : stores .Popfq s = [] := rfl
+
+@[simp] theorem stores_ret (s) : stores .Ret s = [] := rfl
+
+@[simp] theorem stores_store (size src base disp s) :
+    stores (.Store size src base disp) s = [(addr s base disp, size.val)] := rfl
+
+@[simp] theorem stores_storeImm (size base disp imm s) :
+    stores (.StoreImm size base disp imm) s = [(addr s base disp, size.val)] := rfl
+
+@[simp] theorem stores_storeRspImm (imm s) : stores (.StoreRspImm imm) s = [(s.regs RSP, 8)] :=
+  rfl
+
+@[simp] theorem stores_storeRspRax (s) : stores .StoreRspRax s = [(s.regs RSP, 8)] := rfl
+
+@[simp] theorem stores_lockAlu (op w64 src base disp s) :
+    stores (.LockAlu op w64 src base disp) s = [(addr s base disp, opWidth w64)] := rfl
+
+@[simp] theorem stores_lockCmpxchg (w64 src base disp s) :
+    stores (.LockCmpxchg w64 src base disp) s = [(addr s base disp, opWidth w64)] := rfl
+
+@[simp] theorem stores_xchg (w64 src base disp s) :
+    stores (.Xchg w64 src base disp) s = [(addr s base disp, opWidth w64)] := rfl
+
+@[simp] theorem stores_call (t s) : stores (.Call t) s = [(s.regs RSP - 8#64, 8)] := rfl
+
+@[simp] theorem stores_callReg (r s) : stores (.CallReg r) s = [(s.regs RSP - 8#64, 8)] := rfl
+
+@[simp] theorem stores_load (size sx base dst disp s) :
+    stores (.Load size sx base dst disp) s = [] := rfl
+
+@[simp] theorem stores_aluRM (op reg base disp s) :
+    stores (.AluRM op reg base disp) s = [] := rfl
+
+@[simp] theorem stores_alu (w64 op src dst s) : stores (.Alu w64 op src dst) s = [] := rfl
+
+@[simp] theorem stores_aluImm (w64 op dst imm s) :
+    stores (.AluImm w64 op dst imm) s = [] := rfl
+
+@[simp] theorem stores_jcc (cc t s) : stores (.Jcc cc t) s = [] := rfl
+
+@[simp] theorem stores_jmp (t s) : stores (.Jmp t) s = [] := rfl
+
+@[simp] theorem stores_jmpNear (t s) : stores (.JmpNear t) s = [] := rfl
+
+/-- A register-only primitive writes nothing. -/
+theorem stores_regOnly_nil {i : x64_ir.PInsn} (s : State) (h : accesses i s = []) :
+    stores i s = [] := by
+  cases i <;> simp_all [stores, accesses]
 
 end X64
 

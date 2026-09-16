@@ -24,13 +24,28 @@ structure MacroOk (P : Params) (code : List x64_ir.PInsn) (p q : Nat)
   returns : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
     ∀ s'', Step P code s' (.returned s'') →
       s''.regs RSP = P.rsp0 + 8#64 ∧ s''.regs RBP = P.rbp0 ∧ s''.regs R15 = P.fp0
+  stores : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+    ∀ c, Step P code s' c → ∀ i, code[s'.pc]? = some i → ∀ bn ∈ stores i s', StoreOk P bn.1 bn.2
+  rsp : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+    (s'.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (s'.regs RSP).toNat + 128
 ```
 
 Read it as: started at the macro's first primitive from a state the checker's
 *pre*-state describes, every step the expansion takes is safe; control leaves
 the range only by falling through to `q`, where the checker's *post*-state
 describes it, or to one of the listed exits, where the state listed with it
-does; and if the expansion returns, it returns under the contract.
+does; if the expansion returns, it returns under the contract; every range it
+writes is one the activation may write; and the stack pointer never leaves the
+native stack window.
+
+The fourth clause is the one a caller needs of a callee, and most macros
+discharge it in a line: a register-only primitive writes nothing, and a guest
+store writes exactly the range its address rule already placed in a region.
+The fifth is what the whole-function `StackKept` of
+`AsyncEbpf/X64/Contract.lean` is assembled from, and every macro proof already
+has it: `Agree` pins `rsp` at `rsp0 - 8·d` with `d ≤ 16`, and the macros that
+move `rsp` — the prologue, the epilogue, the division's pushes, the two calls
+— carry the depth through their own invariant.
 
 `Stays P code inside s s'` is the reflexive-transitive closure of `Step … (.next
 _)` through states whose program counter satisfies `inside`, the last one
@@ -173,6 +188,20 @@ structure MacroOk (P : Params) (code : List x64_ir.PInsn) (p q : Nat)
   returns : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
     ∀ s'', Step P code s' (.returned s'') →
       s''.regs RSP = P.rsp0 + 8#64 ∧ s''.regs RBP = P.rbp0 ∧ s''.regs R15 = P.fp0
+  /-- And every range it *writes* is one this activation may write: the fourth
+  clause, `SafeStores` localised to one macro exactly as `safe` is `Safe`. -/
+  stores : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+    ∀ c, Step P code s' c → ∀ i, code[s'.pc]? = some i →
+      ∀ bn ∈ X64.stores i s', StoreOk P bn.1 bn.2
+  /-- And the stack pointer stays in the native stack window at every position
+  of the macro, the boundary states included: at or below its entry value, and
+  no more than sixteen words below it. `Agree` says it of a boundary state,
+  where the checker's depth describes it; this says it of the states *inside*
+  the macro too, which is what the whole-function `StackKept` is made of and
+  what a callee's frame being below this activation's frame scratch rests
+  on. -/
+  rsp : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+    (s'.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (s'.regs RSP).toNat + 128
 
 /-! ## Register-only primitives -/
 
@@ -244,6 +273,41 @@ def writes : x64_ir.PInsn → List Nat
 /-- A register-only primitive touches no memory. -/
 theorem accesses_regOnly {i : x64_ir.PInsn} (hi : RegOnly i) (s : State) : accesses i s = [] := by
   cases i <;> first | rfl | (exfalso; exact hi)
+
+/-- And so writes none. -/
+theorem stores_regOnly {i : x64_ir.PInsn} (hi : RegOnly i) (s : State) : stores i s = [] := by
+  cases i <;> first | rfl | (exfalso; exact hi)
+
+/-- The `rsp` clause of a macro whose every position agrees with a state the
+checker described: the depth bookkeeping is the whole proof. -/
+theorem macroOk_rsp_of_agree {P : Params} {code : List x64_ir.PInsn} {p q : Nat}
+    {pre : x64_check.State} (hL : Layout P)
+    (h : ∀ s : State, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+      ∃ a : x64_check.State, Agree P a s') :
+    ∀ s : State, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+      (s'.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (s'.regs RSP).toNat + 128 := by
+  intro s hs hag s' hsty
+  obtain ⟨a, ha⟩ := h s hs hag s' hsty
+  exact rsp_window_of_agree hL ha
+
+/-- The `rsp` clause of a macro that tracks the stack pointer by depth, which
+is what the macros with pushes of their own do: the division's fix-ups, the
+two calls, the prologue. `d` is the depth at the position reached, not the
+depth the macro started at. -/
+theorem macroOk_rsp_of_window {P : Params} {code : List x64_ir.PInsn} {p q : Nat}
+    {pre : x64_check.State} (hL : Layout P)
+    (h : ∀ s : State, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+      ∃ d : Nat, d ≤ 16 ∧ s'.regs RSP = P.rsp0 - BitVec.ofNat 64 (8 * d)) :
+    ∀ s : State, s.pc = p → Agree P pre s → ∀ s', Stays P code (Range p q) s s' →
+      (s'.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (s'.regs RSP).toNat + 128 := by
+  intro s hs hag s' hsty
+  obtain ⟨d, hd, hv⟩ := h s hs hag s' hsty
+  exact rsp_window_of_depth hL hv hd
+
+/-- A macro whose primitives write nothing owes the `stores` clause nothing. -/
+theorem stores_nil_ok {P : Params} {i : x64_ir.PInsn} {s : State} (h : stores i s = []) :
+    ∀ bn ∈ stores i s, StoreOk P bn.1 bn.2 := by
+  simp [h]
 
 /-- A register-only primitive steps to the next position, keeps memory, and
 changes only the registers `writes` names. -/
@@ -484,6 +548,35 @@ theorem stack_push_access {P : Params} {a : x64_check.State} {s : State}
     AccessOk P (s.regs RSP - 8#64) 8 := by
   rw [h.rsp, rsp_push]
   exact stack_slot_ok hL hd
+
+/-! ### The same three, for stores
+
+The word at `rsp` and the word below it are writable as long as the depth is
+at least one — at depth zero `rsp` is the entry word, which holds the return
+address the epilogue reads and nothing writes — and a slot of the frame
+scratch is writable only if it is one of the four `x64_ir::frame` names. -/
+
+/-- The word a push at this depth is about to write. -/
+theorem stack_push_store {P : Params} {a : x64_check.State} {s : State}
+    (hL : Layout P) (h : Agree P a s) (hd : a.depth.val + 1 ≤ 16) :
+    StoreOk P (s.regs RSP - 8#64) 8 := by
+  rw [h.rsp, rsp_push]
+  exact storeOk_stack hL (by omega) hd
+
+/-- The word at `rsp`, once something has been pushed. -/
+theorem stack_top_store {P : Params} {a : x64_check.State} {s : State}
+    (hL : Layout P) (h : Agree P a s) (hd : 1 ≤ a.depth.val) :
+    StoreOk P (s.regs RSP) 8 := by
+  rw [h.rsp]
+  exact storeOk_stack hL hd h.depth
+
+/-- A store through `rbp` into one of the four writable slots. -/
+theorem frame_slot_store {P : Params} {a : x64_check.State} {s : State} {base : Std.U8}
+    {disp : Std.I32} {n j : Nat} (hL : Layout P) (h : Agree P a s) (hb : base.val = RBP)
+    (hj : j = 16 ∨ j = 24 ∨ j = 32 ∨ j = 144) (hd : disp.val = -(j : Int)) (hn : n ≤ 8) :
+    StoreOk P (addr s base disp) n := by
+  rw [addr_rbp h hb]
+  exact storeOk_slot hL hj hd hn
 
 end X64
 

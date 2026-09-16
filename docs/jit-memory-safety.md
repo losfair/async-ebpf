@@ -146,17 +146,27 @@ In `lean/AsyncEbpf/X64/`:
   checks read, byte-addressed memory, and a program counter over the
   primitive list. Branch targets are labels, so no encoding is modelled. A
   call to an address outside the function is an *external call*: it
-  returns to the pushed return address with `rsp`, `rbp`, `rbx`,
-  `r12`-`r15` and the read-only frame slots and descriptor preserved and
-  everything else arbitrary. That is the SysV contract for the dispatcher
-  and the callbacks, and this theorem's own conclusion for a lazily
-  compiled callee.
-- `Contract.lean` states the entry contract and the allowed set: the
-  descriptor at `[rbp - 8]` and the derived constants below it describe two
-  disjoint guest regions with disjoint native backings, neither containing
-  the first page; the frame register holds the native address of the
-  current frame's top, inside the stack's backing; the native stack has a
-  bounded window below `rsp`.
+  returns to the pushed return address with `rsp`, `rbp`, `r15` and the
+  read-only frame slots and descriptor preserved, and everything else —
+  `rbx` and `r12`-`r14` among it, and guest memory wherever the runtime
+  mapped it — arbitrary. That is what the runtime promises of the
+  dispatcher and the callbacks, and it is exactly this theorem's own
+  conclusion for a lazily compiled callee, which is why it promises no more
+  than that conclusion does. `stores` names the subset of an instruction's
+  accesses that write.
+- `Contract.lean` states the entry contract, the allowed set and the
+  writable set: the descriptor at `[rbp - 8]` and the derived constants
+  below it describe two disjoint guest regions with disjoint native
+  backings, neither containing the first page; the frame register holds the
+  native address of the current frame's top, inside the stack's backing;
+  the native stack has a bounded window below `rsp`. `WritableAllowed` is
+  the part of the allowed set a function may *change* — the native stack
+  below the entry `rsp`, the four writable frame slots, the two guest
+  backings and the first page — and `SafeStores`, the second half of
+  `Contract`, says every store lands in it. That is what a caller needs of
+  its callee and what `Safe` on its own does not say; `romem_kept` is the
+  corollary, that the read-only slots and the descriptor come back
+  untouched.
 - `CheckSpec.lean` turns `check = ok` into a chain of abstract states with
   one rule application per macro; `Expand.lean` turns `expand` into a
   concatenation of per-macro chunks with every label resolved; `Abs.lean`

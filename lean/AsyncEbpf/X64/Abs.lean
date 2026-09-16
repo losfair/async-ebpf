@@ -46,18 +46,6 @@ The three facts about 64-bit addresses every window argument below reduces to.
 All three are stated on `toNat`, or on `Int` where a displacement is signed,
 because that is the form `omega` reasons in. -/
 
-theorem toNat_sub_ofNat {x : Word} {k : Nat} (h : k ≤ x.toNat) (hk : k < 2 ^ 64) :
-    (x - BitVec.ofNat 64 k).toNat = x.toNat - k := by
-  have := x.isLt
-  rw [BitVec.toNat_sub, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hk]
-  omega
-
-theorem toNat_add_ofNat {x : Word} {k : Nat} (h : x.toNat + k < 2 ^ 64) :
-    (x + BitVec.ofNat 64 k).toNat = x.toNat + k := by
-  have := x.isLt
-  rw [BitVec.toNat_add, BitVec.toNat_ofNat]
-  omega
-
 /-- A sign-extended 32-bit displacement denotes the integer it names. -/
 theorem toInt_signExtend (d : BitVec 32) : (BitVec.signExtend 64 d).toInt = d.toInt := by
   have h1 : d.toInt < 2 ^ 31 := by have := BitVec.toInt_lt (x := d); simpa using this
@@ -81,25 +69,12 @@ theorem toNat_addr {x : Word} {d : Std.I32}
   rw [hsum, hyi] at *
   split at hcond <;> omega
 
-/-! ## The layout, read off -/
+/-! ## The layout, read off
 
-namespace Layout
-
-variable {P : Params}
-
-/-- The frame scratch really is the 160 bytes below `rbp0`. -/
-theorem frameSlots_toNat (h : Layout P) : (frameSlots P).toNat = P.rbp0.toNat - 160 := by
-  have := h.frameRoom
-  rw [frameSlots, show (160#64 : Word) = BitVec.ofNat 64 160 from rfl]
-  exact toNat_sub_ofNat (by omega) (by norm_num)
-
-/-- And the native stack window the 136 bytes from `rsp0 - 128`. -/
-theorem stackWindow_toNat (h : Layout P) : (stackWindow P).toNat = P.rsp0.toNat - 128 := by
-  have := h.stackRoom
-  rw [stackWindow, show (128#64 : Word) = BitVec.ofNat 64 128 from rfl]
-  exact toNat_sub_ofNat (by omega) (by norm_num)
-
-end Layout
+`Layout.frameSlots_toNat`, `Layout.stackWindow_toNat`, `rbp_sub_toNat`,
+`desc_add_toNat` and `derivedSlot_toNat` are in
+`AsyncEbpf/X64/Contract.lean`, beside `writableAllowed_off_ro`, which needs
+them too. -/
 
 /-- Two disjoint ranges have no address in common. -/
 theorem notInRange_of_disjoint {c : Word} {j : Nat} {d : Word} {i : Nat}
@@ -208,6 +183,68 @@ theorem guestOk_of_window {P : Params} {c : Word} {k : Nat} {v : Word} {n : Nat}
     exact ⟨⟨by omega, fun a ha => hall a (hsub a ha)⟩, fun a ha => hfr a (hsub a ha),
       fun a ha => hde a (hsub a ha)⟩
 
+/-! ### The same, for stores
+
+`StoreOk` is `AccessOk` over `WritableAllowed` instead of `Allowed`, and the
+three rules that produce a guest access produce it too: a `Checked` base is
+zero, which is the first page, or inside a guest backing; the frame fast path
+is inside the stack's backing; and all three are writable. What is *not*
+writable, and so has no rule here, is the read-only part of the frame scratch,
+the word at the entry `rsp` and the descriptor. -/
+
+/-- An empty store writes nothing wherever it points. -/
+theorem storeOk_zero (P : Params) (b : Word) : StoreOk P b 0 := by
+  refine ⟨by have := b.isLt; omega, fun a ha => ?_⟩
+  exact absurd ha (by simp only [InRange, not_and, not_lt]; omega)
+
+/-- `guestOk_of_window` for writes: `[base + disp, base + disp + n)` inside a
+window every byte of which may be written. -/
+theorem storeOk_of_window {P : Params} {c : Word} {k : Nat} {v : Word} {n : Nat}
+    {disp : Std.I32}
+    (hnw : c.toNat + k ≤ 2 ^ 64)
+    (hall : ∀ a : Word, InRange c k a → WritableAllowed P a)
+    (hlo : (c.toNat : Int) ≤ (v.toNat : Int) + disp.val)
+    (hhi : (v.toNat : Int) + disp.val + n ≤ (c.toNat : Int) + k) :
+    StoreOk P (v + BitVec.signExtend 64 disp.bv) n := by
+  rcases Nat.eq_zero_or_pos n with rfl | hn
+  · exact storeOk_zero _ _
+  · have hb : (((v + BitVec.signExtend 64 disp.bv).toNat : Int)) = (v.toNat : Int) + disp.val := by
+      refine toNat_addr ?_ ?_ <;> omega
+    refine ⟨by omega, fun a ha => hall a ?_⟩
+    obtain ⟨h1, h2⟩ := ha
+    exact ⟨by omega, by omega⟩
+
+/-- The checked rule for a store: the same three cases, all writable. -/
+theorem tagOk_checked_store {P : Params} {w : Std.U32} {v : Word} {n : Nat} {disp : Std.I32}
+    (hL : Layout P) (h : TagOk P (.Checked w) v)
+    (hd0 : 0 ≤ disp.val) (hdn : disp.val + n ≤ (w.val : Int)) (hw : w.val ≤ 4096) :
+    StoreOk P (v + BitVec.signExtend 64 disp.bv) n := by
+  rcases h with hz | hs | hd
+  · subst hz
+    refine storeOk_of_window (c := 0#64) (k := 4096) (by norm_num)
+      (fun a ha => Or.inr (Or.inr (Or.inr (Or.inr ha))))
+      (by simp only [BitVec.toNat_ofNat]; omega) ?_
+    simp only [BitVec.toNat_ofNat]
+    omega
+  · obtain ⟨hlo, hhi⟩ := hs
+    exact storeOk_of_window hL.stackNativeNoWrap
+      (fun a ha => Or.inr (Or.inr (Or.inl ha))) (by omega) (by omega)
+  · obtain ⟨hlo, hhi⟩ := hd
+    exact storeOk_of_window hL.dataNativeNoWrap
+      (fun a ha => Or.inr (Or.inr (Or.inr (Or.inl ha)))) (by omega) (by omega)
+
+/-- The frame fast path for a store: the frame window lies inside the stack's
+native backing, which is writable. -/
+theorem frame_store_ok {P : Params} {v : Word} {n : Nat} {disp : Std.I32}
+    (hL : Layout P) (hv : v = P.fp0)
+    (hlo : -(P.frameSize : Int) ≤ disp.val) (hhi : disp.val + n ≤ 0) :
+    StoreOk P (v + BitVec.signExtend 64 disp.bv) n := by
+  subst hv
+  have ha := hL.frameAbove
+  have hb := hL.frameBelow
+  exact storeOk_of_window hL.stackNativeNoWrap
+    (fun a ha => Or.inr (Or.inr (Or.inl ha))) (by omega) (by omega)
+
 /-- The checked rule: a `Checked w` base with the access inside `[0, w)`. The
 first page catches the parked zero, and the region catches everything else;
 the two are the same statement because a region is never narrower than a page
@@ -279,6 +316,42 @@ theorem stack_slot_ok {P : Params} {d : Nat} (hL : Layout P) (hd : d ≤ 16) :
   exact ⟨by omega, fun a ha => allowed_stack ⟨by simp only [InRange] at ha; omega,
     by simp only [InRange] at ha; simp only [stackWindowLen]; omega⟩⟩
 
+/-- The stack pointer at a depth the checker admits lies in the native stack
+window: at or below its entry value, and no more than sixteen words below it.
+This is what the whole-function `StackKept` of `AsyncEbpf/X64/Contract.lean`
+asks of every reachable state, and every macro proof has it to hand, because
+tracking `rsp` as `rsp0 - 8·d` with `d ≤ 16` is what `Agree` already does. -/
+theorem rsp_window_of_depth {P : Params} {v : Word} {d : Nat} (hL : Layout P)
+    (hv : v = P.rsp0 - BitVec.ofNat 64 (8 * d)) (hd : d ≤ 16) :
+    v.toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ v.toNat + 128 := by
+  have hroom := hL.stackRoom
+  have hb : (P.rsp0 - BitVec.ofNat 64 (8 * d)).toNat = P.rsp0.toNat - 8 * d :=
+    toNat_sub_ofNat (by omega) (by omega)
+  rw [hv, hb]
+  omega
+
+/-- At the entry `rsp` itself, which is depth zero. -/
+theorem rsp_window_of_rsp0 {P : Params} {v : Word} (hv : v = P.rsp0) :
+    v.toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ v.toNat + 128 := by
+  rw [hv]; omega
+
+/-- A store to the native stack: the word a push at depth `d` writes, for any
+depth the checker admits. It is inside `[rsp0 - 128, rsp0)` — one word below
+the entry `rsp` at the shallowest — and so misses the return address the entry
+word holds, which is why `WritableAllowed` stops at `rsp0` where `Allowed`
+goes eight bytes further. -/
+theorem storeOk_stack {P : Params} {d : Nat} (hL : Layout P) (hd1 : 1 ≤ d) (hd : d ≤ 16) :
+    StoreOk P (P.rsp0 - BitVec.ofNat 64 (8 * d)) 8 := by
+  have hroom := hL.stackRoom
+  have hb : (P.rsp0 - BitVec.ofNat 64 (8 * d)).toNat = P.rsp0.toNat - 8 * d :=
+    toNat_sub_ofNat (by omega) (by omega)
+  have e : (P.rsp0 - 128#64).toNat = P.rsp0.toNat - 128 := by
+    rw [show (128#64 : Word) = BitVec.ofNat 64 128 from rfl]
+    exact toNat_sub_ofNat (by omega) (by norm_num)
+  refine ⟨by omega, fun a ha => Or.inl ?_⟩
+  simp only [InRange, hb] at ha
+  exact ⟨by simp only [e]; omega, by simp only [e]; omega⟩
+
 /-- `rsp - 8` is the word one deeper. -/
 theorem rsp_push {P : Params} {d : Nat} :
     P.rsp0 - BitVec.ofNat 64 (8 * d) - 8#64 = P.rsp0 - BitVec.ofNat 64 (8 * (d + 1)) := by
@@ -317,24 +390,6 @@ of them keeps `RoMem`. -/
 theorem store_zero (m : Mem) (b : Word) (v : BitVec (8 * 0)) : store 0 m b v = m := by
   funext x
   simp [store]
-
-theorem rbp_sub_toNat {P : Params} (hL : Layout P) {j : Nat} (hj : j ≤ 160) :
-    (P.rbp0 - BitVec.ofNat 64 j).toNat = P.rbp0.toNat - j := by
-  have := hL.frameRoom
-  exact toNat_sub_ofNat (by omega) (by omega)
-
-theorem desc_add_toNat {P : Params} (hL : Layout P) {j : Nat} (hj : j < 200) :
-    (P.desc + BitVec.ofNat 64 j).toNat = P.desc.toNat + j := by
-  have := hL.descNoWrap
-  exact toNat_add_ofNat (by omega)
-
-theorem derivedSlot_toNat {P : Params} (hL : Layout P) {i : Nat} (hi : i ≤ 11) :
-    (derivedSlot P i).toNat = P.rbp0.toNat - 136 + 8 * i := by
-  have hr := hL.frameRoom
-  have h1 : (P.rbp0 - 136#64).toNat = P.rbp0.toNat - 136 :=
-    rbp_sub_toNat hL (j := 136) (by norm_num)
-  rw [derivedSlot]
-  rw [toNat_add_ofNat (by omega), h1]
 
 /-- The core of it: a store that misses the three read-only ranges leaves
 every byte `RoMem` names where it was. -/
@@ -998,10 +1053,44 @@ theorem rbp_slot {P : Params} {disp : Std.I32} {k : Nat} (hk : 0 < k) (hkb : k <
     P.rbp0 + BitVec.signExtend 64 disp.bv = P.rbp0 - BitVec.ofNat 64 k := by
   rw [signExtend_neg hk hkb h]; ring
 
+/-- A store to one of the four writable frame slots, addressed through `rbp`
+as `x64_ir::frame` addresses them. The read-only slots have no such rule: the
+generated code never writes them, which is what `RoMem` says. -/
+theorem storeOk_slot {P : Params} {n : Nat} {disp : Std.I32} {j : Nat} (hL : Layout P)
+    (hj : j = 16 ∨ j = 24 ∨ j = 32 ∨ j = 144) (hd : disp.val = -(j : Int)) (hn : n ≤ 8) :
+    StoreOk P (P.rbp0 + BitVec.signExtend 64 disp.bv) n := by
+  have hr := hL.frameRoom
+  rw [rbp_slot (k := j) (by omega) (by omega) hd]
+  have hb : (P.rbp0 - BitVec.ofNat 64 j).toNat = P.rbp0.toNat - j :=
+    rbp_sub_toNat hL (by omega)
+  have e16 : (P.rbp0 - 16#64).toNat = P.rbp0.toNat - 16 := by
+    rw [show (16#64 : Word) = BitVec.ofNat 64 16 from rfl]; exact rbp_sub_toNat hL (by norm_num)
+  have e24 : (P.rbp0 - 24#64).toNat = P.rbp0.toNat - 24 := by
+    rw [show (24#64 : Word) = BitVec.ofNat 64 24 from rfl]; exact rbp_sub_toNat hL (by norm_num)
+  have e32 : (P.rbp0 - 32#64).toNat = P.rbp0.toNat - 32 := by
+    rw [show (32#64 : Word) = BitVec.ofNat 64 32 from rfl]; exact rbp_sub_toNat hL (by norm_num)
+  have e144 : (P.rbp0 - 144#64).toNat = P.rbp0.toNat - 144 := by
+    rw [show (144#64 : Word) = BitVec.ofNat 64 144 from rfl]
+    exact rbp_sub_toNat hL (by norm_num)
+  refine ⟨by omega, fun a ha => ?_⟩
+  simp only [InRange, hb] at ha
+  refine Or.inr (Or.inl ?_)
+  rcases hj with rfl | rfl | rfl | rfl
+  · exact Or.inl ⟨by simp only [e16]; omega, by simp only [e16]; omega⟩
+  · exact Or.inr (Or.inl ⟨by simp only [e24]; omega, by simp only [e24]; omega⟩)
+  · exact Or.inr (Or.inr (Or.inl ⟨by simp only [e32]; omega, by simp only [e32]; omega⟩))
+  · exact Or.inr (Or.inr (Or.inr ⟨by simp only [e144]; omega, by simp only [e144]; omega⟩))
+
 /-- At depth one, `rsp` is one word below its entry value. -/
 theorem agree_depth_one {P : Params} {a : x64_check.State} {s : State} (h : Agree P a s)
     (hd : a.depth.val = 1) : s.regs RSP = P.rsp0 - 8#64 := by
   rw [h.rsp, hd]
+
+/-- So an agreeing state has its stack pointer in the window. -/
+theorem rsp_window_of_agree {P : Params} {a : x64_check.State} {s : State} (hL : Layout P)
+    (h : Agree P a s) :
+    (s.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (s.regs RSP).toNat + 128 :=
+  rsp_window_of_depth hL h.rsp h.depth
 
 /-- And with the frame register intact it still holds the native frame base. -/
 theorem agree_fp {P : Params} {a : x64_check.State} {s : State} (h : Agree P a s)
