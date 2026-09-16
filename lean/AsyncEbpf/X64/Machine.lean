@@ -140,6 +140,10 @@ structure Params where
   frameSize : Nat
   /-- Guest-address distance between successive frame pointers. -/
   stride : Nat
+  /-- The native (coroutine) stack mapping `[stackLo, stackHi)`, which holds
+  `rsp0`, `rbp0` and every activation's frame scratch and pushes. -/
+  stackLo : Word
+  stackHi : Word
 
 /-! ## Widths -/
 

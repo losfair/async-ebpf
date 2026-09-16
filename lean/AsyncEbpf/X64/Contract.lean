@@ -180,6 +180,22 @@ structure Layout (P : Params) : Prop where
   zero base could rewrite the descriptor the next check reads. -/
   frameOffPage : RangesDisjoint 0#64 4096 (frameSlots P) 160
   descOffPage : RangesDisjoint 0#64 4096 P.desc 200
+  /-- The native stack is one mapping, `[stackLo, stackHi)`, that holds the
+  entry `rsp` with the whole window below it and the frame scratch above it,
+  sits clear of the first page, the two guest backings and the descriptor,
+  and keeps two hundred and forty bytes below the native floor: what a
+  local call pushes before the callee's own window begins. These are what
+  make an activation's contract pass to the activation it calls. -/
+  nativeStackNoWrap : P.stackLo.toNat ≤ P.stackHi.toNat ∧ P.stackHi.toNat ≤ 2 ^ 64
+  nativeStackLo : P.stackLo.toNat + 128 ≤ P.rsp0.toNat
+  nativeStackHi : P.rbp0.toNat ≤ P.stackHi.toNat
+  nativeStackOffPage : RangesDisjoint 0#64 4096 P.stackLo (P.stackHi.toNat - P.stackLo.toNat)
+  stackNativeOffNativeStack :
+    RangesDisjoint P.stackLo (P.stackHi.toNat - P.stackLo.toNat) P.snb (stackSpan P)
+  dataNativeOffNativeStack :
+    RangesDisjoint P.stackLo (P.stackHi.toNat - P.stackLo.toNat) P.dnb (dataSpan P)
+  descOffNativeStack : RangesDisjoint P.stackLo (P.stackHi.toNat - P.stackLo.toNat) P.desc 200
+  floorNative : P.stackLo.toNat + 240 ≤ P.nativeFloor.toNat
 
 /-- The bytes below the frame pointer, and the descriptor, that the entry
 trampoline filled in and the generated code never writes: the descriptor's

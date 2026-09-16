@@ -681,10 +681,17 @@ fn live_step(cfg: &Cfg, insn: MInsn, index: usize, pc: u32, st: &mut State) -> R
   }
 }
 
-/// What a call leaves: the caller-saved registers and the writable frame
-/// slots, the parked group base among them. The callee-saved registers, the
-/// frame register included, come back as they went in.
+/// What a call leaves: every register but `rsp`, `rbp` and the frame
+/// register, and the writable frame slots, the parked group base among them.
+/// A host callee keeps `rbx` and `r12`-`r14` by convention and a lazily
+/// compiled callee has them restored from the caller's pushes, but the
+/// contract the proof states for a callee promises neither, so the walk
+/// forgets them.
 fn clobber_call(st: &mut State) {
+  set_tag(st, RBX, Tag::Top);
+  set_tag(st, R12, Tag::Top);
+  set_tag(st, R13, Tag::Top);
+  set_tag(st, R14, Tag::Top);
   set_tag(st, RAX, Tag::Top);
   set_tag(st, RCX, Tag::Top);
   set_tag(st, RDX, Tag::Top);

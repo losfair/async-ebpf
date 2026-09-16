@@ -471,16 +471,17 @@ pub enum MInsn {
   },
 
   /// Call external helper `idx` through the dispatcher. Contract: the
-  /// dispatcher is registered; writes every caller-saved register and every
-  /// writable frame slot; two pushes deep.
+  /// dispatcher is registered; writes every register but `rsp`, `rbp` and
+  /// the frame register, and every writable frame slot; two pushes deep.
   HelperCall {
     idx: u32,
   },
 
   /// A lazily-resolved local call through resolver slot `id`. Contract:
-  /// the callbacks are registered; writes the caller-saved registers and the
-  /// writable frame slots; the frame register is moved down one stride for
-  /// the callee and restored; thirteen pushes deep.
+  /// the callbacks are registered; writes every register but `rsp`, `rbp`
+  /// and the frame register, and the writable frame slots; the frame
+  /// register is moved down one stride for the callee and restored;
+  /// thirteen pushes deep.
   LazyLocalCall {
     id: u32,
   },

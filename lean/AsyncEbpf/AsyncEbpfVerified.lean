@@ -5743,7 +5743,7 @@ inductive x64_ir.AluRR where
 | Test : x64_ir.AluRR
 
 /-- [async_ebpf_verified::x64_ir::MInsn]
-    Source: '../../src/verified/x64_ir.rs', lines 278:0-493:1
+    Source: '../../src/verified/x64_ir.rs', lines 278:0-494:1
     Visibility: public -/
 @[discriminant isize]
 inductive x64_ir.MInsn where
@@ -6502,6 +6502,21 @@ def x64_check.data_step
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.RAX : Std.U8 := 0#u8
 
+/-- [async_ebpf_verified::x64_ir::R14]
+    Source: '../../src/verified/x64_ir.rs', lines 51:0-51:23
+    Visibility: public -/
+@[global_simps, irreducible] def x64_ir.R14 : Std.U8 := 14#u8
+
+/-- [async_ebpf_verified::x64_ir::R13]
+    Source: '../../src/verified/x64_ir.rs', lines 50:0-50:23
+    Visibility: public -/
+@[global_simps, irreducible] def x64_ir.R13 : Std.U8 := 13#u8
+
+/-- [async_ebpf_verified::x64_ir::R12]
+    Source: '../../src/verified/x64_ir.rs', lines 49:0-49:23
+    Visibility: public -/
+@[global_simps, irreducible] def x64_ir.R12 : Std.U8 := 12#u8
+
 /-- [async_ebpf_verified::x64_ir::R8]
     Source: '../../src/verified/x64_ir.rs', lines 45:0-45:21
     Visibility: public -/
@@ -6517,20 +6532,29 @@ def x64_check.data_step
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.RSI : Std.U8 := 6#u8
 
+/-- [async_ebpf_verified::x64_ir::RBX]
+    Source: '../../src/verified/x64_ir.rs', lines 40:0-40:22
+    Visibility: public -/
+@[global_simps, irreducible] def x64_ir.RBX : Std.U8 := 3#u8
+
 /-- [async_ebpf_verified::x64_check::clobber_call]:
-    Source: '../../src/verified/x64_check.rs', lines 687:0-698:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 690:0-705:1 -/
 def x64_check.clobber_call
   (st : x64_check.State) : Result x64_check.State := do
-  let st1 ← x64_check.set_tag st x64_ir.RAX x64_check.Tag.Top
-  let st2 ← x64_check.set_tag st1 x64_ir.RCX x64_check.Tag.Top
-  let st3 ← x64_check.set_tag st2 x64_ir.RDX x64_check.Tag.Top
-  let st4 ← x64_check.set_tag st3 x64_ir.RSI x64_check.Tag.Top
-  let st5 ← x64_check.set_tag st4 x64_ir.RDI x64_check.Tag.Top
-  let st6 ← x64_check.set_tag st5 x64_ir.R8 x64_check.Tag.Top
-  let st7 ← x64_check.set_tag st6 x64_ir.R9 x64_check.Tag.Top
-  let st8 ← x64_check.set_tag st7 x64_ir.R10 x64_check.Tag.Top
-  let st9 ← x64_check.set_tag st8 x64_ir.R11 x64_check.Tag.Top
-  ok { st9 with group := x64_check.Tag.Top }
+  let st1 ← x64_check.set_tag st x64_ir.RBX x64_check.Tag.Top
+  let st2 ← x64_check.set_tag st1 x64_ir.R12 x64_check.Tag.Top
+  let st3 ← x64_check.set_tag st2 x64_ir.R13 x64_check.Tag.Top
+  let st4 ← x64_check.set_tag st3 x64_ir.R14 x64_check.Tag.Top
+  let st5 ← x64_check.set_tag st4 x64_ir.RAX x64_check.Tag.Top
+  let st6 ← x64_check.set_tag st5 x64_ir.RCX x64_check.Tag.Top
+  let st7 ← x64_check.set_tag st6 x64_ir.RDX x64_check.Tag.Top
+  let st8 ← x64_check.set_tag st7 x64_ir.RSI x64_check.Tag.Top
+  let st9 ← x64_check.set_tag st8 x64_ir.RDI x64_check.Tag.Top
+  let st10 ← x64_check.set_tag st9 x64_ir.R8 x64_check.Tag.Top
+  let st11 ← x64_check.set_tag st10 x64_ir.R9 x64_check.Tag.Top
+  let st12 ← x64_check.set_tag st11 x64_ir.R10 x64_check.Tag.Top
+  let st13 ← x64_check.set_tag st12 x64_ir.R11 x64_check.Tag.Top
+  ok { st13 with group := x64_check.Tag.Top }
 
 /-- [async_ebpf_verified::x64_check::live_step]:
     Source: '../../src/verified/x64_check.rs', lines 497:0-682:1 -/
@@ -6837,7 +6861,7 @@ def x64_check.live_step
   else ok (core.result.Result.Ok (), st)
 
 /-- [async_ebpf_verified::x64_check::step]:
-    Source: '../../src/verified/x64_check.rs', lines 703:0-722:1 -/
+    Source: '../../src/verified/x64_check.rs', lines 710:0-729:1 -/
 def x64_check.step
   (cfg : x64_ir.Cfg) (labels : x64_check.Labels) (code : Slice x64_ir.MInsn)
   (index : Std.Usize) (pc : Std.U32) (st : x64_check.State) :
@@ -6890,7 +6914,7 @@ def x64_check.step
     ok (r, st)
 
 /-- [async_ebpf_verified::x64_check::check]: loop body 0:
-    Source: '../../src/verified/x64_check.rs', lines 737:2-751:1
+    Source: '../../src/verified/x64_check.rs', lines 744:2-758:1
     Visibility: public -/
 @[rust_loop_body]
 def x64_check.check_loop.body
@@ -6930,7 +6954,7 @@ def x64_check.check_loop.body
     else ok (done (core.result.Result.Ok ()))
 
 /-- [async_ebpf_verified::x64_check::check]: loop 0:
-    Source: '../../src/verified/x64_check.rs', lines 737:2-751:1
+    Source: '../../src/verified/x64_check.rs', lines 744:2-758:1
     Visibility: public -/
 @[rust_loop]
 def x64_check.check_loop
@@ -6945,7 +6969,7 @@ def x64_check.check_loop
     (st, pc, i)
 
 /-- [async_ebpf_verified::x64_check::check]:
-    Source: '../../src/verified/x64_check.rs', lines 731:0-751:1
+    Source: '../../src/verified/x64_check.rs', lines 738:0-758:1
     Visibility: public -/
 def x64_check.check
   (cfg : x64_ir.Cfg) (code : Slice x64_ir.MInsn) :
@@ -6957,7 +6981,7 @@ def x64_check.check
   x64_check.check_loop cfg code num_macros labels st 0#u32 0#usize
 
 /-- [async_ebpf_verified::x64_ir::AluRM]
-    Source: '../../src/verified/x64_ir.rs', lines 698:0-709:1
+    Source: '../../src/verified/x64_ir.rs', lines 699:0-710:1
     Visibility: public -/
 @[discriminant isize]
 inductive x64_ir.AluRM where
@@ -6968,7 +6992,7 @@ inductive x64_ir.AluRM where
 | Or : x64_ir.AluRM
 
 /-- [async_ebpf_verified::x64_ir::PTarget]
-    Source: '../../src/verified/x64_ir.rs', lines 498:0-507:1
+    Source: '../../src/verified/x64_ir.rs', lines 499:0-508:1
     Visibility: public -/
 @[discriminant isize]
 inductive x64_ir.PTarget where
@@ -6978,7 +7002,7 @@ inductive x64_ir.PTarget where
 | Local : Std.U32 → x64_ir.PTarget
 
 /-- [async_ebpf_verified::x64_ir::PInsn]
-    Source: '../../src/verified/x64_ir.rs', lines 514:0-693:1
+    Source: '../../src/verified/x64_ir.rs', lines 515:0-694:1
     Visibility: public -/
 @[discriminant isize]
 inductive x64_ir.PInsn where
@@ -7056,7 +7080,7 @@ def x64_expand.expand_retpoline
   ok (i, out8)
 
 /-- [async_ebpf_verified::x64_ir::cc::B]
-    Source: '../../src/verified/x64_ir.rs', lines 715:2-715:25
+    Source: '../../src/verified/x64_ir.rs', lines 716:2-716:25
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.B : Std.U8 := 130#u8
 
@@ -7077,26 +7101,6 @@ def x64_ir.memory.LOCAL_CALL_GUEST_FLOOR : Std.I32 := 144#i32
     Visibility: public -/
 @[global_simps, irreducible]
 def x64_ir.frame.FRAME_OFFSET : Std.I32 := (-8)#i32
-
-/-- [async_ebpf_verified::x64_ir::R14]
-    Source: '../../src/verified/x64_ir.rs', lines 51:0-51:23
-    Visibility: public -/
-@[global_simps, irreducible] def x64_ir.R14 : Std.U8 := 14#u8
-
-/-- [async_ebpf_verified::x64_ir::R13]
-    Source: '../../src/verified/x64_ir.rs', lines 50:0-50:23
-    Visibility: public -/
-@[global_simps, irreducible] def x64_ir.R13 : Std.U8 := 13#u8
-
-/-- [async_ebpf_verified::x64_ir::R12]
-    Source: '../../src/verified/x64_ir.rs', lines 49:0-49:23
-    Visibility: public -/
-@[global_simps, irreducible] def x64_ir.R12 : Std.U8 := 12#u8
-
-/-- [async_ebpf_verified::x64_ir::RBX]
-    Source: '../../src/verified/x64_ir.rs', lines 40:0-40:22
-    Visibility: public -/
-@[global_simps, irreducible] def x64_ir.RBX : Std.U8 := 3#u8
 
 /-- [async_ebpf_verified::x64_ir::REGISTER_MAP]
     Source: '../../src/verified/x64_ir.rs', lines 65:0-65:90
@@ -7236,7 +7240,7 @@ def x64_expand.expand_lazy_local_call
   ok (i3, out17)
 
 /-- [async_ebpf_verified::x64_ir::cc::NE]
-    Source: '../../src/verified/x64_ir.rs', lines 718:2-718:26
+    Source: '../../src/verified/x64_ir.rs', lines 719:2-719:26
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.NE : Std.U8 := 133#u8
 
@@ -7395,7 +7399,7 @@ def x64_expand.is_mul (kind : x64_ir.MulDivKind) : Result Bool := do
   | x64_ir.MulDivKind.Mod => ok false
 
 /-- [async_ebpf_verified::x64_ir::cc::E]
-    Source: '../../src/verified/x64_ir.rs', lines 717:2-717:25
+    Source: '../../src/verified/x64_ir.rs', lines 718:2-718:25
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.E : Std.U8 := 132#u8
 
@@ -8571,115 +8575,115 @@ def x64_ir.MInsn.Insts.CoreMarkerCopy : core.marker.Copy x64_ir.MInsn := {
 }
 
 /-- [async_ebpf_verified::x64_ir::{impl core::clone::Clone for async_ebpf_verified::x64_ir::PTarget}::clone]:
-    Source: '../../src/verified/x64_ir.rs', lines 496:15-496:20
+    Source: '../../src/verified/x64_ir.rs', lines 497:15-497:20
     Visibility: public -/
 def x64_ir.PTarget.Insts.CoreCloneClone.clone
   (self : x64_ir.PTarget) : Result x64_ir.PTarget := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::x64_ir::{impl core::clone::Clone for async_ebpf_verified::x64_ir::PTarget}]
-    Source: '../../src/verified/x64_ir.rs', lines 496:15-496:20 -/
+    Source: '../../src/verified/x64_ir.rs', lines 497:15-497:20 -/
 @[reducible]
 def x64_ir.PTarget.Insts.CoreCloneClone : core.clone.Clone x64_ir.PTarget := {
   clone := x64_ir.PTarget.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [async_ebpf_verified::x64_ir::{impl core::marker::Copy for async_ebpf_verified::x64_ir::PTarget}]
-    Source: '../../src/verified/x64_ir.rs', lines 496:9-496:13 -/
+    Source: '../../src/verified/x64_ir.rs', lines 497:9-497:13 -/
 @[reducible]
 def x64_ir.PTarget.Insts.CoreMarkerCopy : core.marker.Copy x64_ir.PTarget := {
   cloneInst := x64_ir.PTarget.Insts.CoreCloneClone
 }
 
 /-- [async_ebpf_verified::x64_ir::{impl core::clone::Clone for async_ebpf_verified::x64_ir::PInsn}::clone]:
-    Source: '../../src/verified/x64_ir.rs', lines 512:15-512:20
+    Source: '../../src/verified/x64_ir.rs', lines 513:15-513:20
     Visibility: public -/
 def x64_ir.PInsn.Insts.CoreCloneClone.clone
   (self : x64_ir.PInsn) : Result x64_ir.PInsn := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::x64_ir::{impl core::clone::Clone for async_ebpf_verified::x64_ir::PInsn}]
-    Source: '../../src/verified/x64_ir.rs', lines 512:15-512:20 -/
+    Source: '../../src/verified/x64_ir.rs', lines 513:15-513:20 -/
 @[reducible]
 def x64_ir.PInsn.Insts.CoreCloneClone : core.clone.Clone x64_ir.PInsn := {
   clone := x64_ir.PInsn.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [async_ebpf_verified::x64_ir::{impl core::marker::Copy for async_ebpf_verified::x64_ir::PInsn}]
-    Source: '../../src/verified/x64_ir.rs', lines 512:9-512:13 -/
+    Source: '../../src/verified/x64_ir.rs', lines 513:9-513:13 -/
 @[reducible]
 def x64_ir.PInsn.Insts.CoreMarkerCopy : core.marker.Copy x64_ir.PInsn := {
   cloneInst := x64_ir.PInsn.Insts.CoreCloneClone
 }
 
 /-- [async_ebpf_verified::x64_ir::{impl core::clone::Clone for async_ebpf_verified::x64_ir::AluRM}::clone]:
-    Source: '../../src/verified/x64_ir.rs', lines 696:15-696:20
+    Source: '../../src/verified/x64_ir.rs', lines 697:15-697:20
     Visibility: public -/
 def x64_ir.AluRM.Insts.CoreCloneClone.clone
   (self : x64_ir.AluRM) : Result x64_ir.AluRM := do
   ok self
 
 /-- Trait implementation: [async_ebpf_verified::x64_ir::{impl core::clone::Clone for async_ebpf_verified::x64_ir::AluRM}]
-    Source: '../../src/verified/x64_ir.rs', lines 696:15-696:20 -/
+    Source: '../../src/verified/x64_ir.rs', lines 697:15-697:20 -/
 @[reducible]
 def x64_ir.AluRM.Insts.CoreCloneClone : core.clone.Clone x64_ir.AluRM := {
   clone := x64_ir.AluRM.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [async_ebpf_verified::x64_ir::{impl core::marker::Copy for async_ebpf_verified::x64_ir::AluRM}]
-    Source: '../../src/verified/x64_ir.rs', lines 696:9-696:13 -/
+    Source: '../../src/verified/x64_ir.rs', lines 697:9-697:13 -/
 @[reducible]
 def x64_ir.AluRM.Insts.CoreMarkerCopy : core.marker.Copy x64_ir.AluRM := {
   cloneInst := x64_ir.AluRM.Insts.CoreCloneClone
 }
 
 /-- [async_ebpf_verified::x64_ir::cc::AE]
-    Source: '../../src/verified/x64_ir.rs', lines 716:2-716:26
+    Source: '../../src/verified/x64_ir.rs', lines 717:2-717:26
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.AE : Std.U8 := 131#u8
 
 /-- [async_ebpf_verified::x64_ir::cc::BE]
-    Source: '../../src/verified/x64_ir.rs', lines 719:2-719:26
+    Source: '../../src/verified/x64_ir.rs', lines 720:2-720:26
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.BE : Std.U8 := 134#u8
 
 /-- [async_ebpf_verified::x64_ir::cc::A]
-    Source: '../../src/verified/x64_ir.rs', lines 720:2-720:25
+    Source: '../../src/verified/x64_ir.rs', lines 721:2-721:25
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.A : Std.U8 := 135#u8
 
 /-- [async_ebpf_verified::x64_ir::cc::L]
-    Source: '../../src/verified/x64_ir.rs', lines 721:2-721:25
+    Source: '../../src/verified/x64_ir.rs', lines 722:2-722:25
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.L : Std.U8 := 140#u8
 
 /-- [async_ebpf_verified::x64_ir::cc::GE]
-    Source: '../../src/verified/x64_ir.rs', lines 722:2-722:26
+    Source: '../../src/verified/x64_ir.rs', lines 723:2-723:26
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.GE : Std.U8 := 141#u8
 
 /-- [async_ebpf_verified::x64_ir::cc::LE]
-    Source: '../../src/verified/x64_ir.rs', lines 723:2-723:26
+    Source: '../../src/verified/x64_ir.rs', lines 724:2-724:26
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.LE : Std.U8 := 142#u8
 
 /-- [async_ebpf_verified::x64_ir::cc::G]
-    Source: '../../src/verified/x64_ir.rs', lines 724:2-724:25
+    Source: '../../src/verified/x64_ir.rs', lines 725:2-725:25
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.cc.G : Std.U8 := 143#u8
 
 /-- [async_ebpf_verified::x64_ir::MAX_JUMPS]
-    Source: '../../src/verified/x64_ir.rs', lines 728:0-728:33
+    Source: '../../src/verified/x64_ir.rs', lines 729:0-729:33
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.MAX_JUMPS : Std.U32 := 65536#u32
 
 /-- [async_ebpf_verified::x64_ir::MAX_LOADS]
-    Source: '../../src/verified/x64_ir.rs', lines 729:0-729:33
+    Source: '../../src/verified/x64_ir.rs', lines 730:0-730:33
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.MAX_LOADS : Std.U32 := 65536#u32
 
 /-- [async_ebpf_verified::x64_ir::MAX_LEAS]
-    Source: '../../src/verified/x64_ir.rs', lines 730:0-730:32
+    Source: '../../src/verified/x64_ir.rs', lines 731:0-731:32
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.MAX_LEAS : Std.U32 := 65536#u32
 
