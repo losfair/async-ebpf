@@ -34,12 +34,10 @@ simulator's value as the witness.
 * `CodeOk code`: every register operand of every instruction of the list is
   one of the sixteen the encoder emits. The simulator masks a register number
   to four bits and the machine model writes the number it is given, so the two
-  agree exactly there; `x64_lower` never builds anything else.
-  `CodeOk` also excludes `pop rsp`, which is the one instruction the two
-  models still disagree about: `Step.pop` writes the destination last, so the
-  popped word wins, which is what the hardware does, while `x64_sim::pop`
-  still writes `rsp` last. The backend never emits `pop rsp`; the condition
-  comes off the day the simulator's `pop` writes its destination last too.
+  agree exactly there; `x64_lower` never builds anything else. That is the
+  only condition on the list: `pop rsp` included, the two models agree
+  instruction for instruction — both move `rsp` before they write the
+  destination, so the popped word wins, which is what the hardware does.
 * `mem_base + mem.len() ≤ 2 ^ 64`: the mapped range does not wrap, which is
   what makes "the bytes at `a`" a range at all — the same hypothesis
   `Bytes.lean` takes for its own range lemmas.
@@ -138,21 +136,17 @@ writes the number it is given. They agree exactly on the sixteen registers the
 encoder can emit, so the theorem is about lists whose register operands are
 below sixteen — which is every list `x64_lower` builds.
 
-`Pop` carries one more condition. The two models disagree about `pop rsp`:
-`Step.pop` writes the destination last, so the popped word wins, which is what
-the hardware does; `x64_sim::pop` still writes `rsp` last, which is what
-`Step.pop` said before it was corrected. The backend never emits `pop rsp`, so
-the condition costs nothing here, and it comes off the day the simulator's
-`pop` writes its destination last too. -/
+It is the only condition. `pop rsp` in particular needs none: both models
+move `rsp` first and write the destination second, so the popped word wins in
+each, as it does on the hardware. -/
 
 /-- A register operand the simulator's masking leaves alone. -/
 def RegOk (r : Std.U8) : Prop := r.val < 16
 
-/-- The register operands of one instruction are all encodable, and it is not
-`pop rsp`. -/
+/-- The register operands of one instruction are all encodable. -/
 def InsnOk : x64_ir.PInsn → Prop
   | .Push r => RegOk r
-  | .Pop r => RegOk r ∧ r.val ≠ RSP
+  | .Pop r => RegOk r
   | .Alu _ _ src dst => RegOk src ∧ RegOk dst
   | .AluImm _ _ dst _ => RegOk dst
   | .ShiftImm _ _ dst _ => RegOk dst
@@ -2518,7 +2512,7 @@ theorem step_refines_frame {code : Slice x64_ir.PInsn} {s s' : x64_sim.Sim}
     | Fault => simp at h
     | Unsupported => simp at h
   | Pop r =>
-    obtain ⟨hr, hrsp⟩ : RegOk r ∧ r.val ≠ RSP := hok
+    have hr : RegOk r := hok
     unfold x64_sim.pop at h
     obtain_bind ⟨top, htop, h⟩ := h
     obtain_bind ⟨pr, hpr, h⟩ := h
@@ -2526,8 +2520,8 @@ theorem step_refines_frame {code : Slice x64_ir.PInsn} {s s' : x64_sim.Sim}
     cases ok1 with
     | false => simp at h
     | true =>
-      obtain_bind ⟨s1, hs1, h⟩ := h
       obtain_bind ⟨i, hi, h⟩ := h
+      obtain_bind ⟨s1, hs1, h⟩ := h
       obtain_bind ⟨s2, hs2, h⟩ := h
       obtain_bind ⟨i1, hi1, h⟩ := h
       simp only [ok.injEq, Prod.mk.injEq] at h
@@ -2537,22 +2531,11 @@ theorem step_refines_frame {code : Slice x64_ir.PInsn} {s s' : x64_sim.Sim}
         have h2 : load64 (absMem s) (U64.bv top) = (U64.bv v).setWidth 64 := hload
         rw [h2]
         simp
-      obtain ⟨-, hb2, hc2, hm2⟩ := set_reg_frame hs2
-      obtain ⟨-, hb1, hc1, hm1⟩ := set_reg_frame hs1
-      refine ⟨?_, ⟨by rw [show ({ s2 with pc := i1 } : x64_sim.Sim).mem_base = s2.mem_base from rfl,
-          hb2, hb1],
-        by rw [show ({ s2 with pc := i1 } : x64_sim.Sim).code_base = s2.code_base from rfl, hc2, hc1],
-        by rw [show ({ s2 with pc := i1 } : x64_sim.Sim).mem = s2.mem from rfl, hm2, hm1]⟩⟩
-      rw [absState_bump (s1 := s2) (i := i1) (usize_add_eq_ok hi1), set_reg_abs regOk_RSP hs2,
-        set_reg_abs hr hs1, add64_eq hi, ← hv, reg_eq regOk_RSP htop, sim_rsp_val,
+      refine ⟨?_, frame_pc ((frame_set_reg hs1).trans' (frame_set_reg hs2))⟩
+      rw [absState_bump (s1 := s2) (i := i1) (usize_add_eq_ok hi1), set_reg_abs hr hs2,
+        set_reg_abs regOk_RSP hs1, add64_eq hi, ← hv, reg_eq regOk_RSP htop, sim_rsp_val,
         show U64.bv (8#u64 : Std.U64) = (8#64 : BitVec 64) from rfl]
-      have hcomm : ∀ x : Word, Function.update (Function.update (absState s).regs r.val x) RSP
-            ((absState s).regs RSP + 8#64)
-          = Function.update (Function.update (absState s).regs RSP ((absState s).regs RSP + 8#64))
-            r.val x := fun x => Function.update_comm (by omega) _ _ _
-      dsimp only
-      rw [hcomm]
-      exact Step.pop (absState s) r hfetch
+      exact Step.pop _ r hfetch
   | Alu w64 op src dst =>
     obtain ⟨hsrc, hdst⟩ : RegOk src ∧ RegOk dst := hok
     unfold x64_sim.alu_rr at h

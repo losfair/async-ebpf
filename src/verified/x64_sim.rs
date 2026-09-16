@@ -1023,14 +1023,15 @@ fn push(s: &mut Sim, v: u64) -> Outcome {
   }
 }
 
-/// `pop`: the word is read before `rsp` moves, and `rsp` is written last — so
-/// `pop rsp` ends at `rsp + 8`, as the Lean model says.
+/// `pop`: the word is read, then `rsp` moves, then the destination is
+/// written — so `pop rsp` ends holding the popped word, as the hardware and
+/// `Step.pop` in the Lean model both say.
 fn pop(s: &mut Sim, r: u8) -> Outcome {
   let top = reg(s, RSP);
   let (ok, v) = load_mem(s, top, 8);
   if ok {
-    set_reg(s, r, v);
     set_reg(s, RSP, add64(top, 8));
+    set_reg(s, r, v);
     s.pc += 1;
     Outcome::Next
   } else {

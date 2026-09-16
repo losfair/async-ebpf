@@ -1413,10 +1413,10 @@ fn the_primitives_that_leave_the_list_are_not_executed() {
 }
 
 #[test]
-fn pop_rsp_follows_the_lean_model_rather_than_the_hardware() {
-  // `Step.pop` writes `rsp` after the destination, so `pop rsp` lands at
-  // `rsp + 8` and not at the popped word. The backend never emits it, and the
-  // differential harness never generates it.
+fn pop_rsp_lands_on_the_popped_word() {
+  // `Step.pop` moves `rsp` before it writes the destination, as the hardware
+  // does, so `pop rsp` ends holding the popped word and not `rsp + 8`. The
+  // backend never emits it, and the differential harness never generates it.
   let code = vec![PInsn::Pop(RSP)];
   let mut s = model(0);
   s.regs[RSP as usize] = 0x1_0000;
@@ -1426,7 +1426,7 @@ fn pop_rsp_follows_the_lean_model_rather_than_the_hardware() {
     i += 1;
   }
   assert_eq!(run(&code, &mut s, 4), Outcome::Halt);
-  assert_eq!(s.regs[RSP as usize], 0x1_0008);
+  assert_eq!(s.regs[RSP as usize], 0xaaaa_aaaa_aaaa_aaaa);
 }
 
 #[test]

@@ -17566,7 +17566,7 @@ def x64_sim.push
   else ok (x64_sim.Outcome.Fault, s1)
 
 /-- [async_ebpf_verified::x64_sim::pop]:
-    Source: '../../src/verified/x64_sim.rs', lines 1028:0-1039:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1029:0-1040:1 -/
 def x64_sim.pop
   (s : x64_sim.Sim) (r : Std.U8) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17575,15 +17575,15 @@ def x64_sim.pop
   let (ok1, v) ← x64_sim.load_mem s top 8#usize
   if ok1
   then
-    let s1 ← x64_sim.set_reg s r v
     let i ← x64_sim.add64 top 8#u64
-    let s2 ← x64_sim.set_reg s1 x64_sim.RSP i
+    let s1 ← x64_sim.set_reg s x64_sim.RSP i
+    let s2 ← x64_sim.set_reg s1 r v
     let i1 ← s2.pc + 1#usize
     ok (x64_sim.Outcome.Next, { s2 with pc := i1 })
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::ret]:
-    Source: '../../src/verified/x64_sim.rs', lines 1042:0-1058:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1043:0-1059:1 -/
 def x64_sim.ret
   (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17607,7 +17607,7 @@ def x64_sim.ret
   else ok (x64_sim.Outcome.Fault, s)
 
 /-- [async_ebpf_verified::x64_sim::call]:
-    Source: '../../src/verified/x64_sim.rs', lines 1061:0-1077:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1062:0-1078:1 -/
 def x64_sim.call
   (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) (t : x64_ir.PTarget) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17629,7 +17629,7 @@ def x64_sim.call
   else ok (x64_sim.Outcome.Unsupported, s)
 
 /-- [async_ebpf_verified::x64_sim::step_at]:
-    Source: '../../src/verified/x64_sim.rs', lines 1084:0-1308:1 -/
+    Source: '../../src/verified/x64_sim.rs', lines 1085:0-1309:1 -/
 def x64_sim.step_at
   (code : Slice x64_ir.PInsn) (insn : x64_ir.PInsn) (s : x64_sim.Sim) :
   Result (x64_sim.Outcome × x64_sim.Sim)
@@ -17809,7 +17809,7 @@ def x64_sim.step_at
   | x64_ir.PInsn.HelperTable => ok (x64_sim.Outcome.Halt, s)
 
 /-- [async_ebpf_verified::x64_sim::step]:
-    Source: '../../src/verified/x64_sim.rs', lines 1311:0-1318:1
+    Source: '../../src/verified/x64_sim.rs', lines 1312:0-1319:1
     Visibility: public -/
 def x64_sim.step
   (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) :
@@ -17822,7 +17822,7 @@ def x64_sim.step
   else ok (x64_sim.Outcome.Halt, s)
 
 /-- [async_ebpf_verified::x64_sim::run]: loop body 0:
-    Source: '../../src/verified/x64_sim.rs', lines 1327:2-1337:3
+    Source: '../../src/verified/x64_sim.rs', lines 1328:2-1338:3
     Visibility: public -/
 @[rust_loop_body]
 def x64_sim.run_loop.body
@@ -17848,7 +17848,7 @@ def x64_sim.run_loop.body
   else ok (done (out, s))
 
 /-- [async_ebpf_verified::x64_sim::run]: loop 0:
-    Source: '../../src/verified/x64_sim.rs', lines 1327:2-1337:3
+    Source: '../../src/verified/x64_sim.rs', lines 1328:2-1338:3
     Visibility: public -/
 @[rust_loop]
 def x64_sim.run_loop
@@ -17862,7 +17862,7 @@ def x64_sim.run_loop
     (s, i, out, done1)
 
 /-- [async_ebpf_verified::x64_sim::run]:
-    Source: '../../src/verified/x64_sim.rs', lines 1323:0-1339:1
+    Source: '../../src/verified/x64_sim.rs', lines 1324:0-1340:1
     Visibility: public -/
 @[reducible]
 def x64_sim.run
