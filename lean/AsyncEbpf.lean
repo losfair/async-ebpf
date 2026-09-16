@@ -35,3 +35,4 @@ import AsyncEbpf.X64.Encode
 import AsyncEbpf.X64.Assemble
 import AsyncEbpf.X64.RoundtripReg
 import AsyncEbpf.X64.RoundtripMem
+import AsyncEbpf.X64.AssembleSpec
