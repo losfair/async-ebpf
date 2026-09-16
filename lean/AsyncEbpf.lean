@@ -33,3 +33,4 @@ import AsyncEbpf.X64.LayoutCheck
 import AsyncEbpf.X64.SimRefines
 import AsyncEbpf.X64.Encode
 import AsyncEbpf.X64.Assemble
+import AsyncEbpf.X64.RoundtripReg
