@@ -29,15 +29,20 @@ differ in nothing else, and the glue reads them the same way.
 ## How
 
 Both proofs are one `stays_invariant` over a per-position description of the
-machine state. `Kept` is the part every position of both macros carries — the
-stack depth, `rbp`, the frame register, the read-only bytes, and the four
-callee-saved registers the lazy call spills — and `Saved` is the lazy call's
-extra clause: the four spill slots among the twelve words it pushes still
-hold the registers the four `pop`s at the end read back out of them. The
-description is *absent* at the positions no execution reaches — the
-default-dispatcher path the `jne` skips and the retpoline's speculation trap
-— which is how "inside the region but unreachable" is spelled for an
-invariant that has to say something everywhere.
+machine state. `Kept` is that description: the stack depth, `rbp`, the frame
+register and the read-only bytes, at every position of both macros. It says
+nothing about the four registers the lazy call spills, because nothing needs
+it to: a lazily compiled callee does not keep them, and the state the
+checker's `clobber_call` leaves says `Top` of all four. The description is
+*absent* at the positions no execution reaches — the default-dispatcher path
+the `jne` skips and the retpoline's speculation trap — which is how "inside
+the region but unreachable" is spelled for an invariant that has to say
+something everywhere.
+
+The depth `Kept` carries is also what the two new clauses are read off: the
+`stores` clause turns each push, each call's push and the retpoline's
+`mov [rsp], rax` into `storeOk_stack` at that depth, and the `rsp` clause is
+`rsp_window_of_depth` at it.
 
 The three facts about leaving the list are `kept_callReg` (a `call reg` and
 the `ExternalReturn` that answers it), `romem_kept` (an external callee that
@@ -226,26 +231,6 @@ theorem rsp_toNat {P : Params} (hL : Layout P) {d : Nat} (hd : d ≤ 16) :
   have := hL.stackRoom
   exact toNat_sub_ofNat (by omega) (by omega)
 
-/-- The four frame slots an external callee may write are in the frame
-scratch, which the native stack never reaches. -/
-theorem stack_not_writable {P : Params} (hL : Layout P) {k : Nat} (hk : k ≤ 16) {a : Word}
-    (h1 : P.rsp0.toNat - 8 * k ≤ a.toNat) (h2 : a.toNat < P.rsp0.toNat - 8 * k + 8) :
-    ¬ WritableSlot P a := by
-  have hr := hL.frameRoom
-  have hs := hL.stackRoom
-  have hb := hL.stackBelowFrame
-  have hfs := hL.frameSlots_toNat
-  have e16 : (P.rbp0 - 16#64).toNat = P.rbp0.toNat - 16 := by
-    rw [show (16#64 : Word) = BitVec.ofNat 64 16 from rfl]; exact rbp_sub_toNat hL (by norm_num)
-  have e24 : (P.rbp0 - 24#64).toNat = P.rbp0.toNat - 24 := by
-    rw [show (24#64 : Word) = BitVec.ofNat 64 24 from rfl]; exact rbp_sub_toNat hL (by norm_num)
-  have e32 : (P.rbp0 - 32#64).toNat = P.rbp0.toNat - 32 := by
-    rw [show (32#64 : Word) = BitVec.ofNat 64 32 from rfl]; exact rbp_sub_toNat hL (by norm_num)
-  have e144 : (P.rbp0 - 144#64).toNat = P.rbp0.toNat - 144 := by
-    rw [show (144#64 : Word) = BitVec.ofNat 64 144 from rfl]; exact rbp_sub_toNat hL (by norm_num)
-  simp only [WritableSlot, InRange, e16, e24, e32, e144]
-  omega
-
 /-- A store to one word of the native stack is invisible to a load of
 another. -/
 theorem load64_stack_other {P : Params} (hL : Layout P) {m : Mem} {i j : Nat}
@@ -259,6 +244,20 @@ theorem load64_stack_other {P : Params} (hL : Layout P) {m : Mem} {i j : Nat}
   have ej := rsp_toNat hL hj
   exact load64_store64_disjoint m _ _ v (by omega) (by omega)
     (by simp only [RangesDisjoint, ei, ej]; omega)
+
+/-- A byte of the frame scratch lies in neither guest backing and outside the
+first page, which is what `ExternalReturn.frameKept` asks of it on top of its
+not being one of the four writable slots. -/
+theorem frame_offRegions {P : Params} (hL : Layout P) {a : Word}
+    (h1 : P.rbp0.toNat - 160 ≤ a.toNat) (h2 : a.toNat < P.rbp0.toNat) :
+    ¬ InRange P.snb (stackSpan P) a ∧ ¬ InRange P.dnb (dataSpan P) a ∧
+      ¬ InRange 0#64 4096 a := by
+  have hfs := hL.frameSlots_toNat
+  have hr := hL.frameRoom
+  have hin : InRange (frameSlots P) 160 a := ⟨by omega, by omega⟩
+  exact ⟨notInRange_of_disjoint hL.stackNativeOffFrame a hin,
+    notInRange_of_disjoint hL.dataNativeOffFrame a hin,
+    notInRange_of_disjoint hL.frameOffPage.symm a hin⟩
 
 /-- An external callee that left the frame scratch and the descriptor alone
 left the entry contract's bytes where they were. -/
@@ -343,15 +342,24 @@ theorem romem_kept {P : Params} {m m' : Mem} (hL : Layout P) (h : RoMem P m)
     exact h.deltaSlot
 
 /-- What `ExternalReturn` is worth once the return address is known: the
-position it lands on, the stack it restores, the registers it keeps, and the
-two families of bytes it leaves alone. -/
+position it lands on, the stack it restores, the two registers it keeps, and
+the two families of bytes it leaves alone.
+
+Both halves are weaker than they were. Only `rbp` and the frame register come
+back: a lazily compiled callee is another instance of this theorem, and this
+theorem promises nothing of `rbx` and `r12`–`r14`. And a byte above the
+return address comes back unchanged only once it is known to be none of the
+four writable slots, to lie in neither guest backing, and to be outside the
+first page. Every byte this file has to carry across a call is a byte of the
+frame scratch, and `frame_offRegions` is what knows all three of it. -/
 theorem externalReturn_facts {P : Params} {code : List x64_ir.PInsn} {u u' : State}
     (hlen : code.length < 2 ^ 64) (h : ExternalReturn P code u u') {j : Nat}
     (hj : j < 2 ^ 64) (hval : load64 u.mem (u.regs RSP) = codeAddr P j) :
     u'.pc = j ∧ u'.regs RSP = u.regs RSP + 8#64 ∧
-      (∀ r ∈ [RBX, RBP, R12, R13, R14, R15], u'.regs r = u.regs r) ∧
+      (∀ r ∈ [RBP, R15], u'.regs r = u.regs r) ∧
       (∀ a : Word, (u.regs RSP).toNat + 8 ≤ a.toNat → ¬ WritableSlot P a →
-        u'.mem a = u.mem a) ∧
+        ¬ InRange P.snb (stackSpan P) a → ¬ InRange P.dnb (dataSpan P) a →
+        ¬ InRange 0#64 4096 a → u'.mem a = u.mem a) ∧
       (∀ a : Word, P.desc.toNat ≤ a.toNat → a.toNat < P.desc.toNat + 200 →
         u'.mem a = u.mem a) := by
   obtain ⟨i, hi, heq, hpc⟩ := h.returnsHere
@@ -361,43 +369,30 @@ theorem externalReturn_facts {P : Params} {code : List x64_ir.PInsn} {u u' : Sta
 
 /-! ## What both proofs carry
 
-`Kept` is the description every position of both expansions satisfies, and
-`Saved` is the lazy call's extra clause about its spill slots. Between them
-they are exactly what `Agree P (ClobberCall pre)` needs at the end: the
-caller-saved registers are `Top` and say nothing, and every other register is
-where it was. -/
+`Kept` is the description every position of both expansions satisfies, and it
+is exactly what `Agree P (ClobberCall pre)` needs at the end: the thirteen
+clobbered registers are `Top` and say nothing, and the other three — `rsp`,
+`rbp` and the frame register — are where they were. -/
 
-/-- The four callee-saved registers the lazy call spills, in push order:
-`map_register 6 .. 9`. -/
-def svReg (i : Nat) : Nat :=
-  if i = 1 then RBX else if i = 2 then R12 else if i = 3 then R13 else R14
+/-- The stack depth, the two fixed registers, the frame register and the
+entry contract's bytes: what every position of both expansions carries.
 
-/-- The stack depth, the two fixed registers, the frame register, the entry
-contract's bytes, and the four spilled registers. -/
+The four registers the lazy call spills used to be here too, kept across a
+call by `ExternalReturn.calleeSaved`. They are not kept any more — a lazily
+compiled callee promises nothing of `rbx` and `r12`–`r14` — and they are not
+needed either: `Clobbered` now covers all four, so the state the checker's
+`clobber_call` leaves says `Top` of them and `agree_kept` has nothing to
+prove. The four `pop`s at the end of the lazy call do restore them from its
+own pushes; that is the machine's business, not this description's. -/
 structure Kept (P : Params) (s t : State) (dd : Nat) (fp : Word) : Prop where
   rsp : t.regs RSP = P.rsp0 - BitVec.ofNat 64 (8 * dd)
   rbp : t.regs RBP = P.rbp0
   fpv : t.regs R15 = fp
   ro : RoMem P t.mem
-  keep : ∀ i, 1 ≤ i → i ≤ 4 → t.regs (svReg i) = s.regs (svReg i)
-
-/-- The spill slots hold what was pushed into them, as far down as the walk
-has pushed. -/
-def Saved (P : Params) (s t : State) (d dd : Nat) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ 4 → d + i ≤ dd →
-    load64 t.mem (P.rsp0 - BitVec.ofNat 64 (8 * (d + i))) = s.regs (svReg i)
 
 @[simp] theorem push_regs_ne (s : State) (v : Word) {x : Nat} (hx : x ≠ RSP) :
     (push s v).regs x = s.regs x := by
   simp only [push, Function.update_of_ne hx]
-
-theorem svReg_mem (i : Nat) (h1 : 1 ≤ i) (h2 : i ≤ 4) :
-    svReg i ∈ [RBX, RBP, R12, R13, R14, R15] := by
-  have h : i = 1 ∨ i = 2 ∨ i = 3 ∨ i = 4 := by omega
-  rcases h with rfl | rfl | rfl | rfl <;> simp [svReg]
-
-theorem svReg_ne_rsp (i : Nat) : svReg i ≠ RSP := by
-  simp only [svReg]; split <;> [skip; split] <;> [skip; skip; split] <;> decide
 
 /-- A macro's state agrees with what the checker's `clobber_call` left. -/
 theorem agree_kept {P : Params} {pre post : x64_check.State} {s t : State}
@@ -406,20 +401,16 @@ theorem agree_kept {P : Params} {pre post : x64_check.State} {s t : State}
   have hdep : post.depth = pre.depth := hcl.2.2.1
   refine ⟨?_, ?_, ?_, h.rbp, h.ro, ?_⟩
   · intro r hr
-    by_cases hcs : CallerSaved r
+    by_cases hcs : Clobbered r
     · rw [hcl.1 r hcs]; trivial
     · rw [hcl.2.1 r hcs]
-      have hcases : r = 3 ∨ r = 4 ∨ r = 5 ∨ r = 12 ∨ r = 13 ∨ r = 14 ∨ r = 15 := by
-        simp only [CallerSaved, not_or] at hcs
+      have hcases : r = 4 ∨ r = 5 ∨ r = 15 := by
+        simp only [Clobbered, not_or] at hcs
         omega
       have hkp : t.regs r = s.regs r := by
-        rcases hcases with rfl | rfl | rfl | rfl | rfl | rfl | rfl
-        · exact h.keep 1 (by norm_num) (by norm_num)
+        rcases hcases with rfl | rfl | rfl
         · rw [h.rsp, hag.rsp]
         · rw [h.rbp, hag.rbp]
-        · exact h.keep 2 (by norm_num) (by norm_num)
-        · exact h.keep 3 (by norm_num) (by norm_num)
-        · exact h.keep 4 (by norm_num) (by norm_num)
         · exact h.fpv
       rw [hkp]
       exact hag.regs r hr
@@ -427,72 +418,14 @@ theorem agree_kept {P : Params} {pre post : x64_check.State} {s t : State}
   · rw [hdep]; exact hag.depth
   · rw [hcl.2.2.2.1]; trivial
 
-/-- A push: one word deeper, and the word it wrote is the register it named. -/
-theorem kept_push {P : Params} {s t t' : State} {d dd : Nat} {fp v : Word}
-    (hL : Layout P) (hk : Kept P s t dd fp) (hsv : Saved P s t d dd)
-    (hddd : d ≤ dd) (hd16 : dd + 1 ≤ 16)
-    (hv : dd + 1 ≤ d + 4 → v = s.regs (svReg (dd + 1 - d)))
-    (hregs : ∀ x, x ≠ RSP → t'.regs x = t.regs x)
-    (hrsp : t'.regs RSP = t.regs RSP - 8#64)
-    (hmem : t'.mem = store64 t.mem (t.regs RSP - 8#64) v) :
-    Kept P s t' (dd + 1) fp ∧ Saved P s t' d (dd + 1) := by
-  have hb : t.regs RSP - 8#64 = P.rsp0 - BitVec.ofNat 64 (8 * (dd + 1)) := by
-    rw [hk.rsp, rsp_push]
-  constructor
-  · refine ⟨by rw [hrsp, hb], ?_, ?_, ?_, ?_⟩
-    · rw [hregs RBP (by decide)]; exact hk.rbp
-    · rw [hregs R15 (by decide)]; exact hk.fpv
-    · rw [hmem, hb]
-      exact romem_store64_stack hL hk.ro hd16 _
-    · intro i h1 h2
-      rw [hregs _ (svReg_ne_rsp i)]
-      exact hk.keep i h1 h2
-  · intro i h1 h2 h3
-    rcases Nat.lt_or_ge (d + i) (dd + 1) with hlt | hge
-    · rw [hmem, hb, load64_stack_other hL (by omega) (by omega) (by omega)]
-      exact hsv i h1 h2 (by omega)
-    · have heq : d + i = dd + 1 := by omega
-      have hi : i = dd + 1 - d := by omega
-      rw [hmem, hb, heq, load64_store64_same]
-      rw [hv (by omega), hi]
-
-/-- A pop: one word shallower. `hkeepr` is what says a pop into one of the
-four spilled registers is the pop that restores it. -/
-theorem kept_pop {P : Params} {s t t' : State} {d dd : Nat} {fp : Word} {r : Nat}
-    (hL : Layout P) (hk : Kept P s t (dd + 1) fp) (hsv : Saved P s t d (dd + 1))
-    (hddd : d ≤ dd) (hd16 : dd + 1 ≤ 16)
-    (hrn : r ≠ RSP) (hrn5 : r ≠ RBP) (hrn15 : r ≠ R15)
-    (hkeepr : ∀ i, 1 ≤ i → i ≤ 4 → r = svReg i → d + i = dd + 1)
-    (hregs : ∀ x, x ≠ r → x ≠ RSP → t'.regs x = t.regs x)
-    (hval : t'.regs r = load64 t.mem (t.regs RSP))
-    (hrsp : t'.regs RSP = t.regs RSP + 8#64)
-    (hmem : t'.mem = t.mem) :
-    Kept P s t' dd fp ∧ Saved P s t' d dd := by
-  constructor
-  · refine ⟨by rw [hrsp, hk.rsp, rsp_pop], ?_, ?_, ?_, ?_⟩
-    · rw [hregs RBP (Ne.symm hrn5) (by decide)]; exact hk.rbp
-    · rw [hregs R15 (Ne.symm hrn15) (by decide)]; exact hk.fpv
-    · rw [hmem]; exact hk.ro
-    · intro i h1 h2
-      by_cases hc : svReg i = r
-      · have heq := hkeepr i h1 h2 hc.symm
-        rw [← hc] at hval
-        rw [hval, hk.rsp, ← heq]
-        exact hsv i h1 h2 (by omega)
-      · rw [hregs _ hc (svReg_ne_rsp i)]
-        exact hk.keep i h1 h2
-  · intro i h1 h2 h3
-    rw [hmem]
-    exact hsv i h1 h2 (by omega)
-
 /-- `call reg` and the external return that answers it: the position after the
 call, the stack restored, and everything the description carries kept. -/
 theorem kept_callReg {P : Params} {code : List x64_ir.PInsn} {s t t' : State}
-    {d dd : Nat} {fp : Word} {r : Std.U8}
+    {dd : Nat} {fp : Word} {r : Std.U8}
     (hL : Layout P) (hlen : code.length < 2 ^ 64)
-    (hk : Kept P s t dd fp) (hsv : Saved P s t d dd) (hddd : d ≤ dd) (hd16 : dd + 1 ≤ 16)
+    (hk : Kept P s t dd fp) (hd16 : dd + 1 ≤ 16)
     (hc : code[t.pc]? = some (.CallReg r)) (hstep : Step P code t (.next t')) :
-    t'.pc = t.pc + 1 ∧ Kept P s t' dd fp ∧ Saved P s t' d dd := by
+    t'.pc = t.pc + 1 ∧ Kept P s t' dd fp := by
   obtain ⟨u, hext, hu⟩ := step_callReg hc hstep
   simp only [Config.next.injEq] at hu
   subst hu
@@ -523,13 +456,14 @@ theorem kept_callReg {P : Params} {code : List x64_ir.PInsn} {s t t' : State}
     show store64 t.mem (t.regs RSP - 8#64) (retAddr P t) a = t.mem a
     rw [hb]
     exact store64_other _ (by omega) (by omega)
-  refine ⟨hpc, ⟨?_, ?_, ?_, ?_, ?_⟩, ?_⟩
+  refine ⟨hpc, ?_, ?_, ?_, ?_⟩
   · rw [hrsp', hwrsp, rsp_pop]
   · rw [hkeep' RBP (by simp), push_regs_ne _ _ (by decide)]; exact hk.rbp
   · rw [hkeep' R15 (by simp), push_regs_ne _ _ (by decide)]; exact hk.fpv
   · refine romem_kept hL hk.ro ?_ ?_
     · intro a h1 h2 h3
-      rw [hfr' a (by rw [hwrsp] at *; omega) h3, hwmem a (by omega)]
+      obtain ⟨hsn, hdn, hpg⟩ := frame_offRegions hL h1 h2
+      rw [hfr' a (by rw [hwrsp] at *; omega) h3 hsn hdn hpg, hwmem a (by omega)]
     · intro a h1 h2
       have hdisj := hL.stackOffDesc
       have hsw := hL.stackWindow_toNat
@@ -538,25 +472,6 @@ theorem kept_callReg {P : Params} {code : List x64_ir.PInsn} {s t t' : State}
       show store64 t.mem (t.regs RSP - 8#64) (retAddr P t) a = t.mem a
       rw [hb]
       exact store64_other _ (by omega) (by omega)
-  · intro i h1 h2
-    rw [hkeep' _ (svReg_mem i h1 h2), push_regs_ne _ _ (svReg_ne_rsp i)]
-    exact hk.keep i h1 h2
-  · intro i h1 h2 h3
-    have hxt : (P.rsp0 - BitVec.ofNat 64 (8 * (d + i))).toNat = P.rsp0.toNat - 8 * (d + i) :=
-      rsp_toNat hL (by omega)
-    have step1 : load64 t'.mem (P.rsp0 - BitVec.ofNat 64 (8 * (d + i)))
-        = load64 (push t (retAddr P t)).mem (P.rsp0 - BitVec.ofNat 64 (8 * (d + i))) := by
-      refine load64_congr (fun n hn => ?_)
-      have hx : ((P.rsp0 - BitVec.ofNat 64 (8 * (d + i))) + BitVec.ofNat 64 n).toNat
-          = (P.rsp0 - BitVec.ofNat 64 (8 * (d + i))).toNat + n :=
-        toNat_add_ofNat (by omega)
-      refine hfr' _ ?_ ?_
-      · rw [hwrsp]; omega
-      · exact stack_not_writable hL (k := d + i) (by omega) (by omega) (by omega)
-    rw [step1]
-    show load64 (store64 t.mem (t.regs RSP - 8#64) (retAddr P t)) _ = _
-    rw [hb, load64_stack_other hL (by omega) (by omega) (by omega)]
-    exact hsv i h1 h2 h3
 
 /-! ## A macro whose region is not one range
 
@@ -579,6 +494,14 @@ structure MacroOkIn (P : Params) (code : List x64_ir.PInsn) (inside : Nat → Pr
   returns : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code inside s s' →
     ∀ s'', Step P code s' (.returned s'') →
       s''.regs RSP = P.rsp0 + 8#64 ∧ s''.regs RBP = P.rbp0 ∧ s''.regs R15 = P.fp0
+  /-- Every range the region *writes* is one this activation may write. -/
+  stores : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code inside s s' →
+    ∀ c, Step P code s' c → ∀ i, code[s'.pc]? = some i →
+      ∀ bn ∈ X64.stores i s', StoreOk P bn.1 bn.2
+  /-- And the stack pointer stays in the native stack window at every position
+  of the region, the retpoline's two words included. -/
+  rsp : ∀ s, s.pc = p → Agree P pre s → ∀ s', Stays P code inside s s' →
+    (s'.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (s'.regs RSP).toNat + 128
 
 /-! ## Reading the two primitives the framework left out -/
 
@@ -614,20 +537,15 @@ theorem regOnly_next {P code} {t t' : State} {i : x64_ir.PInsn} (hi : RegOnly i)
 /-- A write to a register the description says nothing about. -/
 theorem kept_wReg {P : Params} {s t t' : State} {dd : Nat} {fp : Word} {r : Nat}
     (hk : Kept P s t dd fp) (hr4 : r ≠ RSP) (hr5 : r ≠ RBP) (hr15 : r ≠ R15)
-    (hrsv : ∀ i, 1 ≤ i → i ≤ 4 → svReg i ≠ r)
     (hregs : ∀ x, x ≠ r → t'.regs x = t.regs x) (hmem : t'.mem = t.mem) :
     Kept P s t' dd fp := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_⟩
   · rw [hregs RSP (Ne.symm hr4)]; exact hk.rsp
   · rw [hregs RBP (Ne.symm hr5)]; exact hk.rbp
   · rw [hregs R15 (Ne.symm hr15)]; exact hk.fpv
   · rw [hmem]; exact hk.ro
-  · intro i h1 h2
-    rw [hregs _ (hrsv i h1 h2)]
-    exact hk.keep i h1 h2
 
-/-- The `Kept` half of a push, which the helper call needs without the spill
-bookkeeping the lazy call carries. -/
+/-- A push: one word deeper, and everything the description names kept. -/
 theorem kept_pushW {P : Params} {s t t' : State} {dd : Nat} {fp v : Word}
     (hL : Layout P) (hk : Kept P s t dd fp) (hd16 : dd + 1 ≤ 16)
     (hregs : ∀ x, x ≠ RSP → t'.regs x = t.regs x)
@@ -636,13 +554,10 @@ theorem kept_pushW {P : Params} {s t t' : State} {dd : Nat} {fp v : Word}
     Kept P s t' (dd + 1) fp := by
   have hb : t.regs RSP - 8#64 = P.rsp0 - BitVec.ofNat 64 (8 * (dd + 1)) := by
     rw [hk.rsp, rsp_push]
-  refine ⟨by rw [hrsp, hb], ?_, ?_, ?_, ?_⟩
+  refine ⟨by rw [hrsp, hb], ?_, ?_, ?_⟩
   · rw [hregs RBP (by decide)]; exact hk.rbp
   · rw [hregs R15 (by decide)]; exact hk.fpv
   · rw [hmem, hb]; exact romem_store64_stack hL hk.ro hd16 _
-  · intro i h1 h2
-    rw [hregs _ (svReg_ne_rsp i)]
-    exact hk.keep i h1 h2
 
 /-! ## Register numbers
 
@@ -667,27 +582,20 @@ theorem ctxt_val : (x64_ir.VOLATILE_CTXT).val = R11 := by
     (popRsp s).regs x = s.regs x := by
   simp only [popRsp, Function.update_of_ne hx]
 
-theorem svReg_val (i : Nat) (h1 : 1 ≤ i) (h2 : i ≤ 4) :
-    svReg i = 3 ∨ svReg i = 12 ∨ svReg i = 13 ∨ svReg i = 14 := by
-  have h : i = 1 ∨ i = 2 ∨ i = 3 ∨ i = 4 := by omega
-  rcases h with rfl | rfl | rfl | rfl <;> simp [svReg]
-
-/-- A write to a caller-saved register moves nothing the description names. -/
+/-- A write to a register a call is allowed to clobber moves nothing the
+description names: `Clobbered` is the thirteen registers that are neither
+`rsp`, `rbp` nor the frame register. -/
 theorem kept_wRegCaller {P : Params} {s t t' : State} {dd : Nat} {fp : Word} {r : Nat}
-    (hk : Kept P s t dd fp) (hr : CallerSaved r)
+    (hk : Kept P s t dd fp) (hr : Clobbered r)
     (hregs : ∀ x, x ≠ r → t'.regs x = t.regs x) (hmem : t'.mem = t.mem) :
     Kept P s t' dd fp := by
-  simp only [CallerSaved] at hr
-  have key : r ≠ RSP ∧ r ≠ RBP ∧ r ≠ R15 ∧ ∀ i, 1 ≤ i → i ≤ 4 → svReg i ≠ r := by
-    rcases hr with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
-      refine ⟨by decide, by decide, by decide, fun i h1 h2 => ?_⟩ <;>
-      (rcases svReg_val i h1 h2 with h | h | h | h <;> rw [h] <;> decide)
-  exact kept_wReg hk key.1 key.2.1 key.2.2.1 key.2.2.2 hregs hmem
+  simp only [Clobbered] at hr
+  refine kept_wReg hk ?_ ?_ ?_ hregs hmem <;> simp only [RSP, RBP, R15] <;> omega
 
 theorem kept_same {P : Params} {s t t' : State} {dd : Nat} {fp : Word} (hk : Kept P s t dd fp)
     (hregs : ∀ x, t'.regs x = t.regs x) (hmem : t'.mem = t.mem) : Kept P s t' dd fp :=
   ⟨by rw [hregs]; exact hk.rsp, by rw [hregs]; exact hk.rbp, by rw [hregs]; exact hk.fpv,
-    by rw [hmem]; exact hk.ro, fun i h1 h2 => by rw [hregs]; exact hk.keep i h1 h2⟩
+    by rw [hmem]; exact hk.ro⟩
 
 /-- `cmp rax, 0` reads the register it names. -/
 theorem cmp_zero_zf (t : State) :
@@ -868,7 +776,7 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
       iterate 1 refine Or.inr ?_
       refine Or.inl ⟨?_, ?_, ?_⟩
       · simp only [wReg, ht]
-      · refine kept_wRegCaller (r := (x64_ir.RAX).val) hk (by rw [rax_val]; simp [CallerSaved])
+      · refine kept_wRegCaller (r := (x64_ir.RAX).val) hk (by rw [rax_val]; simp [Clobbered])
           (fun x hxx => ?_) rfl
         simp only [wReg, Function.update_of_ne hxx]
       · simp only [wReg, rax_val, Function.update_self]
@@ -925,7 +833,7 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
       iterate 5 refine Or.inr ?_
       refine Or.inl ⟨?_, ?_, ?_⟩
       · omega
-      · refine kept_wRegCaller (r := (x64_ir.R9).val) hk (by rw [r9_val]; simp [CallerSaved])
+      · refine kept_wRegCaller (r := (x64_ir.R9).val) hk (by rw [r9_val]; simp [Clobbered])
           (fun x hxx => hregs x ?_) hmem
         simp only [writes, List.mem_singleton]; exact hxx
       · rw [hregs RAX (by simp [writes, r9_val])]; exact hx
@@ -1017,7 +925,7 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
       iterate 11 refine Or.inr ?_
       refine Or.inl ⟨?_, ?_, ?_, ?_⟩
       · simp only [ht]
-      · refine ⟨hk.rsp, hk.rbp, hk.fpv, ?_, hk.keep⟩
+      · refine ⟨hk.rsp, hk.rbp, hk.fpv, ?_⟩
         show RoMem P (store64 t.mem (t.regs RSP) (t.regs RAX))
         rw [hk.rsp]
         exact romem_store64_stack hL hk.ro (by omega) _
@@ -1054,18 +962,16 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
         iterate 12 refine Or.inr ?_
         refine ⟨?_, ?_⟩
         · exact Or.inl hpc
-        · refine ⟨?_, ?_, ?_, ?_, ?_⟩
+        · refine ⟨?_, ?_, ?_, ?_⟩
           · rw [hrsp', hrspp, rsp_pop]
           · rw [hkeep' RBP (by simp), popRsp_regs_ne _ (by decide)]; exact hk.rbp
           · rw [hkeep' R15 (by simp), popRsp_regs_ne _ (by decide)]; exact hk.fpv
           · refine romem_kept hL hk.ro ?_ ?_
             · intro a h1 h2 h3
-              rw [hfr' a (by rw [hrspp] at *; omega) h3, popRsp_mem]
+              obtain ⟨hsn, hdn, hpg⟩ := frame_offRegions hL h1 h2
+              rw [hfr' a (by rw [hrspp] at *; omega) h3 hsn hdn hpg, popRsp_mem]
             · intro a h1 h2
               rw [hde' a h1 h2, popRsp_mem]
-          · intro i h1 h2
-            rw [hkeep' _ (svReg_mem i h1 h2), popRsp_regs_ne _ (svReg_ne_rsp i)]
-            exact hk.keep i h1 h2
     · -- the five scrubs of eBPF `r1`-`r5`
       rcases ht with ht | ht | ht | ht | ht
       · -- `xor RDI, RDI`
@@ -1078,7 +984,7 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
         iterate 12 refine Or.inr ?_
         refine ⟨?_, ?_⟩
         · exact Or.inr (Or.inl (by omega : t'.pc = p + 15))
-        · refine kept_wRegCaller (r := (x64_ir.RDI).val) hk (by rw [rdi_val]; simp [CallerSaved])
+        · refine kept_wRegCaller (r := (x64_ir.RDI).val) hk (by rw [rdi_val]; simp [Clobbered])
             (fun x hxx => hregs x ?_) hmem
           simp only [writes, List.mem_singleton]; exact hxx
       · -- `xor RSI, RSI`
@@ -1091,7 +997,7 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
         iterate 12 refine Or.inr ?_
         refine ⟨?_, ?_⟩
         · exact Or.inr (Or.inr (Or.inl (by omega : t'.pc = p + 16)))
-        · refine kept_wRegCaller (r := (x64_ir.RSI).val) hk (by rw [rsi_val]; simp [CallerSaved])
+        · refine kept_wRegCaller (r := (x64_ir.RSI).val) hk (by rw [rsi_val]; simp [Clobbered])
             (fun x hxx => hregs x ?_) hmem
           simp only [writes, List.mem_singleton]; exact hxx
       · -- `xor RDX, RDX`
@@ -1104,7 +1010,7 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
         iterate 12 refine Or.inr ?_
         refine ⟨?_, ?_⟩
         · exact Or.inr (Or.inr (Or.inr (Or.inl (by omega : t'.pc = p + 17))))
-        · refine kept_wRegCaller (r := (x64_ir.RDX).val) hk (by rw [rdx_val]; simp [CallerSaved])
+        · refine kept_wRegCaller (r := (x64_ir.RDX).val) hk (by rw [rdx_val]; simp [Clobbered])
             (fun x hxx => hregs x ?_) hmem
           simp only [writes, List.mem_singleton]; exact hxx
       · -- `xor R10, R10`
@@ -1117,7 +1023,7 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
         iterate 12 refine Or.inr ?_
         refine ⟨?_, ?_⟩
         · exact Or.inr (Or.inr (Or.inr (Or.inr ((by omega : t'.pc = p + 18)))))
-        · refine kept_wRegCaller (r := (x64_ir.R10).val) hk (by rw [r10_val]; simp [CallerSaved])
+        · refine kept_wRegCaller (r := (x64_ir.R10).val) hk (by rw [r10_val]; simp [Clobbered])
             (fun x hxx => hregs x ?_) hmem
           simp only [writes, List.mem_singleton]; exact hxx
       · -- `xor R8, R8`
@@ -1128,7 +1034,7 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
           (i := .Alu true x64_ir.AluRR.Xor x64_ir.R8 x64_ir.R8) trivial hc hstep'
         refine Or.inr ⟨?_, ?_⟩
         · omega
-        · refine kept_wRegCaller (r := (x64_ir.R8).val) hk (by rw [r8_val]; simp [CallerSaved])
+        · refine kept_wRegCaller (r := (x64_ir.R8).val) hk (by rw [r8_val]; simp [Clobbered])
             (fun x hxx => hregs x ?_) hmem
           simp only [writes, List.mem_singleton]; exact hxx
   -- The walk never leaves the description.
@@ -1138,13 +1044,13 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
     intro s t hs hag hsty
     have h0 : HcInv P pre.depth.val p rp s s := by
       simp only [HcInv]
-      exact Or.inl ⟨hs, ⟨hag.rsp, hag.rbp, rfl, hag.ro, fun i _ _ => rfl⟩⟩
+      exact Or.inl ⟨hs, ⟨hag.rsp, hag.rbp, rfl, hag.ro⟩⟩
     refine stays_invariant (I := HcInv P pre.depth.val p rp s) h0 ?_ hsty
     intro u u' hIu hin hstepu hin'
     rcases hadv s u u' hIu hstepu with h | ⟨hq, -⟩
     · exact h
     · exact absurd (hq ▸ hin') hqout
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · -- every access the region makes is to the native stack
     intro s hs hag s' hsty c hstep' i hi bn hbn
     have hI := hinv s s' hs hag hsty
@@ -1275,6 +1181,86 @@ theorem macroOkIn_helperCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_
         simp at hr1
       · rw [ht, e18] at hr1
         simp at hr1
+  · -- and every range it writes is a word of the native stack below `rsp0`
+    intro s hs hag s' hsty c hstep' i hi bn hbn
+    have hI := hinv s s' hs hag hsty
+    simp only [HcInv] at hI
+    rcases hI with ⟨ht, hk⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ |
+      ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -, -⟩ | ⟨ht, hk, -, -⟩ | ⟨ht, hk, -, -⟩ |
+      ⟨ht, hk, -, -⟩ | ⟨ht, hk, -, -⟩ | ⟨ht, hk⟩
+    · rw [ht, e0] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rw [ht, e1] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rw [ht, e2] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rw [ht, e10] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rw [ht, e11] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rw [ht, e12] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rw [ht, e13] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_call, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · rw [ht, r0] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rw [ht, r1] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_call, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · rw [ht, r5] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rw [ht, r6] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_storeRspRax, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP) 8
+      rw [hk.rsp]
+      exact storeOk_stack hL (by omega) (by omega)
+    · rw [ht, r7] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · rcases ht with ht | ht | ht | ht | ht
+      · rw [ht, e14] at hi
+        obtain rfl : i = _ := by simpa using hi.symm
+        simp [stores] at hbn
+      · rw [ht, e15] at hi
+        obtain rfl : i = _ := by simpa using hi.symm
+        simp [stores] at hbn
+      · rw [ht, e16] at hi
+        obtain rfl : i = _ := by simpa using hi.symm
+        simp [stores] at hbn
+      · rw [ht, e17] at hi
+        obtain rfl : i = _ := by simpa using hi.symm
+        simp [stores] at hbn
+      · rw [ht, e18] at hi
+        obtain rfl : i = _ := by simpa using hi.symm
+        simp [stores] at hbn
+  · -- and `rsp` never leaves the native stack window: the depth the
+    -- description carries is two words at the deepest
+    intro s hs hag s' hsty
+    have hI := hinv s s' hs hag hsty
+    simp only [HcInv] at hI
+    rcases hI with ⟨-, hk⟩ | ⟨-, hk, -⟩ | ⟨-, hk, -, -⟩ | ⟨-, hk, -⟩ | ⟨-, hk, -⟩ |
+      ⟨-, hk, -⟩ | ⟨-, hk, -⟩ | ⟨-, hk, -, -⟩ | ⟨-, hk, -, -⟩ | ⟨-, hk, -, -⟩ |
+      ⟨-, hk, -, -⟩ | ⟨-, hk, -, -⟩ | ⟨-, hk⟩ <;>
+      exact rsp_window_of_depth hL hk.rsp (by omega)
 
 /-! ## The lazy local call
 
@@ -1310,63 +1296,42 @@ theorem aluImm_addR15 (imm : Std.I32) (t : State) :
       = t.regs R15 + BitVec.signExtend 64 imm.bv := by
   simp [aluImmStep, wRegFlags, r15_val, wr]
 
-/-- No spill slot is claimed at the depth the macro is entered at. -/
-theorem saved_none {P : Params} {s t : State} {d dd : Nat} (h : dd < d + 1) :
-    Saved P s t d dd := fun i h1 h2 h3 => absurd h3 (by omega)
-
-theorem saved_mem {P : Params} {s t t' : State} {d dd : Nat} (hsv : Saved P s t d dd)
-    (hmem : t'.mem = t.mem) : Saved P s t' d dd := fun i h1 h2 h3 => by
-  rw [hmem]; exact hsv i h1 h2 h3
-
-theorem svReg_eq (i : Nat) (h1 : 1 ≤ i) (h2 : i ≤ 4) :
-    (i = 1 ∧ svReg i = 3) ∨ (i = 2 ∧ svReg i = 12) ∨ (i = 3 ∧ svReg i = 13) ∨
-      (i = 4 ∧ svReg i = 14) := by
-  have h : i = 1 ∨ i = 2 ∨ i = 3 ∨ i = 4 := by omega
-  rcases h with rfl | rfl | rfl | rfl <;> simp [svReg]
-
-/-- A write to `r15`, the only register outside the caller-saved set the
+/-- A write to `r15`, the only register outside the clobbered set the
 generated code ever moves. -/
 theorem kept_fp {P : Params} {s t t' : State} {dd : Nat} {fp fp' : Word}
     (hk : Kept P s t dd fp) (hfp : t'.regs R15 = fp')
     (hregs : ∀ x, x ≠ R15 → t'.regs x = t.regs x) (hmem : t'.mem = t.mem) :
     Kept P s t' dd fp' := by
-  refine ⟨?_, ?_, hfp, ?_, ?_⟩
+  refine ⟨?_, ?_, hfp, ?_⟩
   · rw [hregs RSP (by decide)]; exact hk.rsp
   · rw [hregs RBP (by decide)]; exact hk.rbp
   · rw [hmem]; exact hk.ro
-  · intro i h1 h2
-    rw [hregs _ (by rcases svReg_val i h1 h2 with h | h | h | h <;> rw [h] <;> decide)]
-    exact hk.keep i h1 h2
 
-/-- A pop into a caller-saved register: no spill slot is restored by it. -/
-theorem kept_popCaller {P : Params} {s t t' : State} {d dd : Nat} {fp : Word} {r : Nat}
-    (hL : Layout P) (hk : Kept P s t (dd + 1) fp) (hsv : Saved P s t d (dd + 1))
-    (hddd : d ≤ dd) (hd16 : dd + 1 ≤ 16) (hr : CallerSaved r)
+/-- A pop into a register a call may clobber, which is every register the two
+expansions pop: one word shallower, and nothing the description names moves. -/
+theorem kept_popCaller {P : Params} {s t t' : State} {dd : Nat} {fp : Word} {r : Nat}
+    (hk : Kept P s t (dd + 1) fp) (hr : Clobbered r)
     (hregs : ∀ x, x ≠ r → x ≠ RSP → t'.regs x = t.regs x)
-    (hval : t'.regs r = load64 t.mem (t.regs RSP))
     (hrsp : t'.regs RSP = t.regs RSP + 8#64) (hmem : t'.mem = t.mem) :
-    Kept P s t' dd fp ∧ Saved P s t' d dd := by
-  simp only [CallerSaved] at hr
-  rcases hr with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
-    exact kept_pop hL hk hsv hddd hd16 (by decide) (by decide) (by decide)
-      (fun i h1 h2 h3 => by
-        exfalso
-        rcases svReg_val i h1 h2 with h | h | h | h <;> rw [h] at h3 <;> omega)
-      hregs hval hrsp hmem
+    Kept P s t' dd fp := by
+  simp only [Clobbered] at hr
+  have h5 : (RBP : Nat) ≠ r := by simp only [RBP]; omega
+  have h15 : (R15 : Nat) ≠ r := by simp only [R15]; omega
+  exact ⟨by rw [hrsp, hk.rsp, rsp_pop], by rw [hregs RBP h5 (by decide)]; exact hk.rbp,
+    by rw [hregs R15 h15 (by decide)]; exact hk.fpv, by rw [hmem]; exact hk.ro⟩
 
-/-- The three register facts a `pop` leaves behind. -/
+/-- The two register facts a `pop` leaves behind. `pop` writes `rsp` before it
+writes its destination, so the destination's update is the outer one and a
+`pop rsp` would end holding the popped word. -/
 theorem pop_facts (t : State) (r : Std.U8) (hr : r.val ≠ RSP) :
     (∀ x, x ≠ r.val → x ≠ RSP →
-      (Function.update (Function.update t.regs r.val (load64 t.mem (t.regs RSP)))
-        RSP (t.regs RSP + 8#64)) x = t.regs x) ∧
-    (Function.update (Function.update t.regs r.val (load64 t.mem (t.regs RSP)))
-        RSP (t.regs RSP + 8#64)) r.val = load64 t.mem (t.regs RSP) ∧
-    (Function.update (Function.update t.regs r.val (load64 t.mem (t.regs RSP)))
-        RSP (t.regs RSP + 8#64)) RSP = t.regs RSP + 8#64 := by
-  refine ⟨fun x h1 h2 => ?_, ?_, ?_⟩
-  · rw [Function.update_of_ne h2, Function.update_of_ne h1]
-  · rw [Function.update_of_ne hr, Function.update_self]
-  · rw [Function.update_self]
+      (Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+        r.val (load64 t.mem (t.regs RSP))) x = t.regs x) ∧
+    (Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+        r.val (load64 t.mem (t.regs RSP))) RSP = t.regs RSP + 8#64 := by
+  refine ⟨fun x h1 h2 => ?_, ?_⟩
+  · rw [Function.update_of_ne h1, Function.update_of_ne h2]
+  · rw [Function.update_of_ne (Ne.symm hr), Function.update_self]
 
 theorem regOnly_step {P code} {t t' : State} {i : x64_ir.PInsn}
     (hc : code[t.pc]? = some i) (hi : RegOnly i) (h : Step P code t (.next t')) :
@@ -1379,82 +1344,53 @@ theorem regOnly_step {P code} {t t' : State} {i : x64_ir.PInsn}
 /-- The description of the lazy local call's state, position by position.
 `imm` is the frame stride as the primitive layer carries it: between the
 `sub r15` at position 8 and the `add r15` at position 38 the frame register is
-one stride lower, and the twelve words below the entry `rsp` hold what the
-spills put there. -/
+one stride lower, and the depth walks down twelve words and back up. -/
 def LzInv (P : Params) (d p : Nat) (imm : Std.I32) (s t : State) : Prop :=
-  (t.pc = p ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 1 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d ∧ t.regs RCX = P.desc) ∨
-  (t.pc = p + 2 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 3 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 4 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 5 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d ∧ t.regs RCX = P.desc) ∨
-  (t.pc = p + 6 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 7 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 8 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 9 ∧ Kept P s t d (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧ Saved P s t d d) ∨
-  (t.pc = p + 10 ∧ Kept P s t (d + 1) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 1)) ∨
-  (t.pc = p + 11 ∧ Kept P s t (d + 2) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 2)) ∨
-  (t.pc = p + 12 ∧ Kept P s t (d + 3) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 3)) ∨
-  (t.pc = p + 13 ∧ Kept P s t (d + 4) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 4)) ∨
-  (t.pc = p + 14 ∧ Kept P s t (d + 5) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 5)) ∨
-  (t.pc = p + 15 ∧ Kept P s t (d + 6) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 6)) ∨
-  (t.pc = p + 16 ∧ Kept P s t (d + 7) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 7)) ∨
-  (t.pc = p + 17 ∧ Kept P s t (d + 8) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 8)) ∨
-  (t.pc = p + 18 ∧ Kept P s t (d + 9) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 9)) ∨
-  (t.pc = p + 19 ∧ Kept P s t (d + 10) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 10)) ∨
-  (t.pc = p + 20 ∧ Kept P s t (d + 11) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 11)) ∨
-  (t.pc = p + 21 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 12)) ∨
-  (t.pc = p + 22 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 12)) ∨
-  (t.pc = p + 23 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 12)) ∨
-  (t.pc = p + 24 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 12)) ∨
-  (t.pc = p + 25 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 12)) ∨
-  (t.pc = p + 26 ∧ Kept P s t (d + 11) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 11)) ∨
-  (t.pc = p + 27 ∧ Kept P s t (d + 10) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 10)) ∨
-  (t.pc = p + 28 ∧ Kept P s t (d + 9) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 9)) ∨
-  (t.pc = p + 29 ∧ Kept P s t (d + 8) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 8)) ∨
-  (t.pc = p + 30 ∧ Kept P s t (d + 7) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 7)) ∨
-  (t.pc = p + 31 ∧ Kept P s t (d + 6) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 6)) ∨
-  (t.pc = p + 32 ∧ Kept P s t (d + 5) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 5)) ∨
-  (t.pc = p + 33 ∧ Kept P s t (d + 4) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 4)) ∨
-  (t.pc = p + 34 ∧ Kept P s t (d + 4) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 4)) ∨
-  (t.pc = p + 35 ∧ Kept P s t (d + 3) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 3)) ∨
-  (t.pc = p + 36 ∧ Kept P s t (d + 2) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 2)) ∨
-  (t.pc = p + 37 ∧ Kept P s t (d + 1) (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧
-    Saved P s t d (d + 1)) ∨
-  (t.pc = p + 38 ∧ Kept P s t d (s.regs R15 - BitVec.signExtend 64 imm.bv) ∧ Saved P s t d d) ∨
-  (t.pc = p + 39 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 40 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 41 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 42 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 43 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d) ∨
-  (t.pc = p + 44 ∧ Kept P s t d (s.regs R15) ∧ Saved P s t d d)
+  (t.pc = p ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 1 ∧ Kept P s t d (s.regs R15) ∧ t.regs RCX = P.desc) ∨
+  (t.pc = p + 2 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 3 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 4 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 5 ∧ Kept P s t d (s.regs R15) ∧ t.regs RCX = P.desc) ∨
+  (t.pc = p + 6 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 7 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 8 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 9 ∧ Kept P s t d (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 10 ∧ Kept P s t (d + 1) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 11 ∧ Kept P s t (d + 2) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 12 ∧ Kept P s t (d + 3) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 13 ∧ Kept P s t (d + 4) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 14 ∧ Kept P s t (d + 5) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 15 ∧ Kept P s t (d + 6) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 16 ∧ Kept P s t (d + 7) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 17 ∧ Kept P s t (d + 8) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 18 ∧ Kept P s t (d + 9) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 19 ∧ Kept P s t (d + 10) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 20 ∧ Kept P s t (d + 11) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 21 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 22 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 23 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 24 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 25 ∧ Kept P s t (d + 12) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 26 ∧ Kept P s t (d + 11) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 27 ∧ Kept P s t (d + 10) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 28 ∧ Kept P s t (d + 9) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 29 ∧ Kept P s t (d + 8) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 30 ∧ Kept P s t (d + 7) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 31 ∧ Kept P s t (d + 6) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 32 ∧ Kept P s t (d + 5) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 33 ∧ Kept P s t (d + 4) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 34 ∧ Kept P s t (d + 4) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 35 ∧ Kept P s t (d + 3) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 36 ∧ Kept P s t (d + 2) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 37 ∧ Kept P s t (d + 1) (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 38 ∧ Kept P s t d (s.regs R15 - BitVec.signExtend 64 imm.bv)) ∨
+  (t.pc = p + 39 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 40 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 41 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 42 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 43 ∧ Kept P s t d (s.regs R15)) ∨
+  (t.pc = p + 44 ∧ Kept P s t d (s.regs R15))
 
 /-- Every position the description names is inside the macro's range. -/
 theorem lzInv_inside {P : Params} {d p : Nat} {imm : Std.I32} {s t : State}
@@ -1462,14 +1398,14 @@ theorem lzInv_inside {P : Params} {d p : Nat} {imm : Std.I32} {s t : State}
   simp only [LzInv] at h
   simp only [Range]
   rcases h with
-    ⟨ht, -, -⟩ | ⟨ht, -, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -, -⟩ |
-    ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-    ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-    ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-    ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-    ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-    ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-    ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩
+    ⟨ht, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -, -⟩ |
+    ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+    ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+    ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+    ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+    ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+    ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+    ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩
   all_goals omega
 
 /-- `MInsn::LazyLocalCall`.
@@ -1479,8 +1415,11 @@ the guest or the native floor is crossed and jump to the exhausted path, which
 calls the embedder's non-returning callback and traps; the rest spills twelve
 registers, calls the resolver, calls what it returned, unspills, and rejoins
 at the `done` label, which is the run's last primitive. Both external returns
-are answered by `ExternalReturn`, which is what keeps the frame register, the
-entry contract's bytes and the four spill slots the unspill reads back. -/
+are answered by `ExternalReturn`, which is what keeps the stack pointer, `rbp`,
+the frame register and the entry contract's bytes across them; what the four
+unspilling `pop`s read back is nothing this proof has to say anything about,
+because the state the checker's `clobber_call` leaves says `Top` of all four
+registers they write. -/
 theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64_ir.Cfg}
     {pre post : x64_check.State} {id : Std.U32} {index : Std.Usize} {pcv : Std.U32}
     {p label : Nat}
@@ -1645,15 +1584,15 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
     intro s t t' hI hstep'
     simp only [LzInv] at hI ⊢
     rcases hI with
-      ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv, hrcx⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ |
-      ⟨ht, hk, hsv, hrcx⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ |
-      ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ |
-      ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ |
-      ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ |
-      ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ |
-      ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ |
-      ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ |
-      ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩ | ⟨ht, hk, hsv⟩
+      ⟨ht, hk⟩ | ⟨ht, hk, hrcx⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk, hrcx⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩
     · -- position 0
       have hc := e0
       rw [← ht] at hc
@@ -1662,12 +1601,11 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
         subst hu
         refine Or.inl ?_
         iterate 1 refine Or.inr ?_
-        refine Or.inl ⟨?_, ?_, ?_, ?_⟩
+        refine Or.inl ⟨?_, ?_, ?_⟩
         · simp only [wReg]; omega
         · exact kept_wRegCaller (r := (x64_ir.RCX).val) hk
-            (by rw [rcx_val]; simp [CallerSaved])
+            (by rw [rcx_val]; simp [Clobbered])
             (fun x hxx => by simp only [wReg, Function.update_of_ne hxx]) rfl
-        · exact saved_none (by omega)
         · show (wReg t x64_ir.RCX (loadExt (8#u8 : Std.U8).val false t.mem
             (addr t x64_ir.RBP x64_ir.frame.FRAME_OFFSET))).regs RCX = P.desc
           simp only [wReg, rcx_val, Function.update_self]
@@ -1683,12 +1621,11 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
         subst hu
         refine Or.inl ?_
         iterate 2 refine Or.inr ?_
-        refine Or.inl ⟨?_, ?_, ?_⟩
+        refine Or.inl ⟨?_, ?_⟩
         · simp only [wReg]; omega
         · exact kept_wRegCaller (r := (x64_ir.RCX).val) hk
-            (by rw [rcx_val]; simp [CallerSaved])
+            (by rw [rcx_val]; simp [Clobbered])
             (fun x hxx => by simp only [wReg, Function.update_of_ne hxx]) rfl
-        · exact saved_none (by omega)
       · simp at hbad
     · -- position 2
       have hc := e2
@@ -1698,10 +1635,9 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
       subst hu
       refine Or.inl ?_
       iterate 3 refine Or.inr ?_
-      refine Or.inl ⟨?_, ?_, ?_⟩
+      refine Or.inl ⟨?_, ?_⟩
       · simp only [aluRRStep_pc]; omega
       · exact kept_same hk (fun x => by simp only [aluRRStep, wFlags]) rfl
-      · exact saved_none (by omega)
     · -- position 3
       have hc := e3
       rw [← ht] at hc
@@ -1713,13 +1649,12 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
         subst hu
         refine Or.inl ?_
         iterate 40 refine Or.inr ?_
-        exact Or.inl ⟨rfl, kept_same hk (fun x => rfl) rfl, saved_none (by omega)⟩
+        exact Or.inl ⟨rfl, kept_same hk (fun x => rfl) rfl⟩
       · simp only [Config.next.injEq] at hu
         subst hu
         refine Or.inl ?_
         iterate 4 refine Or.inr ?_
-        exact Or.inl ⟨by simp only [wNext]; omega,
-          kept_same hk (fun x => rfl) rfl, saved_none (by omega)⟩
+        exact Or.inl ⟨by simp only [wNext]; omega, kept_same hk (fun x => rfl) rfl⟩
     · -- position 4
       have hc := e4
       rw [← ht] at hc
@@ -1728,12 +1663,11 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
         subst hu
         refine Or.inl ?_
         iterate 5 refine Or.inr ?_
-        refine Or.inl ⟨?_, ?_, ?_, ?_⟩
+        refine Or.inl ⟨?_, ?_, ?_⟩
         · simp only [wReg]; omega
         · exact kept_wRegCaller (r := (x64_ir.RCX).val) hk
-            (by rw [rcx_val]; simp [CallerSaved])
+            (by rw [rcx_val]; simp [Clobbered])
             (fun x hxx => by simp only [wReg, Function.update_of_ne hxx]) rfl
-        · exact saved_none (by omega)
         · show (wReg t x64_ir.RCX (loadExt (8#u8 : Std.U8).val false t.mem
             (addr t x64_ir.RBP x64_ir.frame.FRAME_OFFSET))).regs RCX = P.desc
           simp only [wReg, rcx_val, Function.update_self]
@@ -1749,12 +1683,11 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
         subst hu
         refine Or.inl ?_
         iterate 6 refine Or.inr ?_
-        refine Or.inl ⟨?_, ?_, ?_⟩
+        refine Or.inl ⟨?_, ?_⟩
         · simp only [wReg]; omega
         · exact kept_wRegCaller (r := (x64_ir.RCX).val) hk
-            (by rw [rcx_val]; simp [CallerSaved])
+            (by rw [rcx_val]; simp [Clobbered])
             (fun x hxx => by simp only [wReg, Function.update_of_ne hxx]) rfl
-        · exact saved_none (by omega)
       · simp at hbad
     · -- position 6
       have hc := e6
@@ -1764,10 +1697,9 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
       subst hu
       refine Or.inl ?_
       iterate 7 refine Or.inr ?_
-      refine Or.inl ⟨?_, ?_, ?_⟩
+      refine Or.inl ⟨?_, ?_⟩
       · simp only [aluRRStep_pc]; omega
       · exact kept_same hk (fun x => by simp only [aluRRStep, wFlags]) rfl
-      · exact saved_none (by omega)
     · -- position 7
       have hc := e7
       rw [← ht] at hc
@@ -1779,13 +1711,12 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
         subst hu
         refine Or.inl ?_
         iterate 40 refine Or.inr ?_
-        exact Or.inl ⟨rfl, kept_same hk (fun x => rfl) rfl, saved_none (by omega)⟩
+        exact Or.inl ⟨rfl, kept_same hk (fun x => rfl) rfl⟩
       · simp only [Config.next.injEq] at hu
         subst hu
         refine Or.inl ?_
         iterate 8 refine Or.inr ?_
-        exact Or.inl ⟨by simp only [wNext]; omega,
-          kept_same hk (fun x => rfl) rfl, saved_none (by omega)⟩
+        exact Or.inl ⟨by simp only [wNext]; omega, kept_same hk (fun x => rfl) rfl⟩
     · -- position 8
       have hc := e8
       rw [← ht] at hc
@@ -1794,237 +1725,210 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
       subst hu
       refine Or.inl ?_
       iterate 9 refine Or.inr ?_
-      refine Or.inl ⟨?_, ?_, ?_⟩
+      refine Or.inl ⟨?_, ?_⟩
       · simp only [aluImmStep_pc]; omega
       · refine kept_fp hk ?_ (fun x hxx =>
           aluImmStep_regs_ne _ _ _ _ _ (by rw [r15_val]; exact hxx)) rfl
         rw [aluImm_subR15, hk.fpv]
-      · exact saved_none (by omega)
     · -- position 9
       have hc := e9
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.RBX).val))
-        (v := t.regs (x64_ir.RBX).val) hL hk hsv (by omega) (by omega)
-        (by
-          intro _
-          rw [show pre.depth.val + 1 - pre.depth.val = 1 from (by omega), rbx_val]
-          exact hk.keep 1 (by norm_num) (by norm_num))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.RBX).val))
+        (v := t.regs (x64_ir.RBX).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.RBX).val) hxx)
         (push_rsp t (t.regs (x64_ir.RBX).val)) (push_mem t (t.regs (x64_ir.RBX).val))
       refine Or.inl ?_
       iterate 10 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 10
       have hc := e10
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.R12).val))
-        (v := t.regs (x64_ir.R12).val) hL hk hsv (by omega) (by omega)
-        (by
-          intro _
-          rw [show pre.depth.val + 1 + 1 - pre.depth.val = 2 from (by omega), r12_val]
-          exact hk.keep 2 (by norm_num) (by norm_num))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.R12).val))
+        (v := t.regs (x64_ir.R12).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.R12).val) hxx)
         (push_rsp t (t.regs (x64_ir.R12).val)) (push_mem t (t.regs (x64_ir.R12).val))
       refine Or.inl ?_
       iterate 11 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 11
       have hc := e11
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.R13).val))
-        (v := t.regs (x64_ir.R13).val) hL hk hsv (by omega) (by omega)
-        (by
-          intro _
-          rw [show pre.depth.val + 2 + 1 - pre.depth.val = 3 from (by omega), r13_val]
-          exact hk.keep 3 (by norm_num) (by norm_num))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.R13).val))
+        (v := t.regs (x64_ir.R13).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.R13).val) hxx)
         (push_rsp t (t.regs (x64_ir.R13).val)) (push_mem t (t.regs (x64_ir.R13).val))
       refine Or.inl ?_
       iterate 12 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 12
       have hc := e12
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.R14).val))
-        (v := t.regs (x64_ir.R14).val) hL hk hsv (by omega) (by omega)
-        (by
-          intro _
-          rw [show pre.depth.val + 3 + 1 - pre.depth.val = 4 from (by omega), r14_val]
-          exact hk.keep 4 (by norm_num) (by norm_num))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.R14).val))
+        (v := t.regs (x64_ir.R14).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.R14).val) hxx)
         (push_rsp t (t.regs (x64_ir.R14).val)) (push_mem t (t.regs (x64_ir.R14).val))
       refine Or.inl ?_
       iterate 13 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 13
       have hc := e13
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.RDI).val))
-        (v := t.regs (x64_ir.RDI).val) hL hk hsv (by omega) (by omega)
-        (fun hh => absurd hh (by omega))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.RDI).val))
+        (v := t.regs (x64_ir.RDI).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.RDI).val) hxx)
         (push_rsp t (t.regs (x64_ir.RDI).val)) (push_mem t (t.regs (x64_ir.RDI).val))
       refine Or.inl ?_
       iterate 14 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 14
       have hc := e14
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.RSI).val))
-        (v := t.regs (x64_ir.RSI).val) hL hk hsv (by omega) (by omega)
-        (fun hh => absurd hh (by omega))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.RSI).val))
+        (v := t.regs (x64_ir.RSI).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.RSI).val) hxx)
         (push_rsp t (t.regs (x64_ir.RSI).val)) (push_mem t (t.regs (x64_ir.RSI).val))
       refine Or.inl ?_
       iterate 15 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 15
       have hc := e15
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.RDX).val))
-        (v := t.regs (x64_ir.RDX).val) hL hk hsv (by omega) (by omega)
-        (fun hh => absurd hh (by omega))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.RDX).val))
+        (v := t.regs (x64_ir.RDX).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.RDX).val) hxx)
         (push_rsp t (t.regs (x64_ir.RDX).val)) (push_mem t (t.regs (x64_ir.RDX).val))
       refine Or.inl ?_
       iterate 16 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 16
       have hc := e16
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.R10).val))
-        (v := t.regs (x64_ir.R10).val) hL hk hsv (by omega) (by omega)
-        (fun hh => absurd hh (by omega))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.R10).val))
+        (v := t.regs (x64_ir.R10).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.R10).val) hxx)
         (push_rsp t (t.regs (x64_ir.R10).val)) (push_mem t (t.regs (x64_ir.R10).val))
       refine Or.inl ?_
       iterate 17 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 17
       have hc := e17
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.R8).val))
-        (v := t.regs (x64_ir.R8).val) hL hk hsv (by omega) (by omega)
-        (fun hh => absurd hh (by omega))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.R8).val))
+        (v := t.regs (x64_ir.R8).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.R8).val) hxx)
         (push_rsp t (t.regs (x64_ir.R8).val)) (push_mem t (t.regs (x64_ir.R8).val))
       refine Or.inl ?_
       iterate 18 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 18
       have hc := e18
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.VOLATILE_CTXT).val))
-        (v := t.regs (x64_ir.VOLATILE_CTXT).val) hL hk hsv (by omega) (by omega)
-        (fun hh => absurd hh (by omega))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.VOLATILE_CTXT).val))
+        (v := t.regs (x64_ir.VOLATILE_CTXT).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.VOLATILE_CTXT).val) hxx)
         (push_rsp t (t.regs (x64_ir.VOLATILE_CTXT).val))
         (push_mem t (t.regs (x64_ir.VOLATILE_CTXT).val))
       refine Or.inl ?_
       iterate 19 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 19
       have hc := e19
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.RAX).val))
-        (v := t.regs (x64_ir.RAX).val) hL hk hsv (by omega) (by omega)
-        (fun hh => absurd hh (by omega))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.RAX).val))
+        (v := t.regs (x64_ir.RAX).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.RAX).val) hxx)
         (push_rsp t (t.regs (x64_ir.RAX).val)) (push_mem t (t.regs (x64_ir.RAX).val))
       refine Or.inl ?_
       iterate 20 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 20
       have hc := e20
       rw [← ht] at hc
       have hu := step_push hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      have h2 := kept_push (t' := push t (t.regs (x64_ir.RAX).val))
-        (v := t.regs (x64_ir.RAX).val) hL hk hsv (by omega) (by omega)
-        (fun hh => absurd hh (by omega))
+      have h2 := kept_pushW (t' := push t (t.regs (x64_ir.RAX).val))
+        (v := t.regs (x64_ir.RAX).val) hL hk (by omega)
         (fun x hxx => push_regs_ne t (t.regs (x64_ir.RAX).val) hxx)
         (push_rsp t (t.regs (x64_ir.RAX).val)) (push_mem t (t.regs (x64_ir.RAX).val))
       refine Or.inl ?_
       iterate 21 refine Or.inr ?_
       exact Or.inl ⟨by simp only []; omega,
-        kept_same h2.1 (fun x => rfl) rfl, saved_mem h2.2 rfl⟩
+        kept_same h2 (fun x => rfl) rfl⟩
     · -- position 21
       have hc := e21
       rw [← ht] at hc
       obtain ⟨hpc, hmem, hregs⟩ := regOnly_step hc trivial hstep'
       refine Or.inl ?_
       iterate 22 refine Or.inr ?_
-      refine Or.inl ⟨?_, ?_, ?_⟩
+      refine Or.inl ⟨?_, ?_⟩
       · omega
       · refine kept_wRegCaller (r := (x64_ir.RDI).val) hk
-          (by rw [rdi_val]; simp [CallerSaved]) (fun x hxx => hregs x ?_) hmem
+          (by rw [rdi_val]; simp [Clobbered]) (fun x hxx => hregs x ?_) hmem
         simp only [writes, List.mem_singleton]; exact hxx
-      · exact saved_mem hsv hmem
     · -- position 22
       have hc := e22
       rw [← ht] at hc
       obtain ⟨hpc, hmem, hregs⟩ := regOnly_step hc trivial hstep'
       refine Or.inl ?_
       iterate 23 refine Or.inr ?_
-      refine Or.inl ⟨?_, ?_, ?_⟩
+      refine Or.inl ⟨?_, ?_⟩
       · omega
       · refine kept_wRegCaller (r := (x64_ir.RAX).val) hk
-          (by rw [rax_val]; simp [CallerSaved]) (fun x hxx => hregs x ?_) hmem
+          (by rw [rax_val]; simp [Clobbered]) (fun x hxx => hregs x ?_) hmem
         simp only [writes, List.mem_singleton]; exact hxx
-      · exact saved_mem hsv hmem
     · -- position 23
       have hc := e23
       rw [← ht] at hc
-      obtain ⟨hpc, hka, hsa⟩ :=
-        kept_callReg hL hlen hk hsv (by omega) (by omega) hc hstep'
+      obtain ⟨hpc, hka⟩ :=
+        kept_callReg hL hlen hk (by omega) hc hstep'
       refine Or.inl ?_
       iterate 24 refine Or.inr ?_
-      exact Or.inl ⟨by omega, hka, hsa⟩
+      exact Or.inl ⟨by omega, hka⟩
     · -- position 24
       have hc := e24
       rw [← ht] at hc
@@ -2033,268 +1937,223 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
       subst hu
       refine Or.inl ?_
       iterate 25 refine Or.inr ?_
-      refine Or.inl ⟨?_, ?_, ?_⟩
+      refine Or.inl ⟨?_, ?_⟩
       · simp only [aluRRStep_pc]; omega
       · exact kept_wRegCaller (r := (x64_ir.RCX).val) hk
-          (by rw [rcx_val]; simp [CallerSaved])
+          (by rw [rcx_val]; simp [Clobbered])
           (fun x hxx => aluRRStep_regs_ne _ _ _ _ _ hxx) rfl
-      · exact saved_mem hsv (aluRRStep_mem _ _ _ _ _)
     · -- position 25
       have hc := e25
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.RAX (by rw [rax_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_popCaller
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.RAX (by rw [rax_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.RAX).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.RAX).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 11) (r := (x64_ir.RAX).val) hL hk hsv
-        (by omega) (by omega) (by rw [rax_val]; simp [CallerSaved]) g1 g2 g3 rfl
+        (dd := pre.depth.val + 11) (r := (x64_ir.RAX).val) hk
+        (by rw [rax_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 26 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 26
       have hc := e26
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.RAX (by rw [rax_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_popCaller
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.RAX (by rw [rax_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.RAX).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.RAX).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 10) (r := (x64_ir.RAX).val) hL hk hsv
-        (by omega) (by omega) (by rw [rax_val]; simp [CallerSaved]) g1 g2 g3 rfl
+        (dd := pre.depth.val + 10) (r := (x64_ir.RAX).val) hk
+        (by rw [rax_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 27 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 27
       have hc := e27
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.VOLATILE_CTXT (by rw [ctxt_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_popCaller
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.VOLATILE_CTXT (by rw [ctxt_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.VOLATILE_CTXT).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.VOLATILE_CTXT).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 9) (r := (x64_ir.VOLATILE_CTXT).val) hL hk hsv
-        (by omega) (by omega) (by rw [ctxt_val]; simp [CallerSaved]) g1 g2 g3 rfl
+        (dd := pre.depth.val + 9) (r := (x64_ir.VOLATILE_CTXT).val) hk
+        (by rw [ctxt_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 28 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 28
       have hc := e28
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.R8 (by rw [r8_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_popCaller
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.R8 (by rw [r8_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.R8).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.R8).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 8) (r := (x64_ir.R8).val) hL hk hsv
-        (by omega) (by omega) (by rw [r8_val]; simp [CallerSaved]) g1 g2 g3 rfl
+        (dd := pre.depth.val + 8) (r := (x64_ir.R8).val) hk
+        (by rw [r8_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 29 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 29
       have hc := e29
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.R10 (by rw [r10_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_popCaller
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.R10 (by rw [r10_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.R10).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.R10).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 7) (r := (x64_ir.R10).val) hL hk hsv
-        (by omega) (by omega) (by rw [r10_val]; simp [CallerSaved]) g1 g2 g3 rfl
+        (dd := pre.depth.val + 7) (r := (x64_ir.R10).val) hk
+        (by rw [r10_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 30 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 30
       have hc := e30
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.RDX (by rw [rdx_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_popCaller
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.RDX (by rw [rdx_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.RDX).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.RDX).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 6) (r := (x64_ir.RDX).val) hL hk hsv
-        (by omega) (by omega) (by rw [rdx_val]; simp [CallerSaved]) g1 g2 g3 rfl
+        (dd := pre.depth.val + 6) (r := (x64_ir.RDX).val) hk
+        (by rw [rdx_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 31 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 31
       have hc := e31
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.RSI (by rw [rsi_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_popCaller
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.RSI (by rw [rsi_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.RSI).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.RSI).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 5) (r := (x64_ir.RSI).val) hL hk hsv
-        (by omega) (by omega) (by rw [rsi_val]; simp [CallerSaved]) g1 g2 g3 rfl
+        (dd := pre.depth.val + 5) (r := (x64_ir.RSI).val) hk
+        (by rw [rsi_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 32 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 32
       have hc := e32
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.RDI (by rw [rdi_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_popCaller
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.RDI (by rw [rdi_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.RDI).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.RDI).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 4) (r := (x64_ir.RDI).val) hL hk hsv
-        (by omega) (by omega) (by rw [rdi_val]; simp [CallerSaved]) g1 g2 g3 rfl
+        (dd := pre.depth.val + 4) (r := (x64_ir.RDI).val) hk
+        (by rw [rdi_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 33 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 33
       have hc := e33
       rw [← ht] at hc
-      obtain ⟨hpc, hka, hsa⟩ :=
-        kept_callReg hL hlen hk hsv (by omega) (by omega) hc hstep'
+      obtain ⟨hpc, hka⟩ :=
+        kept_callReg hL hlen hk (by omega) hc hstep'
       refine Or.inl ?_
       iterate 34 refine Or.inr ?_
-      exact Or.inl ⟨by omega, hka, hsa⟩
+      exact Or.inl ⟨by omega, hka⟩
     · -- position 34
       have hc := e34
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.R14 (by rw [r14_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_pop
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.R14 (by rw [r14_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.R14).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.R14).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 3) (r := (x64_ir.R14).val) hL hk hsv
-        (by omega) (by omega) (by rw [r14_val]; decide) (by rw [r14_val]; decide)
-        (by rw [r14_val]; decide)
-        (fun i h1 h2 h3 => by
-          rw [r14_val] at h3
-          have hii : i = 4 := by
-            rcases svReg_eq i h1 h2 with ⟨hi, he⟩ | ⟨hi, he⟩ | ⟨hi, he⟩ | ⟨hi, he⟩
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · exact hi
-          omega)
-        g1 g2 g3 rfl
+        (dd := pre.depth.val + 3) (r := (x64_ir.R14).val) hk
+        (by rw [r14_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 35 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 35
       have hc := e35
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.R13 (by rw [r13_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_pop
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.R13 (by rw [r13_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.R13).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.R13).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 2) (r := (x64_ir.R13).val) hL hk hsv
-        (by omega) (by omega) (by rw [r13_val]; decide) (by rw [r13_val]; decide)
-        (by rw [r13_val]; decide)
-        (fun i h1 h2 h3 => by
-          rw [r13_val] at h3
-          have hii : i = 3 := by
-            rcases svReg_eq i h1 h2 with ⟨hi, he⟩ | ⟨hi, he⟩ | ⟨hi, he⟩ | ⟨hi, he⟩
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · exact hi
-            · rw [he] at h3; exact absurd h3 (by decide)
-          omega)
-        g1 g2 g3 rfl
+        (dd := pre.depth.val + 2) (r := (x64_ir.R13).val) hk
+        (by rw [r13_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 36 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 36
       have hc := e36
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.R12 (by rw [r12_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_pop
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.R12 (by rw [r12_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.R12).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.R12).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val + 1) (r := (x64_ir.R12).val) hL hk hsv
-        (by omega) (by omega) (by rw [r12_val]; decide) (by rw [r12_val]; decide)
-        (by rw [r12_val]; decide)
-        (fun i h1 h2 h3 => by
-          rw [r12_val] at h3
-          have hii : i = 2 := by
-            rcases svReg_eq i h1 h2 with ⟨hi, he⟩ | ⟨hi, he⟩ | ⟨hi, he⟩ | ⟨hi, he⟩
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · exact hi
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · rw [he] at h3; exact absurd h3 (by decide)
-          omega)
-        g1 g2 g3 rfl
+        (dd := pre.depth.val + 1) (r := (x64_ir.R12).val) hk
+        (by rw [r12_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 37 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 37
       have hc := e37
       rw [← ht] at hc
       have hu := step_pop hc hstep'
       simp only [Config.next.injEq] at hu
       subst hu
-      obtain ⟨g1, g2, g3⟩ := pop_facts t x64_ir.RBX (by rw [rbx_val]; decide)
-      obtain ⟨hka, hsa⟩ := kept_pop
+      obtain ⟨g1, g3⟩ := pop_facts t x64_ir.RBX (by rw [rbx_val]; decide)
+      have hka := kept_popCaller
         (t' := { t with
-          regs := Function.update (Function.update t.regs (x64_ir.RBX).val
-            (load64 t.mem (t.regs RSP))) RSP (t.regs RSP + 8#64),
+          regs := Function.update (Function.update t.regs RSP (t.regs RSP + 8#64))
+            (x64_ir.RBX).val (load64 t.mem (t.regs RSP)),
           pc := t.pc + 1 })
-        (dd := pre.depth.val) (r := (x64_ir.RBX).val) hL hk hsv
-        (by omega) (by omega) (by rw [rbx_val]; decide) (by rw [rbx_val]; decide)
-        (by rw [rbx_val]; decide)
-        (fun i h1 h2 h3 => by
-          rw [rbx_val] at h3
-          have hii : i = 1 := by
-            rcases svReg_eq i h1 h2 with ⟨hi, he⟩ | ⟨hi, he⟩ | ⟨hi, he⟩ | ⟨hi, he⟩
-            · exact hi
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · rw [he] at h3; exact absurd h3 (by decide)
-            · rw [he] at h3; exact absurd h3 (by decide)
-          omega)
-        g1 g2 g3 rfl
+        (dd := pre.depth.val) (r := (x64_ir.RBX).val) hk
+        (by rw [rbx_val]; simp [Clobbered]) g1 g3 rfl
       refine Or.inl ?_
       iterate 38 refine Or.inr ?_
-      exact Or.inl ⟨by simp only []; omega, hka, hsa⟩
+      exact Or.inl ⟨by simp only []; omega, hka⟩
     · -- position 38
       have hc := e38
       rw [← ht] at hc
@@ -2303,13 +2162,12 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
       subst hu
       refine Or.inl ?_
       iterate 39 refine Or.inr ?_
-      refine Or.inl ⟨?_, ?_, ?_⟩
+      refine Or.inl ⟨?_, ?_⟩
       · simp only [aluImmStep_pc]; omega
       · refine kept_fp hk ?_ (fun x hxx =>
           aluImmStep_regs_ne _ _ _ _ _ (by rw [r15_val]; exact hxx)) rfl
         rw [aluImm_addR15, hk.fpv]
         ring
-      · exact saved_none (by omega)
     · -- position 39
       have hc := e39
       rw [← ht] at hc
@@ -2321,7 +2179,7 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
       subst hu
       refine Or.inl ?_
       iterate 44 refine Or.inr ?_
-      exact ⟨rfl, kept_same hk (fun x => rfl) rfl, saved_none (by omega)⟩
+      exact ⟨rfl, kept_same hk (fun x => rfl) rfl⟩
     · -- position 40
       have hc := e40
       rw [← ht] at hc
@@ -2329,27 +2187,26 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
       refine Or.inl ?_
       iterate 41 refine Or.inr ?_
       exact Or.inl ⟨by omega,
-        kept_same hk (fun x => hregs x (by simp [writes])) hmem, saved_mem hsv hmem⟩
+        kept_same hk (fun x => hregs x (by simp [writes])) hmem⟩
     · -- position 41
       have hc := e41
       rw [← ht] at hc
       obtain ⟨hpc, hmem, hregs⟩ := regOnly_step hc trivial hstep'
       refine Or.inl ?_
       iterate 42 refine Or.inr ?_
-      refine Or.inl ⟨?_, ?_, ?_⟩
+      refine Or.inl ⟨?_, ?_⟩
       · omega
       · refine kept_wRegCaller (r := (x64_ir.RAX).val) hk
-          (by rw [rax_val]; simp [CallerSaved]) (fun x hxx => hregs x ?_) hmem
+          (by rw [rax_val]; simp [Clobbered]) (fun x hxx => hregs x ?_) hmem
         simp only [writes, List.mem_singleton]; exact hxx
-      · exact saved_mem hsv hmem
     · -- position 42
       have hc := e42
       rw [← ht] at hc
-      obtain ⟨hpc, hka, hsa⟩ :=
-        kept_callReg hL hlen hk hsv (by omega) (by omega) hc hstep'
+      obtain ⟨hpc, hka⟩ :=
+        kept_callReg hL hlen hk (by omega) hc hstep'
       refine Or.inl ?_
       iterate 43 refine Or.inr ?_
-      exact Or.inl ⟨by omega, hka, hsa⟩
+      exact Or.inl ⟨by omega, hka⟩
     · -- position 43
       have hc := e43
       rw [← ht] at hc
@@ -2369,28 +2226,27 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
     have h0 : LzInv P pre.depth.val p
         (UScalar.hcast .I32 cfg.stack_frame_stride) s s := by
       simp only [LzInv]
-      exact Or.inl ⟨hs, ⟨hag.rsp, hag.rbp, rfl, hag.ro, fun i _ _ => rfl⟩,
-        saved_none (by omega)⟩
+      exact Or.inl ⟨hs, ⟨hag.rsp, hag.rbp, rfl, hag.ro⟩⟩
     refine stays_invariant
       (I := LzInv P pre.depth.val p (UScalar.hcast .I32 cfg.stack_frame_stride) s) h0 ?_ hsty
     intro u u' hIu hin hstepu hin'
     rcases hadv s u u' hIu hstepu with h | ⟨hq, -⟩
     · exact h
     · exact absurd (hq ▸ hin') hqout
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · -- every access is to the frame scratch, the descriptor or the native stack
     intro s hs hag s' hsty c hstep' i hi bn hbn
     have hI := hinv s s' hs hag hsty
     simp only [LzInv] at hI
     rcases hI with
-      ⟨ht, hk, -⟩ | ⟨ht, hk, -, hrcx⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ |
-      ⟨ht, hk, -, hrcx⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ |
-      ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ |
-      ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ |
-      ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ |
-      ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ |
-      ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ |
-      ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk, -⟩
+      ⟨ht, hk⟩ | ⟨ht, hk, hrcx⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk, hrcx⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩
     · have hc := e0
       rw [← ht] at hc
       rw [hc] at hi
@@ -2763,14 +2619,14 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
     have hI := hinv s s' hs hag hsty
     simp only [LzInv] at hI
     rcases hI with
-      ⟨ht, -, -⟩ | ⟨ht, -, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -, -⟩ |
-      ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-      ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-      ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-      ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-      ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-      ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩ |
-      ⟨ht, -, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -, -⟩
+      ⟨ht, -⟩ | ⟨ht, -, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -, -⟩ |
+      ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+      ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+      ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+      ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+      ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+      ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩ |
+      ⟨ht, -⟩ | ⟨ht, -⟩ | ⟨ht, -⟩
     · have hc := e0
       rw [← ht] at hc
       rw [hc] at hr1
@@ -2951,6 +2807,320 @@ theorem macroOk_lazyLocalCall {P : Params} {code : List x64_ir.PInsn} {cfg : x64
       rw [← ht] at hc
       rw [hc] at hr1
       simp at hr1
+  · -- and every range it writes is one of the thirteen words its own
+    -- pushes and calls put below `rsp0`
+    intro s hs hag s' hsty c hstep' i hi bn hbn
+    have hI := hinv s s' hs hag hsty
+    simp only [LzInv] at hI
+    rcases hI with
+      ⟨ht, hk⟩ | ⟨ht, hk, -⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk, -⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ |
+      ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩ | ⟨ht, hk⟩
+    · have hc := e0
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e1
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e2
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e3
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e4
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e5
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e6
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e7
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e8
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e9
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e10
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e11
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e12
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e13
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e14
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e15
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e16
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e17
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e18
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e19
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e20
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_push, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e21
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e22
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e23
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_callReg, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e24
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e25
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e26
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e27
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e28
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e29
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e30
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e31
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e32
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e33
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_callReg, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e34
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e35
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e36
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e37
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e38
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e39
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e40
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e41
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e42
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp only [stores_callReg, List.mem_singleton] at hbn
+      subst hbn
+      show StoreOk P (s'.regs RSP - 8#64) 8
+      rw [hk.rsp, rsp_push]
+      exact storeOk_stack hL (by omega) (by omega)
+    · have hc := e43
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+    · have hc := e44
+      rw [← ht] at hc
+      rw [hc] at hi
+      obtain rfl : i = _ := by simpa using hi.symm
+      simp [stores] at hbn
+  · -- and `rsp` never leaves the native stack window: the depth the
+    -- description carries walks down twelve words and back up
+    intro s hs hag s' hsty
+    have hI := hinv s s' hs hag hsty
+    simp only [LzInv] at hI
+    rcases hI with
+      ⟨-, hk⟩ | ⟨-, hk, -⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ |
+      ⟨-, hk, -⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ |
+      ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ |
+      ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ |
+      ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ |
+      ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ |
+      ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ |
+      ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ | ⟨-, hk⟩ <;>
+      exact rsp_window_of_depth hL hk.rsp (by omega)
 
 end CallSupport
 
