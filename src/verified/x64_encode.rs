@@ -31,6 +31,17 @@
 //! builds reaches either behaviour.
 //!
 //! [`x64_decode`](super::x64_decode) inverts [`encode_one`].
+//!
+//! # A shape the extraction needs
+//!
+//! No arm of [`encode_one`]'s or [`size_of`]'s match branches: every arm is a
+//! constant, a single call, or a call to one of the small helpers beside the
+//! byte emitters — `emit_muldiv_rcx`, `emit_movsx`, `emit_cmp_rcx_minus_one`,
+//! `emit_call_reg`, `emit_guest_load` and their `*_len` counterparts — which
+//! do the branching. An `if` written directly in an arm of a match this wide
+//! makes Aeneas fail to join the branch while the function's borrowed argument
+//! is live (`Unreachable`, from `interp/InterpAbs.ml`), and the whole body is
+//! extracted as `sorry`. Keep new variants' arms one call wide.
 
 // `Range::contains` is a method call on a range, which the extraction has no
 // model for; every bound here is written out as a comparison instead.
@@ -445,6 +456,99 @@ fn emit_helper_table(out: &mut Vec<u8>) {
 /// The bytes [`emit_helper_table`] writes.
 pub const HELPER_TABLE_LEN: usize = 8 * MAX_EXT_FUNCS as usize;
 
+/// `mul rcx` / `div rcx` / `idiv rcx`, at 32 or 64 bits.
+fn emit_muldiv_rcx(out: &mut Vec<u8>, w64: bool, kind: MulDivKind, signed: bool) {
+  if w64 {
+    emit_rex(out, 1, 0, 0, 0);
+  }
+  emit_alu(out, false, 0xf7, muldiv_ext(kind, signed), RCX);
+}
+
+fn muldiv_rcx_len(w64: bool, kind: MulDivKind, signed: bool) -> usize {
+  let rex: usize = if w64 { 1 } else { 0 };
+  rex + alu_len(false, muldiv_ext(kind, signed), RCX)
+}
+
+/// `movsx dst, src`, from 8, 16 or 32 source bits.
+///
+/// The explicit REX is what makes a byte source name `SIL`/`DIL`/`SPL`/`BPL`
+/// rather than `AH`/`CH`/`DH`/`BH`, so it is emitted even when no
+/// high-register bit is set.
+fn emit_movsx(out: &mut Vec<u8>, from: u8, w64: bool, src: u8, dst: u8) {
+  if w64 || from == 8 {
+    emit_rex(out, bit(w64), high(dst), 0, high(src));
+  } else {
+    emit_basic_rex(out, 0, dst, src);
+  }
+  if from == 32 {
+    emit1(out, 0x63);
+  } else {
+    emit1(out, 0x0f);
+    if from == 8 {
+      emit1(out, 0xbe);
+    } else {
+      emit1(out, 0xbf);
+    }
+  }
+  emit_modrm_reg2reg(out, dst, src);
+}
+
+fn movsx_len(from: u8, w64: bool, src: u8, dst: u8) -> usize {
+  let rex: usize = if w64 || from == 8 {
+    1
+  } else {
+    basic_rex_len(0, dst, src)
+  };
+  let op: usize = if from == 32 { 1 } else { 2 };
+  rex + op + 1
+}
+
+/// `cmp rcx, -1` / `cmp ecx, -1`.
+fn emit_cmp_rcx_minus_one(out: &mut Vec<u8>, w64: bool) {
+  if w64 {
+    emit1(out, 0x48);
+  }
+  emit1(out, 0x83);
+  emit1(out, 0xf9);
+  emit1(out, 0xff);
+}
+
+fn cmp_rcx_minus_one_len(w64: bool) -> usize {
+  let rex: usize = if w64 { 1 } else { 0 };
+  rex + 3
+}
+
+/// `call reg`.
+fn emit_call_reg(out: &mut Vec<u8>, reg: u8) {
+  if (reg & 8) != 0 {
+    emit1(out, 0x41);
+  }
+  emit1(out, 0xff);
+  emit1(out, 0xd0 | (reg & 7));
+}
+
+fn call_reg_len(reg: u8) -> usize {
+  let rex: usize = if (reg & 8) != 0 { 1 } else { 0 };
+  rex + 2
+}
+
+/// A guest load, zero- or sign-extending.
+fn emit_guest_load(out: &mut Vec<u8>, size: Size, sx: bool, base: u8, dst: u8, disp: i32) {
+  if sx {
+    emit_load_sx(out, size, base, dst, disp);
+  } else {
+    emit_load(out, size, base, dst, disp);
+  }
+}
+
+fn guest_load_len(size: Size, sx: bool, base: u8, dst: u8, disp: i32) -> usize {
+  if sx {
+    load_sx_len(size, base, disp)
+  } else {
+    load_len(size, base, dst, disp)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // One primitive
 // ---------------------------------------------------------------------------
@@ -488,38 +592,13 @@ pub fn encode_one(p: &PInsn, out: &mut Vec<u8>) {
     }
     PInsn::ShiftCl { w64, op, dst } => emit_alu(out, w64, 0xd3, shift_ext(op), dst),
     PInsn::Neg { w64, dst } => emit_alu(out, w64, 0xf7, 3, dst),
-    PInsn::MulDivRcx { w64, kind, signed } => {
-      if w64 {
-        emit_rex(out, 1, 0, 0, 0);
-      }
-      emit_alu(out, false, 0xf7, muldiv_ext(kind, signed), RCX);
-    }
+    PInsn::MulDivRcx { w64, kind, signed } => emit_muldiv_rcx(out, w64, kind, signed),
     PInsn::MovSx {
       from,
       w64,
       src,
       dst,
-    } => {
-      // The explicit REX is what makes a byte source name `SIL`/`DIL`/`SPL`/
-      // `BPL` rather than `AH`/`CH`/`DH`/`BH`, so it is emitted even when no
-      // high-register bit is set.
-      if w64 || from == 8 {
-        emit_rex(out, bit(w64), high(dst), 0, high(src));
-      } else {
-        emit_basic_rex(out, 0, dst, src);
-      }
-      if from == 32 {
-        emit1(out, 0x63);
-      } else {
-        emit1(out, 0x0f);
-        if from == 8 {
-          emit1(out, 0xbe);
-        } else {
-          emit1(out, 0xbf);
-        }
-      }
-      emit_modrm_reg2reg(out, dst, src);
-    }
+    } => emit_movsx(out, from, w64, src, dst),
     PInsn::Bswap { w64, dst } => {
       emit_basic_rex(out, bit(w64), 0, dst);
       emit1(out, 0x0f);
@@ -546,14 +625,7 @@ pub fn encode_one(p: &PInsn, out: &mut Vec<u8>) {
       emit1(out, 0x99);
     }
     PInsn::Cdq => emit1(out, 0x99),
-    PInsn::CmpRcxMinusOne { w64 } => {
-      if w64 {
-        emit1(out, 0x48);
-      }
-      emit1(out, 0x83);
-      emit1(out, 0xf9);
-      emit1(out, 0xff);
-    }
+    PInsn::CmpRcxMinusOne { w64 } => emit_cmp_rcx_minus_one(out, w64),
     PInsn::CmpEaxImm { imm } => {
       emit1(out, 0x3d);
       emit4(out, imm);
@@ -565,13 +637,7 @@ pub fn encode_one(p: &PInsn, out: &mut Vec<u8>) {
       base,
       dst,
       disp,
-    } => {
-      if sx {
-        emit_load_sx(out, size, base, dst, disp);
-      } else {
-        emit_load(out, size, base, dst, disp);
-      }
-    }
+    } => emit_guest_load(out, size, sx, base, dst, disp),
     PInsn::Store {
       size,
       src,
@@ -684,13 +750,7 @@ pub fn encode_one(p: &PInsn, out: &mut Vec<u8>) {
       emit1(out, 0x0f);
       emit1(out, 0x0b);
     }
-    PInsn::CallReg(reg) => {
-      if (reg & 8) != 0 {
-        emit1(out, 0x41);
-      }
-      emit1(out, 0xff);
-      emit1(out, 0xd0 | (reg & 7));
-    }
+    PInsn::CallReg(reg) => emit_call_reg(out, reg),
     PInsn::RipLoadDispatcher { dst } => {
       // The REX `R` bit is zero: the only destination is RAX.
       emit_rex(out, 1, 0, 0, 0);
@@ -745,24 +805,13 @@ pub fn size_of(p: &PInsn) -> usize {
     } => alu_len(w64, shift_ext(op), dst) + 1,
     PInsn::ShiftCl { w64, op, dst } => alu_len(w64, shift_ext(op), dst),
     PInsn::Neg { w64, dst } => alu_len(w64, 3, dst),
-    PInsn::MulDivRcx { w64, kind, signed } => {
-      let rex: usize = if w64 { 1 } else { 0 };
-      rex + alu_len(false, muldiv_ext(kind, signed), RCX)
-    }
+    PInsn::MulDivRcx { w64, kind, signed } => muldiv_rcx_len(w64, kind, signed),
     PInsn::MovSx {
       from,
       w64,
       src,
       dst,
-    } => {
-      let rex: usize = if w64 || from == 8 {
-        1
-      } else {
-        basic_rex_len(0, dst, src)
-      };
-      let op: usize = if from == 32 { 1 } else { 2 };
-      rex + op + 1
-    }
+    } => movsx_len(from, w64, src, dst),
     PInsn::Bswap { w64, dst } => basic_rex_len(bit(w64), 0, dst) + 2,
     PInsn::Rol16 { dst } => 1 + alu_len(false, 0, dst) + 1,
     PInsn::Cmov { cc: _, dst, src } => basic_rex_len(1, dst, src) + 3,
@@ -771,10 +820,7 @@ pub fn size_of(p: &PInsn) -> usize {
     PInsn::Popfq => 1,
     PInsn::Cqo => 2,
     PInsn::Cdq => 1,
-    PInsn::CmpRcxMinusOne { w64 } => {
-      let rex: usize = if w64 { 1 } else { 0 };
-      rex + 3
-    }
+    PInsn::CmpRcxMinusOne { w64 } => cmp_rcx_minus_one_len(w64),
     PInsn::CmpEaxImm { imm: _ } => 5,
 
     PInsn::Load {
@@ -783,13 +829,7 @@ pub fn size_of(p: &PInsn) -> usize {
       base,
       dst,
       disp,
-    } => {
-      if sx {
-        load_sx_len(size, base, disp)
-      } else {
-        load_len(size, base, dst, disp)
-      }
-    }
+    } => guest_load_len(size, sx, base, dst, disp),
     PInsn::Store {
       size,
       src,
@@ -840,10 +880,7 @@ pub fn size_of(p: &PInsn) -> usize {
     PInsn::Ret => 1,
     PInsn::Pause => 2,
     PInsn::Ud2 => 2,
-    PInsn::CallReg(reg) => {
-      let rex: usize = if (reg & 8) != 0 { 1 } else { 0 };
-      rex + 2
-    }
+    PInsn::CallReg(reg) => call_reg_len(reg),
     PInsn::RipLoadDispatcher { dst: _ } => 7,
     PInsn::RipLeaHelperTable { dst: _ } => 7,
 

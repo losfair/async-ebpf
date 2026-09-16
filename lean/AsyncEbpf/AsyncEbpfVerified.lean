@@ -7053,6 +7053,4478 @@ inductive x64_ir.PInsn where
 | DispatcherSlot : Std.U64 → x64_ir.PInsn
 | HelperTable : x64_ir.PInsn
 
+/-- [async_ebpf_verified::x64_decode::Decoded]
+    Source: '../../src/verified/x64_decode.rs', lines 90:0-97:1
+    Visibility: public -/
+structure x64_decode.Decoded where
+  insn : x64_ir.PInsn
+  len : Std.Usize
+  disp : Std.I64
+
+/-- [async_ebpf_verified::x64_decode::{impl core::clone::Clone for async_ebpf_verified::x64_decode::Decoded}::clone]:
+    Source: '../../src/verified/x64_decode.rs', lines 88:15-88:20
+    Visibility: public -/
+def x64_decode.Decoded.Insts.CoreCloneClone.clone
+  (self : x64_decode.Decoded) : Result x64_decode.Decoded := do
+  ok self
+
+/-- Trait implementation: [async_ebpf_verified::x64_decode::{impl core::clone::Clone for async_ebpf_verified::x64_decode::Decoded}]
+    Source: '../../src/verified/x64_decode.rs', lines 88:15-88:20 -/
+@[reducible]
+def x64_decode.Decoded.Insts.CoreCloneClone : core.clone.Clone
+  x64_decode.Decoded := {
+  clone := x64_decode.Decoded.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [async_ebpf_verified::x64_decode::{impl core::marker::Copy for async_ebpf_verified::x64_decode::Decoded}]
+    Source: '../../src/verified/x64_decode.rs', lines 88:9-88:13 -/
+@[reducible]
+def x64_decode.Decoded.Insts.CoreMarkerCopy : core.marker.Copy
+  x64_decode.Decoded := {
+  cloneInst := x64_decode.Decoded.Insts.CoreCloneClone
+}
+
+/-- [async_ebpf_verified::x64_decode::byte_at]:
+    Source: '../../src/verified/x64_decode.rs', lines 104:0-110:1 -/
+def x64_decode.byte_at
+  (bytes : Slice Std.U8) (i : Std.Usize) : Result Std.I32 := do
+  let i1 := Slice.len bytes
+  if i < i1
+  then let i2 ← Slice.index_usize bytes i
+       ok (UScalar.hcast .I32 i2)
+  else ok (-1)#i32
+
+/-- [async_ebpf_verified::x64_decode::have]:
+    Source: '../../src/verified/x64_decode.rs', lines 113:0-116:1 -/
+def x64_decode.have
+  (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) :
+  Result Bool
+  := do
+  let «end» ← «at» + n
+  let i := Slice.len bytes
+  ok («end» <= i)
+
+/-- [async_ebpf_verified::x64_decode::read32]:
+    Source: '../../src/verified/x64_decode.rs', lines 119:0-128:1 -/
+def x64_decode.read32
+  (bytes : Slice Std.U8) («at» : Std.Usize) : Result Std.U32 := do
+  let b ← x64_decode.have bytes «at» 4#usize
+  if b
+  then
+    let i ← Slice.index_usize bytes «at»
+    let i1 ← lift (UScalar.cast .U32 i)
+    let i2 ← «at» + 1#usize
+    let i3 ← Slice.index_usize bytes i2
+    let i4 ← lift (UScalar.cast .U32 i3)
+    let i5 ← i4 <<< 8#i32
+    let i6 ← lift (i1 ||| i5)
+    let i7 ← «at» + 2#usize
+    let i8 ← Slice.index_usize bytes i7
+    let i9 ← lift (UScalar.cast .U32 i8)
+    let i10 ← i9 <<< 16#i32
+    let i11 ← lift (i6 ||| i10)
+    let i12 ← «at» + 3#usize
+    let i13 ← Slice.index_usize bytes i12
+    let i14 ← lift (UScalar.cast .U32 i13)
+    let i15 ← i14 <<< 24#i32
+    ok (i11 ||| i15)
+  else ok 0#u32
+
+/-- [async_ebpf_verified::x64_decode::read64]:
+    Source: '../../src/verified/x64_decode.rs', lines 131:0-144:1 -/
+def x64_decode.read64
+  (bytes : Slice Std.U8) («at» : Std.Usize) : Result Std.U64 := do
+  let b ← x64_decode.have bytes «at» 8#usize
+  if b
+  then
+    let i ← Slice.index_usize bytes «at»
+    let i1 ← lift (UScalar.cast .U64 i)
+    let i2 ← «at» + 1#usize
+    let i3 ← Slice.index_usize bytes i2
+    let i4 ← lift (UScalar.cast .U64 i3)
+    let i5 ← i4 <<< 8#i32
+    let i6 ← lift (i1 ||| i5)
+    let i7 ← «at» + 2#usize
+    let i8 ← Slice.index_usize bytes i7
+    let i9 ← lift (UScalar.cast .U64 i8)
+    let i10 ← i9 <<< 16#i32
+    let i11 ← lift (i6 ||| i10)
+    let i12 ← «at» + 3#usize
+    let i13 ← Slice.index_usize bytes i12
+    let i14 ← lift (UScalar.cast .U64 i13)
+    let i15 ← i14 <<< 24#i32
+    let i16 ← lift (i11 ||| i15)
+    let i17 ← «at» + 4#usize
+    let i18 ← Slice.index_usize bytes i17
+    let i19 ← lift (UScalar.cast .U64 i18)
+    let i20 ← i19 <<< 32#i32
+    let i21 ← lift (i16 ||| i20)
+    let i22 ← «at» + 5#usize
+    let i23 ← Slice.index_usize bytes i22
+    let i24 ← lift (UScalar.cast .U64 i23)
+    let i25 ← i24 <<< 40#i32
+    let i26 ← lift (i21 ||| i25)
+    let i27 ← «at» + 6#usize
+    let i28 ← Slice.index_usize bytes i27
+    let i29 ← lift (UScalar.cast .U64 i28)
+    let i30 ← i29 <<< 48#i32
+    let i31 ← lift (i26 ||| i30)
+    let i32 ← «at» + 7#usize
+    let i33 ← Slice.index_usize bytes i32
+    let i34 ← lift (UScalar.cast .U64 i33)
+    let i35 ← i34 <<< 56#i32
+    ok (i31 ||| i35)
+  else ok 0#u64
+
+/-- [async_ebpf_verified::x64_decode::sx8]:
+    Source: '../../src/verified/x64_decode.rs', lines 147:0-149:1 -/
+def x64_decode.sx8 (b : Std.I32) : Result Std.I64 := do
+  let i ← lift (IScalar.hcast .U8 b)
+  let i1 ← lift (UScalar.hcast .I8 i)
+  ok (IScalar.cast .I64 i1)
+
+/-- [async_ebpf_verified::x64_decode::sx32]:
+    Source: '../../src/verified/x64_decode.rs', lines 152:0-154:1 -/
+def x64_decode.sx32 (v : Std.U32) : Result Std.I64 := do
+  let i ← lift (UScalar.hcast .I32 v)
+  ok (IScalar.cast .I64 i)
+
+/-- [async_ebpf_verified::x64_decode::Pfx]
+    Source: '../../src/verified/x64_decode.rs', lines 161:0-172:1 -/
+structure x64_decode.Pfx where
+  lock : Bool
+  op16 : Bool
+  rep : Bool
+  w : Std.U8
+  r : Std.U8
+  b : Std.U8
+  «at» : Std.Usize
+
+/-- [async_ebpf_verified::x64_decode::prefixes]: loop body 0:
+    Source: '../../src/verified/x64_decode.rs', lines 188:2-208:3 -/
+@[rust_loop_body]
+def x64_decode.prefixes_loop.body
+  (bytes : Slice Std.U8) (n : Std.Usize) (b : Bool) (b1 : Bool) (b2 : Bool)
+  (i : Std.U8) (i1 : Std.U8) (i2 : Std.U8) (i3 : Std.Usize) (more : Bool) :
+  Result (ControlFlow (Bool × Bool × Bool × Std.U8 × Std.U8 × Std.U8 ×
+    Std.Usize × Bool) (Bool × Bool × Bool × Std.U8 × Std.U8 × Std.U8 ×
+    Std.Usize))
+  := do
+  if more
+  then
+    if i3 < n
+    then
+      let c ← Slice.index_usize bytes i3
+      if c = 240#u8
+      then
+        let i4 ← i3 + 1#usize
+        ok (cont (true, b1, b2, i, i1, i2, i4, true))
+      else
+        if c = 102#u8
+        then
+          let i4 ← i3 + 1#usize
+          ok (cont (b, true, b2, i, i1, i2, i4, true))
+        else
+          if c = 243#u8
+          then
+            let i4 ← i3 + 1#usize
+            ok (cont (b, b1, true, i, i1, i2, i4, true))
+          else
+            if c >= 64#u8
+            then
+              if c <= 79#u8
+              then
+                let i4 ← c >>> 3#i32
+                let i5 ← lift (i4 &&& 1#u8)
+                let i6 ← c >>> 2#i32
+                let i7 ← lift (i6 &&& 1#u8)
+                let i8 ← lift (c &&& 1#u8)
+                let i9 ← i3 + 1#usize
+                ok (cont (b, b1, b2, i5, i7, i8, i9, false))
+              else ok (cont (b, b1, b2, i, i1, i2, i3, false))
+            else ok (cont (b, b1, b2, i, i1, i2, i3, false))
+    else ok (done (b, b1, b2, i, i1, i2, i3))
+  else ok (done (b, b1, b2, i, i1, i2, i3))
+
+/-- [async_ebpf_verified::x64_decode::prefixes]: loop 0:
+    Source: '../../src/verified/x64_decode.rs', lines 188:2-208:3 -/
+@[rust_loop]
+def x64_decode.prefixes_loop
+  (bytes : Slice Std.U8) (b : Bool) (b1 : Bool) (b2 : Bool) (i : Std.U8)
+  (i1 : Std.U8) (i2 : Std.U8) (n : Std.Usize) (i3 : Std.Usize) (more : Bool) :
+  Result (Bool × Bool × Bool × Std.U8 × Std.U8 × Std.U8 × Std.Usize)
+  := do
+  loop
+    (fun (b3, b4, b5, i4, i5, i6, i7, more1) => x64_decode.prefixes_loop.body
+      bytes n b3 b4 b5 i4 i5 i6 i7 more1)
+    (b, b1, b2, i, i1, i2, i3, more)
+
+/-- [async_ebpf_verified::x64_decode::prefixes]:
+    Source: '../../src/verified/x64_decode.rs', lines 175:0-211:1 -/
+def x64_decode.prefixes
+  (bytes : Slice Std.U8) («at» : Std.Usize) : Result x64_decode.Pfx := do
+  let n := Slice.len bytes
+  let (b, b1, b2, i, i1, i2, i3) ←
+    x64_decode.prefixes_loop bytes false false false 0#u8 0#u8 0#u8 n «at»
+      true
+  ok
+    { lock := b, op16 := b1, rep := b2, w := i, r := i1, b := i2, «at» := i3
+    }
+
+/-- [async_ebpf_verified::x64_decode::Mem]
+    Source: '../../src/verified/x64_decode.rs', lines 218:0-229:1 -/
+structure x64_decode.Mem where
+  ok : Bool
+  reg : Std.U8
+  base : Std.U8
+  disp : Std.I32
+  len : Std.Usize
+
+/-- [async_ebpf_verified::x64_decode::decode_mem]:
+    Source: '../../src/verified/x64_decode.rs', lines 237:0-282:1 -/
+def x64_decode.decode_mem
+  (bytes : Slice Std.U8) («at» : Std.Usize) (rex_r : Std.U8) (rex_b : Std.U8)
+  :
+  Result x64_decode.Mem
+  := do
+  let head ← x64_decode.byte_at bytes «at»
+  if head >= 0#i32
+  then
+    let modrm ← lift (IScalar.hcast .U8 head)
+    let md ← lift (modrm &&& 192#u8)
+    let i ← modrm >>> 3#i32
+    let i1 ← lift (i &&& 7#u8)
+    let i2 ← rex_r <<< 3#i32
+    let i3 ← lift (i1 ||| i2)
+    let i4 ← lift (modrm &&& 7#u8)
+    let i5 ← rex_b <<< 3#i32
+    let i6 ← lift (i4 ||| i5)
+    let rm ← lift (modrm &&& 7#u8)
+    let sib ← if rm = 4#u8
+                then ok 1#usize
+                else ok 0#usize
+    let sib_ok ←
+      if rm = 4#u8
+      then
+        do
+        let i7 ← «at» + 1#usize
+        let i8 ← x64_decode.byte_at bytes i7
+        ok (i8 = 36#i32)
+      else ok true
+    if md = 192#u8
+    then
+      ok { ok := false, reg := i3, base := i6, disp := 0#i32, len := 0#usize }
+    else
+      if sib_ok
+      then
+        if md = 0#u8
+        then
+          if rm != 4#u8
+          then
+            if rm != 5#u8
+            then
+              ok
+                {
+                  ok := true,
+                  reg := i3,
+                  base := i6,
+                  disp := 0#i32,
+                  len := 1#usize
+                }
+            else
+              ok
+                {
+                  ok := false,
+                  reg := i3,
+                  base := i6,
+                  disp := 0#i32,
+                  len := 0#usize
+                }
+          else
+            ok
+              {
+                ok := false,
+                reg := i3,
+                base := i6,
+                disp := 0#i32,
+                len := 0#usize
+              }
+        else
+          if md = 64#u8
+          then
+            let i7 ← «at» + 1#usize
+            let i8 ← i7 + sib
+            let d ← x64_decode.byte_at bytes i8
+            if d >= 0#i32
+            then
+              let i9 ← x64_decode.sx8 d
+              let i10 ← lift (IScalar.cast .I32 i9)
+              let i11 ← 2#usize + sib
+              ok { ok := true, reg := i3, base := i6, disp := i10, len := i11 }
+            else
+              ok
+                {
+                  ok := false,
+                  reg := i3,
+                  base := i6,
+                  disp := 0#i32,
+                  len := 0#usize
+                }
+          else
+            let i7 ← «at» + 1#usize
+            let i8 ← i7 + sib
+            let b ← x64_decode.have bytes i8 4#usize
+            if b
+            then
+              let i9 ← i7 + sib
+              let i10 ← x64_decode.read32 bytes i9
+              let i11 ← lift (UScalar.hcast .I32 i10)
+              let i12 ← 5#usize + sib
+              ok { ok := true, reg := i3, base := i6, disp := i11, len := i12 }
+            else
+              ok
+                {
+                  ok := false,
+                  reg := i3,
+                  base := i6,
+                  disp := 0#i32,
+                  len := 0#usize
+                }
+      else
+        ok
+          { ok := false, reg := i3, base := i6, disp := 0#i32, len := 0#usize }
+  else
+    ok
+      { ok := false, reg := 0#u8, base := 0#u8, disp := 0#i32, len := 0#usize }
+
+/-- [async_ebpf_verified::x64_decode::Reg2]
+    Source: '../../src/verified/x64_decode.rs', lines 285:0-293:1 -/
+structure x64_decode.Reg2 where
+  ok : Bool
+  reg : Std.U8
+  rm : Std.U8
+  ext : Std.U8
+
+/-- [async_ebpf_verified::x64_decode::decode_reg2]:
+    Source: '../../src/verified/x64_decode.rs', lines 296:0-314:1 -/
+def x64_decode.decode_reg2
+  (bytes : Slice Std.U8) («at» : Std.Usize) (rex_r : Std.U8) (rex_b : Std.U8)
+  :
+  Result x64_decode.Reg2
+  := do
+  let head ← x64_decode.byte_at bytes «at»
+  if head >= 0#i32
+  then
+    let modrm ← lift (IScalar.hcast .U8 head)
+    let i ← lift (modrm &&& 192#u8)
+    if i = 192#u8
+    then
+      let i1 ← modrm >>> 3#i32
+      let i2 ← lift (i1 &&& 7#u8)
+      let i3 ← rex_r <<< 3#i32
+      let i4 ← lift (i2 ||| i3)
+      let i5 ← lift (modrm &&& 7#u8)
+      let i6 ← rex_b <<< 3#i32
+      let i7 ← lift (i5 ||| i6)
+      ok { ok := true, reg := i4, rm := i7, ext := i2 }
+    else ok { ok := false, reg := 0#u8, rm := 0#u8, ext := 0#u8 }
+  else ok { ok := false, reg := 0#u8, rm := 0#u8, ext := 0#u8 }
+
+/-- [async_ebpf_verified::x64_decode::is_rip]:
+    Source: '../../src/verified/x64_decode.rs', lines 317:0-324:1 -/
+def x64_decode.is_rip
+  (bytes : Slice Std.U8) («at» : Std.Usize) : Result Bool := do
+  let head ← x64_decode.byte_at bytes «at»
+  if head >= 0#i32
+  then
+    let i ← lift (IScalar.hcast .U8 head)
+    let i1 ← lift (i &&& 199#u8)
+    ok (i1 = 5#u8)
+  else ok false
+
+/-- [async_ebpf_verified::x64_decode::modrm_reg]:
+    Source: '../../src/verified/x64_decode.rs', lines 327:0-334:1 -/
+def x64_decode.modrm_reg
+  (bytes : Slice Std.U8) («at» : Std.Usize) (rex_r : Std.U8) :
+  Result Std.U8
+  := do
+  let head ← x64_decode.byte_at bytes «at»
+  if head >= 0#i32
+  then
+    let i ← lift (IScalar.hcast .U8 head)
+    let i1 ← i >>> 3#i32
+    let i2 ← lift (i1 &&& 7#u8)
+    let i3 ← rex_r <<< 3#i32
+    ok (i2 ||| i3)
+  else ok 0#u8
+
+/-- [async_ebpf_verified::x64_decode::mem_size]:
+    Source: '../../src/verified/x64_decode.rs', lines 337:0-345:1 -/
+def x64_decode.mem_size (w : Std.U8) (op16 : Bool) : Result Std.U8 := do
+  if w = 1#u8
+  then ok 8#u8
+  else if op16
+       then ok 2#u8
+       else ok 4#u8
+
+/-- [async_ebpf_verified::x64_decode::done]:
+    Source: '../../src/verified/x64_decode.rs', lines 348:0-354:1 -/
+def x64_decode.done
+  (insn : x64_ir.PInsn) («at» : Std.Usize) («end» : Std.Usize)
+  (disp : Std.I64) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← «end» - «at»
+  ok (some { insn, len := i, disp })
+
+/-- [async_ebpf_verified::x64_decode::is_alu_rr]:
+    Source: '../../src/verified/x64_decode.rs', lines 361:0-370:1 -/
+def x64_decode.is_alu_rr (op : Std.U8) : Result Bool := do
+  if op = 1#u8
+  then ok true
+  else
+    if op = 41#u8
+    then ok true
+    else
+      if op = 9#u8
+      then ok true
+      else
+        if op = 33#u8
+        then ok true
+        else
+          if op = 49#u8
+          then ok true
+          else
+            if op = 137#u8
+            then ok true
+            else if op = 57#u8
+                 then ok true
+                 else ok (op = 133#u8)
+
+/-- [async_ebpf_verified::x64_decode::alu_rr_of]:
+    Source: '../../src/verified/x64_decode.rs', lines 374:0-392:1 -/
+def x64_decode.alu_rr_of (op : Std.U8) : Result x64_ir.AluRR := do
+  if op = 1#u8
+  then ok x64_ir.AluRR.Add
+  else
+    if op = 41#u8
+    then ok x64_ir.AluRR.Sub
+    else
+      if op = 9#u8
+      then ok x64_ir.AluRR.Or
+      else
+        if op = 33#u8
+        then ok x64_ir.AluRR.And
+        else
+          if op = 49#u8
+          then ok x64_ir.AluRR.Xor
+          else
+            if op = 137#u8
+            then ok x64_ir.AluRR.Mov
+            else
+              if op = 57#u8
+              then ok x64_ir.AluRR.Cmp
+              else ok x64_ir.AluRR.Test
+
+/-- [async_ebpf_verified::x64_decode::is_alu_ri_ext]:
+    Source: '../../src/verified/x64_decode.rs', lines 395:0-397:1 -/
+def x64_decode.is_alu_ri_ext (ext : Std.U8) : Result Bool := do
+  if ext = 0#u8
+  then ok true
+  else
+    if ext = 1#u8
+    then ok true
+    else
+      if ext = 4#u8
+      then ok true
+      else
+        if ext = 5#u8
+        then ok true
+        else if ext = 6#u8
+             then ok true
+             else ok (ext = 7#u8)
+
+/-- [async_ebpf_verified::x64_decode::alu_ri_of]:
+    Source: '../../src/verified/x64_decode.rs', lines 401:0-415:1 -/
+def x64_decode.alu_ri_of (ext : Std.U8) : Result x64_ir.AluRI := do
+  if ext = 0#u8
+  then ok x64_ir.AluRI.Add
+  else
+    if ext = 1#u8
+    then ok x64_ir.AluRI.Or
+    else
+      if ext = 4#u8
+      then ok x64_ir.AluRI.And
+      else
+        if ext = 5#u8
+        then ok x64_ir.AluRI.Sub
+        else if ext = 6#u8
+             then ok x64_ir.AluRI.Xor
+             else ok x64_ir.AluRI.Cmp
+
+/-- [async_ebpf_verified::x64_decode::is_shift_ext]:
+    Source: '../../src/verified/x64_decode.rs', lines 418:0-420:1 -/
+def x64_decode.is_shift_ext (ext : Std.U8) : Result Bool := do
+  if ext = 4#u8
+  then ok true
+  else if ext = 5#u8
+       then ok true
+       else ok (ext = 7#u8)
+
+/-- [async_ebpf_verified::x64_decode::shift_of]:
+    Source: '../../src/verified/x64_decode.rs', lines 423:0-431:1 -/
+def x64_decode.shift_of (ext : Std.U8) : Result x64_ir.ShiftOp := do
+  if ext = 4#u8
+  then ok x64_ir.ShiftOp.Shl
+  else if ext = 5#u8
+       then ok x64_ir.ShiftOp.Shr
+       else ok x64_ir.ShiftOp.Sar
+
+/-- [async_ebpf_verified::x64_decode::is_alu_rm]:
+    Source: '../../src/verified/x64_decode.rs', lines 441:0-443:1 -/
+def x64_decode.is_alu_rm (op : Std.U8) : Result Bool := do
+  if op = 43#u8
+  then ok true
+  else
+    if op = 3#u8
+    then ok true
+    else
+      if op = 57#u8
+      then ok true
+      else if op = 59#u8
+           then ok true
+           else ok (op = 11#u8)
+
+/-- [async_ebpf_verified::x64_decode::alu_op]:
+    Source: '../../src/verified/x64_decode.rs', lines 434:0-438:1 -/
+def x64_decode.alu_op (op : Std.U8) : Result Bool := do
+  let rr ← x64_decode.is_alu_rr op
+  let rm ← x64_decode.is_alu_rm op
+  if rr
+  then ok true
+  else if rm
+       then ok true
+       else ok (op = 136#u8)
+
+/-- [async_ebpf_verified::x64_decode::alu_rm_of]:
+    Source: '../../src/verified/x64_decode.rs', lines 447:0-459:1 -/
+def x64_decode.alu_rm_of (op : Std.U8) : Result x64_ir.AluRM := do
+  if op = 43#u8
+  then ok x64_ir.AluRM.Sub
+  else
+    if op = 3#u8
+    then ok x64_ir.AluRM.Add
+    else
+      if op = 57#u8
+      then ok x64_ir.AluRM.CmpMR
+      else if op = 59#u8
+           then ok x64_ir.AluRM.CmpRM
+           else ok x64_ir.AluRM.Or
+
+/-- [async_ebpf_verified::x64_ir::MAX_EXT_FUNCS]
+    Source: '../../src/verified/x64_ir.rs', lines 167:0-167:34
+    Visibility: public -/
+@[global_simps, irreducible] def x64_ir.MAX_EXT_FUNCS : Std.U32 := 64#u32
+
+/-- [async_ebpf_verified::x64_encode::HELPER_TABLE_LEN]
+    Source: '../../src/verified/x64_encode.rs', lines 457:0-457:63
+    Visibility: public -/
+@[global_simps, irreducible]
+def x64_encode.HELPER_TABLE_LEN : Result Std.Usize := do
+  let i ← lift (UScalar.cast .Usize x64_ir.MAX_EXT_FUNCS)
+  8#usize * i
+
+/-- [async_ebpf_verified::x64_decode::zeros]: loop body 0:
+    Source: '../../src/verified/x64_decode.rs', lines 1167:2-1172:3 -/
+@[rust_loop_body]
+def x64_decode.zeros_loop.body
+  (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) (ok1 : Bool)
+  (i : Std.Usize) :
+  Result (ControlFlow (Bool × Std.Usize) Bool)
+  := do
+  if ok1
+  then
+    if i < n
+    then
+      let i1 ← «at» + i
+      let i2 ← Slice.index_usize bytes i1
+      let ok2 ← if i2 != 0#u8
+                  then ok false
+                  else ok true
+      let i3 ← i + 1#usize
+      ok (cont (ok2, i3))
+    else ok (done true)
+  else ok (done false)
+
+/-- [async_ebpf_verified::x64_decode::zeros]: loop 0:
+    Source: '../../src/verified/x64_decode.rs', lines 1167:2-1172:3 -/
+@[rust_loop]
+def x64_decode.zeros_loop
+  (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) (ok1 : Bool)
+  (i : Std.Usize) :
+  Result Bool
+  := do
+  loop
+    (fun (ok2, i1) => x64_decode.zeros_loop.body bytes «at» n ok2 i1)
+    (ok1, i)
+
+/-- [async_ebpf_verified::x64_decode::zeros]:
+    Source: '../../src/verified/x64_decode.rs', lines 1164:0-1174:1 -/
+def x64_decode.zeros
+  (bytes : Slice Std.U8) («at» : Std.Usize) (n : Std.Usize) :
+  Result Bool
+  := do
+  let ok1 ← x64_decode.have bytes «at» n
+  x64_decode.zeros_loop bytes «at» n ok1 0#usize
+
+/-- [async_ebpf_verified::x64_decode::decode_data]:
+    Source: '../../src/verified/x64_decode.rs', lines 1177:0-1195:1 -/
+def x64_decode.decode_data
+  (bytes : Slice Std.U8) («at» : Std.Usize) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← x64_encode.HELPER_TABLE_LEN
+  let b ← x64_decode.zeros bytes «at» i
+  if b
+  then ok (some { insn := x64_ir.PInsn.HelperTable, len := i, disp := 0#i64 })
+  else
+    let b1 ← x64_decode.have bytes «at» 8#usize
+    if b1
+    then
+      let i1 ← x64_decode.read64 bytes «at»
+      ok (some
+        {
+          insn := (x64_ir.PInsn.DispatcherSlot i1),
+          len := 8#usize,
+          disp := 0#i64
+        })
+    else ok none
+
+/-- [async_ebpf_verified::x64_decode::decode_unary]:
+    Source: '../../src/verified/x64_decode.rs', lines 1106:0-1157:1 -/
+def x64_decode.decode_unary
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← p.at + 1#usize
+  let g ← x64_decode.decode_reg2 bytes i p.r p.b
+  if g.ok
+  then
+    if g.ext = 0#u8
+    then
+      let i1 ← p.at + 2#usize
+      let b ← x64_decode.have bytes i1 4#usize
+      if b
+      then
+        let i2 ← x64_decode.read32 bytes i1
+        let i3 ← lift (UScalar.hcast .I32 i2)
+        let i4 ← p.at + 6#usize
+        x64_decode.done (x64_ir.PInsn.AluImm (p.w = 1#u8) x64_ir.AluRI.Test
+          g.rm i3) «at» i4 0#i64
+      else ok none
+    else
+      if g.ext = 3#u8
+      then
+        let i1 ← p.at + 2#usize
+        x64_decode.done (x64_ir.PInsn.Neg (p.w = 1#u8) g.rm) «at» i1 0#i64
+      else
+        if g.rm != 1#u8
+        then ok none
+        else
+          if g.ext = 4#u8
+          then
+            let i1 ← p.at + 2#usize
+            x64_decode.done (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
+              x64_ir.MulDivKind.Mul false) «at» i1 0#i64
+          else
+            if g.ext = 6#u8
+            then
+              let i1 ← p.at + 2#usize
+              x64_decode.done (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
+                x64_ir.MulDivKind.Div (g.ext = 7#u8)) «at» i1 0#i64
+            else
+              if g.ext = 7#u8
+              then
+                let i1 ← p.at + 2#usize
+                x64_decode.done (x64_ir.PInsn.MulDivRcx (p.w = 1#u8)
+                  x64_ir.MulDivKind.Div (g.ext = 7#u8)) «at» i1 0#i64
+              else ok none
+  else ok none
+
+/-- [async_ebpf_verified::x64_decode::decode_short_jmp]:
+    Source: '../../src/verified/x64_decode.rs', lines 1081:0-1103:1 -/
+def x64_decode.decode_short_jmp
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← p.at + 1#usize
+  let d ← x64_decode.byte_at bytes i
+  if d < 0#i32
+  then ok none
+  else
+    let i1 ← p.at + 2#usize
+    let pad0 ← x64_decode.byte_at bytes i1
+    let i2 ← p.at + 3#usize
+    let pad1 ← x64_decode.byte_at bytes i2
+    let i3 ← p.at + 4#usize
+    let pad2 ← x64_decode.byte_at bytes i3
+    let padded ←
+      if pad0 = 0#i32
+      then if pad1 = 0#i32
+           then ok (pad2 = 0#i32)
+           else ok false
+      else ok false
+    if padded
+    then
+      let i4 ← p.at + 5#usize
+      let i5 ← x64_decode.sx8 d
+      x64_decode.done (x64_ir.PInsn.JmpNear (x64_ir.PTarget.Local 0#u32))
+        «at» i4 i5
+    else
+      let i4 ← x64_decode.sx8 d
+      x64_decode.done (x64_ir.PInsn.Jmp8 0#u32) «at» i1 i4
+
+/-- [async_ebpf_verified::x64_decode::decode_shift]:
+    Source: '../../src/verified/x64_decode.rs', lines 1051:0-1078:1 -/
+def x64_decode.decode_shift
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← p.at + 1#usize
+  let g ← x64_decode.decode_reg2 bytes i p.r p.b
+  let i1 ← p.at + 2#usize
+  let imm ← x64_decode.byte_at bytes i1
+  if g.ok
+  then
+    if imm < 0#i32
+    then ok none
+    else
+      if p.op16
+      then
+        if g.ext = 0#u8
+        then
+          if imm = 8#i32
+          then
+            let i2 ← p.at + 3#usize
+            x64_decode.done (x64_ir.PInsn.Rol16 g.rm) «at» i2 0#i64
+          else ok none
+        else ok none
+      else
+        let b ← x64_decode.is_shift_ext g.ext
+        if b
+        then
+          let so ← x64_decode.shift_of g.ext
+          let i2 ← p.at + 3#usize
+          x64_decode.done (x64_ir.PInsn.ShiftImm (p.w = 1#u8) so g.rm imm)
+            «at» i2 0#i64
+        else ok none
+  else ok none
+
+/-- [async_ebpf_verified::x64_decode::decode_rest]:
+    Source: '../../src/verified/x64_decode.rs', lines 904:0-1048:1 -/
+def x64_decode.decode_rest
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx)
+  (op : Std.U8) :
+  Result (Option x64_decode.Decoded)
+  := do
+  if op = 61#u8
+  then
+    let i ← p.at + 1#usize
+    let b ← x64_decode.have bytes i 4#usize
+    if b
+    then
+      let i1 ← x64_decode.read32 bytes i
+      let i2 ← p.at + 5#usize
+      x64_decode.done (x64_ir.PInsn.CmpEaxImm i1) «at» i2 0#i64
+    else ok none
+  else
+    if op = 99#u8
+    then
+      let i ← p.at + 1#usize
+      let g ← x64_decode.decode_reg2 bytes i p.r p.b
+      if g.ok
+      then
+        let i1 ← p.at + 2#usize
+        x64_decode.done (x64_ir.PInsn.MovSx 32#u8 (p.w = 1#u8) g.rm g.reg)
+          «at» i1 0#i64
+      else
+        let m ← x64_decode.decode_mem bytes i p.r p.b
+        if m.ok
+        then
+          let i1 ← i + m.len
+          x64_decode.done (x64_ir.PInsn.Load 4#u8 true m.base m.reg m.disp)
+            «at» i1 0#i64
+        else ok none
+    else
+      if op = 129#u8
+      then
+        let i ← p.at + 1#usize
+        let g ← x64_decode.decode_reg2 bytes i p.r p.b
+        let known ← x64_decode.is_alu_ri_ext g.ext
+        let i1 ← p.at + 2#usize
+        let room ← x64_decode.have bytes i1 4#usize
+        if g.ok
+        then
+          if known
+          then
+            if room
+            then
+              let ar ← x64_decode.alu_ri_of g.ext
+              let i2 ← x64_decode.read32 bytes i1
+              let i3 ← lift (UScalar.hcast .I32 i2)
+              let i4 ← p.at + 6#usize
+              x64_decode.done (x64_ir.PInsn.AluImm (p.w = 1#u8) ar g.rm i3)
+                «at» i4 0#i64
+            else ok none
+          else ok none
+        else ok none
+      else
+        if op = 131#u8
+        then
+          let i ← p.at + 1#usize
+          let modrm ← x64_decode.byte_at bytes i
+          let i1 ← p.at + 2#usize
+          let imm ← x64_decode.byte_at bytes i1
+          if modrm = 249#i32
+          then
+            if imm = 255#i32
+            then
+              let i2 ← p.at + 3#usize
+              x64_decode.done (x64_ir.PInsn.CmpRcxMinusOne (p.w = 1#u8)) «at»
+                i2 0#i64
+            else ok none
+          else ok none
+        else
+          if op = 144#u8
+          then
+            if p.rep
+            then
+              let i ← p.at + 1#usize
+              x64_decode.done x64_ir.PInsn.Pause «at» i 0#i64
+            else ok none
+          else
+            if op = 153#u8
+            then
+              if p.w = 1#u8
+              then
+                let i ← p.at + 1#usize
+                x64_decode.done x64_ir.PInsn.Cqo «at» i 0#i64
+              else
+                let i ← p.at + 1#usize
+                x64_decode.done x64_ir.PInsn.Cdq «at» i 0#i64
+            else
+              if op = 156#u8
+              then
+                let i ← p.at + 1#usize
+                x64_decode.done x64_ir.PInsn.Pushfq «at» i 0#i64
+              else
+                if op = 157#u8
+                then
+                  let i ← p.at + 1#usize
+                  x64_decode.done x64_ir.PInsn.Popfq «at» i 0#i64
+                else
+                  if op = 193#u8
+                  then x64_decode.decode_shift bytes «at» p
+                  else
+                    if op = 195#u8
+                    then
+                      let i ← p.at + 1#usize
+                      x64_decode.done x64_ir.PInsn.Ret «at» i 0#i64
+                    else
+                      if op = 211#u8
+                      then
+                        let i ← p.at + 1#usize
+                        let g ← x64_decode.decode_reg2 bytes i p.r p.b
+                        let known ← x64_decode.is_shift_ext g.ext
+                        if g.ok
+                        then
+                          if known
+                          then
+                            let so ← x64_decode.shift_of g.ext
+                            let i1 ← p.at + 2#usize
+                            x64_decode.done (x64_ir.PInsn.ShiftCl (p.w = 1#u8)
+                              so g.rm) «at» i1 0#i64
+                          else ok none
+                        else ok none
+                      else
+                        if op = 232#u8
+                        then
+                          let i ← p.at + 1#usize
+                          let b ← x64_decode.have bytes i 4#usize
+                          if b
+                          then
+                            let insn ←
+                              if op = 232#u8
+                              then
+                                ok (x64_ir.PInsn.Call (x64_ir.PTarget.Local
+                                  0#u32))
+                              else
+                                ok (x64_ir.PInsn.Jmp (x64_ir.PTarget.Local
+                                  0#u32))
+                            let i1 ← p.at + 5#usize
+                            let i2 ← x64_decode.read32 bytes i
+                            let i3 ← x64_decode.sx32 i2
+                            x64_decode.done insn «at» i1 i3
+                          else ok none
+                        else
+                          if op = 233#u8
+                          then
+                            let i ← p.at + 1#usize
+                            let b ← x64_decode.have bytes i 4#usize
+                            if b
+                            then
+                              let insn ←
+                                if op = 232#u8
+                                then
+                                  ok (x64_ir.PInsn.Call (x64_ir.PTarget.Local
+                                    0#u32))
+                                else
+                                  ok (x64_ir.PInsn.Jmp (x64_ir.PTarget.Local
+                                    0#u32))
+                              let i1 ← p.at + 5#usize
+                              let i2 ← x64_decode.read32 bytes i
+                              let i3 ← x64_decode.sx32 i2
+                              x64_decode.done insn «at» i1 i3
+                            else ok none
+                          else
+                            if op = 235#u8
+                            then x64_decode.decode_short_jmp bytes «at» p
+                            else
+                              if op = 247#u8
+                              then x64_decode.decode_unary bytes «at» p
+                              else
+                                if op = 255#u8
+                                then
+                                  let i ← p.at + 1#usize
+                                  let head ← x64_decode.byte_at bytes i
+                                  if head >= 0#i32
+                                  then
+                                    let i1 ← lift (IScalar.hcast .U8 head)
+                                    let i2 ← lift (i1 &&& 248#u8)
+                                    if i2 = 208#u8
+                                    then
+                                      let i3 ← lift (IScalar.hcast .U8 head)
+                                      let i4 ← lift (i3 &&& 7#u8)
+                                      let i5 ← p.b <<< 3#i32
+                                      let i6 ← lift (i4 ||| i5)
+                                      let i7 ← p.at + 2#usize
+                                      x64_decode.done (x64_ir.PInsn.CallReg i6)
+                                        «at» i7 0#i64
+                                    else ok none
+                                  else ok none
+                                else ok none
+
+/-- [async_ebpf_verified::x64_decode::decode_store_imm]:
+    Source: '../../src/verified/x64_decode.rs', lines 829:0-900:1 -/
+def x64_decode.decode_store_imm
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx)
+  (op : Std.U8) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← p.at + 1#usize
+  let g ← x64_decode.decode_reg2 bytes i p.r p.b
+  let modrm ← x64_decode.byte_at bytes i
+  let i1 ← p.at + 2#usize
+  let sib ← x64_decode.byte_at bytes i1
+  let room ← x64_decode.have bytes i1 4#usize
+  if op = 199#u8
+  then
+    if g.ok
+    then
+      if g.ext = 0#u8
+      then
+        if room
+        then
+          let i2 ← x64_decode.read32 bytes i1
+          let i3 ← lift (UScalar.hcast .I32 i2)
+          let i4 ← p.at + 6#usize
+          x64_decode.done (x64_ir.PInsn.AluImm (p.w = 1#u8) x64_ir.AluRI.Mov
+            g.rm i3) «at» i4 0#i64
+        else ok none
+      else ok none
+    else
+      if op = 199#u8
+      then
+        if modrm = 4#i32
+        then
+          if sib = 36#i32
+          then
+            let i2 ← p.at + 3#usize
+            let wide ← x64_decode.have bytes i2 4#usize
+            if p.w = 1#u8
+            then
+              if wide
+              then
+                let i3 ← x64_decode.read32 bytes i2
+                let i4 ← p.at + 7#usize
+                x64_decode.done (x64_ir.PInsn.StoreRspImm i3) «at» i4 0#i64
+              else ok none
+            else ok none
+          else
+            let m ← x64_decode.decode_mem bytes i p.r p.b
+            let size ←
+              if op = 198#u8
+              then ok 1#u8
+              else x64_decode.mem_size p.w p.op16
+            let imm_len ←
+              if size = 1#u8
+              then ok 1#usize
+              else if size = 2#u8
+                   then ok 2#usize
+                   else ok 4#usize
+            let start ← i + m.len
+            let fits ← x64_decode.have bytes start imm_len
+            if m.ok
+            then
+              if m.reg != 0#u8
+              then ok none
+              else
+                if fits
+                then
+                  let imm ←
+                    if size = 1#u8
+                    then
+                      do
+                      let i2 ← Slice.index_usize bytes start
+                      ok (UScalar.hcast .I32 i2)
+                    else
+                      if size = 2#u8
+                      then
+                        do
+                        let i2 ← Slice.index_usize bytes start
+                        let i3 ← lift (UScalar.hcast .I32 i2)
+                        let i4 ← start + 1#usize
+                        let i5 ← Slice.index_usize bytes i4
+                        let i6 ← lift (UScalar.hcast .I32 i5)
+                        let i7 ← i6 <<< 8#i32
+                        ok (i3 ||| i7)
+                      else
+                        do
+                        let i2 ← x64_decode.read32 bytes start
+                        ok (UScalar.hcast .I32 i2)
+                  let i2 ← start + imm_len
+                  x64_decode.done (x64_ir.PInsn.StoreImm size m.base 
+                    m.disp imm) «at» i2 0#i64
+                else ok none
+            else ok none
+        else
+          let m ← x64_decode.decode_mem bytes i p.r p.b
+          let size ←
+            if op = 198#u8
+            then ok 1#u8
+            else x64_decode.mem_size p.w p.op16
+          let imm_len ←
+            if size = 1#u8
+            then ok 1#usize
+            else if size = 2#u8
+                 then ok 2#usize
+                 else ok 4#usize
+          let start ← i + m.len
+          let fits ← x64_decode.have bytes start imm_len
+          if m.ok
+          then
+            if m.reg != 0#u8
+            then ok none
+            else
+              if fits
+              then
+                let imm ←
+                  if size = 1#u8
+                  then
+                    do
+                    let i2 ← Slice.index_usize bytes start
+                    ok (UScalar.hcast .I32 i2)
+                  else
+                    if size = 2#u8
+                    then
+                      do
+                      let i2 ← Slice.index_usize bytes start
+                      let i3 ← lift (UScalar.hcast .I32 i2)
+                      let i4 ← start + 1#usize
+                      let i5 ← Slice.index_usize bytes i4
+                      let i6 ← lift (UScalar.hcast .I32 i5)
+                      let i7 ← i6 <<< 8#i32
+                      ok (i3 ||| i7)
+                    else
+                      do
+                      let i2 ← x64_decode.read32 bytes start
+                      ok (UScalar.hcast .I32 i2)
+                let i2 ← start + imm_len
+                x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
+                  «at» i2 0#i64
+              else ok none
+          else ok none
+      else
+        let m ← x64_decode.decode_mem bytes i p.r p.b
+        let size ←
+          if op = 198#u8
+          then ok 1#u8
+          else x64_decode.mem_size p.w p.op16
+        let imm_len ←
+          if size = 1#u8
+          then ok 1#usize
+          else if size = 2#u8
+               then ok 2#usize
+               else ok 4#usize
+        let start ← i + m.len
+        let fits ← x64_decode.have bytes start imm_len
+        if m.ok
+        then
+          if m.reg != 0#u8
+          then ok none
+          else
+            if fits
+            then
+              let imm ←
+                if size = 1#u8
+                then
+                  do
+                  let i2 ← Slice.index_usize bytes start
+                  ok (UScalar.hcast .I32 i2)
+                else
+                  if size = 2#u8
+                  then
+                    do
+                    let i2 ← Slice.index_usize bytes start
+                    let i3 ← lift (UScalar.hcast .I32 i2)
+                    let i4 ← start + 1#usize
+                    let i5 ← Slice.index_usize bytes i4
+                    let i6 ← lift (UScalar.hcast .I32 i5)
+                    let i7 ← i6 <<< 8#i32
+                    ok (i3 ||| i7)
+                  else
+                    do
+                    let i2 ← x64_decode.read32 bytes start
+                    ok (UScalar.hcast .I32 i2)
+              let i2 ← start + imm_len
+              x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
+                «at» i2 0#i64
+            else ok none
+        else ok none
+  else
+    if op = 199#u8
+    then
+      if modrm = 4#i32
+      then
+        if sib = 36#i32
+        then
+          let i2 ← p.at + 3#usize
+          let wide ← x64_decode.have bytes i2 4#usize
+          if p.w = 1#u8
+          then
+            if wide
+            then
+              let i3 ← x64_decode.read32 bytes i2
+              let i4 ← p.at + 7#usize
+              x64_decode.done (x64_ir.PInsn.StoreRspImm i3) «at» i4 0#i64
+            else ok none
+          else ok none
+        else
+          let m ← x64_decode.decode_mem bytes i p.r p.b
+          let size ←
+            if op = 198#u8
+            then ok 1#u8
+            else x64_decode.mem_size p.w p.op16
+          let imm_len ←
+            if size = 1#u8
+            then ok 1#usize
+            else if size = 2#u8
+                 then ok 2#usize
+                 else ok 4#usize
+          let start ← i + m.len
+          let fits ← x64_decode.have bytes start imm_len
+          if m.ok
+          then
+            if m.reg != 0#u8
+            then ok none
+            else
+              if fits
+              then
+                let imm ←
+                  if size = 1#u8
+                  then
+                    do
+                    let i2 ← Slice.index_usize bytes start
+                    ok (UScalar.hcast .I32 i2)
+                  else
+                    if size = 2#u8
+                    then
+                      do
+                      let i2 ← Slice.index_usize bytes start
+                      let i3 ← lift (UScalar.hcast .I32 i2)
+                      let i4 ← start + 1#usize
+                      let i5 ← Slice.index_usize bytes i4
+                      let i6 ← lift (UScalar.hcast .I32 i5)
+                      let i7 ← i6 <<< 8#i32
+                      ok (i3 ||| i7)
+                    else
+                      do
+                      let i2 ← x64_decode.read32 bytes start
+                      ok (UScalar.hcast .I32 i2)
+                let i2 ← start + imm_len
+                x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
+                  «at» i2 0#i64
+              else ok none
+          else ok none
+      else
+        let m ← x64_decode.decode_mem bytes i p.r p.b
+        let size ←
+          if op = 198#u8
+          then ok 1#u8
+          else x64_decode.mem_size p.w p.op16
+        let imm_len ←
+          if size = 1#u8
+          then ok 1#usize
+          else if size = 2#u8
+               then ok 2#usize
+               else ok 4#usize
+        let start ← i + m.len
+        let fits ← x64_decode.have bytes start imm_len
+        if m.ok
+        then
+          if m.reg != 0#u8
+          then ok none
+          else
+            if fits
+            then
+              let imm ←
+                if size = 1#u8
+                then
+                  do
+                  let i2 ← Slice.index_usize bytes start
+                  ok (UScalar.hcast .I32 i2)
+                else
+                  if size = 2#u8
+                  then
+                    do
+                    let i2 ← Slice.index_usize bytes start
+                    let i3 ← lift (UScalar.hcast .I32 i2)
+                    let i4 ← start + 1#usize
+                    let i5 ← Slice.index_usize bytes i4
+                    let i6 ← lift (UScalar.hcast .I32 i5)
+                    let i7 ← i6 <<< 8#i32
+                    ok (i3 ||| i7)
+                  else
+                    do
+                    let i2 ← x64_decode.read32 bytes start
+                    ok (UScalar.hcast .I32 i2)
+              let i2 ← start + imm_len
+              x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
+                «at» i2 0#i64
+            else ok none
+        else ok none
+    else
+      let m ← x64_decode.decode_mem bytes i p.r p.b
+      let size ←
+        if op = 198#u8
+        then ok 1#u8
+        else x64_decode.mem_size p.w p.op16
+      let imm_len ←
+        if size = 1#u8
+        then ok 1#usize
+        else if size = 2#u8
+             then ok 2#usize
+             else ok 4#usize
+      let start ← i + m.len
+      let fits ← x64_decode.have bytes start imm_len
+      if m.ok
+      then
+        if m.reg != 0#u8
+        then ok none
+        else
+          if fits
+          then
+            let imm ←
+              if size = 1#u8
+              then
+                do
+                let i2 ← Slice.index_usize bytes start
+                ok (UScalar.hcast .I32 i2)
+              else
+                if size = 2#u8
+                then
+                  do
+                  let i2 ← Slice.index_usize bytes start
+                  let i3 ← lift (UScalar.hcast .I32 i2)
+                  let i4 ← start + 1#usize
+                  let i5 ← Slice.index_usize bytes i4
+                  let i6 ← lift (UScalar.hcast .I32 i5)
+                  let i7 ← i6 <<< 8#i32
+                  ok (i3 ||| i7)
+                else
+                  do
+                  let i2 ← x64_decode.read32 bytes start
+                  ok (UScalar.hcast .I32 i2)
+            let i2 ← start + imm_len
+            x64_decode.done (x64_ir.PInsn.StoreImm size m.base m.disp imm)
+              «at» i2 0#i64
+          else ok none
+      else ok none
+
+/-- [async_ebpf_verified::x64_decode::decode_move]:
+    Source: '../../src/verified/x64_decode.rs', lines 775:0-825:1 -/
+def x64_decode.decode_move
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx)
+  (op : Std.U8) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← p.at + 1#usize
+  let rip ← x64_decode.is_rip bytes i
+  let i1 ← p.at + 2#usize
+  let room ← x64_decode.have bytes i1 4#usize
+  if op = 139#u8
+  then
+    if rip
+    then
+      if room
+      then
+        let i2 ← x64_decode.modrm_reg bytes i 0#u8
+        let i3 ← p.at + 6#usize
+        let i4 ← x64_decode.read32 bytes i1
+        let i5 ← x64_decode.sx32 i4
+        x64_decode.done (x64_ir.PInsn.RipLoadDispatcher i2) «at» i3 i5
+      else ok none
+    else
+      if op = 141#u8
+      then ok none
+      else
+        if op = 139#u8
+        then
+          let m ← x64_decode.decode_mem bytes i p.r p.b
+          if m.ok
+          then
+            let i2 ← x64_decode.mem_size p.w false
+            let i3 ← i + m.len
+            x64_decode.done (x64_ir.PInsn.Load i2 false m.base m.reg 
+              m.disp) «at» i3 0#i64
+          else ok none
+        else x64_decode.decode_store_imm bytes «at» p op
+  else
+    if op = 141#u8
+    then
+      if rip
+      then
+        if room
+        then
+          let i2 ← x64_decode.modrm_reg bytes i p.r
+          let i3 ← p.at + 6#usize
+          let i4 ← x64_decode.read32 bytes i1
+          let i5 ← x64_decode.sx32 i4
+          x64_decode.done (x64_ir.PInsn.RipLeaHelperTable i2) «at» i3 i5
+        else ok none
+      else ok none
+    else
+      if op = 139#u8
+      then
+        let m ← x64_decode.decode_mem bytes i p.r p.b
+        if m.ok
+        then
+          let i2 ← x64_decode.mem_size p.w false
+          let i3 ← i + m.len
+          x64_decode.done (x64_ir.PInsn.Load i2 false m.base m.reg m.disp)
+            «at» i3 0#i64
+        else ok none
+      else x64_decode.decode_store_imm bytes «at» p op
+
+/-- [async_ebpf_verified::x64_decode::decode_alu]:
+    Source: '../../src/verified/x64_decode.rs', lines 713:0-772:1 -/
+def x64_decode.decode_alu
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx)
+  (op : Std.U8) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← p.at + 1#usize
+  let g ← x64_decode.decode_reg2 bytes i p.r p.b
+  let rr ← x64_decode.is_alu_rr op
+  let rm ← x64_decode.is_alu_rm op
+  let modrm ← x64_decode.byte_at bytes i
+  let i1 ← p.at + 2#usize
+  let sib ← x64_decode.byte_at bytes i1
+  if g.ok
+  then
+    if rr
+    then
+      let ar ← x64_decode.alu_rr_of op
+      x64_decode.done (x64_ir.PInsn.Alu (p.w = 1#u8) ar g.reg g.rm) «at» i1
+        0#i64
+    else
+      if op = 137#u8
+      then
+        if modrm = 4#i32
+        then
+          if sib = 36#i32
+          then
+            if p.w = 1#u8
+            then
+              let i2 ← p.at + 3#usize
+              x64_decode.done x64_ir.PInsn.StoreRspRax «at» i2 0#i64
+            else ok none
+          else
+            let m ← x64_decode.decode_mem bytes i p.r p.b
+            if m.ok
+            then
+              if op = 136#u8
+              then
+                let size ←
+                  if op = 136#u8
+                  then ok 1#u8
+                  else x64_decode.mem_size p.w p.op16
+                let i2 ← i + m.len
+                x64_decode.done (x64_ir.PInsn.Store size m.reg m.base 
+                  m.disp) «at» i2 0#i64
+              else
+                if op = 137#u8
+                then
+                  let size ←
+                    if op = 136#u8
+                    then ok 1#u8
+                    else x64_decode.mem_size p.w p.op16
+                  let i2 ← i + m.len
+                  x64_decode.done (x64_ir.PInsn.Store size m.reg m.base 
+                    m.disp) «at» i2 0#i64
+                else
+                  if rm
+                  then
+                    let ar ← x64_decode.alu_rm_of op
+                    let i2 ← i + m.len
+                    x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base 
+                      m.disp) «at» i2 0#i64
+                  else ok none
+            else ok none
+        else
+          let m ← x64_decode.decode_mem bytes i p.r p.b
+          if m.ok
+          then
+            if op = 136#u8
+            then
+              let size ←
+                if op = 136#u8
+                then ok 1#u8
+                else x64_decode.mem_size p.w p.op16
+              let i2 ← i + m.len
+              x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+                «at» i2 0#i64
+            else
+              if op = 137#u8
+              then
+                let size ←
+                  if op = 136#u8
+                  then ok 1#u8
+                  else x64_decode.mem_size p.w p.op16
+                let i2 ← i + m.len
+                x64_decode.done (x64_ir.PInsn.Store size m.reg m.base 
+                  m.disp) «at» i2 0#i64
+              else
+                if rm
+                then
+                  let ar ← x64_decode.alu_rm_of op
+                  let i2 ← i + m.len
+                  x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base 
+                    m.disp) «at» i2 0#i64
+                else ok none
+          else ok none
+      else
+        let m ← x64_decode.decode_mem bytes i p.r p.b
+        if m.ok
+        then
+          if op = 136#u8
+          then
+            let size ←
+              if op = 136#u8
+              then ok 1#u8
+              else x64_decode.mem_size p.w p.op16
+            let i2 ← i + m.len
+            x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+              «at» i2 0#i64
+          else
+            if op = 137#u8
+            then
+              let size ←
+                if op = 136#u8
+                then ok 1#u8
+                else x64_decode.mem_size p.w p.op16
+              let i2 ← i + m.len
+              x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+                «at» i2 0#i64
+            else
+              if rm
+              then
+                let ar ← x64_decode.alu_rm_of op
+                let i2 ← i + m.len
+                x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base m.disp)
+                  «at» i2 0#i64
+              else ok none
+        else ok none
+  else
+    if op = 137#u8
+    then
+      if modrm = 4#i32
+      then
+        if sib = 36#i32
+        then
+          if p.w = 1#u8
+          then
+            let i2 ← p.at + 3#usize
+            x64_decode.done x64_ir.PInsn.StoreRspRax «at» i2 0#i64
+          else ok none
+        else
+          let m ← x64_decode.decode_mem bytes i p.r p.b
+          if m.ok
+          then
+            if op = 136#u8
+            then
+              let size ←
+                if op = 136#u8
+                then ok 1#u8
+                else x64_decode.mem_size p.w p.op16
+              let i2 ← i + m.len
+              x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+                «at» i2 0#i64
+            else
+              if op = 137#u8
+              then
+                let size ←
+                  if op = 136#u8
+                  then ok 1#u8
+                  else x64_decode.mem_size p.w p.op16
+                let i2 ← i + m.len
+                x64_decode.done (x64_ir.PInsn.Store size m.reg m.base 
+                  m.disp) «at» i2 0#i64
+              else
+                if rm
+                then
+                  let ar ← x64_decode.alu_rm_of op
+                  let i2 ← i + m.len
+                  x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base 
+                    m.disp) «at» i2 0#i64
+                else ok none
+          else ok none
+      else
+        let m ← x64_decode.decode_mem bytes i p.r p.b
+        if m.ok
+        then
+          if op = 136#u8
+          then
+            let size ←
+              if op = 136#u8
+              then ok 1#u8
+              else x64_decode.mem_size p.w p.op16
+            let i2 ← i + m.len
+            x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+              «at» i2 0#i64
+          else
+            if op = 137#u8
+            then
+              let size ←
+                if op = 136#u8
+                then ok 1#u8
+                else x64_decode.mem_size p.w p.op16
+              let i2 ← i + m.len
+              x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+                «at» i2 0#i64
+            else
+              if rm
+              then
+                let ar ← x64_decode.alu_rm_of op
+                let i2 ← i + m.len
+                x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base m.disp)
+                  «at» i2 0#i64
+              else ok none
+        else ok none
+    else
+      let m ← x64_decode.decode_mem bytes i p.r p.b
+      if m.ok
+      then
+        if op = 136#u8
+        then
+          let size ←
+            if op = 136#u8
+            then ok 1#u8
+            else x64_decode.mem_size p.w p.op16
+          let i2 ← i + m.len
+          x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp) «at»
+            i2 0#i64
+        else
+          if op = 137#u8
+          then
+            let size ←
+              if op = 136#u8
+              then ok 1#u8
+              else x64_decode.mem_size p.w p.op16
+            let i2 ← i + m.len
+            x64_decode.done (x64_ir.PInsn.Store size m.reg m.base m.disp)
+              «at» i2 0#i64
+          else
+            if rm
+            then
+              let ar ← x64_decode.alu_rm_of op
+              let i2 ← i + m.len
+              x64_decode.done (x64_ir.PInsn.AluRM ar m.reg m.base m.disp)
+                «at» i2 0#i64
+            else ok none
+      else ok none
+
+/-- [async_ebpf_verified::x64_decode::decode_one_byte]:
+    Source: '../../src/verified/x64_decode.rs', lines 664:0-710:1 -/
+def x64_decode.decode_one_byte
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx)
+  (op : Std.U8) :
+  Result (Option x64_decode.Decoded)
+  := do
+  if op >= 80#u8
+  then
+    if op <= 95#u8
+    then
+      let i ← lift (op &&& 7#u8)
+      let i1 ← p.b <<< 3#i32
+      let r ← lift (i ||| i1)
+      if op <= 87#u8
+      then
+        let i2 ← p.at + 1#usize
+        x64_decode.done (x64_ir.PInsn.Push r) «at» i2 0#i64
+      else
+        let i2 ← p.at + 1#usize
+        x64_decode.done (x64_ir.PInsn.Pop r) «at» i2 0#i64
+    else
+      if op >= 112#u8
+      then
+        if op <= 127#u8
+        then
+          let i ← p.at + 1#usize
+          let d ← x64_decode.byte_at bytes i
+          if d < 0#i32
+          then ok none
+          else
+            let i1 ← lift (op &&& 15#u8)
+            let i2 ← lift (128#u8 ||| i1)
+            let i3 ← p.at + 2#usize
+            let i4 ← x64_decode.sx8 d
+            x64_decode.done (x64_ir.PInsn.Jcc8 i2 0#u32) «at» i3 i4
+        else
+          if op >= 184#u8
+          then
+            if op <= 191#u8
+            then
+              let i ← p.at + 1#usize
+              let room ← x64_decode.have bytes i 8#usize
+              if p.w = 1#u8
+              then
+                if room
+                then
+                  let i1 ← lift (op &&& 7#u8)
+                  let i2 ← p.b <<< 3#i32
+                  let i3 ← lift (i1 ||| i2)
+                  let i4 ← x64_decode.read64 bytes i
+                  let i5 ← lift (UScalar.hcast .I64 i4)
+                  let i6 ← p.at + 9#usize
+                  x64_decode.done (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
+                else ok none
+              else ok none
+            else
+              let b ← x64_decode.alu_op op
+              if b
+              then x64_decode.decode_alu bytes «at» p op
+              else
+                if op = 139#u8
+                then x64_decode.decode_move bytes «at» p op
+                else
+                  if op = 141#u8
+                  then x64_decode.decode_move bytes «at» p op
+                  else
+                    if op = 198#u8
+                    then x64_decode.decode_move bytes «at» p op
+                    else
+                      if op = 199#u8
+                      then x64_decode.decode_move bytes «at» p op
+                      else x64_decode.decode_rest bytes «at» p op
+          else
+            let b ← x64_decode.alu_op op
+            if b
+            then x64_decode.decode_alu bytes «at» p op
+            else
+              if op = 139#u8
+              then x64_decode.decode_move bytes «at» p op
+              else
+                if op = 141#u8
+                then x64_decode.decode_move bytes «at» p op
+                else
+                  if op = 198#u8
+                  then x64_decode.decode_move bytes «at» p op
+                  else
+                    if op = 199#u8
+                    then x64_decode.decode_move bytes «at» p op
+                    else x64_decode.decode_rest bytes «at» p op
+      else
+        if op >= 184#u8
+        then
+          if op <= 191#u8
+          then
+            let i ← p.at + 1#usize
+            let room ← x64_decode.have bytes i 8#usize
+            if p.w = 1#u8
+            then
+              if room
+              then
+                let i1 ← lift (op &&& 7#u8)
+                let i2 ← p.b <<< 3#i32
+                let i3 ← lift (i1 ||| i2)
+                let i4 ← x64_decode.read64 bytes i
+                let i5 ← lift (UScalar.hcast .I64 i4)
+                let i6 ← p.at + 9#usize
+                x64_decode.done (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
+              else ok none
+            else ok none
+          else
+            let b ← x64_decode.alu_op op
+            if b
+            then x64_decode.decode_alu bytes «at» p op
+            else
+              if op = 139#u8
+              then x64_decode.decode_move bytes «at» p op
+              else
+                if op = 141#u8
+                then x64_decode.decode_move bytes «at» p op
+                else
+                  if op = 198#u8
+                  then x64_decode.decode_move bytes «at» p op
+                  else
+                    if op = 199#u8
+                    then x64_decode.decode_move bytes «at» p op
+                    else x64_decode.decode_rest bytes «at» p op
+        else
+          let b ← x64_decode.alu_op op
+          if b
+          then x64_decode.decode_alu bytes «at» p op
+          else
+            if op = 139#u8
+            then x64_decode.decode_move bytes «at» p op
+            else
+              if op = 141#u8
+              then x64_decode.decode_move bytes «at» p op
+              else
+                if op = 198#u8
+                then x64_decode.decode_move bytes «at» p op
+                else
+                  if op = 199#u8
+                  then x64_decode.decode_move bytes «at» p op
+                  else x64_decode.decode_rest bytes «at» p op
+  else
+    if op >= 112#u8
+    then
+      if op <= 127#u8
+      then
+        let i ← p.at + 1#usize
+        let d ← x64_decode.byte_at bytes i
+        if d < 0#i32
+        then ok none
+        else
+          let i1 ← lift (op &&& 15#u8)
+          let i2 ← lift (128#u8 ||| i1)
+          let i3 ← p.at + 2#usize
+          let i4 ← x64_decode.sx8 d
+          x64_decode.done (x64_ir.PInsn.Jcc8 i2 0#u32) «at» i3 i4
+      else
+        if op >= 184#u8
+        then
+          if op <= 191#u8
+          then
+            let i ← p.at + 1#usize
+            let room ← x64_decode.have bytes i 8#usize
+            if p.w = 1#u8
+            then
+              if room
+              then
+                let i1 ← lift (op &&& 7#u8)
+                let i2 ← p.b <<< 3#i32
+                let i3 ← lift (i1 ||| i2)
+                let i4 ← x64_decode.read64 bytes i
+                let i5 ← lift (UScalar.hcast .I64 i4)
+                let i6 ← p.at + 9#usize
+                x64_decode.done (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
+              else ok none
+            else ok none
+          else
+            let b ← x64_decode.alu_op op
+            if b
+            then x64_decode.decode_alu bytes «at» p op
+            else
+              if op = 139#u8
+              then x64_decode.decode_move bytes «at» p op
+              else
+                if op = 141#u8
+                then x64_decode.decode_move bytes «at» p op
+                else
+                  if op = 198#u8
+                  then x64_decode.decode_move bytes «at» p op
+                  else
+                    if op = 199#u8
+                    then x64_decode.decode_move bytes «at» p op
+                    else x64_decode.decode_rest bytes «at» p op
+        else
+          let b ← x64_decode.alu_op op
+          if b
+          then x64_decode.decode_alu bytes «at» p op
+          else
+            if op = 139#u8
+            then x64_decode.decode_move bytes «at» p op
+            else
+              if op = 141#u8
+              then x64_decode.decode_move bytes «at» p op
+              else
+                if op = 198#u8
+                then x64_decode.decode_move bytes «at» p op
+                else
+                  if op = 199#u8
+                  then x64_decode.decode_move bytes «at» p op
+                  else x64_decode.decode_rest bytes «at» p op
+    else
+      if op >= 184#u8
+      then
+        if op <= 191#u8
+        then
+          let i ← p.at + 1#usize
+          let room ← x64_decode.have bytes i 8#usize
+          if p.w = 1#u8
+          then
+            if room
+            then
+              let i1 ← lift (op &&& 7#u8)
+              let i2 ← p.b <<< 3#i32
+              let i3 ← lift (i1 ||| i2)
+              let i4 ← x64_decode.read64 bytes i
+              let i5 ← lift (UScalar.hcast .I64 i4)
+              let i6 ← p.at + 9#usize
+              x64_decode.done (x64_ir.PInsn.LoadImm i3 i5) «at» i6 0#i64
+            else ok none
+          else ok none
+        else
+          let b ← x64_decode.alu_op op
+          if b
+          then x64_decode.decode_alu bytes «at» p op
+          else
+            if op = 139#u8
+            then x64_decode.decode_move bytes «at» p op
+            else
+              if op = 141#u8
+              then x64_decode.decode_move bytes «at» p op
+              else
+                if op = 198#u8
+                then x64_decode.decode_move bytes «at» p op
+                else
+                  if op = 199#u8
+                  then x64_decode.decode_move bytes «at» p op
+                  else x64_decode.decode_rest bytes «at» p op
+      else
+        let b ← x64_decode.alu_op op
+        if b
+        then x64_decode.decode_alu bytes «at» p op
+        else
+          if op = 139#u8
+          then x64_decode.decode_move bytes «at» p op
+          else
+            if op = 141#u8
+            then x64_decode.decode_move bytes «at» p op
+            else
+              if op = 198#u8
+              then x64_decode.decode_move bytes «at» p op
+              else
+                if op = 199#u8
+                then x64_decode.decode_move bytes «at» p op
+                else x64_decode.decode_rest bytes «at» p op
+
+/-- [async_ebpf_verified::x64_decode::decode_two_byte]:
+    Source: '../../src/verified/x64_decode.rs', lines 557:0-661:1 -/
+def x64_decode.decode_two_byte
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let i ← p.at + 1#usize
+  let second ← x64_decode.byte_at bytes i
+  if second < 0#i32
+  then ok none
+  else
+    if second = 11#i32
+    then
+      let i1 ← p.at + 2#usize
+      x64_decode.done x64_ir.PInsn.Ud2 «at» i1 0#i64
+    else
+      if second >= 64#i32
+      then
+        if second <= 79#i32
+        then
+          let i1 ← p.at + 2#usize
+          let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+          if g.ok
+          then
+            let i2 ← lift (IScalar.hcast .U8 second)
+            let i3 ← lift (i2 &&& 15#u8)
+            let i4 ← lift (128#u8 ||| i3)
+            let i5 ← p.at + 3#usize
+            x64_decode.done (x64_ir.PInsn.Cmov i4 g.reg g.rm) «at» i5 0#i64
+          else ok none
+        else
+          if second >= 128#i32
+          then
+            if second <= 143#i32
+            then
+              let i1 ← p.at + 2#usize
+              let b ← x64_decode.have bytes i1 4#usize
+              if b
+              then
+                let i2 ← lift (IScalar.hcast .U8 second)
+                let i3 ← p.at + 6#usize
+                let i4 ← x64_decode.read32 bytes i1
+                let i5 ← x64_decode.sx32 i4
+                x64_decode.done (x64_ir.PInsn.Jcc i2 (x64_ir.PTarget.Local
+                  0#u32)) «at» i3 i5
+              else ok none
+            else
+              if second >= 200#i32
+              then
+                if second <= 207#i32
+                then
+                  let i1 ← lift (IScalar.hcast .U8 second)
+                  let i2 ← lift (i1 &&& 7#u8)
+                  let i3 ← p.b <<< 3#i32
+                  let i4 ← lift (i2 ||| i3)
+                  let i5 ← p.at + 2#usize
+                  x64_decode.done (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at»
+                    i5 0#i64
+                else
+                  if second = 182#i32
+                  then
+                    let size ← if second = 182#i32
+                                 then ok 1#u8
+                                 else ok 2#u8
+                    let i1 ← p.at + 2#usize
+                    let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                    if m.ok
+                    then
+                      let i2 ← i1 + m.len
+                      x64_decode.done (x64_ir.PInsn.Load size false m.base
+                        m.reg m.disp) «at» i2 0#i64
+                    else ok none
+                  else
+                    if second = 183#i32
+                    then
+                      let size ←
+                        if second = 182#i32
+                        then ok 1#u8
+                        else ok 2#u8
+                      let i1 ← p.at + 2#usize
+                      let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                      if m.ok
+                      then
+                        let i2 ← i1 + m.len
+                        x64_decode.done (x64_ir.PInsn.Load size false 
+                          m.base m.reg m.disp) «at» i2 0#i64
+                      else ok none
+                    else
+                      if second = 190#i32
+                      then
+                        let «from» ←
+                          if second = 190#i32
+                          then ok 8#u8
+                          else ok 16#u8
+                        let size ←
+                          if second = 190#i32
+                          then ok 1#u8
+                          else ok 2#u8
+                        let i1 ← p.at + 2#usize
+                        let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                        if g.ok
+                        then
+                          let i2 ← p.at + 3#usize
+                          x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                            p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                        else
+                          let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                          if m.ok
+                          then
+                            let i2 ← i1 + m.len
+                            x64_decode.done (x64_ir.PInsn.Load size true 
+                              m.base m.reg m.disp) «at» i2 0#i64
+                          else ok none
+                      else
+                        if second = 191#i32
+                        then
+                          let «from» ←
+                            if second = 190#i32
+                            then ok 8#u8
+                            else ok 16#u8
+                          let size ←
+                            if second = 190#i32
+                            then ok 1#u8
+                            else ok 2#u8
+                          let i1 ← p.at + 2#usize
+                          let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                          if g.ok
+                          then
+                            let i2 ← p.at + 3#usize
+                            x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                              p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                          else
+                            let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                            if m.ok
+                            then
+                              let i2 ← i1 + m.len
+                              x64_decode.done (x64_ir.PInsn.Load size true
+                                m.base m.reg m.disp) «at» i2 0#i64
+                            else ok none
+                        else ok none
+              else
+                if second = 182#i32
+                then
+                  let size ← if second = 182#i32
+                               then ok 1#u8
+                               else ok 2#u8
+                  let i1 ← p.at + 2#usize
+                  let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                  if m.ok
+                  then
+                    let i2 ← i1 + m.len
+                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                      m.reg m.disp) «at» i2 0#i64
+                  else ok none
+                else
+                  if second = 183#i32
+                  then
+                    let size ← if second = 182#i32
+                                 then ok 1#u8
+                                 else ok 2#u8
+                    let i1 ← p.at + 2#usize
+                    let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                    if m.ok
+                    then
+                      let i2 ← i1 + m.len
+                      x64_decode.done (x64_ir.PInsn.Load size false m.base
+                        m.reg m.disp) «at» i2 0#i64
+                    else ok none
+                  else
+                    if second = 190#i32
+                    then
+                      let «from» ←
+                        if second = 190#i32
+                        then ok 8#u8
+                        else ok 16#u8
+                      let size ←
+                        if second = 190#i32
+                        then ok 1#u8
+                        else ok 2#u8
+                      let i1 ← p.at + 2#usize
+                      let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                      if g.ok
+                      then
+                        let i2 ← p.at + 3#usize
+                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                      else
+                        let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                        if m.ok
+                        then
+                          let i2 ← i1 + m.len
+                          x64_decode.done (x64_ir.PInsn.Load size true 
+                            m.base m.reg m.disp) «at» i2 0#i64
+                        else ok none
+                    else
+                      if second = 191#i32
+                      then
+                        let «from» ←
+                          if second = 190#i32
+                          then ok 8#u8
+                          else ok 16#u8
+                        let size ←
+                          if second = 190#i32
+                          then ok 1#u8
+                          else ok 2#u8
+                        let i1 ← p.at + 2#usize
+                        let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                        if g.ok
+                        then
+                          let i2 ← p.at + 3#usize
+                          x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                            p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                        else
+                          let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                          if m.ok
+                          then
+                            let i2 ← i1 + m.len
+                            x64_decode.done (x64_ir.PInsn.Load size true 
+                              m.base m.reg m.disp) «at» i2 0#i64
+                          else ok none
+                      else ok none
+          else
+            if second >= 200#i32
+            then
+              if second <= 207#i32
+              then
+                let i1 ← lift (IScalar.hcast .U8 second)
+                let i2 ← lift (i1 &&& 7#u8)
+                let i3 ← p.b <<< 3#i32
+                let i4 ← lift (i2 ||| i3)
+                let i5 ← p.at + 2#usize
+                x64_decode.done (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at» i5
+                  0#i64
+              else
+                if second = 182#i32
+                then
+                  let size ← if second = 182#i32
+                               then ok 1#u8
+                               else ok 2#u8
+                  let i1 ← p.at + 2#usize
+                  let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                  if m.ok
+                  then
+                    let i2 ← i1 + m.len
+                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                      m.reg m.disp) «at» i2 0#i64
+                  else ok none
+                else
+                  if second = 183#i32
+                  then
+                    let size ← if second = 182#i32
+                                 then ok 1#u8
+                                 else ok 2#u8
+                    let i1 ← p.at + 2#usize
+                    let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                    if m.ok
+                    then
+                      let i2 ← i1 + m.len
+                      x64_decode.done (x64_ir.PInsn.Load size false m.base
+                        m.reg m.disp) «at» i2 0#i64
+                    else ok none
+                  else
+                    if second = 190#i32
+                    then
+                      let «from» ←
+                        if second = 190#i32
+                        then ok 8#u8
+                        else ok 16#u8
+                      let size ←
+                        if second = 190#i32
+                        then ok 1#u8
+                        else ok 2#u8
+                      let i1 ← p.at + 2#usize
+                      let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                      if g.ok
+                      then
+                        let i2 ← p.at + 3#usize
+                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                      else
+                        let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                        if m.ok
+                        then
+                          let i2 ← i1 + m.len
+                          x64_decode.done (x64_ir.PInsn.Load size true 
+                            m.base m.reg m.disp) «at» i2 0#i64
+                        else ok none
+                    else
+                      if second = 191#i32
+                      then
+                        let «from» ←
+                          if second = 190#i32
+                          then ok 8#u8
+                          else ok 16#u8
+                        let size ←
+                          if second = 190#i32
+                          then ok 1#u8
+                          else ok 2#u8
+                        let i1 ← p.at + 2#usize
+                        let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                        if g.ok
+                        then
+                          let i2 ← p.at + 3#usize
+                          x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                            p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                        else
+                          let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                          if m.ok
+                          then
+                            let i2 ← i1 + m.len
+                            x64_decode.done (x64_ir.PInsn.Load size true 
+                              m.base m.reg m.disp) «at» i2 0#i64
+                          else ok none
+                      else ok none
+            else
+              if second = 182#i32
+              then
+                let size ← if second = 182#i32
+                             then ok 1#u8
+                             else ok 2#u8
+                let i1 ← p.at + 2#usize
+                let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                if m.ok
+                then
+                  let i2 ← i1 + m.len
+                  x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    m.reg m.disp) «at» i2 0#i64
+                else ok none
+              else
+                if second = 183#i32
+                then
+                  let size ← if second = 182#i32
+                               then ok 1#u8
+                               else ok 2#u8
+                  let i1 ← p.at + 2#usize
+                  let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                  if m.ok
+                  then
+                    let i2 ← i1 + m.len
+                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                      m.reg m.disp) «at» i2 0#i64
+                  else ok none
+                else
+                  if second = 190#i32
+                  then
+                    let «from» ←
+                      if second = 190#i32
+                      then ok 8#u8
+                      else ok 16#u8
+                    let size ← if second = 190#i32
+                                 then ok 1#u8
+                                 else ok 2#u8
+                    let i1 ← p.at + 2#usize
+                    let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                    if g.ok
+                    then
+                      let i2 ← p.at + 3#usize
+                      x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
+                        g.rm g.reg) «at» i2 0#i64
+                    else
+                      let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                      if m.ok
+                      then
+                        let i2 ← i1 + m.len
+                        x64_decode.done (x64_ir.PInsn.Load size true 
+                          m.base m.reg m.disp) «at» i2 0#i64
+                      else ok none
+                  else
+                    if second = 191#i32
+                    then
+                      let «from» ←
+                        if second = 190#i32
+                        then ok 8#u8
+                        else ok 16#u8
+                      let size ←
+                        if second = 190#i32
+                        then ok 1#u8
+                        else ok 2#u8
+                      let i1 ← p.at + 2#usize
+                      let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                      if g.ok
+                      then
+                        let i2 ← p.at + 3#usize
+                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                      else
+                        let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                        if m.ok
+                        then
+                          let i2 ← i1 + m.len
+                          x64_decode.done (x64_ir.PInsn.Load size true 
+                            m.base m.reg m.disp) «at» i2 0#i64
+                        else ok none
+                    else ok none
+      else
+        if second >= 128#i32
+        then
+          if second <= 143#i32
+          then
+            let i1 ← p.at + 2#usize
+            let b ← x64_decode.have bytes i1 4#usize
+            if b
+            then
+              let i2 ← lift (IScalar.hcast .U8 second)
+              let i3 ← p.at + 6#usize
+              let i4 ← x64_decode.read32 bytes i1
+              let i5 ← x64_decode.sx32 i4
+              x64_decode.done (x64_ir.PInsn.Jcc i2 (x64_ir.PTarget.Local
+                0#u32)) «at» i3 i5
+            else ok none
+          else
+            if second >= 200#i32
+            then
+              if second <= 207#i32
+              then
+                let i1 ← lift (IScalar.hcast .U8 second)
+                let i2 ← lift (i1 &&& 7#u8)
+                let i3 ← p.b <<< 3#i32
+                let i4 ← lift (i2 ||| i3)
+                let i5 ← p.at + 2#usize
+                x64_decode.done (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at» i5
+                  0#i64
+              else
+                if second = 182#i32
+                then
+                  let size ← if second = 182#i32
+                               then ok 1#u8
+                               else ok 2#u8
+                  let i1 ← p.at + 2#usize
+                  let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                  if m.ok
+                  then
+                    let i2 ← i1 + m.len
+                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                      m.reg m.disp) «at» i2 0#i64
+                  else ok none
+                else
+                  if second = 183#i32
+                  then
+                    let size ← if second = 182#i32
+                                 then ok 1#u8
+                                 else ok 2#u8
+                    let i1 ← p.at + 2#usize
+                    let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                    if m.ok
+                    then
+                      let i2 ← i1 + m.len
+                      x64_decode.done (x64_ir.PInsn.Load size false m.base
+                        m.reg m.disp) «at» i2 0#i64
+                    else ok none
+                  else
+                    if second = 190#i32
+                    then
+                      let «from» ←
+                        if second = 190#i32
+                        then ok 8#u8
+                        else ok 16#u8
+                      let size ←
+                        if second = 190#i32
+                        then ok 1#u8
+                        else ok 2#u8
+                      let i1 ← p.at + 2#usize
+                      let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                      if g.ok
+                      then
+                        let i2 ← p.at + 3#usize
+                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                      else
+                        let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                        if m.ok
+                        then
+                          let i2 ← i1 + m.len
+                          x64_decode.done (x64_ir.PInsn.Load size true 
+                            m.base m.reg m.disp) «at» i2 0#i64
+                        else ok none
+                    else
+                      if second = 191#i32
+                      then
+                        let «from» ←
+                          if second = 190#i32
+                          then ok 8#u8
+                          else ok 16#u8
+                        let size ←
+                          if second = 190#i32
+                          then ok 1#u8
+                          else ok 2#u8
+                        let i1 ← p.at + 2#usize
+                        let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                        if g.ok
+                        then
+                          let i2 ← p.at + 3#usize
+                          x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                            p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                        else
+                          let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                          if m.ok
+                          then
+                            let i2 ← i1 + m.len
+                            x64_decode.done (x64_ir.PInsn.Load size true 
+                              m.base m.reg m.disp) «at» i2 0#i64
+                          else ok none
+                      else ok none
+            else
+              if second = 182#i32
+              then
+                let size ← if second = 182#i32
+                             then ok 1#u8
+                             else ok 2#u8
+                let i1 ← p.at + 2#usize
+                let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                if m.ok
+                then
+                  let i2 ← i1 + m.len
+                  x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    m.reg m.disp) «at» i2 0#i64
+                else ok none
+              else
+                if second = 183#i32
+                then
+                  let size ← if second = 182#i32
+                               then ok 1#u8
+                               else ok 2#u8
+                  let i1 ← p.at + 2#usize
+                  let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                  if m.ok
+                  then
+                    let i2 ← i1 + m.len
+                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                      m.reg m.disp) «at» i2 0#i64
+                  else ok none
+                else
+                  if second = 190#i32
+                  then
+                    let «from» ←
+                      if second = 190#i32
+                      then ok 8#u8
+                      else ok 16#u8
+                    let size ← if second = 190#i32
+                                 then ok 1#u8
+                                 else ok 2#u8
+                    let i1 ← p.at + 2#usize
+                    let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                    if g.ok
+                    then
+                      let i2 ← p.at + 3#usize
+                      x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
+                        g.rm g.reg) «at» i2 0#i64
+                    else
+                      let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                      if m.ok
+                      then
+                        let i2 ← i1 + m.len
+                        x64_decode.done (x64_ir.PInsn.Load size true 
+                          m.base m.reg m.disp) «at» i2 0#i64
+                      else ok none
+                  else
+                    if second = 191#i32
+                    then
+                      let «from» ←
+                        if second = 190#i32
+                        then ok 8#u8
+                        else ok 16#u8
+                      let size ←
+                        if second = 190#i32
+                        then ok 1#u8
+                        else ok 2#u8
+                      let i1 ← p.at + 2#usize
+                      let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                      if g.ok
+                      then
+                        let i2 ← p.at + 3#usize
+                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                      else
+                        let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                        if m.ok
+                        then
+                          let i2 ← i1 + m.len
+                          x64_decode.done (x64_ir.PInsn.Load size true 
+                            m.base m.reg m.disp) «at» i2 0#i64
+                        else ok none
+                    else ok none
+        else
+          if second >= 200#i32
+          then
+            if second <= 207#i32
+            then
+              let i1 ← lift (IScalar.hcast .U8 second)
+              let i2 ← lift (i1 &&& 7#u8)
+              let i3 ← p.b <<< 3#i32
+              let i4 ← lift (i2 ||| i3)
+              let i5 ← p.at + 2#usize
+              x64_decode.done (x64_ir.PInsn.Bswap (p.w = 1#u8) i4) «at» i5
+                0#i64
+            else
+              if second = 182#i32
+              then
+                let size ← if second = 182#i32
+                             then ok 1#u8
+                             else ok 2#u8
+                let i1 ← p.at + 2#usize
+                let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                if m.ok
+                then
+                  let i2 ← i1 + m.len
+                  x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    m.reg m.disp) «at» i2 0#i64
+                else ok none
+              else
+                if second = 183#i32
+                then
+                  let size ← if second = 182#i32
+                               then ok 1#u8
+                               else ok 2#u8
+                  let i1 ← p.at + 2#usize
+                  let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                  if m.ok
+                  then
+                    let i2 ← i1 + m.len
+                    x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                      m.reg m.disp) «at» i2 0#i64
+                  else ok none
+                else
+                  if second = 190#i32
+                  then
+                    let «from» ←
+                      if second = 190#i32
+                      then ok 8#u8
+                      else ok 16#u8
+                    let size ← if second = 190#i32
+                                 then ok 1#u8
+                                 else ok 2#u8
+                    let i1 ← p.at + 2#usize
+                    let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                    if g.ok
+                    then
+                      let i2 ← p.at + 3#usize
+                      x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
+                        g.rm g.reg) «at» i2 0#i64
+                    else
+                      let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                      if m.ok
+                      then
+                        let i2 ← i1 + m.len
+                        x64_decode.done (x64_ir.PInsn.Load size true 
+                          m.base m.reg m.disp) «at» i2 0#i64
+                      else ok none
+                  else
+                    if second = 191#i32
+                    then
+                      let «from» ←
+                        if second = 190#i32
+                        then ok 8#u8
+                        else ok 16#u8
+                      let size ←
+                        if second = 190#i32
+                        then ok 1#u8
+                        else ok 2#u8
+                      let i1 ← p.at + 2#usize
+                      let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                      if g.ok
+                      then
+                        let i2 ← p.at + 3#usize
+                        x64_decode.done (x64_ir.PInsn.MovSx «from» (
+                          p.w = 1#u8) g.rm g.reg) «at» i2 0#i64
+                      else
+                        let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                        if m.ok
+                        then
+                          let i2 ← i1 + m.len
+                          x64_decode.done (x64_ir.PInsn.Load size true 
+                            m.base m.reg m.disp) «at» i2 0#i64
+                        else ok none
+                    else ok none
+          else
+            if second = 182#i32
+            then
+              let size ← if second = 182#i32
+                           then ok 1#u8
+                           else ok 2#u8
+              let i1 ← p.at + 2#usize
+              let m ← x64_decode.decode_mem bytes i1 p.r p.b
+              if m.ok
+              then
+                let i2 ← i1 + m.len
+                x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                  m.reg m.disp) «at» i2 0#i64
+              else ok none
+            else
+              if second = 183#i32
+              then
+                let size ← if second = 182#i32
+                             then ok 1#u8
+                             else ok 2#u8
+                let i1 ← p.at + 2#usize
+                let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                if m.ok
+                then
+                  let i2 ← i1 + m.len
+                  x64_decode.done (x64_ir.PInsn.Load size false m.base 
+                    m.reg m.disp) «at» i2 0#i64
+                else ok none
+              else
+                if second = 190#i32
+                then
+                  let «from» ←
+                    if second = 190#i32
+                    then ok 8#u8
+                    else ok 16#u8
+                  let size ← if second = 190#i32
+                               then ok 1#u8
+                               else ok 2#u8
+                  let i1 ← p.at + 2#usize
+                  let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                  if g.ok
+                  then
+                    let i2 ← p.at + 3#usize
+                    x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
+                      g.rm g.reg) «at» i2 0#i64
+                  else
+                    let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                    if m.ok
+                    then
+                      let i2 ← i1 + m.len
+                      x64_decode.done (x64_ir.PInsn.Load size true m.base 
+                        m.reg m.disp) «at» i2 0#i64
+                    else ok none
+                else
+                  if second = 191#i32
+                  then
+                    let «from» ←
+                      if second = 190#i32
+                      then ok 8#u8
+                      else ok 16#u8
+                    let size ← if second = 190#i32
+                                 then ok 1#u8
+                                 else ok 2#u8
+                    let i1 ← p.at + 2#usize
+                    let g ← x64_decode.decode_reg2 bytes i1 p.r p.b
+                    if g.ok
+                    then
+                      let i2 ← p.at + 3#usize
+                      x64_decode.done (x64_ir.PInsn.MovSx «from» (p.w = 1#u8)
+                        g.rm g.reg) «at» i2 0#i64
+                    else
+                      let m ← x64_decode.decode_mem bytes i1 p.r p.b
+                      if m.ok
+                      then
+                        let i2 ← i1 + m.len
+                        x64_decode.done (x64_ir.PInsn.Load size true 
+                          m.base m.reg m.disp) «at» i2 0#i64
+                      else ok none
+                  else ok none
+
+/-- [async_ebpf_verified::x64_decode::decode_locked]:
+    Source: '../../src/verified/x64_decode.rs', lines 491:0-554:1 -/
+def x64_decode.decode_locked
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx)
+  (op : Std.U8) :
+  Result (Option x64_decode.Decoded)
+  := do
+  if op = 15#u8
+  then
+    let i ← p.at + 1#usize
+    let second ← x64_decode.byte_at bytes i
+    if second = 177#i32
+    then
+      let i1 ← p.at + 2#usize
+      let m ← x64_decode.decode_mem bytes i1 p.r p.b
+      if m.ok
+      then
+        let i2 ← i1 + m.len
+        x64_decode.done (x64_ir.PInsn.LockCmpxchg (p.w = 1#u8) m.reg 
+          m.base m.disp) «at» i2 0#i64
+      else ok none
+    else ok none
+  else
+    if op = 135#u8
+    then
+      let i ← p.at + 1#usize
+      let m ← x64_decode.decode_mem bytes i p.r p.b
+      if m.ok
+      then
+        let i1 ← i + m.len
+        x64_decode.done (x64_ir.PInsn.Xchg (p.w = 1#u8) m.reg m.base 
+          m.disp) «at» i1 0#i64
+      else ok none
+    else
+      let i ← p.at + 1#usize
+      let m ← x64_decode.decode_mem bytes i p.r p.b
+      if m.ok
+      then
+        let i1 ← i + m.len
+        x64_decode.done (x64_ir.PInsn.LockAlu op (p.w = 1#u8) m.reg m.base
+          m.disp) «at» i1 0#i64
+      else ok none
+
+/-- [async_ebpf_verified::x64_decode::decode_insn]:
+    Source: '../../src/verified/x64_decode.rs', lines 476:0-487:1 -/
+def x64_decode.decode_insn
+  (bytes : Slice Std.U8) («at» : Std.Usize) (p : x64_decode.Pfx) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let head ← x64_decode.byte_at bytes p.at
+  if head < 0#i32
+  then ok none
+  else
+    if p.lock
+    then
+      let i ← lift (IScalar.hcast .U8 head)
+      x64_decode.decode_locked bytes «at» p i
+    else
+      if head = 15#i32
+      then x64_decode.decode_two_byte bytes «at» p
+      else
+        let i ← lift (IScalar.hcast .U8 head)
+        x64_decode.decode_one_byte bytes «at» p i
+
+/-- [async_ebpf_verified::x64_decode::decode_one]:
+    Source: '../../src/verified/x64_decode.rs', lines 466:0-473:1
+    Visibility: public -/
+def x64_decode.decode_one
+  (bytes : Slice Std.U8) («at» : Std.Usize) :
+  Result (Option x64_decode.Decoded)
+  := do
+  let p ← x64_decode.prefixes bytes «at»
+  let insn ← x64_decode.decode_insn bytes «at» p
+  match insn with
+  | none => x64_decode.decode_data bytes «at»
+  | some _ => ok insn
+
+/-- [async_ebpf_verified::x64_encode::AsmError]
+    Source: '../../src/verified/x64_encode.rs', lines 58:0-64:1
+    Visibility: public -/
+@[discriminant isize]
+inductive x64_encode.AsmError where
+| MissingLabel : x64_encode.AsmError
+| RelocationOutOfRange : x64_encode.AsmError
+
+/-- [async_ebpf_verified::x64_encode::{impl core::clone::Clone for async_ebpf_verified::x64_encode::AsmError}::clone]:
+    Source: '../../src/verified/x64_encode.rs', lines 56:15-56:20
+    Visibility: public -/
+def x64_encode.AsmError.Insts.CoreCloneClone.clone
+  (self : x64_encode.AsmError) : Result x64_encode.AsmError := do
+  ok self
+
+/-- Trait implementation: [async_ebpf_verified::x64_encode::{impl core::clone::Clone for async_ebpf_verified::x64_encode::AsmError}]
+    Source: '../../src/verified/x64_encode.rs', lines 56:15-56:20 -/
+@[reducible]
+def x64_encode.AsmError.Insts.CoreCloneClone : core.clone.Clone
+  x64_encode.AsmError := {
+  clone := x64_encode.AsmError.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [async_ebpf_verified::x64_encode::{impl core::marker::Copy for async_ebpf_verified::x64_encode::AsmError}]
+    Source: '../../src/verified/x64_encode.rs', lines 56:9-56:13 -/
+@[reducible]
+def x64_encode.AsmError.Insts.CoreMarkerCopy : core.marker.Copy
+  x64_encode.AsmError := {
+  cloneInst := x64_encode.AsmError.Insts.CoreCloneClone
+}
+
+/-- [async_ebpf_verified::x64_encode::ERR_NONE]
+    Source: '../../src/verified/x64_encode.rs', lines 68:0-68:24 -/
+@[global_simps, irreducible] def x64_encode.ERR_NONE : Std.U32 := 0#u32
+
+/-- [async_ebpf_verified::x64_encode::ERR_MISSING]
+    Source: '../../src/verified/x64_encode.rs', lines 69:0-69:27 -/
+@[global_simps, irreducible] def x64_encode.ERR_MISSING : Std.U32 := 1#u32
+
+/-- [async_ebpf_verified::x64_encode::ERR_RANGE]
+    Source: '../../src/verified/x64_encode.rs', lines 70:0-70:25 -/
+@[global_simps, irreducible] def x64_encode.ERR_RANGE : Std.U32 := 2#u32
+
+/-- [async_ebpf_verified::x64_encode::IMM32_MIN]
+    Source: '../../src/verified/x64_encode.rs', lines 73:0-73:35 -/
+@[global_simps, irreducible]
+def x64_encode.IMM32_MIN : Std.I64 := (-2147483648)#i64
+
+/-- [async_ebpf_verified::x64_encode::IMM32_MAX]
+    Source: '../../src/verified/x64_encode.rs', lines 74:0-74:34 -/
+@[global_simps, irreducible]
+def x64_encode.IMM32_MAX : Std.I64 := 2147483647#i64
+
+/-- [async_ebpf_verified::x64_encode::bit]:
+    Source: '../../src/verified/x64_encode.rs', lines 81:0-87:1 -/
+def x64_encode.bit (b : Bool) : Result Std.U8 := do
+  if b
+  then ok 1#u8
+  else ok 0#u8
+
+/-- [async_ebpf_verified::x64_encode::high]:
+    Source: '../../src/verified/x64_encode.rs', lines 90:0-96:1 -/
+def x64_encode.high (r : Std.U8) : Result Std.U8 := do
+  let i ← lift (r &&& 8#u8)
+  if i != 0#u8
+  then ok 1#u8
+  else ok 0#u8
+
+/-- [async_ebpf_verified::x64_encode::emit1]:
+    Source: '../../src/verified/x64_encode.rs', lines 98:0-100:1 -/
+def x64_encode.emit1
+  (out : alloc.vec.Vec Std.U8) (x : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  alloc.vec.Vec.push out x
+
+/-- [async_ebpf_verified::x64_encode::emit2]:
+    Source: '../../src/verified/x64_encode.rs', lines 102:0-105:1 -/
+def x64_encode.emit2
+  (out : alloc.vec.Vec Std.U8) (x : Std.U16) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← lift (x &&& 255#u16)
+  let i1 ← lift (UScalar.cast .U8 i)
+  let out1 ← alloc.vec.Vec.push out i1
+  let i2 ← x >>> 8#i32
+  let i3 ← lift (i2 &&& 255#u16)
+  let i4 ← lift (UScalar.cast .U8 i3)
+  alloc.vec.Vec.push out1 i4
+
+/-- [async_ebpf_verified::x64_encode::emit4]:
+    Source: '../../src/verified/x64_encode.rs', lines 107:0-112:1 -/
+def x64_encode.emit4
+  (out : alloc.vec.Vec Std.U8) (x : Std.U32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← lift (x &&& 255#u32)
+  let i1 ← lift (UScalar.cast .U8 i)
+  let out1 ← alloc.vec.Vec.push out i1
+  let i2 ← x >>> 8#i32
+  let i3 ← lift (i2 &&& 255#u32)
+  let i4 ← lift (UScalar.cast .U8 i3)
+  let out2 ← alloc.vec.Vec.push out1 i4
+  let i5 ← x >>> 16#i32
+  let i6 ← lift (i5 &&& 255#u32)
+  let i7 ← lift (UScalar.cast .U8 i6)
+  let out3 ← alloc.vec.Vec.push out2 i7
+  let i8 ← x >>> 24#i32
+  let i9 ← lift (i8 &&& 255#u32)
+  let i10 ← lift (UScalar.cast .U8 i9)
+  alloc.vec.Vec.push out3 i10
+
+/-- [async_ebpf_verified::x64_encode::emit8]:
+    Source: '../../src/verified/x64_encode.rs', lines 114:0-123:1 -/
+def x64_encode.emit8
+  (out : alloc.vec.Vec Std.U8) (x : Std.U64) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← lift (x &&& 255#u64)
+  let i1 ← lift (UScalar.cast .U8 i)
+  let out1 ← alloc.vec.Vec.push out i1
+  let i2 ← x >>> 8#i32
+  let i3 ← lift (i2 &&& 255#u64)
+  let i4 ← lift (UScalar.cast .U8 i3)
+  let out2 ← alloc.vec.Vec.push out1 i4
+  let i5 ← x >>> 16#i32
+  let i6 ← lift (i5 &&& 255#u64)
+  let i7 ← lift (UScalar.cast .U8 i6)
+  let out3 ← alloc.vec.Vec.push out2 i7
+  let i8 ← x >>> 24#i32
+  let i9 ← lift (i8 &&& 255#u64)
+  let i10 ← lift (UScalar.cast .U8 i9)
+  let out4 ← alloc.vec.Vec.push out3 i10
+  let i11 ← x >>> 32#i32
+  let i12 ← lift (i11 &&& 255#u64)
+  let i13 ← lift (UScalar.cast .U8 i12)
+  let out5 ← alloc.vec.Vec.push out4 i13
+  let i14 ← x >>> 40#i32
+  let i15 ← lift (i14 &&& 255#u64)
+  let i16 ← lift (UScalar.cast .U8 i15)
+  let out6 ← alloc.vec.Vec.push out5 i16
+  let i17 ← x >>> 48#i32
+  let i18 ← lift (i17 &&& 255#u64)
+  let i19 ← lift (UScalar.cast .U8 i18)
+  let out7 ← alloc.vec.Vec.push out6 i19
+  let i20 ← x >>> 56#i32
+  let i21 ← lift (i20 &&& 255#u64)
+  let i22 ← lift (UScalar.cast .U8 i21)
+  alloc.vec.Vec.push out7 i22
+
+/-- [async_ebpf_verified::x64_encode::emit_modrm]:
+    Source: '../../src/verified/x64_encode.rs', lines 125:0-127:1 -/
+def x64_encode.emit_modrm
+  (out : alloc.vec.Vec Std.U8) (md : Std.U8) (r : Std.U8) (m : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← lift (md &&& 192#u8)
+  let i1 ← lift (r &&& 7#u8)
+  let i2 ← i1 <<< 3#i32
+  let i3 ← lift (i ||| i2)
+  let i4 ← lift (m &&& 7#u8)
+  let i5 ← lift (i3 ||| i4)
+  alloc.vec.Vec.push out i5
+
+/-- [async_ebpf_verified::x64_encode::emit_modrm_reg2reg]:
+    Source: '../../src/verified/x64_encode.rs', lines 129:0-131:1 -/
+def x64_encode.emit_modrm_reg2reg
+  (out : alloc.vec.Vec Std.U8) (r : Std.U8) (m : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  x64_encode.emit_modrm out 192#u8 r m
+
+/-- [async_ebpf_verified::x64_encode::near_disp]:
+    Source: '../../src/verified/x64_encode.rs', lines 134:0-136:1 -/
+def x64_encode.near_disp (d : Std.I32) : Result Bool := do
+  if d >= (-128)#i32
+  then ok (d <= 127#i32)
+  else ok false
+
+/-- [async_ebpf_verified::x64_encode::needs_disp]:
+    Source: '../../src/verified/x64_encode.rs', lines 143:0-145:1 -/
+def x64_encode.needs_disp (rm : Std.U8) : Result Bool := do
+  if rm = x64_ir.RSP
+  then ok true
+  else
+    if rm = x64_ir.RBP
+    then ok true
+    else if rm = x64_ir.R12
+         then ok true
+         else ok (rm = x64_ir.R13)
+
+/-- [async_ebpf_verified::x64_encode::needs_sib]:
+    Source: '../../src/verified/x64_encode.rs', lines 153:0-155:1 -/
+def x64_encode.needs_sib (rm : Std.U8) : Result Bool := do
+  if rm = x64_ir.RSP
+  then ok true
+  else ok (rm = x64_ir.R12)
+
+/-- [async_ebpf_verified::x64_encode::emit_modrm_and_displacement]:
+    Source: '../../src/verified/x64_encode.rs', lines 158:0-178:1 -/
+def x64_encode.emit_modrm_and_displacement
+  (out : alloc.vec.Vec Std.U8) (reg : Std.U8) (rm : Std.U8) (d : Std.I32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let rm1 ← lift (rm &&& 15#u8)
+  let reg1 ← lift (reg &&& 15#u8)
+  let needs ← x64_encode.needs_disp rm1
+  if d = 0#i32
+  then
+    if needs
+    then
+      let near ← x64_encode.near_disp d
+      let md ← if near
+                 then ok 64#u8
+                 else ok 128#u8
+      let out1 ← x64_encode.emit_modrm out md reg1 rm1
+      let b ← x64_encode.needs_sib rm1
+      let out2 ← if b
+                   then x64_encode.emit1 out1 36#u8
+                   else ok out1
+      if near
+      then let i ← lift (IScalar.hcast .U8 d)
+           x64_encode.emit1 out2 i
+      else let i ← lift (IScalar.hcast .U32 d)
+           x64_encode.emit4 out2 i
+    else x64_encode.emit_modrm out 0#u8 reg1 rm1
+  else
+    let near ← x64_encode.near_disp d
+    let md ← if near
+               then ok 64#u8
+               else ok 128#u8
+    let out1 ← x64_encode.emit_modrm out md reg1 rm1
+    let b ← x64_encode.needs_sib rm1
+    let out2 ← if b
+                 then x64_encode.emit1 out1 36#u8
+                 else ok out1
+    if near
+    then let i ← lift (IScalar.hcast .U8 d)
+         x64_encode.emit1 out2 i
+    else let i ← lift (IScalar.hcast .U32 d)
+         x64_encode.emit4 out2 i
+
+/-- [async_ebpf_verified::x64_encode::modrm_and_displacement_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 181:0-191:1 -/
+def x64_encode.modrm_and_displacement_len
+  (rm : Std.U8) (d : Std.I32) : Result Std.Usize := do
+  let rm1 ← lift (rm &&& 15#u8)
+  let needs ← x64_encode.needs_disp rm1
+  if d = 0#i32
+  then
+    if needs
+    then
+      let b ← x64_encode.needs_sib rm1
+      let sib ← if b
+                  then ok 1#usize
+                  else ok 0#usize
+      let b1 ← x64_encode.near_disp d
+      let disp ← if b1
+                   then ok 1#usize
+                   else ok 4#usize
+      let i ← 1#usize + sib
+      i + disp
+    else ok 1#usize
+  else
+    let b ← x64_encode.needs_sib rm1
+    let sib ← if b
+                then ok 1#usize
+                else ok 0#usize
+    let b1 ← x64_encode.near_disp d
+    let disp ← if b1
+                 then ok 1#usize
+                 else ok 4#usize
+    let i ← 1#usize + sib
+    i + disp
+
+/-- [async_ebpf_verified::x64_encode::emit_rex]:
+    Source: '../../src/verified/x64_encode.rs', lines 193:0-195:1 -/
+def x64_encode.emit_rex
+  (out : alloc.vec.Vec Std.U8) (w : Std.U8) (r : Std.U8) (x : Std.U8)
+  (b : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← w <<< 3#i32
+  let i1 ← lift (64#u8 ||| i)
+  let i2 ← r <<< 2#i32
+  let i3 ← lift (i1 ||| i2)
+  let i4 ← x <<< 1#i32
+  let i5 ← lift (i3 ||| i4)
+  let i6 ← lift (i5 ||| b)
+  alloc.vec.Vec.push out i6
+
+/-- [async_ebpf_verified::x64_encode::basic_rex]:
+    Source: '../../src/verified/x64_encode.rs', lines 198:0-200:1 -/
+def x64_encode.basic_rex
+  (w : Std.U8) (src : Std.U8) (dst : Std.U8) : Result Bool := do
+  if w != 0#u8
+  then ok true
+  else
+    let i ← lift (src &&& 8#u8)
+    if i != 0#u8
+    then ok true
+    else let i1 ← lift (dst &&& 8#u8)
+         ok (i1 != 0#u8)
+
+/-- [async_ebpf_verified::x64_encode::emit_basic_rex]:
+    Source: '../../src/verified/x64_encode.rs', lines 204:0-208:1 -/
+def x64_encode.emit_basic_rex
+  (out : alloc.vec.Vec Std.U8) (w : Std.U8) (src : Std.U8) (dst : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let b ← x64_encode.basic_rex w src dst
+  if b
+  then
+    let i ← x64_encode.high src
+    let i1 ← x64_encode.high dst
+    x64_encode.emit_rex out w i 0#u8 i1
+  else ok out
+
+/-- [async_ebpf_verified::x64_encode::basic_rex_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 210:0-216:1 -/
+def x64_encode.basic_rex_len
+  (w : Std.U8) (src : Std.U8) (dst : Std.U8) : Result Std.Usize := do
+  let b ← x64_encode.basic_rex w src dst
+  if b
+  then ok 1#usize
+  else ok 0#usize
+
+/-- [async_ebpf_verified::x64_encode::emit_alu]:
+    Source: '../../src/verified/x64_encode.rs', lines 218:0-222:1 -/
+def x64_encode.emit_alu
+  (out : alloc.vec.Vec Std.U8) (w64 : Bool) (op : Std.U8) (src : Std.U8)
+  (dst : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← x64_encode.bit w64
+  let out1 ← x64_encode.emit_basic_rex out i src dst
+  let out2 ← x64_encode.emit1 out1 op
+  x64_encode.emit_modrm_reg2reg out2 src dst
+
+/-- [async_ebpf_verified::x64_encode::alu_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 224:0-226:1 -/
+def x64_encode.alu_len
+  (w64 : Bool) (src : Std.U8) (dst : Std.U8) : Result Std.Usize := do
+  let i ← x64_encode.bit w64
+  let i1 ← x64_encode.basic_rex_len i src dst
+  i1 + 2#usize
+
+/-- [async_ebpf_verified::x64_encode::emit_load]:
+    Source: '../../src/verified/x64_encode.rs', lines 229:0-241:1 -/
+def x64_encode.emit_load
+  (out : alloc.vec.Vec Std.U8) (size : Std.U8) (src : Std.U8) (dst : Std.U8)
+  (offset : Std.I32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← x64_encode.bit (size = 8#u8)
+  let out1 ← x64_encode.emit_basic_rex out i dst src
+  let out2 ←
+    if size = 1#u8
+    then
+      do
+      let out3 ← x64_encode.emit1 out1 15#u8
+      x64_encode.emit1 out3 182#u8
+    else
+      if size = 2#u8
+      then
+        do
+        let out3 ← x64_encode.emit1 out1 15#u8
+        x64_encode.emit1 out3 183#u8
+      else x64_encode.emit1 out1 139#u8
+  x64_encode.emit_modrm_and_displacement out2 dst src offset
+
+/-- [async_ebpf_verified::x64_encode::load_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 243:0-246:1 -/
+def x64_encode.load_len
+  (size : Std.U8) (src : Std.U8) (dst : Std.U8) (offset : Std.I32) :
+  Result Std.Usize
+  := do
+  let op ←
+    if size = 1#u8
+    then ok 2#usize
+    else if size = 2#u8
+         then ok 2#usize
+         else ok 1#usize
+  let i ← x64_encode.bit (size = 8#u8)
+  let i1 ← x64_encode.basic_rex_len i dst src
+  let i2 ← i1 + op
+  let i3 ← x64_encode.modrm_and_displacement_len src offset
+  i2 + i3
+
+/-- [async_ebpf_verified::x64_encode::emit_load_sx]:
+    Source: '../../src/verified/x64_encode.rs', lines 251:0-266:1 -/
+def x64_encode.emit_load_sx
+  (out : alloc.vec.Vec Std.U8) (size : Std.U8) (src : Std.U8) (dst : Std.U8)
+  (offset : Std.I32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  if size != 8#u8
+  then
+    let out1 ← x64_encode.emit_basic_rex out 1#u8 dst src
+    let out2 ←
+      if size = 4#u8
+      then x64_encode.emit1 out1 99#u8
+      else
+        do
+        let out3 ← x64_encode.emit1 out1 15#u8
+        if size = 1#u8
+        then x64_encode.emit1 out3 190#u8
+        else x64_encode.emit1 out3 191#u8
+    x64_encode.emit_modrm_and_displacement out2 dst src offset
+  else ok out
+
+/-- [async_ebpf_verified::x64_encode::load_sx_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 268:0-275:1 -/
+def x64_encode.load_sx_len
+  (size : Std.U8) (src : Std.U8) (offset : Std.I32) : Result Std.Usize := do
+  if size = 8#u8
+  then ok 0#usize
+  else
+    let op ← if size = 4#u8
+               then ok 1#usize
+               else ok 2#usize
+    let i ← 1#usize + op
+    let i1 ← x64_encode.modrm_and_displacement_len src offset
+    i + i1
+
+/-- [async_ebpf_verified::x64_encode::store_rex]:
+    Source: '../../src/verified/x64_encode.rs', lines 282:0-284:1 -/
+def x64_encode.store_rex
+  (size : Std.U8) (src : Std.U8) (dst : Std.U8) : Result Bool := do
+  if size = 8#u8
+  then ok true
+  else
+    let i ← lift (src &&& 8#u8)
+    if i != 0#u8
+    then ok true
+    else
+      let i1 ← lift (dst &&& 8#u8)
+      if i1 != 0#u8
+      then ok true
+      else ok (size = 1#u8)
+
+/-- [async_ebpf_verified::x64_encode::emit_store]:
+    Source: '../../src/verified/x64_encode.rs', lines 287:0-300:1 -/
+def x64_encode.emit_store
+  (out : alloc.vec.Vec Std.U8) (size : Std.U8) (src : Std.U8) (dst : Std.U8)
+  (offset : Std.I32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let out1 ← if size = 2#u8
+               then x64_encode.emit1 out 102#u8
+               else ok out
+  let b ← x64_encode.store_rex size src dst
+  let out2 ←
+    if b
+    then
+      do
+      let i ← x64_encode.bit (size = 8#u8)
+      let i1 ← x64_encode.high src
+      let i2 ← x64_encode.high dst
+      x64_encode.emit_rex out1 i i1 0#u8 i2
+    else ok out1
+  let out3 ←
+    if size = 1#u8
+    then x64_encode.emit1 out2 136#u8
+    else x64_encode.emit1 out2 137#u8
+  x64_encode.emit_modrm_and_displacement out3 src dst offset
+
+/-- [async_ebpf_verified::x64_encode::store_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 302:0-306:1 -/
+def x64_encode.store_len
+  (size : Std.U8) (src : Std.U8) (dst : Std.U8) (offset : Std.I32) :
+  Result Std.Usize
+  := do
+  let pfx ← if size = 2#u8
+              then ok 1#usize
+              else ok 0#usize
+  let b ← x64_encode.store_rex size src dst
+  let rex ← if b
+              then ok 1#usize
+              else ok 0#usize
+  let i ← pfx + rex
+  let i1 ← i + 1#usize
+  let i2 ← x64_encode.modrm_and_displacement_len dst offset
+  i1 + i2
+
+/-- [async_ebpf_verified::x64_encode::emit_store_imm]:
+    Source: '../../src/verified/x64_encode.rs', lines 309:0-327:1 -/
+def x64_encode.emit_store_imm
+  (out : alloc.vec.Vec Std.U8) (size : Std.U8) (dst : Std.U8)
+  (offset : Std.I32) (imm : Std.I32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let out1 ← if size = 2#u8
+               then x64_encode.emit1 out 102#u8
+               else ok out
+  let i ← x64_encode.bit (size = 8#u8)
+  let out2 ← x64_encode.emit_basic_rex out1 i 0#u8 dst
+  let out3 ←
+    if size = 1#u8
+    then x64_encode.emit1 out2 198#u8
+    else x64_encode.emit1 out2 199#u8
+  let out4 ← x64_encode.emit_modrm_and_displacement out3 0#u8 dst offset
+  if size = 1#u8
+  then let i1 ← lift (IScalar.hcast .U8 imm)
+       x64_encode.emit1 out4 i1
+  else
+    if size = 2#u8
+    then let i1 ← lift (IScalar.hcast .U16 imm)
+         x64_encode.emit2 out4 i1
+    else let i1 ← lift (IScalar.hcast .U32 imm)
+         x64_encode.emit4 out4 i1
+
+/-- [async_ebpf_verified::x64_encode::store_imm_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 329:0-339:1 -/
+def x64_encode.store_imm_len
+  (size : Std.U8) (dst : Std.U8) (offset : Std.I32) : Result Std.Usize := do
+  let pfx ← if size = 2#u8
+              then ok 1#usize
+              else ok 0#usize
+  let imm ←
+    if size = 1#u8
+    then ok 1#usize
+    else if size = 2#u8
+         then ok 2#usize
+         else ok 4#usize
+  let i ← x64_encode.bit (size = 8#u8)
+  let i1 ← x64_encode.basic_rex_len i 0#u8 dst
+  let i2 ← pfx + i1
+  let i3 ← i2 + 1#usize
+  let i4 ← x64_encode.modrm_and_displacement_len dst offset
+  let i5 ← i3 + i4
+  i5 + imm
+
+/-- [async_ebpf_verified::x64_encode::imm_fits32]:
+    Source: '../../src/verified/x64_encode.rs', lines 342:0-344:1 -/
+def x64_encode.imm_fits32 (imm : Std.I64) : Result Bool := do
+  if imm >= x64_encode.IMM32_MIN
+  then ok (imm <= x64_encode.IMM32_MAX)
+  else ok false
+
+/-- [async_ebpf_verified::x64_encode::emit_load_imm]:
+    Source: '../../src/verified/x64_encode.rs', lines 347:0-356:1 -/
+def x64_encode.emit_load_imm
+  (out : alloc.vec.Vec Std.U8) (dst : Std.U8) (imm : Std.I64) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let b ← x64_encode.imm_fits32 imm
+  if b
+  then
+    let out1 ← x64_encode.emit_alu out true 199#u8 0#u8 dst
+    let i ← lift (IScalar.hcast .U32 imm)
+    x64_encode.emit4 out1 i
+  else
+    let out1 ← x64_encode.emit_basic_rex out 1#u8 0#u8 dst
+    let i ← lift (dst &&& 7#u8)
+    let i1 ← lift (184#u8 ||| i)
+    let out2 ← x64_encode.emit1 out1 i1
+    let i2 ← lift (IScalar.hcast .U64 imm)
+    x64_encode.emit8 out2 i2
+
+/-- [async_ebpf_verified::x64_encode::load_imm_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 358:0-364:1 -/
+def x64_encode.load_imm_len
+  (dst : Std.U8) (imm : Std.I64) : Result Std.Usize := do
+  let b ← x64_encode.imm_fits32 imm
+  if b
+  then let i ← x64_encode.alu_len true 0#u8 dst
+       i + 4#usize
+  else
+    let i ← x64_encode.basic_rex_len 1#u8 0#u8 dst
+    let i1 ← i + 1#usize
+    i1 + 8#usize
+
+/-- [async_ebpf_verified::x64_encode::alu_rr_opcode]:
+    Source: '../../src/verified/x64_encode.rs', lines 367:0-378:1 -/
+def x64_encode.alu_rr_opcode (op : x64_ir.AluRR) : Result Std.U8 := do
+  match op with
+  | x64_ir.AluRR.Add => ok 1#u8
+  | x64_ir.AluRR.Sub => ok 41#u8
+  | x64_ir.AluRR.Or => ok 9#u8
+  | x64_ir.AluRR.And => ok 33#u8
+  | x64_ir.AluRR.Xor => ok 49#u8
+  | x64_ir.AluRR.Mov => ok 137#u8
+  | x64_ir.AluRR.Cmp => ok 57#u8
+  | x64_ir.AluRR.Test => ok 133#u8
+
+/-- [async_ebpf_verified::x64_encode::alu_ri_opcode]:
+    Source: '../../src/verified/x64_encode.rs', lines 381:0-392:1 -/
+def x64_encode.alu_ri_opcode (op : x64_ir.AluRI) : Result Std.U8 := do
+  match op with
+  | x64_ir.AluRI.Add => ok 129#u8
+  | x64_ir.AluRI.Or => ok 129#u8
+  | x64_ir.AluRI.And => ok 129#u8
+  | x64_ir.AluRI.Sub => ok 129#u8
+  | x64_ir.AluRI.Xor => ok 129#u8
+  | x64_ir.AluRI.Cmp => ok 129#u8
+  | x64_ir.AluRI.Mov => ok 199#u8
+  | x64_ir.AluRI.Test => ok 247#u8
+
+/-- [async_ebpf_verified::x64_encode::alu_ri_ext]:
+    Source: '../../src/verified/x64_encode.rs', lines 395:0-406:1 -/
+def x64_encode.alu_ri_ext (op : x64_ir.AluRI) : Result Std.U8 := do
+  match op with
+  | x64_ir.AluRI.Add => ok 0#u8
+  | x64_ir.AluRI.Or => ok 1#u8
+  | x64_ir.AluRI.And => ok 4#u8
+  | x64_ir.AluRI.Sub => ok 5#u8
+  | x64_ir.AluRI.Xor => ok 6#u8
+  | x64_ir.AluRI.Cmp => ok 7#u8
+  | x64_ir.AluRI.Mov => ok 0#u8
+  | x64_ir.AluRI.Test => ok 0#u8
+
+/-- [async_ebpf_verified::x64_encode::shift_ext]:
+    Source: '../../src/verified/x64_encode.rs', lines 408:0-414:1 -/
+def x64_encode.shift_ext (op : x64_ir.ShiftOp) : Result Std.U8 := do
+  match op with
+  | x64_ir.ShiftOp.Shl => ok 4#u8
+  | x64_ir.ShiftOp.Shr => ok 5#u8
+  | x64_ir.ShiftOp.Sar => ok 7#u8
+
+/-- [async_ebpf_verified::x64_encode::alu_rm_opcode]:
+    Source: '../../src/verified/x64_encode.rs', lines 417:0-425:1 -/
+def x64_encode.alu_rm_opcode (op : x64_ir.AluRM) : Result Std.U8 := do
+  match op with
+  | x64_ir.AluRM.Sub => ok 43#u8
+  | x64_ir.AluRM.Add => ok 3#u8
+  | x64_ir.AluRM.CmpMR => ok 57#u8
+  | x64_ir.AluRM.CmpRM => ok 59#u8
+  | x64_ir.AluRM.Or => ok 11#u8
+
+/-- [async_ebpf_verified::x64_encode::muldiv_ext]:
+    Source: '../../src/verified/x64_encode.rs', lines 429:0-440:1 -/
+def x64_encode.muldiv_ext
+  (kind : x64_ir.MulDivKind) (signed : Bool) : Result Std.U8 := do
+  match kind with
+  | x64_ir.MulDivKind.Mul => ok 4#u8
+  | x64_ir.MulDivKind.Div => if signed
+                             then ok 7#u8
+                             else ok 6#u8
+  | x64_ir.MulDivKind.Mod => if signed
+                             then ok 7#u8
+                             else ok 6#u8
+
+/-- [async_ebpf_verified::x64_encode::emit_helper_table]: loop body 0:
+    Source: '../../src/verified/x64_encode.rs', lines 450:2-453:3 -/
+@[rust_loop_body]
+def x64_encode.emit_helper_table_loop.body
+  (out : alloc.vec.Vec Std.U8) (k : Std.U32) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U8) × Std.U32) (alloc.vec.Vec
+    Std.U8))
+  := do
+  if k < x64_ir.MAX_EXT_FUNCS
+  then
+    let out1 ← x64_encode.emit8 out 0#u64
+    let k1 ← k + 1#u32
+    ok (cont (out1, k1))
+  else ok (done out)
+
+/-- [async_ebpf_verified::x64_encode::emit_helper_table]: loop 0:
+    Source: '../../src/verified/x64_encode.rs', lines 450:2-453:3 -/
+@[rust_loop]
+def x64_encode.emit_helper_table_loop
+  (out : alloc.vec.Vec Std.U8) (k : Std.U32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  loop
+    (fun (out1, k1) => x64_encode.emit_helper_table_loop.body out1 k1)
+    (out, k)
+
+/-- [async_ebpf_verified::x64_encode::emit_helper_table]:
+    Source: '../../src/verified/x64_encode.rs', lines 448:0-454:1 -/
+@[reducible]
+def x64_encode.emit_helper_table
+  (out : alloc.vec.Vec Std.U8) : Result (alloc.vec.Vec Std.U8) := do
+  x64_encode.emit_helper_table_loop out 0#u32
+
+/-- [async_ebpf_verified::x64_encode::emit_muldiv_rcx]:
+    Source: '../../src/verified/x64_encode.rs', lines 460:0-465:1 -/
+def x64_encode.emit_muldiv_rcx
+  (out : alloc.vec.Vec Std.U8) (w64 : Bool) (kind : x64_ir.MulDivKind)
+  (signed : Bool) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let out1 ←
+    if w64
+    then x64_encode.emit_rex out 1#u8 0#u8 0#u8 0#u8
+    else ok out
+  let i ← x64_encode.muldiv_ext kind signed
+  x64_encode.emit_alu out1 false 247#u8 i x64_ir.RCX
+
+/-- [async_ebpf_verified::x64_encode::muldiv_rcx_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 467:0-470:1 -/
+def x64_encode.muldiv_rcx_len
+  (w64 : Bool) (kind : x64_ir.MulDivKind) (signed : Bool) :
+  Result Std.Usize
+  := do
+  let rex ← if w64
+              then ok 1#usize
+              else ok 0#usize
+  let i ← x64_encode.muldiv_ext kind signed
+  let i1 ← x64_encode.alu_len false i x64_ir.RCX
+  rex + i1
+
+/-- [async_ebpf_verified::x64_encode::emit_movsx]:
+    Source: '../../src/verified/x64_encode.rs', lines 477:0-494:1 -/
+def x64_encode.emit_movsx
+  (out : alloc.vec.Vec Std.U8) («from» : Std.U8) (w64 : Bool) (src : Std.U8)
+  (dst : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let out1 ←
+    if w64
+    then
+      do
+      let i ← x64_encode.bit true
+      let i1 ← x64_encode.high dst
+      let i2 ← x64_encode.high src
+      x64_encode.emit_rex out i i1 0#u8 i2
+    else
+      if «from» = 8#u8
+      then
+        do
+        let i ← x64_encode.bit false
+        let i1 ← x64_encode.high dst
+        let i2 ← x64_encode.high src
+        x64_encode.emit_rex out i i1 0#u8 i2
+      else x64_encode.emit_basic_rex out 0#u8 dst src
+  let out2 ←
+    if «from» = 32#u8
+    then x64_encode.emit1 out1 99#u8
+    else
+      do
+      let out3 ← x64_encode.emit1 out1 15#u8
+      if «from» = 8#u8
+      then x64_encode.emit1 out3 190#u8
+      else x64_encode.emit1 out3 191#u8
+  x64_encode.emit_modrm_reg2reg out2 dst src
+
+/-- [async_ebpf_verified::x64_encode::movsx_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 496:0-504:1 -/
+def x64_encode.movsx_len
+  («from» : Std.U8) (w64 : Bool) (src : Std.U8) (dst : Std.U8) :
+  Result Std.Usize
+  := do
+  let rex ←
+    if w64
+    then ok 1#usize
+    else
+      if «from» = 8#u8
+      then ok 1#usize
+      else x64_encode.basic_rex_len 0#u8 dst src
+  let op ← if «from» = 32#u8
+             then ok 1#usize
+             else ok 2#usize
+  let i ← rex + op
+  i + 1#usize
+
+/-- [async_ebpf_verified::x64_encode::emit_cmp_rcx_minus_one]:
+    Source: '../../src/verified/x64_encode.rs', lines 507:0-514:1 -/
+def x64_encode.emit_cmp_rcx_minus_one
+  (out : alloc.vec.Vec Std.U8) (w64 : Bool) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let out1 ← if w64
+               then x64_encode.emit1 out 72#u8
+               else ok out
+  let out2 ← x64_encode.emit1 out1 131#u8
+  let out3 ← x64_encode.emit1 out2 249#u8
+  x64_encode.emit1 out3 255#u8
+
+/-- [async_ebpf_verified::x64_encode::cmp_rcx_minus_one_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 516:0-519:1 -/
+def x64_encode.cmp_rcx_minus_one_len (w64 : Bool) : Result Std.Usize := do
+  let rex ← if w64
+              then ok 1#usize
+              else ok 0#usize
+  rex + 3#usize
+
+/-- [async_ebpf_verified::x64_encode::emit_call_reg]:
+    Source: '../../src/verified/x64_encode.rs', lines 522:0-528:1 -/
+def x64_encode.emit_call_reg
+  (out : alloc.vec.Vec Std.U8) (reg : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← lift (reg &&& 8#u8)
+  let out1 ← if i != 0#u8
+               then x64_encode.emit1 out 65#u8
+               else ok out
+  let out2 ← x64_encode.emit1 out1 255#u8
+  let i1 ← lift (reg &&& 7#u8)
+  let i2 ← lift (208#u8 ||| i1)
+  x64_encode.emit1 out2 i2
+
+/-- [async_ebpf_verified::x64_encode::call_reg_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 530:0-533:1 -/
+def x64_encode.call_reg_len (reg : Std.U8) : Result Std.Usize := do
+  let i ← lift (reg &&& 8#u8)
+  let rex ← if i != 0#u8
+              then ok 1#usize
+              else ok 0#usize
+  rex + 2#usize
+
+/-- [async_ebpf_verified::x64_encode::emit_guest_load]:
+    Source: '../../src/verified/x64_encode.rs', lines 536:0-542:1 -/
+def x64_encode.emit_guest_load
+  (out : alloc.vec.Vec Std.U8) (size : Std.U8) (sx : Bool) (base : Std.U8)
+  (dst : Std.U8) (disp : Std.I32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  if sx
+  then x64_encode.emit_load_sx out size base dst disp
+  else x64_encode.emit_load out size base dst disp
+
+/-- [async_ebpf_verified::x64_encode::guest_load_len]:
+    Source: '../../src/verified/x64_encode.rs', lines 544:0-550:1 -/
+def x64_encode.guest_load_len
+  (size : Std.U8) (sx : Bool) (base : Std.U8) (dst : Std.U8) (disp : Std.I32) :
+  Result Std.Usize
+  := do
+  if sx
+  then x64_encode.load_sx_len size base disp
+  else x64_encode.load_len size base dst disp
+
+/-- [async_ebpf_verified::x64_encode::encode_one]:
+    Source: '../../src/verified/x64_encode.rs', lines 567:0-771:1
+    Visibility: public -/
+def x64_encode.encode_one
+  (p : x64_ir.PInsn) (out : alloc.vec.Vec Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  match p with
+  | x64_ir.PInsn.PcLabel _ => ok out
+  | x64_ir.PInsn.Local _ => ok out
+  | x64_ir.PInsn.ExitLabel => ok out
+  | x64_ir.PInsn.RetpolineLabel => ok out
+  | x64_ir.PInsn.Push r =>
+    let out1 ← x64_encode.emit_basic_rex out 0#u8 0#u8 r
+    let i ← lift (r &&& 7#u8)
+    let i1 ← lift (80#u8 ||| i)
+    x64_encode.emit1 out1 i1
+  | x64_ir.PInsn.Pop r =>
+    let out1 ← x64_encode.emit_basic_rex out 0#u8 0#u8 r
+    let i ← lift (r &&& 7#u8)
+    let i1 ← lift (88#u8 ||| i)
+    x64_encode.emit1 out1 i1
+  | x64_ir.PInsn.Alu w64 op src dst =>
+    let i ← x64_encode.alu_rr_opcode op
+    x64_encode.emit_alu out w64 i src dst
+  | x64_ir.PInsn.AluImm w64 op dst imm =>
+    let i ← x64_encode.alu_ri_opcode op
+    let i1 ← x64_encode.alu_ri_ext op
+    let out1 ← x64_encode.emit_alu out w64 i i1 dst
+    let i2 ← lift (IScalar.hcast .U32 imm)
+    x64_encode.emit4 out1 i2
+  | x64_ir.PInsn.ShiftImm w64 op dst imm =>
+    let i ← x64_encode.shift_ext op
+    let out1 ← x64_encode.emit_alu out w64 193#u8 i dst
+    let i1 ← lift (IScalar.hcast .U8 imm)
+    x64_encode.emit1 out1 i1
+  | x64_ir.PInsn.ShiftCl w64 op dst =>
+    let i ← x64_encode.shift_ext op
+    x64_encode.emit_alu out w64 211#u8 i dst
+  | x64_ir.PInsn.Neg w64 dst => x64_encode.emit_alu out w64 247#u8 3#u8 dst
+  | x64_ir.PInsn.MulDivRcx w64 kind signed =>
+    x64_encode.emit_muldiv_rcx out w64 kind signed
+  | x64_ir.PInsn.MovSx «from» w64 src dst =>
+    x64_encode.emit_movsx out «from» w64 src dst
+  | x64_ir.PInsn.Bswap w64 dst =>
+    let i ← x64_encode.bit w64
+    let out1 ← x64_encode.emit_basic_rex out i 0#u8 dst
+    let out2 ← x64_encode.emit1 out1 15#u8
+    let i1 ← lift (dst &&& 7#u8)
+    let i2 ← lift (200#u8 ||| i1)
+    x64_encode.emit1 out2 i2
+  | x64_ir.PInsn.Rol16 dst =>
+    let out1 ← x64_encode.emit1 out 102#u8
+    let out2 ← x64_encode.emit_alu out1 false 193#u8 0#u8 dst
+    x64_encode.emit1 out2 8#u8
+  | x64_ir.PInsn.Cmov cc dst src =>
+    let out1 ← x64_encode.emit_basic_rex out 1#u8 dst src
+    let out2 ← x64_encode.emit1 out1 15#u8
+    let i ← lift (cc &&& 15#u8)
+    let i1 ← lift (64#u8 ||| i)
+    let out3 ← x64_encode.emit1 out2 i1
+    x64_encode.emit_modrm_reg2reg out3 dst src
+  | x64_ir.PInsn.LoadImm dst imm => x64_encode.emit_load_imm out dst imm
+  | x64_ir.PInsn.Pushfq => x64_encode.emit1 out 156#u8
+  | x64_ir.PInsn.Popfq => x64_encode.emit1 out 157#u8
+  | x64_ir.PInsn.Cqo =>
+    let out1 ← x64_encode.emit1 out 72#u8
+    x64_encode.emit1 out1 153#u8
+  | x64_ir.PInsn.Cdq => x64_encode.emit1 out 153#u8
+  | x64_ir.PInsn.CmpRcxMinusOne w64 =>
+    x64_encode.emit_cmp_rcx_minus_one out w64
+  | x64_ir.PInsn.CmpEaxImm imm =>
+    let out1 ← x64_encode.emit1 out 61#u8
+    x64_encode.emit4 out1 imm
+  | x64_ir.PInsn.Load size sx base dst disp =>
+    x64_encode.emit_guest_load out size sx base dst disp
+  | x64_ir.PInsn.Store size src base disp =>
+    x64_encode.emit_store out size src base disp
+  | x64_ir.PInsn.StoreImm size base disp imm =>
+    x64_encode.emit_store_imm out size base disp imm
+  | x64_ir.PInsn.AluRM op reg base disp =>
+    let out1 ← x64_encode.emit_basic_rex out 1#u8 reg base
+    let i ← x64_encode.alu_rm_opcode op
+    let out2 ← x64_encode.emit1 out1 i
+    x64_encode.emit_modrm_and_displacement out2 reg base disp
+  | x64_ir.PInsn.StoreRspImm imm =>
+    let out1 ← x64_encode.emit1 out 72#u8
+    let out2 ← x64_encode.emit1 out1 199#u8
+    let out3 ← x64_encode.emit1 out2 4#u8
+    let out4 ← x64_encode.emit1 out3 36#u8
+    x64_encode.emit4 out4 imm
+  | x64_ir.PInsn.StoreRspRax =>
+    let out1 ← x64_encode.emit1 out 72#u8
+    let out2 ← x64_encode.emit1 out1 137#u8
+    let out3 ← x64_encode.emit1 out2 4#u8
+    x64_encode.emit1 out3 36#u8
+  | x64_ir.PInsn.LockAlu op w64 src base disp =>
+    let out1 ← x64_encode.emit1 out 240#u8
+    let i ← x64_encode.bit w64
+    let out2 ← x64_encode.emit_basic_rex out1 i src base
+    let out3 ← x64_encode.emit1 out2 op
+    x64_encode.emit_modrm_and_displacement out3 src base disp
+  | x64_ir.PInsn.LockCmpxchg w64 src base disp =>
+    let out1 ← x64_encode.emit1 out 240#u8
+    let i ← x64_encode.bit w64
+    let out2 ← x64_encode.emit_basic_rex out1 i src base
+    let out3 ← x64_encode.emit1 out2 15#u8
+    let out4 ← x64_encode.emit1 out3 177#u8
+    x64_encode.emit_modrm_and_displacement out4 src base disp
+  | x64_ir.PInsn.Xchg w64 src base disp =>
+    let out1 ← x64_encode.emit1 out 240#u8
+    let i ← x64_encode.bit w64
+    let out2 ← x64_encode.emit_basic_rex out1 i src base
+    let out3 ← x64_encode.emit1 out2 135#u8
+    x64_encode.emit_modrm_and_displacement out3 src base disp
+  | x64_ir.PInsn.Jcc cc _ =>
+    let out1 ← x64_encode.emit1 out 15#u8
+    let out2 ← x64_encode.emit1 out1 cc
+    x64_encode.emit4 out2 0#u32
+  | x64_ir.PInsn.Jmp _ =>
+    let out1 ← x64_encode.emit1 out 233#u8
+    x64_encode.emit4 out1 0#u32
+  | x64_ir.PInsn.JmpNear _ =>
+    let out1 ← x64_encode.emit1 out 235#u8
+    x64_encode.emit4 out1 0#u32
+  | x64_ir.PInsn.Call _ =>
+    let out1 ← x64_encode.emit1 out 232#u8
+    x64_encode.emit4 out1 0#u32
+  | x64_ir.PInsn.Jcc8 cc _ =>
+    let i ← lift (cc &&& 15#u8)
+    let i1 ← lift (112#u8 ||| i)
+    let out1 ← x64_encode.emit1 out i1
+    x64_encode.emit1 out1 0#u8
+  | x64_ir.PInsn.Jmp8 _ =>
+    let out1 ← x64_encode.emit1 out 235#u8
+    x64_encode.emit1 out1 0#u8
+  | x64_ir.PInsn.Ret => x64_encode.emit1 out 195#u8
+  | x64_ir.PInsn.Pause =>
+    let out1 ← x64_encode.emit1 out 243#u8
+    x64_encode.emit1 out1 144#u8
+  | x64_ir.PInsn.Ud2 =>
+    let out1 ← x64_encode.emit1 out 15#u8
+    x64_encode.emit1 out1 11#u8
+  | x64_ir.PInsn.CallReg reg => x64_encode.emit_call_reg out reg
+  | x64_ir.PInsn.RipLoadDispatcher dst =>
+    let out1 ← x64_encode.emit_rex out 1#u8 0#u8 0#u8 0#u8
+    let out2 ← x64_encode.emit1 out1 139#u8
+    let out3 ← x64_encode.emit_modrm out2 0#u8 dst 5#u8
+    x64_encode.emit4 out3 0#u32
+  | x64_ir.PInsn.RipLeaHelperTable dst =>
+    let i ← x64_encode.high dst
+    let out1 ← x64_encode.emit_rex out 1#u8 i 0#u8 0#u8
+    let out2 ← x64_encode.emit1 out1 141#u8
+    let out3 ← x64_encode.emit_modrm out2 0#u8 dst 5#u8
+    x64_encode.emit4 out3 0#u32
+  | x64_ir.PInsn.DispatcherSlot addr => x64_encode.emit8 out addr
+  | x64_ir.PInsn.HelperTable => x64_encode.emit_helper_table out
+
+/-- [async_ebpf_verified::x64_encode::size_of]:
+    Source: '../../src/verified/x64_encode.rs', lines 778:0-890:1
+    Visibility: public -/
+def x64_encode.size_of (p : x64_ir.PInsn) : Result Std.Usize := do
+  match p with
+  | x64_ir.PInsn.PcLabel _ => ok 0#usize
+  | x64_ir.PInsn.Local _ => ok 0#usize
+  | x64_ir.PInsn.ExitLabel => ok 0#usize
+  | x64_ir.PInsn.RetpolineLabel => ok 0#usize
+  | x64_ir.PInsn.Push r =>
+    let i ← x64_encode.basic_rex_len 0#u8 0#u8 r
+    i + 1#usize
+  | x64_ir.PInsn.Pop r =>
+    let i ← x64_encode.basic_rex_len 0#u8 0#u8 r
+    i + 1#usize
+  | x64_ir.PInsn.Alu w64 _ src dst => x64_encode.alu_len w64 src dst
+  | x64_ir.PInsn.AluImm w64 op dst _ =>
+    let i ← x64_encode.alu_ri_ext op
+    let i1 ← x64_encode.alu_len w64 i dst
+    i1 + 4#usize
+  | x64_ir.PInsn.ShiftImm w64 op dst _ =>
+    let i ← x64_encode.shift_ext op
+    let i1 ← x64_encode.alu_len w64 i dst
+    i1 + 1#usize
+  | x64_ir.PInsn.ShiftCl w64 op dst =>
+    let i ← x64_encode.shift_ext op
+    x64_encode.alu_len w64 i dst
+  | x64_ir.PInsn.Neg w64 dst => x64_encode.alu_len w64 3#u8 dst
+  | x64_ir.PInsn.MulDivRcx w64 kind signed =>
+    x64_encode.muldiv_rcx_len w64 kind signed
+  | x64_ir.PInsn.MovSx «from» w64 src dst =>
+    x64_encode.movsx_len «from» w64 src dst
+  | x64_ir.PInsn.Bswap w64 dst =>
+    let i ← x64_encode.bit w64
+    let i1 ← x64_encode.basic_rex_len i 0#u8 dst
+    i1 + 2#usize
+  | x64_ir.PInsn.Rol16 dst =>
+    let i ← x64_encode.alu_len false 0#u8 dst
+    let i1 ← 1#usize + i
+    i1 + 1#usize
+  | x64_ir.PInsn.Cmov _ dst src =>
+    let i ← x64_encode.basic_rex_len 1#u8 dst src
+    i + 3#usize
+  | x64_ir.PInsn.LoadImm dst imm => x64_encode.load_imm_len dst imm
+  | x64_ir.PInsn.Pushfq => ok 1#usize
+  | x64_ir.PInsn.Popfq => ok 1#usize
+  | x64_ir.PInsn.Cqo => ok 2#usize
+  | x64_ir.PInsn.Cdq => ok 1#usize
+  | x64_ir.PInsn.CmpRcxMinusOne w64 => x64_encode.cmp_rcx_minus_one_len w64
+  | x64_ir.PInsn.CmpEaxImm _ => ok 5#usize
+  | x64_ir.PInsn.Load size sx base dst disp =>
+    x64_encode.guest_load_len size sx base dst disp
+  | x64_ir.PInsn.Store size src base disp =>
+    x64_encode.store_len size src base disp
+  | x64_ir.PInsn.StoreImm size base disp _ =>
+    x64_encode.store_imm_len size base disp
+  | x64_ir.PInsn.AluRM _ _ base disp =>
+    let i ← x64_encode.modrm_and_displacement_len base disp
+    2#usize + i
+  | x64_ir.PInsn.StoreRspImm _ => ok 8#usize
+  | x64_ir.PInsn.StoreRspRax => ok 4#usize
+  | x64_ir.PInsn.LockAlu _ w64 src base disp =>
+    let i ← x64_encode.bit w64
+    let i1 ← x64_encode.basic_rex_len i src base
+    let i2 ← 1#usize + i1
+    let i3 ← i2 + 1#usize
+    let i4 ← x64_encode.modrm_and_displacement_len base disp
+    i3 + i4
+  | x64_ir.PInsn.LockCmpxchg w64 src base disp =>
+    let i ← x64_encode.bit w64
+    let i1 ← x64_encode.basic_rex_len i src base
+    let i2 ← 1#usize + i1
+    let i3 ← i2 + 2#usize
+    let i4 ← x64_encode.modrm_and_displacement_len base disp
+    i3 + i4
+  | x64_ir.PInsn.Xchg w64 src base disp =>
+    let i ← x64_encode.bit w64
+    let i1 ← x64_encode.basic_rex_len i src base
+    let i2 ← 1#usize + i1
+    let i3 ← i2 + 1#usize
+    let i4 ← x64_encode.modrm_and_displacement_len base disp
+    i3 + i4
+  | x64_ir.PInsn.Jcc _ _ => ok 6#usize
+  | x64_ir.PInsn.Jmp _ => ok 5#usize
+  | x64_ir.PInsn.JmpNear _ => ok 5#usize
+  | x64_ir.PInsn.Call _ => ok 5#usize
+  | x64_ir.PInsn.Jcc8 _ _ => ok 2#usize
+  | x64_ir.PInsn.Jmp8 _ => ok 2#usize
+  | x64_ir.PInsn.Ret => ok 1#usize
+  | x64_ir.PInsn.Pause => ok 2#usize
+  | x64_ir.PInsn.Ud2 => ok 2#usize
+  | x64_ir.PInsn.CallReg reg => x64_encode.call_reg_len reg
+  | x64_ir.PInsn.RipLoadDispatcher _ => ok 7#usize
+  | x64_ir.PInsn.RipLeaHelperTable _ => ok 7#usize
+  | x64_ir.PInsn.DispatcherSlot _ => ok 8#usize
+  | x64_ir.PInsn.HelperTable => x64_encode.HELPER_TABLE_LEN
+
+/-- [async_ebpf_verified::x64_encode::offsets]: loop body 0:
+    Source: '../../src/verified/x64_encode.rs', lines 904:2-908:3
+    Visibility: public -/
+@[rust_loop_body]
+def x64_encode.offsets_loop.body
+  (code : Slice x64_ir.PInsn) (starts : alloc.vec.Vec Std.U32)
+  (off : Std.Usize) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U32) × Std.Usize × Std.Usize)
+    ((alloc.vec.Vec Std.U32) × Std.Usize))
+  := do
+  let i1 := Slice.len code
+  if i < i1
+  then
+    let i2 ← lift (UScalar.cast .U32 off)
+    let starts1 ← alloc.vec.Vec.push starts i2
+    let p ← Slice.index_usize code i
+    let i3 ← x64_encode.size_of p
+    let off1 ← off + i3
+    let i4 ← i + 1#usize
+    ok (cont (starts1, off1, i4))
+  else ok (done (starts, off))
+
+/-- [async_ebpf_verified::x64_encode::offsets]: loop 0:
+    Source: '../../src/verified/x64_encode.rs', lines 904:2-908:3
+    Visibility: public -/
+@[rust_loop]
+def x64_encode.offsets_loop
+  (code : Slice x64_ir.PInsn) (starts : alloc.vec.Vec Std.U32)
+  (off : Std.Usize) (i : Std.Usize) :
+  Result ((alloc.vec.Vec Std.U32) × Std.Usize)
+  := do
+  loop
+    (fun (starts1, off1, i1) => x64_encode.offsets_loop.body code starts1 off1
+      i1)
+    (starts, off, i)
+
+/-- [async_ebpf_verified::x64_encode::offsets]:
+    Source: '../../src/verified/x64_encode.rs', lines 901:0-910:1
+    Visibility: public -/
+def x64_encode.offsets
+  (code : Slice x64_ir.PInsn) (starts : alloc.vec.Vec Std.U32) :
+  Result (alloc.vec.Vec Std.U32)
+  := do
+  let (starts1, off) ← x64_encode.offsets_loop code starts 0#usize 0#usize
+  let i ← lift (UScalar.cast .U32 off)
+  alloc.vec.Vec.push starts1 i
+
+/-- [async_ebpf_verified::x64_encode::Labels]
+    Source: '../../src/verified/x64_encode.rs', lines 920:0-933:1 -/
+structure x64_encode.Labels where
+  pc : alloc.vec.Vec Std.U32
+  pc_set : alloc.vec.Vec Bool
+  «local» : alloc.vec.Vec Std.U32
+  local_set : alloc.vec.Vec Bool
+  exit : Std.U32
+  exit_set : Bool
+  retpoline : Std.U32
+  retpoline_set : Bool
+  dispatcher : Std.U32
+  dispatcher_set : Bool
+  helper_table : Std.U32
+  helper_table_set : Bool
+
+/-- [async_ebpf_verified::x64_encode::label_kind]:
+    Source: '../../src/verified/x64_encode.rs', lines 938:0-948:1 -/
+def x64_encode.label_kind (p : x64_ir.PInsn) : Result (Std.U8 × Std.U32) := do
+  match p with
+  | x64_ir.PInsn.PcLabel pc => ok (1#u8, pc)
+  | x64_ir.PInsn.Local n => ok (2#u8, n)
+  | x64_ir.PInsn.ExitLabel => ok (3#u8, 0#u32)
+  | x64_ir.PInsn.RetpolineLabel => ok (4#u8, 0#u32)
+  | x64_ir.PInsn.Push _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Pop _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Alu _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.AluImm _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.ShiftImm _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.ShiftCl _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Neg _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.MulDivRcx _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.MovSx _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Bswap _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Rol16 _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Cmov _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.LoadImm _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Pushfq => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Popfq => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Cqo => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Cdq => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.CmpRcxMinusOne _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.CmpEaxImm _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Load _ _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Store _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.StoreImm _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.AluRM _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.StoreRspImm _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.StoreRspRax => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.LockAlu _ _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.LockCmpxchg _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Xchg _ _ _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Jcc _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Jmp _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.JmpNear _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Call _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Jcc8 _ _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Jmp8 _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Ret => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Pause => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.Ud2 => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.CallReg _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.RipLoadDispatcher _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.RipLeaHelperTable _ => ok (0#u8, 0#u32)
+  | x64_ir.PInsn.DispatcherSlot _ => ok (5#u8, 0#u32)
+  | x64_ir.PInsn.HelperTable => ok (6#u8, 0#u32)
+
+/-- [async_ebpf_verified::x64_encode::pc_label_count]: loop body 0:
+    Source: '../../src/verified/x64_encode.rs', lines 954:2-963:3 -/
+@[rust_loop_body]
+def x64_encode.pc_label_count_loop.body
+  (code : Slice x64_ir.PInsn) (n : Std.Usize) (i : Std.Usize) :
+  Result (ControlFlow (Std.Usize × Std.Usize) Std.Usize)
+  := do
+  let i1 := Slice.len code
+  if i < i1
+  then
+    let p ← Slice.index_usize code i
+    let (kind, number) ← x64_encode.label_kind p
+    let n1 ←
+      if kind = 1#u8
+      then
+        do
+        let i2 ← lift (UScalar.cast .Usize number)
+        let k ← i2 + 1#usize
+        if k > n
+        then ok k
+        else ok n
+      else ok n
+    let i2 ← i + 1#usize
+    ok (cont (n1, i2))
+  else ok (done n)
+
+/-- [async_ebpf_verified::x64_encode::pc_label_count]: loop 0:
+    Source: '../../src/verified/x64_encode.rs', lines 954:2-963:3 -/
+@[rust_loop]
+def x64_encode.pc_label_count_loop
+  (code : Slice x64_ir.PInsn) (n : Std.Usize) (i : Std.Usize) :
+  Result Std.Usize
+  := do
+  loop
+    (fun (n1, i1) => x64_encode.pc_label_count_loop.body code n1 i1)
+    (n, i)
+
+/-- [async_ebpf_verified::x64_encode::pc_label_count]:
+    Source: '../../src/verified/x64_encode.rs', lines 951:0-965:1 -/
+@[reducible]
+def x64_encode.pc_label_count
+  (code : Slice x64_ir.PInsn) : Result Std.Usize := do
+  x64_encode.pc_label_count_loop code 0#usize 0#usize
+
+/-- [async_ebpf_verified::x64_encode::local_label_count]: loop body 0:
+    Source: '../../src/verified/x64_encode.rs', lines 971:2-980:3 -/
+@[rust_loop_body]
+def x64_encode.local_label_count_loop.body
+  (code : Slice x64_ir.PInsn) (n : Std.Usize) (i : Std.Usize) :
+  Result (ControlFlow (Std.Usize × Std.Usize) Std.Usize)
+  := do
+  let i1 := Slice.len code
+  if i < i1
+  then
+    let p ← Slice.index_usize code i
+    let (kind, number) ← x64_encode.label_kind p
+    let n1 ←
+      if kind = 2#u8
+      then
+        do
+        let i2 ← lift (UScalar.cast .Usize number)
+        let k ← i2 + 1#usize
+        if k > n
+        then ok k
+        else ok n
+      else ok n
+    let i2 ← i + 1#usize
+    ok (cont (n1, i2))
+  else ok (done n)
+
+/-- [async_ebpf_verified::x64_encode::local_label_count]: loop 0:
+    Source: '../../src/verified/x64_encode.rs', lines 971:2-980:3 -/
+@[rust_loop]
+def x64_encode.local_label_count_loop
+  (code : Slice x64_ir.PInsn) (n : Std.Usize) (i : Std.Usize) :
+  Result Std.Usize
+  := do
+  loop
+    (fun (n1, i1) => x64_encode.local_label_count_loop.body code n1 i1)
+    (n, i)
+
+/-- [async_ebpf_verified::x64_encode::local_label_count]:
+    Source: '../../src/verified/x64_encode.rs', lines 968:0-982:1 -/
+@[reducible]
+def x64_encode.local_label_count
+  (code : Slice x64_ir.PInsn) : Result Std.Usize := do
+  x64_encode.local_label_count_loop code 0#usize 0#usize
+
+/-- [async_ebpf_verified::x64_encode::collect_labels]: loop body 0:
+    Source: '../../src/verified/x64_encode.rs', lines 1005:4-1036:5 -/
+@[rust_loop_body]
+def x64_encode.collect_labels_loop.body
+  (code : Slice x64_ir.PInsn) (starts : Slice Std.U32) (np : Std.Usize)
+  (nl : Std.Usize) (n : Std.Usize) (v : alloc.vec.Vec Std.U32)
+  (v1 : alloc.vec.Vec Bool) (v2 : alloc.vec.Vec Std.U32)
+  (v3 : alloc.vec.Vec Bool) (i : Std.U32) (b : Bool) (i1 : Std.U32) (b1 : Bool)
+  (i2 : Std.U32) (b2 : Bool) (i3 : Std.U32) (b3 : Bool) (i4 : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Bool) ×
+    (alloc.vec.Vec Std.U32) × (alloc.vec.Vec Bool) × Std.U32 × Bool ×
+    Std.U32 × Bool × Std.U32 × Bool × Std.U32 × Bool × Std.Usize)
+    ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Bool) × (alloc.vec.Vec Std.U32)
+    × (alloc.vec.Vec Bool) × Std.U32 × Bool × Std.U32 × Bool × Std.U32 ×
+    Bool × Std.U32 × Bool))
+  := do
+  if i4 < n
+  then
+    let here ← Slice.index_usize starts i4
+    let p ← Slice.index_usize code i4
+    let (kind, number) ← x64_encode.label_kind p
+    let k ← lift (UScalar.cast .Usize number)
+    let (v4, v5, v6, v7, i5, b4, i6, b5, i7, b6, i8, b7) ←
+      if kind = 1#u8
+      then
+        do
+        let (v8, v9) ←
+          if k < np
+          then
+            do
+            let (_, index_mut_back) ←
+              alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+                Std.U32) v k
+            let (_, index_mut_back1) ←
+              alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+                Bool) v1 k
+            let v10 := index_mut_back1 true
+            let v11 := index_mut_back here
+            ok (v11, v10)
+          else ok (v, v1)
+        ok (v8, v9, v2, v3, i, b, i1, b1, i2, b2, i3, b3)
+      else
+        do
+        let (v8, v9, i9, b8, i10, b9, i11, b10, i12, b11) ←
+          if kind = 2#u8
+          then
+            do
+            let (v10, v11) ←
+              if k < nl
+              then
+                do
+                let (_, index_mut_back) ←
+                  alloc.vec.Vec.index_mut
+                    (core.slice.index.SliceIndexUsizeSlice Std.U32) v2 k
+                let (_, index_mut_back1) ←
+                  alloc.vec.Vec.index_mut
+                    (core.slice.index.SliceIndexUsizeSlice Bool) v3 k
+                let v12 := index_mut_back1 true
+                let v13 := index_mut_back here
+                ok (v13, v12)
+              else ok (v2, v3)
+            ok (v10, v11, i, b, i1, b1, i2, b2, i3, b3)
+          else
+            do
+            let (i13, b12, i14, b13, i15, b14, i16, b15) ←
+              if kind = 3#u8
+              then ok (here, true, i1, b1, i2, b2, i3, b3)
+              else
+                do
+                let (i17, b16, i18, b17, i19, b18) ←
+                  if kind = 4#u8
+                  then ok (here, true, i2, b2, i3, b3)
+                  else
+                    do
+                    let (i20, b19, i21, b20) ←
+                      if kind = 5#u8
+                      then
+                        do
+                        let i22 ← if b2
+                                    then ok i2
+                                    else ok here
+                        ok (i22, true, i3, b3)
+                      else
+                        do
+                        let (i22, b21) ←
+                          if kind = 6#u8
+                          then
+                            do
+                            let i23 ← if b3
+                                        then ok i3
+                                        else ok here
+                            ok (i23, true)
+                          else ok (i3, b3)
+                        ok (i2, b2, i22, b21)
+                    ok (i1, b1, i20, b19, i21, b20)
+                ok (i, b, i17, b16, i18, b17, i19, b18)
+            ok (v2, v3, i13, b12, i14, b13, i15, b14, i16, b15)
+        ok (v, v1, v8, v9, i9, b8, i10, b9, i11, b10, i12, b11)
+    let i9 ← i4 + 1#usize
+    ok (cont (v4, v5, v6, v7, i5, b4, i6, b5, i7, b6, i8, b7, i9))
+  else ok (done (v, v1, v2, v3, i, b, i1, b1, i2, b2, i3, b3))
+
+/-- [async_ebpf_verified::x64_encode::collect_labels]: loop 0:
+    Source: '../../src/verified/x64_encode.rs', lines 1005:4-1036:5 -/
+@[rust_loop]
+def x64_encode.collect_labels_loop
+  (code : Slice x64_ir.PInsn) (starts : Slice Std.U32) (np : Std.Usize)
+  (nl : Std.Usize) (v : alloc.vec.Vec Std.U32) (v1 : alloc.vec.Vec Bool)
+  (v2 : alloc.vec.Vec Std.U32) (v3 : alloc.vec.Vec Bool) (i : Std.U32)
+  (b : Bool) (i1 : Std.U32) (b1 : Bool) (i2 : Std.U32) (b2 : Bool)
+  (i3 : Std.U32) (b3 : Bool) (n : Std.Usize) (i4 : Std.Usize) :
+  Result ((alloc.vec.Vec Std.U32) × (alloc.vec.Vec Bool) × (alloc.vec.Vec
+    Std.U32) × (alloc.vec.Vec Bool) × Std.U32 × Bool × Std.U32 × Bool ×
+    Std.U32 × Bool × Std.U32 × Bool)
+  := do
+  loop
+    (fun (v4, v5, v6, v7, i5, b4, i6, b5, i7, b6, i8, b7, i9) =>
+      x64_encode.collect_labels_loop.body code starts np nl n v4 v5 v6 v7 i5 b4
+      i6 b5 i7 b6 i8 b7 i9)
+    (v, v1, v2, v3, i, b, i1, b1, i2, b2, i3, b3, i4)
+
+/-- [async_ebpf_verified::x64_encode::collect_labels]:
+    Source: '../../src/verified/x64_encode.rs', lines 985:0-1039:1 -/
+def x64_encode.collect_labels
+  (code : Slice x64_ir.PInsn) (starts : Slice Std.U32) :
+  Result x64_encode.Labels
+  := do
+  let np ← x64_encode.pc_label_count code
+  let nl ← x64_encode.local_label_count code
+  let v ← alloc.vec.from_elem core.clone.CloneU32 0#u32 np
+  let v1 ← alloc.vec.from_elem core.clone.CloneBool false np
+  let v2 ← alloc.vec.from_elem core.clone.CloneU32 0#u32 nl
+  let v3 ← alloc.vec.from_elem core.clone.CloneBool false nl
+  let n := Slice.len code
+  let i := Slice.len starts
+  if i > n
+  then
+    let (v4, v5, v6, v7, i1, b, i2, b1, i3, b2, i4, b3) ←
+      x64_encode.collect_labels_loop code starts np nl v v1 v2 v3 0#u32 false
+        0#u32 false 0#u32 false 0#u32 false n 0#usize
+    ok
+      {
+        pc := v4,
+        pc_set := v5,
+        «local» := v6,
+        local_set := v7,
+        exit := i1,
+        exit_set := b,
+        retpoline := i2,
+        retpoline_set := b1,
+        dispatcher := i3,
+        dispatcher_set := b2,
+        helper_table := i4,
+        helper_table_set := b3
+      }
+  else
+    ok
+      {
+        pc := v,
+        pc_set := v1,
+        «local» := v2,
+        local_set := v3,
+        exit := 0#u32,
+        exit_set := false,
+        retpoline := 0#u32,
+        retpoline_set := false,
+        dispatcher := 0#u32,
+        dispatcher_set := false,
+        helper_table := 0#u32,
+        helper_table_set := false
+      }
+
+/-- [async_ebpf_verified::x64_encode::target_loc]:
+    Source: '../../src/verified/x64_encode.rs', lines 1048:0-1089:1 -/
+def x64_encode.target_loc
+  (labels : x64_encode.Labels) (target : x64_ir.PTarget) : Result Std.I64 := do
+  match target with
+  | x64_ir.PTarget.Pc pc =>
+    let k ← lift (UScalar.cast .Usize pc)
+    let i := alloc.vec.Vec.len labels.pc
+    if k < i
+    then
+      let b ←
+        alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Bool)
+          labels.pc_set k
+      if b
+      then
+        let i1 ←
+          alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32)
+            labels.pc k
+        ok (UScalar.hcast .I64 i1)
+      else ok (-1)#i64
+    else ok (-1)#i64
+  | x64_ir.PTarget.Exit =>
+    if labels.exit_set
+    then ok (UScalar.hcast .I64 labels.exit)
+    else ok (-1)#i64
+  | x64_ir.PTarget.Retpoline =>
+    if labels.retpoline_set
+    then ok (UScalar.hcast .I64 labels.retpoline)
+    else ok (-1)#i64
+  | x64_ir.PTarget.Local n =>
+    let k ← lift (UScalar.cast .Usize n)
+    let i := alloc.vec.Vec.len labels.local
+    if k < i
+    then
+      let b ←
+        alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Bool)
+          labels.local_set k
+      if b
+      then
+        let i1 ←
+          alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32)
+            labels.local k
+        ok (UScalar.hcast .I64 i1)
+      else ok (-1)#i64
+    else ok (-1)#i64
+
+/-- [async_ebpf_verified::x64_encode::put32]:
+    Source: '../../src/verified/x64_encode.rs', lines 1092:0-1099:1 -/
+def x64_encode.put32
+  (out : alloc.vec.Vec Std.U8) («at» : Std.Usize) (v : Std.U32) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i ← «at» + 4#usize
+  let i1 := alloc.vec.Vec.len out
+  if i <= i1
+  then
+    let i2 ← lift (v &&& 255#u32)
+    let (_, index_mut_back) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U8)
+        out «at»
+    let i3 ← lift (UScalar.cast .U8 i2)
+    let i4 ← v >>> 8#i32
+    let i5 ← lift (i4 &&& 255#u32)
+    let out1 := index_mut_back i3
+    let i6 ← «at» + 1#usize
+    let (_, index_mut_back1) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U8)
+        out1 i6
+    let i7 ← lift (UScalar.cast .U8 i5)
+    let i8 ← v >>> 16#i32
+    let i9 ← lift (i8 &&& 255#u32)
+    let out2 := index_mut_back1 i7
+    let i10 ← «at» + 2#usize
+    let (_, index_mut_back2) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U8)
+        out2 i10
+    let i11 ← lift (UScalar.cast .U8 i9)
+    let i12 ← v >>> 24#i32
+    let i13 ← lift (i12 &&& 255#u32)
+    let out3 := index_mut_back2 i11
+    let i14 ← «at» + 3#usize
+    let (_, index_mut_back3) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U8)
+        out3 i14
+    let i15 ← lift (UScalar.cast .U8 i13)
+    ok (index_mut_back3 i15)
+  else ok out
+
+/-- [async_ebpf_verified::x64_encode::put8]:
+    Source: '../../src/verified/x64_encode.rs', lines 1102:0-1106:1 -/
+def x64_encode.put8
+  (out : alloc.vec.Vec Std.U8) («at» : Std.Usize) (v : Std.U8) :
+  Result (alloc.vec.Vec Std.U8)
+  := do
+  let i := alloc.vec.Vec.len out
+  if «at» < i
+  then
+    let (_, index_mut_back) ←
+      alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice Std.U8)
+        out «at»
+    ok (index_mut_back v)
+  else ok out
+
+/-- [async_ebpf_verified::x64_encode::write_rel32]:
+    Source: '../../src/verified/x64_encode.rs', lines 1114:0-1123:1 -/
+def x64_encode.write_rel32
+  (out : alloc.vec.Vec Std.U8) (base : Std.Usize) (site : Std.Usize)
+  (loc : Std.I64) :
+  Result (Std.U32 × (alloc.vec.Vec Std.U8))
+  := do
+  if loc < 0#i64
+  then ok (x64_encode.ERR_MISSING, out)
+  else
+    let i ← lift (UScalar.hcast .I64 site)
+    let i1 ← i + 4#i64
+    let rel ← loc - i1
+    let i2 ← base + site
+    let i3 ← lift (IScalar.hcast .U32 rel)
+    let out1 ← x64_encode.put32 out i2 i3
+    ok (x64_encode.ERR_NONE, out1)
+
+/-- [async_ebpf_verified::x64_encode::write_rel8]:
+    Source: '../../src/verified/x64_encode.rs', lines 1131:0-1144:1 -/
+def x64_encode.write_rel8
+  (out : alloc.vec.Vec Std.U8) (base : Std.Usize) (site : Std.Usize)
+  (loc : Std.I64) :
+  Result (Std.U32 × (alloc.vec.Vec Std.U8))
+  := do
+  if loc < 0#i64
+  then ok (x64_encode.ERR_MISSING, out)
+  else
+    let i ← lift (UScalar.hcast .I64 site)
+    let i1 ← i + 1#i64
+    let rel ← loc - i1
+    if rel < (-128)#i64
+    then ok (x64_encode.ERR_RANGE, out)
+    else
+      if rel > 127#i64
+      then ok (x64_encode.ERR_RANGE, out)
+      else
+        let i2 ← base + site
+        let i3 ← lift (IScalar.hcast .U8 rel)
+        let out1 ← x64_encode.put8 out i2 i3
+        ok (x64_encode.ERR_NONE, out1)
+
+/-- [async_ebpf_verified::x64_encode::patch]:
+    Source: '../../src/verified/x64_encode.rs', lines 1148:0-1193:1 -/
+def x64_encode.patch
+  (labels : x64_encode.Labels) (out : alloc.vec.Vec Std.U8) (base : Std.Usize)
+  (here : Std.Usize) (p : x64_ir.PInsn) :
+  Result (Std.U32 × (alloc.vec.Vec Std.U8))
+  := do
+  match p with
+  | x64_ir.PInsn.PcLabel _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Local _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.ExitLabel => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.RetpolineLabel => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Push _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Pop _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Alu _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.AluImm _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.ShiftImm _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.ShiftCl _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Neg _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.MulDivRcx _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.MovSx _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Bswap _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Rol16 _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Cmov _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.LoadImm _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Pushfq => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Popfq => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Cqo => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Cdq => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.CmpRcxMinusOne _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.CmpEaxImm _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Load _ _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Store _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.StoreImm _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.AluRM _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.StoreRspImm _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.StoreRspRax => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.LockAlu _ _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.LockCmpxchg _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Xchg _ _ _ _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Jcc _ target =>
+    let loc ← x64_encode.target_loc labels target
+    let i ← here + 2#usize
+    x64_encode.write_rel32 out base i loc
+  | x64_ir.PInsn.Jmp target =>
+    let loc ← x64_encode.target_loc labels target
+    let i ← here + 1#usize
+    x64_encode.write_rel32 out base i loc
+  | x64_ir.PInsn.JmpNear target =>
+    let loc ← x64_encode.target_loc labels target
+    let i ← here + 1#usize
+    x64_encode.write_rel8 out base i loc
+  | x64_ir.PInsn.Call target =>
+    let loc ← x64_encode.target_loc labels target
+    let i ← here + 1#usize
+    x64_encode.write_rel32 out base i loc
+  | x64_ir.PInsn.Jcc8 _ target =>
+    let loc ← x64_encode.target_loc labels (x64_ir.PTarget.Local target)
+    let i ← here + 1#usize
+    x64_encode.write_rel8 out base i loc
+  | x64_ir.PInsn.Jmp8 target =>
+    let loc ← x64_encode.target_loc labels (x64_ir.PTarget.Local target)
+    let i ← here + 1#usize
+    x64_encode.write_rel8 out base i loc
+  | x64_ir.PInsn.Ret => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Pause => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.Ud2 => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.CallReg _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.RipLoadDispatcher _ =>
+    let loc ←
+      if labels.dispatcher_set
+      then ok (UScalar.hcast .I64 labels.dispatcher)
+      else ok (-1)#i64
+    let i ← here + 3#usize
+    x64_encode.write_rel32 out base i loc
+  | x64_ir.PInsn.RipLeaHelperTable _ =>
+    let loc ←
+      if labels.helper_table_set
+      then ok (UScalar.hcast .I64 labels.helper_table)
+      else ok (-1)#i64
+    let i ← here + 3#usize
+    x64_encode.write_rel32 out base i loc
+  | x64_ir.PInsn.DispatcherSlot _ => ok (x64_encode.ERR_NONE, out)
+  | x64_ir.PInsn.HelperTable => ok (x64_encode.ERR_NONE, out)
+
+/-- [async_ebpf_verified::x64_encode::assemble]: loop body 0:
+    Source: '../../src/verified/x64_encode.rs', lines 1213:4-1219:5
+    Visibility: public -/
+@[rust_loop_body]
+def x64_encode.assemble_loop.body
+  (code : Slice x64_ir.PInsn) (starts : alloc.vec.Vec Std.U32)
+  (labels : x64_encode.Labels) (base : Std.Usize) (n : Std.Usize)
+  (out : alloc.vec.Vec Std.U8) (err : Std.U32) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U8) × Std.U32 × Std.Usize)
+    ((alloc.vec.Vec Std.U8) × Std.U32))
+  := do
+  if i < n
+  then
+    if err = x64_encode.ERR_NONE
+    then
+      let p ← Slice.index_usize code i
+      let i1 ←
+        alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U32)
+          starts i
+      let here ← lift (UScalar.cast .Usize i1)
+      let out1 ← x64_encode.encode_one p out
+      let (err1, out2) ← x64_encode.patch labels out1 base here p
+      let i2 ← i + 1#usize
+      ok (cont (out2, err1, i2))
+    else ok (done (out, err))
+  else ok (done (out, err))
+
+/-- [async_ebpf_verified::x64_encode::assemble]: loop 0:
+    Source: '../../src/verified/x64_encode.rs', lines 1213:4-1219:5
+    Visibility: public -/
+@[rust_loop]
+def x64_encode.assemble_loop
+  (code : Slice x64_ir.PInsn) (out : alloc.vec.Vec Std.U8)
+  (starts : alloc.vec.Vec Std.U32) (labels : x64_encode.Labels)
+  (base : Std.Usize) (n : Std.Usize) (err : Std.U32) (i : Std.Usize) :
+  Result ((alloc.vec.Vec Std.U8) × Std.U32)
+  := do
+  loop
+    (fun (out1, err1, i1) => x64_encode.assemble_loop.body code starts labels
+      base n out1 err1 i1)
+    (out, err, i)
+
+/-- [async_ebpf_verified::x64_encode::assemble]:
+    Source: '../../src/verified/x64_encode.rs', lines 1201:0-1229:1
+    Visibility: public -/
+def x64_encode.assemble
+  (code : Slice x64_ir.PInsn) (out : alloc.vec.Vec Std.U8) :
+  Result ((core.result.Result Unit x64_encode.AsmError) × (alloc.vec.Vec
+    Std.U8))
+  := do
+  let starts ← x64_encode.offsets code (alloc.vec.Vec.new Std.U32)
+  let s := alloc.vec.Vec.deref starts
+  let labels ← x64_encode.collect_labels code s
+  let base := alloc.vec.Vec.len out
+  let n := Slice.len code
+  let i := alloc.vec.Vec.len starts
+  if i > n
+  then
+    let (out1, err) ←
+      x64_encode.assemble_loop code out starts labels base n
+        x64_encode.ERR_NONE 0#usize
+    if err = x64_encode.ERR_MISSING
+    then ok (core.result.Result.Err x64_encode.AsmError.MissingLabel, out1)
+    else
+      if err = x64_encode.ERR_RANGE
+      then
+        ok (core.result.Result.Err x64_encode.AsmError.RelocationOutOfRange,
+          out1)
+      else ok (core.result.Result.Ok (), out1)
+  else
+    if x64_encode.ERR_NONE = x64_encode.ERR_MISSING
+    then ok (core.result.Result.Err x64_encode.AsmError.MissingLabel, out)
+    else
+      if x64_encode.ERR_NONE = x64_encode.ERR_RANGE
+      then
+        ok (core.result.Result.Err x64_encode.AsmError.RelocationOutOfRange,
+          out)
+      else ok (core.result.Result.Ok (), out)
+
 /-- [async_ebpf_verified::x64_ir::frame::GROUP_BASE_OFFSET]
     Source: '../../src/verified/x64_ir.rs', lines 140:2-140:42
     Visibility: public -/
@@ -8412,11 +12884,6 @@ def x64_ir.PlanEntry.Insts.CoreMarkerCopy : core.marker.Copy x64_ir.PlanEntry
 @[global_simps, irreducible]
 def x64_ir.frame.FRAME_RESERVED : Std.I32 := 160#i32
 
-/-- [async_ebpf_verified::x64_ir::MAX_EXT_FUNCS]
-    Source: '../../src/verified/x64_ir.rs', lines 167:0-167:34
-    Visibility: public -/
-@[global_simps, irreducible] def x64_ir.MAX_EXT_FUNCS : Std.U32 := 64#u32
-
 /-- [async_ebpf_verified::x64_ir::{impl core::clone::Clone for async_ebpf_verified::x64_ir::Cfg}::clone]:
     Source: '../../src/verified/x64_ir.rs', lines 170:15-170:20
     Visibility: public -/
@@ -8686,6 +13153,385 @@ def x64_ir.AluRM.Insts.CoreMarkerCopy : core.marker.Copy x64_ir.AluRM := {
     Source: '../../src/verified/x64_ir.rs', lines 731:0-731:32
     Visibility: public -/
 @[global_simps, irreducible] def x64_ir.MAX_LEAS : Std.U32 := 65536#u32
+
+/-- [async_ebpf_verified::x64_layout::FIRST_PAGE_LEN]
+    Source: '../../src/verified/x64_layout.rs', lines 36:0-36:37
+    Visibility: public -/
+@[global_simps, irreducible]
+def x64_layout.FIRST_PAGE_LEN : Std.U64 := 4096#u64
+
+/-- [async_ebpf_verified::x64_layout::DESCRIPTOR_LEN]
+    Source: '../../src/verified/x64_layout.rs', lines 39:0-39:36
+    Visibility: public -/
+@[global_simps, irreducible] def x64_layout.DESCRIPTOR_LEN : Std.U64 := 200#u64
+
+/-- [async_ebpf_verified::x64_layout::MIN_REGION_SPAN]
+    Source: '../../src/verified/x64_layout.rs', lines 43:0-43:38
+    Visibility: public -/
+@[global_simps, irreducible]
+def x64_layout.MIN_REGION_SPAN : Std.U64 := 4096#u64
+
+/-- [async_ebpf_verified::x64_layout::NATIVE_CALL_RESERVE]
+    Source: '../../src/verified/x64_layout.rs', lines 47:0-47:41
+    Visibility: public -/
+@[global_simps, irreducible]
+def x64_layout.NATIVE_CALL_RESERVE : Std.U64 := 240#u64
+
+/-- [async_ebpf_verified::x64_layout::NativeLayout]
+    Source: '../../src/verified/x64_layout.rs', lines 58:0-86:1
+    Visibility: public -/
+structure x64_layout.NativeLayout where
+  stack_guest_bottom : Std.U64
+  stack_guest_top : Std.U64
+  stack_native_base : Std.U64
+  data_guest_bottom : Std.U64
+  data_guest_top : Std.U64
+  data_native_base : Std.U64
+  descriptor : Std.U64
+  native_stack_lo : Std.U64
+  native_stack_hi : Std.U64
+  guest_floor : Std.U64
+  native_floor : Std.U64
+  frame_size : Std.U64
+  frame_stride : Std.U64
+
+/-- [async_ebpf_verified::x64_layout::{impl core::clone::Clone for async_ebpf_verified::x64_layout::NativeLayout}::clone]:
+    Source: '../../src/verified/x64_layout.rs', lines 56:15-56:20
+    Visibility: public -/
+def x64_layout.NativeLayout.Insts.CoreCloneClone.clone
+  (self : x64_layout.NativeLayout) : Result x64_layout.NativeLayout := do
+  ok self
+
+/-- Trait implementation: [async_ebpf_verified::x64_layout::{impl core::clone::Clone for async_ebpf_verified::x64_layout::NativeLayout}]
+    Source: '../../src/verified/x64_layout.rs', lines 56:15-56:20 -/
+@[reducible]
+def x64_layout.NativeLayout.Insts.CoreCloneClone : core.clone.Clone
+  x64_layout.NativeLayout := {
+  clone := x64_layout.NativeLayout.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [async_ebpf_verified::x64_layout::{impl core::marker::Copy for async_ebpf_verified::x64_layout::NativeLayout}]
+    Source: '../../src/verified/x64_layout.rs', lines 56:9-56:13 -/
+@[reducible]
+def x64_layout.NativeLayout.Insts.CoreMarkerCopy : core.marker.Copy
+  x64_layout.NativeLayout := {
+  cloneInst := x64_layout.NativeLayout.Insts.CoreCloneClone
+}
+
+/-- [async_ebpf_verified::x64_layout::fits]:
+    Source: '../../src/verified/x64_layout.rs', lines 93:0-95:1 -/
+def x64_layout.fits (a : Std.U64) (b : Std.U64) : Result Bool := do
+  let i ← core.num.U64.MAX - b
+  ok (a <= i)
+
+/-- [async_ebpf_verified::x64_layout::sub_mod]:
+    Source: '../../src/verified/x64_layout.rs', lines 101:0-107:1 -/
+def x64_layout.sub_mod (a : Std.U64) (b : Std.U64) : Result Std.U64 := do
+  if a >= b
+  then a - b
+  else let i ← b - a
+       let i1 ← core.num.U64.MAX - i
+       i1 + 1#u64
+
+/-- [async_ebpf_verified::x64_layout::disjoint]:
+    Source: '../../src/verified/x64_layout.rs', lines 115:0-129:1 -/
+def x64_layout.disjoint
+  (a_lo : Std.U64) (a_len : Std.U64) (b_lo : Std.U64) (b_len : Std.U64) :
+  Result Bool
+  := do
+  let a_fits ← x64_layout.fits a_lo a_len
+  let b_fits ← x64_layout.fits b_lo b_len
+  if a_fits
+  then
+    if b_fits
+    then
+      let a_hi ← a_lo + a_len
+      let b_hi ← b_lo + b_len
+      if a_hi <= b_lo
+      then ok true
+      else ok (b_hi <= a_lo)
+    else ok false
+  else ok false
+
+/-- [async_ebpf_verified::x64_layout::stack_span]:
+    Source: '../../src/verified/x64_layout.rs', lines 134:0-139:1 -/
+def x64_layout.stack_span (l : x64_layout.NativeLayout) : Result Std.U64 := do
+  if l.stack_guest_bottom > l.stack_guest_top
+  then ok 0#u64
+  else l.stack_guest_top - l.stack_guest_bottom
+
+/-- [async_ebpf_verified::x64_layout::data_span]:
+    Source: '../../src/verified/x64_layout.rs', lines 143:0-148:1 -/
+def x64_layout.data_span (l : x64_layout.NativeLayout) : Result Std.U64 := do
+  if l.data_guest_bottom > l.data_guest_top
+  then ok 0#u64
+  else l.data_guest_top - l.data_guest_bottom
+
+/-- [async_ebpf_verified::x64_layout::native_stack_span]:
+    Source: '../../src/verified/x64_layout.rs', lines 154:0-159:1 -/
+def x64_layout.native_stack_span
+  (l : x64_layout.NativeLayout) : Result Std.U64 := do
+  if l.native_stack_lo > l.native_stack_hi
+  then ok 0#u64
+  else l.native_stack_hi - l.native_stack_lo
+
+/-- [async_ebpf_verified::x64_layout::stack_ordered]:
+    Source: '../../src/verified/x64_layout.rs', lines 162:0-164:1 -/
+def x64_layout.stack_ordered (l : x64_layout.NativeLayout) : Result Bool := do
+  ok (l.stack_guest_bottom <= l.stack_guest_top)
+
+/-- [async_ebpf_verified::x64_layout::data_ordered]:
+    Source: '../../src/verified/x64_layout.rs', lines 167:0-169:1 -/
+def x64_layout.data_ordered (l : x64_layout.NativeLayout) : Result Bool := do
+  ok (l.data_guest_bottom <= l.data_guest_top)
+
+/-- [async_ebpf_verified::x64_layout::guest_disjoint]:
+    Source: '../../src/verified/x64_layout.rs', lines 173:0-177:1 -/
+def x64_layout.guest_disjoint (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_s ← x64_layout.stack_span l
+  let span_d ← x64_layout.data_span l
+  x64_layout.disjoint l.stack_guest_bottom span_s l.data_guest_bottom span_d
+
+/-- [async_ebpf_verified::x64_layout::stack_native_no_wrap]:
+    Source: '../../src/verified/x64_layout.rs', lines 181:0-184:1 -/
+def x64_layout.stack_native_no_wrap
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_s ← x64_layout.stack_span l
+  x64_layout.fits l.stack_native_base span_s
+
+/-- [async_ebpf_verified::x64_layout::data_native_no_wrap]:
+    Source: '../../src/verified/x64_layout.rs', lines 188:0-191:1 -/
+def x64_layout.data_native_no_wrap
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_d ← x64_layout.data_span l
+  x64_layout.fits l.data_native_base span_d
+
+/-- [async_ebpf_verified::x64_layout::desc_no_wrap]:
+    Source: '../../src/verified/x64_layout.rs', lines 195:0-197:1 -/
+def x64_layout.desc_no_wrap (l : x64_layout.NativeLayout) : Result Bool := do
+  x64_layout.fits l.descriptor x64_layout.DESCRIPTOR_LEN
+
+/-- [async_ebpf_verified::x64_layout::native_stack_no_wrap]:
+    Source: '../../src/verified/x64_layout.rs', lines 201:0-203:1 -/
+def x64_layout.native_stack_no_wrap
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  ok (l.native_stack_lo <= l.native_stack_hi)
+
+/-- [async_ebpf_verified::x64_layout::native_disjoint]:
+    Source: '../../src/verified/x64_layout.rs', lines 207:0-211:1 -/
+def x64_layout.native_disjoint
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_s ← x64_layout.stack_span l
+  let span_d ← x64_layout.data_span l
+  x64_layout.disjoint l.stack_native_base span_s l.data_native_base span_d
+
+/-- [async_ebpf_verified::x64_layout::stack_native_off_page]:
+    Source: '../../src/verified/x64_layout.rs', lines 215:0-218:1 -/
+def x64_layout.stack_native_off_page
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_s ← x64_layout.stack_span l
+  x64_layout.disjoint 0#u64 x64_layout.FIRST_PAGE_LEN l.stack_native_base
+    span_s
+
+/-- [async_ebpf_verified::x64_layout::data_native_off_page]:
+    Source: '../../src/verified/x64_layout.rs', lines 221:0-224:1 -/
+def x64_layout.data_native_off_page
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_d ← x64_layout.data_span l
+  x64_layout.disjoint 0#u64 x64_layout.FIRST_PAGE_LEN l.data_native_base span_d
+
+/-- [async_ebpf_verified::x64_layout::stack_native_off_desc]:
+    Source: '../../src/verified/x64_layout.rs', lines 229:0-232:1 -/
+def x64_layout.stack_native_off_desc
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_s ← x64_layout.stack_span l
+  x64_layout.disjoint l.descriptor x64_layout.DESCRIPTOR_LEN
+    l.stack_native_base span_s
+
+/-- [async_ebpf_verified::x64_layout::data_native_off_desc]:
+    Source: '../../src/verified/x64_layout.rs', lines 235:0-238:1 -/
+def x64_layout.data_native_off_desc
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_d ← x64_layout.data_span l
+  x64_layout.disjoint l.descriptor x64_layout.DESCRIPTOR_LEN l.data_native_base
+    span_d
+
+/-- [async_ebpf_verified::x64_layout::desc_off_page]:
+    Source: '../../src/verified/x64_layout.rs', lines 241:0-243:1 -/
+def x64_layout.desc_off_page (l : x64_layout.NativeLayout) : Result Bool := do
+  x64_layout.disjoint 0#u64 x64_layout.FIRST_PAGE_LEN l.descriptor
+    x64_layout.DESCRIPTOR_LEN
+
+/-- [async_ebpf_verified::x64_layout::native_stack_off_page]:
+    Source: '../../src/verified/x64_layout.rs', lines 247:0-250:1 -/
+def x64_layout.native_stack_off_page
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_n ← x64_layout.native_stack_span l
+  x64_layout.disjoint 0#u64 x64_layout.FIRST_PAGE_LEN l.native_stack_lo span_n
+
+/-- [async_ebpf_verified::x64_layout::stack_native_off_native_stack]:
+    Source: '../../src/verified/x64_layout.rs', lines 254:0-258:1 -/
+def x64_layout.stack_native_off_native_stack
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_n ← x64_layout.native_stack_span l
+  let span_s ← x64_layout.stack_span l
+  x64_layout.disjoint l.native_stack_lo span_n l.stack_native_base span_s
+
+/-- [async_ebpf_verified::x64_layout::data_native_off_native_stack]:
+    Source: '../../src/verified/x64_layout.rs', lines 261:0-265:1 -/
+def x64_layout.data_native_off_native_stack
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_n ← x64_layout.native_stack_span l
+  let span_d ← x64_layout.data_span l
+  x64_layout.disjoint l.native_stack_lo span_n l.data_native_base span_d
+
+/-- [async_ebpf_verified::x64_layout::desc_off_native_stack]:
+    Source: '../../src/verified/x64_layout.rs', lines 268:0-271:1 -/
+def x64_layout.desc_off_native_stack
+  (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_n ← x64_layout.native_stack_span l
+  x64_layout.disjoint l.native_stack_lo span_n l.descriptor
+    x64_layout.DESCRIPTOR_LEN
+
+/-- [async_ebpf_verified::x64_layout::floor_room]:
+    Source: '../../src/verified/x64_layout.rs', lines 276:0-285:1 -/
+def x64_layout.floor_room (l : x64_layout.NativeLayout) : Result Bool := do
+  let b ← x64_layout.fits l.stack_native_base l.frame_size
+  if b
+  then
+    let one_frame ← l.stack_native_base + l.frame_size
+    let b1 ← x64_layout.fits one_frame l.frame_stride
+    if b1
+    then let i ← one_frame + l.frame_stride
+         ok (i <= l.guest_floor)
+    else ok false
+  else ok false
+
+/-- [async_ebpf_verified::x64_layout::floor_native]:
+    Source: '../../src/verified/x64_layout.rs', lines 290:0-295:1 -/
+def x64_layout.floor_native (l : x64_layout.NativeLayout) : Result Bool := do
+  let b ← x64_layout.fits l.native_stack_lo x64_layout.NATIVE_CALL_RESERVE
+  if b
+  then
+    let i ← l.native_stack_lo + x64_layout.NATIVE_CALL_RESERVE
+    ok (i <= l.native_floor)
+  else ok false
+
+/-- [async_ebpf_verified::x64_layout::stack_wide]:
+    Source: '../../src/verified/x64_layout.rs', lines 299:0-302:1 -/
+def x64_layout.stack_wide (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_s ← x64_layout.stack_span l
+  ok (span_s >= x64_layout.MIN_REGION_SPAN)
+
+/-- [async_ebpf_verified::x64_layout::data_wide]:
+    Source: '../../src/verified/x64_layout.rs', lines 305:0-308:1 -/
+def x64_layout.data_wide (l : x64_layout.NativeLayout) : Result Bool := do
+  let span_d ← x64_layout.data_span l
+  ok (span_d >= x64_layout.MIN_REGION_SPAN)
+
+/-- [async_ebpf_verified::x64_layout::layout_ok]:
+    Source: '../../src/verified/x64_layout.rs', lines 318:0-361:1
+    Visibility: public -/
+def x64_layout.layout_ok (l : x64_layout.NativeLayout) : Result Bool := do
+  let ordered_s ← x64_layout.stack_ordered l
+  let ordered_d ← x64_layout.data_ordered l
+  let wide_s ← x64_layout.stack_wide l
+  let wide_d ← x64_layout.data_wide l
+  let nowrap_s ← x64_layout.stack_native_no_wrap l
+  let nowrap_d ← x64_layout.data_native_no_wrap l
+  let nowrap_desc ← x64_layout.desc_no_wrap l
+  let nowrap_native ← x64_layout.native_stack_no_wrap l
+  let guest_pair ← x64_layout.guest_disjoint l
+  let native_pair ← x64_layout.native_disjoint l
+  let page_s ← x64_layout.stack_native_off_page l
+  let page_d ← x64_layout.data_native_off_page l
+  let page_desc ← x64_layout.desc_off_page l
+  let page_native ← x64_layout.native_stack_off_page l
+  let desc_s ← x64_layout.stack_native_off_desc l
+  let desc_d ← x64_layout.data_native_off_desc l
+  let native_s ← x64_layout.stack_native_off_native_stack l
+  let native_d ← x64_layout.data_native_off_native_stack l
+  let native_desc ← x64_layout.desc_off_native_stack l
+  let room_guest ← x64_layout.floor_room l
+  let room_native ← x64_layout.floor_native l
+  if ordered_s
+  then
+    if ordered_d
+    then
+      if wide_s
+      then
+        if wide_d
+        then
+          if nowrap_s
+          then
+            if nowrap_d
+            then
+              if nowrap_desc
+              then
+                if nowrap_native
+                then
+                  if guest_pair
+                  then
+                    if native_pair
+                    then
+                      if page_s
+                      then
+                        if page_d
+                        then
+                          if page_desc
+                          then
+                            if page_native
+                            then
+                              if desc_s
+                              then
+                                if desc_d
+                                then
+                                  if native_s
+                                  then
+                                    if native_d
+                                    then
+                                      if native_desc
+                                      then
+                                        if room_guest
+                                        then ok room_native
+                                        else ok false
+                                      else ok false
+                                    else ok false
+                                  else ok false
+                                else ok false
+                              else ok false
+                            else ok false
+                          else ok false
+                        else ok false
+                      else ok false
+                    else ok false
+                  else ok false
+                else ok false
+              else ok false
+            else ok false
+          else ok false
+        else ok false
+      else ok false
+    else ok false
+  else ok false
+
+/-- [async_ebpf_verified::x64_layout::derived_block]:
+    Source: '../../src/verified/x64_layout.rs', lines 372:0-383:1
+    Visibility: public -/
+def x64_layout.derived_block
+  (bottom : Std.U64) (top : Std.U64) (native_base : Std.U64) :
+  Result (Array Std.U64 6#usize)
+  := do
+  let delta ← x64_layout.sub_mod native_base bottom
+  let top1 ← x64_layout.sub_mod top 1#u64
+  let top2 ← x64_layout.sub_mod top 2#u64
+  let top4 ← x64_layout.sub_mod top 4#u64
+  let top8 ← x64_layout.sub_mod top 8#u64
+  let span1 ← x64_layout.sub_mod top1 bottom
+  let span2 ← x64_layout.sub_mod top2 bottom
+  let span4 ← x64_layout.sub_mod top4 bottom
+  let span8 ← x64_layout.sub_mod top8 bottom
+  ok (Array.make 6#usize [ bottom, delta, span1, span2, span4, span8 ])
 
 /-- [async_ebpf_verified::x64_lower::Reject]
     Source: '../../src/verified/x64_lower.rs', lines 48:0-83:1
@@ -11182,5 +16028,1840 @@ def x64_lower.lower
       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
         Unit (core.convert.FromSame x64_lower.Reject) residual
     ok (r1, out)
+
+/-- [async_ebpf_verified::x64_sim::Sim]
+    Source: '../../src/verified/x64_sim.rs', lines 76:0-90:1
+    Visibility: public -/
+structure x64_sim.Sim where
+  regs : Array Std.U64 16#usize
+  cf : Bool
+  zf : Bool
+  sf : Bool
+  of : Bool
+  mem_base : Std.U64
+  mem : alloc.vec.Vec Std.U8
+  pc : Std.Usize
+  code_base : Std.U64
+
+/-- [async_ebpf_verified::x64_sim::Outcome]
+    Source: '../../src/verified/x64_sim.rs', lines 95:0-106:1
+    Visibility: public -/
+@[discriminant isize]
+inductive x64_sim.Outcome where
+| Next : x64_sim.Outcome
+| Halt : x64_sim.Outcome
+| Fault : x64_sim.Outcome
+| Unsupported : x64_sim.Outcome
+
+/-- [async_ebpf_verified::x64_sim::{impl core::clone::Clone for async_ebpf_verified::x64_sim::Outcome}::clone]:
+    Source: '../../src/verified/x64_sim.rs', lines 93:15-93:20
+    Visibility: public -/
+def x64_sim.Outcome.Insts.CoreCloneClone.clone
+  (self : x64_sim.Outcome) : Result x64_sim.Outcome := do
+  ok self
+
+/-- Trait implementation: [async_ebpf_verified::x64_sim::{impl core::clone::Clone for async_ebpf_verified::x64_sim::Outcome}]
+    Source: '../../src/verified/x64_sim.rs', lines 93:15-93:20 -/
+@[reducible]
+def x64_sim.Outcome.Insts.CoreCloneClone : core.clone.Clone x64_sim.Outcome
+  := {
+  clone := x64_sim.Outcome.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [async_ebpf_verified::x64_sim::{impl core::marker::Copy for async_ebpf_verified::x64_sim::Outcome}]
+    Source: '../../src/verified/x64_sim.rs', lines 93:9-93:13 -/
+@[reducible]
+def x64_sim.Outcome.Insts.CoreMarkerCopy : core.marker.Copy x64_sim.Outcome
+  := {
+  cloneInst := x64_sim.Outcome.Insts.CoreCloneClone
+}
+
+/-- [async_ebpf_verified::x64_sim::Flags]
+    Source: '../../src/verified/x64_sim.rs', lines 110:0-115:1
+    Visibility: public -/
+structure x64_sim.Flags where
+  cf : Bool
+  zf : Bool
+  sf : Bool
+  of : Bool
+
+/-- [async_ebpf_verified::x64_sim::{impl core::clone::Clone for async_ebpf_verified::x64_sim::Flags}::clone]:
+    Source: '../../src/verified/x64_sim.rs', lines 109:15-109:20
+    Visibility: public -/
+def x64_sim.Flags.Insts.CoreCloneClone.clone
+  (self : x64_sim.Flags) : Result x64_sim.Flags := do
+  ok self
+
+/-- Trait implementation: [async_ebpf_verified::x64_sim::{impl core::clone::Clone for async_ebpf_verified::x64_sim::Flags}]
+    Source: '../../src/verified/x64_sim.rs', lines 109:15-109:20 -/
+@[reducible]
+def x64_sim.Flags.Insts.CoreCloneClone : core.clone.Clone x64_sim.Flags := {
+  clone := x64_sim.Flags.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [async_ebpf_verified::x64_sim::{impl core::marker::Copy for async_ebpf_verified::x64_sim::Flags}]
+    Source: '../../src/verified/x64_sim.rs', lines 109:9-109:13 -/
+@[reducible]
+def x64_sim.Flags.Insts.CoreMarkerCopy : core.marker.Copy x64_sim.Flags := {
+  cloneInst := x64_sim.Flags.Insts.CoreCloneClone
+}
+
+/-- [async_ebpf_verified::x64_sim::MASK64]
+    Source: '../../src/verified/x64_sim.rs', lines 117:0-117:43 -/
+@[global_simps, irreducible]
+def x64_sim.MASK64 : Std.U128 := 18446744073709551615#u128
+
+/-- [async_ebpf_verified::x64_sim::MASK32]
+    Source: '../../src/verified/x64_sim.rs', lines 118:0-118:32 -/
+@[global_simps, irreducible] def x64_sim.MASK32 : Std.U64 := 4294967295#u64
+
+/-- [async_ebpf_verified::x64_sim::add64]:
+    Source: '../../src/verified/x64_sim.rs', lines 129:0-131:1
+    Visibility: public -/
+def x64_sim.add64 (a : Std.U64) (b : Std.U64) : Result Std.U64 := do
+  let i ← lift (UScalar.cast .U128 a)
+  let i1 ← lift (UScalar.cast .U128 b)
+  let i2 ← i + i1
+  let i3 ← lift (i2 &&& x64_sim.MASK64)
+  ok (UScalar.cast .U64 i3)
+
+/-- [async_ebpf_verified::x64_sim::sub64]:
+    Source: '../../src/verified/x64_sim.rs', lines 134:0-136:1
+    Visibility: public -/
+def x64_sim.sub64 (a : Std.U64) (b : Std.U64) : Result Std.U64 := do
+  let i ← lift (UScalar.cast .U128 a)
+  let i1 ← lift (~~~ b)
+  let i2 ← lift (UScalar.cast .U128 i1)
+  let i3 ← i + i2
+  let i4 ← i3 + 1#u128
+  let i5 ← lift (i4 &&& x64_sim.MASK64)
+  ok (UScalar.cast .U64 i5)
+
+/-- [async_ebpf_verified::x64_sim::width_mask]:
+    Source: '../../src/verified/x64_sim.rs', lines 139:0-145:1 -/
+def x64_sim.width_mask (w64 : Bool) : Result Std.U64 := do
+  if w64
+  then ok 18446744073709551615#u64
+  else ok x64_sim.MASK32
+
+/-- [async_ebpf_verified::x64_sim::width_bits]:
+    Source: '../../src/verified/x64_sim.rs', lines 148:0-154:1 -/
+def x64_sim.width_bits (w64 : Bool) : Result Std.U32 := do
+  if w64
+  then ok 64#u32
+  else ok 32#u32
+
+/-- [async_ebpf_verified::x64_sim::op_width]:
+    Source: '../../src/verified/x64_sim.rs', lines 157:0-163:1 -/
+def x64_sim.op_width (w64 : Bool) : Result Std.Usize := do
+  if w64
+  then ok 8#usize
+  else ok 4#usize
+
+/-- [async_ebpf_verified::x64_sim::msb]:
+    Source: '../../src/verified/x64_sim.rs', lines 166:0-172:1 -/
+def x64_sim.msb (w64 : Bool) (v : Std.U64) : Result Bool := do
+  if w64
+  then let i ← v >>> 63#i32
+       let i1 ← lift (i &&& 1#u64)
+       ok (i1 = 1#u64)
+  else let i ← v >>> 31#i32
+       let i1 ← lift (i &&& 1#u64)
+       ok (i1 = 1#u64)
+
+/-- [async_ebpf_verified::x64_sim::lo32]:
+    Source: '../../src/verified/x64_sim.rs', lines 175:0-177:1 -/
+def x64_sim.lo32 (v : Std.U64) : Result Std.U64 := do
+  ok (v &&& x64_sim.MASK32)
+
+/-- [async_ebpf_verified::x64_sim::wr]:
+    Source: '../../src/verified/x64_sim.rs', lines 181:0-187:1 -/
+def x64_sim.wr (w64 : Bool) (v : Std.U64) : Result Std.U64 := do
+  if w64
+  then ok v
+  else x64_sim.lo32 v
+
+/-- [async_ebpf_verified::x64_sim::sign_extend]:
+    Source: '../../src/verified/x64_sim.rs', lines 190:0-204:1 -/
+def x64_sim.sign_extend (v : Std.U64) (bits : Std.U32) : Result Std.U64 := do
+  if bits = 0#u32
+  then ok 0#u64
+  else
+    if bits >= 64#u32
+    then ok v
+    else
+      let i ← 1#u64 <<< bits
+      let m ← i - 1#u64
+      let val ← lift (v &&& m)
+      let i1 ← bits - 1#u32
+      let i2 ← val >>> i1
+      let i3 ← lift (i2 &&& 1#u64)
+      if i3 = 1#u64
+      then let i4 ← lift (~~~ m)
+           ok (val ||| i4)
+      else ok val
+
+/-- [async_ebpf_verified::x64_sim::sx32]:
+    Source: '../../src/verified/x64_sim.rs', lines 207:0-209:1 -/
+def x64_sim.sx32 (imm : Std.I32) : Result Std.U64 := do
+  let i ← lift (IScalar.hcast .U32 imm)
+  let i1 ← lift (UScalar.cast .U64 i)
+  x64_sim.sign_extend i1 32#u32
+
+/-- [async_ebpf_verified::x64_sim::shl_at]:
+    Source: '../../src/verified/x64_sim.rs', lines 212:0-219:1 -/
+def x64_sim.shl_at
+  (w64 : Bool) (v : Std.U64) (n : Std.U32) : Result Std.U64 := do
+  let bits ← x64_sim.width_bits w64
+  if n >= bits
+  then ok 0#u64
+  else let i ← v <<< n
+       let i1 ← x64_sim.width_mask w64
+       ok (i &&& i1)
+
+/-- [async_ebpf_verified::x64_sim::shr_at]:
+    Source: '../../src/verified/x64_sim.rs', lines 222:0-230:1 -/
+def x64_sim.shr_at
+  (w64 : Bool) (v : Std.U64) (n : Std.U32) : Result Std.U64 := do
+  let bits ← x64_sim.width_bits w64
+  let i ← x64_sim.width_mask w64
+  let x ← lift (v &&& i)
+  if n >= bits
+  then ok 0#u64
+  else x >>> n
+
+/-- [async_ebpf_verified::x64_sim::sar_at]:
+    Source: '../../src/verified/x64_sim.rs', lines 233:0-238:1 -/
+def x64_sim.sar_at
+  (w64 : Bool) (v : Std.U64) (n : Std.U32) : Result Std.U64 := do
+  let bits ← x64_sim.width_bits w64
+  let i ← x64_sim.sign_extend v bits
+  let x ← lift (UScalar.hcast .I64 i)
+  let amt ← if n >= 63#u32
+              then ok 63#u32
+              else ok n
+  let i1 ← x >>> amt
+  let i2 ← lift (IScalar.hcast .U64 i1)
+  let i3 ← x64_sim.width_mask w64
+  ok (i2 &&& i3)
+
+/-- [async_ebpf_verified::x64_sim::flags_of_add_sub]:
+    Source: '../../src/verified/x64_sim.rs', lines 246:0-274:1
+    Visibility: public -/
+def x64_sim.flags_of_add_sub
+  (w64 : Bool) (sub : Bool) (a : Std.U64) (b : Std.U64) :
+  Result x64_sim.Flags
+  := do
+  let m ← x64_sim.width_mask w64
+  let x ← lift (a &&& m)
+  let y ← lift (b &&& m)
+  let sx ← x64_sim.msb w64 x
+  let sy ← x64_sim.msb w64 y
+  if sub
+  then
+    let i ← x64_sim.sub64 x y
+    let r ← lift (i &&& m)
+    let sr ← x64_sim.msb w64 r
+    if sx != sy
+    then ok { cf := (x < y), zf := (r = 0#u64), sf := sr, of := (sr != sx) }
+    else ok { cf := (x < y), zf := (r = 0#u64), sf := sr, of := false }
+  else
+    let i ← lift (UScalar.cast .U128 x)
+    let i1 ← lift (UScalar.cast .U128 y)
+    let wide ← i + i1
+    let i2 ← lift (UScalar.cast .U128 m)
+    let i3 ← lift (wide &&& i2)
+    let r ← lift (UScalar.cast .U64 i3)
+    let sr ← x64_sim.msb w64 r
+    let i4 ← lift (UScalar.cast .U128 m)
+    if sx = sy
+    then
+      ok { cf := (wide > i4), zf := (r = 0#u64), sf := sr, of := (sr != sx) }
+    else ok { cf := (wide > i4), zf := (r = 0#u64), sf := sr, of := false }
+
+/-- [async_ebpf_verified::x64_sim::flags_of_logic]:
+    Source: '../../src/verified/x64_sim.rs', lines 277:0-285:1
+    Visibility: public -/
+def x64_sim.flags_of_logic
+  (w64 : Bool) (r : Std.U64) : Result x64_sim.Flags := do
+  let i ← x64_sim.width_mask w64
+  let v ← lift (r &&& i)
+  let b ← x64_sim.msb w64 v
+  ok { cf := false, zf := (v = 0#u64), sf := b, of := false }
+
+/-- [async_ebpf_verified::x64_sim::flags_word]:
+    Source: '../../src/verified/x64_sim.rs', lines 288:0-294:1 -/
+def x64_sim.flags_word (f : x64_sim.Flags) : Result Std.U64 := do
+  let a ← if f.cf
+            then ok 1#u64
+            else ok 0#u64
+  let b ← if f.zf
+            then ok 64#u64
+            else ok 0#u64
+  let c ← if f.sf
+            then ok 128#u64
+            else ok 0#u64
+  let d ← if f.of
+            then ok 2048#u64
+            else ok 0#u64
+  let i ← lift (a ||| b)
+  let i1 ← lift (i ||| c)
+  ok (i1 ||| d)
+
+/-- [async_ebpf_verified::x64_sim::flags_of_word]:
+    Source: '../../src/verified/x64_sim.rs', lines 297:0-304:1 -/
+def x64_sim.flags_of_word (v : Std.U64) : Result x64_sim.Flags := do
+  let i ← v >>> 0#i32
+  let i1 ← lift (i &&& 1#u64)
+  let i2 ← v >>> 6#i32
+  let i3 ← lift (i2 &&& 1#u64)
+  let i4 ← v >>> 7#i32
+  let i5 ← lift (i4 &&& 1#u64)
+  let i6 ← v >>> 11#i32
+  let i7 ← lift (i6 &&& 1#u64)
+  ok
+    {
+      cf := (i1 = 1#u64),
+      zf := (i3 = 1#u64),
+      sf := (i5 = 1#u64),
+      of := (i7 = 1#u64)
+    }
+
+/-- [async_ebpf_verified::x64_sim::cond]:
+    Source: '../../src/verified/x64_sim.rs', lines 308:0-334:1
+    Visibility: public -/
+def x64_sim.cond (cc : Std.U8) (f : x64_sim.Flags) : Result Bool := do
+  if cc = 130#u8
+  then ok f.cf
+  else
+    if cc = 131#u8
+    then ok (¬ f.cf)
+    else
+      if cc = 132#u8
+      then ok f.zf
+      else
+        if cc = 133#u8
+        then ok (¬ f.zf)
+        else
+          if cc = 134#u8
+          then if f.cf
+               then ok true
+               else ok f.zf
+          else
+            if cc = 135#u8
+            then if f.cf
+                 then ok false
+                 else ok (¬ f.zf)
+            else
+              if cc = 140#u8
+              then ok (f.sf != f.of)
+              else
+                if cc = 141#u8
+                then ok (f.sf = f.of)
+                else
+                  if cc = 142#u8
+                  then if f.zf
+                       then ok true
+                       else ok (f.sf != f.of)
+                  else
+                    if cc = 143#u8
+                    then if f.zf
+                         then ok false
+                         else ok (f.sf = f.of)
+                    else ok false
+
+/-- [async_ebpf_verified::x64_sim::RAX]
+    Source: '../../src/verified/x64_sim.rs', lines 340:0-340:18 -/
+@[global_simps, irreducible] def x64_sim.RAX : Std.U8 := 0#u8
+
+/-- [async_ebpf_verified::x64_sim::RCX]
+    Source: '../../src/verified/x64_sim.rs', lines 341:0-341:18 -/
+@[global_simps, irreducible] def x64_sim.RCX : Std.U8 := 1#u8
+
+/-- [async_ebpf_verified::x64_sim::RDX]
+    Source: '../../src/verified/x64_sim.rs', lines 342:0-342:18 -/
+@[global_simps, irreducible] def x64_sim.RDX : Std.U8 := 2#u8
+
+/-- [async_ebpf_verified::x64_sim::RSP]
+    Source: '../../src/verified/x64_sim.rs', lines 343:0-343:18 -/
+@[global_simps, irreducible] def x64_sim.RSP : Std.U8 := 4#u8
+
+/-- [async_ebpf_verified::x64_sim::reg]:
+    Source: '../../src/verified/x64_sim.rs', lines 347:0-349:1
+    Visibility: public -/
+def x64_sim.reg (s : x64_sim.Sim) (r : Std.U8) : Result Std.U64 := do
+  let i ← lift (r &&& 15#u8)
+  let i1 ← lift (UScalar.cast .Usize i)
+  Array.index_usize s.regs i1
+
+/-- [async_ebpf_verified::x64_sim::set_reg]:
+    Source: '../../src/verified/x64_sim.rs', lines 351:0-353:1 -/
+def x64_sim.set_reg
+  (s : x64_sim.Sim) (r : Std.U8) (v : Std.U64) : Result x64_sim.Sim := do
+  let i ← lift (r &&& 15#u8)
+  let i1 ← lift (UScalar.cast .Usize i)
+  let a ← Array.update s.regs i1 v
+  ok { s with regs := a }
+
+/-- [async_ebpf_verified::x64_sim::get_flags]:
+    Source: '../../src/verified/x64_sim.rs', lines 355:0-362:1 -/
+def x64_sim.get_flags (s : x64_sim.Sim) : Result x64_sim.Flags := do
+  ok { cf := s.cf, zf := s.zf, sf := s.sf, of := s.of }
+
+/-- [async_ebpf_verified::x64_sim::set_flags]:
+    Source: '../../src/verified/x64_sim.rs', lines 364:0-369:1 -/
+def x64_sim.set_flags
+  (s : x64_sim.Sim) (f : x64_sim.Flags) : Result x64_sim.Sim := do
+  ok { s with cf := f.cf, zf := f.zf, sf := f.sf, of := f.of }
+
+/-- [async_ebpf_verified::x64_sim::addr]:
+    Source: '../../src/verified/x64_sim.rs', lines 372:0-374:1 -/
+def x64_sim.addr
+  (s : x64_sim.Sim) (base : Std.U8) (disp : Std.I32) : Result Std.U64 := do
+  let i ← x64_sim.reg s base
+  let i1 ← x64_sim.sx32 disp
+  x64_sim.add64 i i1
+
+/-- [async_ebpf_verified::x64_sim::in_bounds]:
+    Source: '../../src/verified/x64_sim.rs', lines 377:0-383:1 -/
+def x64_sim.in_bounds
+  (s : x64_sim.Sim) (a : Std.U64) (n : Std.Usize) : Result Bool := do
+  let lo ← lift (UScalar.cast .U128 s.mem_base)
+  let i := alloc.vec.Vec.len s.mem
+  let i1 ← lift (UScalar.cast .U128 i)
+  let hi ← lo + i1
+  let start ← lift (UScalar.cast .U128 a)
+  let i2 ← lift (UScalar.cast .U128 n)
+  let «end» ← start + i2
+  if start >= lo
+  then ok («end» <= hi)
+  else ok false
+
+/-- [async_ebpf_verified::x64_sim::load_mem]: loop body 0:
+    Source: '../../src/verified/x64_sim.rs', lines 392:2-398:3 -/
+@[rust_loop_body]
+def x64_sim.load_mem_loop.body
+  (s : x64_sim.Sim) (n : Std.Usize) (off : Std.Usize) (ok1 : Bool)
+  (v : Std.U64) (i : Std.Usize) :
+  Result (ControlFlow (Bool × Std.U64 × Std.Usize) (Bool × Std.U64))
+  := do
+  if ok1
+  then
+    if i < n
+    then
+      let idx ← off + i
+      let i1 := alloc.vec.Vec.len s.mem
+      let v1 ←
+        if idx < i1
+        then
+          do
+          let i2 ←
+            alloc.vec.Vec.index (core.slice.index.SliceIndexUsizeSlice Std.U8)
+              s.mem idx
+          let i3 ← lift (UScalar.cast .U64 i2)
+          let i4 ← 8#usize * i
+          let i5 ← i3 <<< i4
+          ok (v ||| i5)
+        else ok v
+      let i2 ← i + 1#usize
+      ok (cont (true, v1, i2))
+    else ok (done (true, v))
+  else ok (done (false, v))
+
+/-- [async_ebpf_verified::x64_sim::load_mem]: loop 0:
+    Source: '../../src/verified/x64_sim.rs', lines 392:2-398:3 -/
+@[rust_loop]
+def x64_sim.load_mem_loop
+  (s : x64_sim.Sim) (n : Std.Usize) (ok1 : Bool) (off : Std.Usize)
+  (v : Std.U64) (i : Std.Usize) :
+  Result (Bool × Std.U64)
+  := do
+  loop
+    (fun (ok2, v1, i1) => x64_sim.load_mem_loop.body s n off ok2 v1 i1)
+    (ok1, v, i)
+
+/-- [async_ebpf_verified::x64_sim::load_mem]:
+    Source: '../../src/verified/x64_sim.rs', lines 387:0-400:1 -/
+def x64_sim.load_mem
+  (s : x64_sim.Sim) (a : Std.U64) (n : Std.Usize) :
+  Result (Bool × Std.U64)
+  := do
+  let ok1 ← x64_sim.in_bounds s a n
+  let (s1, off) ←
+    if ok1
+    then
+      do
+      let i ← a - s.mem_base
+      let off1 ← lift (UScalar.cast .Usize i)
+      ok (s, off1)
+    else ok (s, 0#usize)
+  x64_sim.load_mem_loop s1 n ok1 off 0#u64 0#usize
+
+/-- [async_ebpf_verified::x64_sim::store_mem]: loop body 0:
+    Source: '../../src/verified/x64_sim.rs', lines 409:2-415:3 -/
+@[rust_loop_body]
+def x64_sim.store_mem_loop.body
+  (n : Std.Usize) (v : Std.U64) (off : Std.Usize) (len : Std.Usize)
+  (v1 : alloc.vec.Vec Std.U8) (ok1 : Bool) (i : Std.Usize) :
+  Result (ControlFlow ((alloc.vec.Vec Std.U8) × Bool × Std.Usize)
+    ((alloc.vec.Vec Std.U8) × Bool))
+  := do
+  if ok1
+  then
+    if i < n
+    then
+      let idx ← off + i
+      let v2 ←
+        if idx < len
+        then
+          do
+          let i1 ← 8#usize * i
+          let i2 ← v >>> i1
+          let i3 ← lift (i2 &&& 255#u64)
+          let (_, index_mut_back) ←
+            alloc.vec.Vec.index_mut (core.slice.index.SliceIndexUsizeSlice
+              Std.U8) v1 idx
+          let i4 ← lift (UScalar.cast .U8 i3)
+          ok (index_mut_back i4)
+        else ok v1
+      let i1 ← i + 1#usize
+      ok (cont (v2, true, i1))
+    else ok (done (v1, true))
+  else ok (done (v1, false))
+
+/-- [async_ebpf_verified::x64_sim::store_mem]: loop 0:
+    Source: '../../src/verified/x64_sim.rs', lines 409:2-415:3 -/
+@[rust_loop]
+def x64_sim.store_mem_loop
+  (v : alloc.vec.Vec Std.U8) (n : Std.Usize) (v1 : Std.U64) (ok1 : Bool)
+  (off : Std.Usize) (len : Std.Usize) (i : Std.Usize) :
+  Result ((alloc.vec.Vec Std.U8) × Bool)
+  := do
+  loop
+    (fun (v2, ok2, i1) => x64_sim.store_mem_loop.body n v1 off len v2 ok2 i1)
+    (v, ok1, i)
+
+/-- [async_ebpf_verified::x64_sim::store_mem]:
+    Source: '../../src/verified/x64_sim.rs', lines 404:0-417:1 -/
+def x64_sim.store_mem
+  (s : x64_sim.Sim) (a : Std.U64) (n : Std.Usize) (v : Std.U64) :
+  Result (Bool × x64_sim.Sim)
+  := do
+  let ok1 ← x64_sim.in_bounds s a n
+  let (s1, off) ←
+    if ok1
+    then
+      do
+      let i ← a - s.mem_base
+      let off1 ← lift (UScalar.cast .Usize i)
+      ok (s, off1)
+    else ok (s, 0#usize)
+  let len := alloc.vec.Vec.len s1.mem
+  let (v1, ok2) ← x64_sim.store_mem_loop s1.mem n v ok1 off len 0#usize
+  ok (ok2, { s1 with mem := v1 })
+
+/-- [async_ebpf_verified::x64_sim::size_bytes]:
+    Source: '../../src/verified/x64_sim.rs', lines 420:0-432:1 -/
+def x64_sim.size_bytes (size : Std.U8) : Result Std.Usize := do
+  if size = 1#u8
+  then ok 1#usize
+  else
+    if size = 2#u8
+    then ok 2#usize
+    else
+      if size = 4#u8
+      then ok 4#usize
+      else if size = 8#u8
+           then ok 8#usize
+           else ok 0#usize
+
+/-- [async_ebpf_verified::x64_sim::is_target]:
+    Source: '../../src/verified/x64_sim.rs', lines 439:0-458:1 -/
+def x64_sim.is_target
+  (t : x64_ir.PTarget) (i : x64_ir.PInsn) : Result Bool := do
+  match t with
+  | x64_ir.PTarget.Pc p =>
+    match i with
+    | x64_ir.PInsn.PcLabel q => ok (p = q)
+    | x64_ir.PInsn.Local _ => ok false
+    | x64_ir.PInsn.ExitLabel => ok false
+    | x64_ir.PInsn.RetpolineLabel => ok false
+    | x64_ir.PInsn.Push _ => ok false
+    | x64_ir.PInsn.Pop _ => ok false
+    | x64_ir.PInsn.Alu _ _ _ _ => ok false
+    | x64_ir.PInsn.AluImm _ _ _ _ => ok false
+    | x64_ir.PInsn.ShiftImm _ _ _ _ => ok false
+    | x64_ir.PInsn.ShiftCl _ _ _ => ok false
+    | x64_ir.PInsn.Neg _ _ => ok false
+    | x64_ir.PInsn.MulDivRcx _ _ _ => ok false
+    | x64_ir.PInsn.MovSx _ _ _ _ => ok false
+    | x64_ir.PInsn.Bswap _ _ => ok false
+    | x64_ir.PInsn.Rol16 _ => ok false
+    | x64_ir.PInsn.Cmov _ _ _ => ok false
+    | x64_ir.PInsn.LoadImm _ _ => ok false
+    | x64_ir.PInsn.Pushfq => ok false
+    | x64_ir.PInsn.Popfq => ok false
+    | x64_ir.PInsn.Cqo => ok false
+    | x64_ir.PInsn.Cdq => ok false
+    | x64_ir.PInsn.CmpRcxMinusOne _ => ok false
+    | x64_ir.PInsn.CmpEaxImm _ => ok false
+    | x64_ir.PInsn.Load _ _ _ _ _ => ok false
+    | x64_ir.PInsn.Store _ _ _ _ => ok false
+    | x64_ir.PInsn.StoreImm _ _ _ _ => ok false
+    | x64_ir.PInsn.AluRM _ _ _ _ => ok false
+    | x64_ir.PInsn.StoreRspImm _ => ok false
+    | x64_ir.PInsn.StoreRspRax => ok false
+    | x64_ir.PInsn.LockAlu _ _ _ _ _ => ok false
+    | x64_ir.PInsn.LockCmpxchg _ _ _ _ => ok false
+    | x64_ir.PInsn.Xchg _ _ _ _ => ok false
+    | x64_ir.PInsn.Jcc _ _ => ok false
+    | x64_ir.PInsn.Jmp _ => ok false
+    | x64_ir.PInsn.JmpNear _ => ok false
+    | x64_ir.PInsn.Call _ => ok false
+    | x64_ir.PInsn.Jcc8 _ _ => ok false
+    | x64_ir.PInsn.Jmp8 _ => ok false
+    | x64_ir.PInsn.Ret => ok false
+    | x64_ir.PInsn.Pause => ok false
+    | x64_ir.PInsn.Ud2 => ok false
+    | x64_ir.PInsn.CallReg _ => ok false
+    | x64_ir.PInsn.RipLoadDispatcher _ => ok false
+    | x64_ir.PInsn.RipLeaHelperTable _ => ok false
+    | x64_ir.PInsn.DispatcherSlot _ => ok false
+    | x64_ir.PInsn.HelperTable => ok false
+  | x64_ir.PTarget.Exit =>
+    match i with
+    | x64_ir.PInsn.PcLabel _ => ok false
+    | x64_ir.PInsn.Local _ => ok false
+    | x64_ir.PInsn.ExitLabel => ok true
+    | x64_ir.PInsn.RetpolineLabel => ok false
+    | x64_ir.PInsn.Push _ => ok false
+    | x64_ir.PInsn.Pop _ => ok false
+    | x64_ir.PInsn.Alu _ _ _ _ => ok false
+    | x64_ir.PInsn.AluImm _ _ _ _ => ok false
+    | x64_ir.PInsn.ShiftImm _ _ _ _ => ok false
+    | x64_ir.PInsn.ShiftCl _ _ _ => ok false
+    | x64_ir.PInsn.Neg _ _ => ok false
+    | x64_ir.PInsn.MulDivRcx _ _ _ => ok false
+    | x64_ir.PInsn.MovSx _ _ _ _ => ok false
+    | x64_ir.PInsn.Bswap _ _ => ok false
+    | x64_ir.PInsn.Rol16 _ => ok false
+    | x64_ir.PInsn.Cmov _ _ _ => ok false
+    | x64_ir.PInsn.LoadImm _ _ => ok false
+    | x64_ir.PInsn.Pushfq => ok false
+    | x64_ir.PInsn.Popfq => ok false
+    | x64_ir.PInsn.Cqo => ok false
+    | x64_ir.PInsn.Cdq => ok false
+    | x64_ir.PInsn.CmpRcxMinusOne _ => ok false
+    | x64_ir.PInsn.CmpEaxImm _ => ok false
+    | x64_ir.PInsn.Load _ _ _ _ _ => ok false
+    | x64_ir.PInsn.Store _ _ _ _ => ok false
+    | x64_ir.PInsn.StoreImm _ _ _ _ => ok false
+    | x64_ir.PInsn.AluRM _ _ _ _ => ok false
+    | x64_ir.PInsn.StoreRspImm _ => ok false
+    | x64_ir.PInsn.StoreRspRax => ok false
+    | x64_ir.PInsn.LockAlu _ _ _ _ _ => ok false
+    | x64_ir.PInsn.LockCmpxchg _ _ _ _ => ok false
+    | x64_ir.PInsn.Xchg _ _ _ _ => ok false
+    | x64_ir.PInsn.Jcc _ _ => ok false
+    | x64_ir.PInsn.Jmp _ => ok false
+    | x64_ir.PInsn.JmpNear _ => ok false
+    | x64_ir.PInsn.Call _ => ok false
+    | x64_ir.PInsn.Jcc8 _ _ => ok false
+    | x64_ir.PInsn.Jmp8 _ => ok false
+    | x64_ir.PInsn.Ret => ok false
+    | x64_ir.PInsn.Pause => ok false
+    | x64_ir.PInsn.Ud2 => ok false
+    | x64_ir.PInsn.CallReg _ => ok false
+    | x64_ir.PInsn.RipLoadDispatcher _ => ok false
+    | x64_ir.PInsn.RipLeaHelperTable _ => ok false
+    | x64_ir.PInsn.DispatcherSlot _ => ok false
+    | x64_ir.PInsn.HelperTable => ok false
+  | x64_ir.PTarget.Retpoline =>
+    match i with
+    | x64_ir.PInsn.PcLabel _ => ok false
+    | x64_ir.PInsn.Local _ => ok false
+    | x64_ir.PInsn.ExitLabel => ok false
+    | x64_ir.PInsn.RetpolineLabel => ok true
+    | x64_ir.PInsn.Push _ => ok false
+    | x64_ir.PInsn.Pop _ => ok false
+    | x64_ir.PInsn.Alu _ _ _ _ => ok false
+    | x64_ir.PInsn.AluImm _ _ _ _ => ok false
+    | x64_ir.PInsn.ShiftImm _ _ _ _ => ok false
+    | x64_ir.PInsn.ShiftCl _ _ _ => ok false
+    | x64_ir.PInsn.Neg _ _ => ok false
+    | x64_ir.PInsn.MulDivRcx _ _ _ => ok false
+    | x64_ir.PInsn.MovSx _ _ _ _ => ok false
+    | x64_ir.PInsn.Bswap _ _ => ok false
+    | x64_ir.PInsn.Rol16 _ => ok false
+    | x64_ir.PInsn.Cmov _ _ _ => ok false
+    | x64_ir.PInsn.LoadImm _ _ => ok false
+    | x64_ir.PInsn.Pushfq => ok false
+    | x64_ir.PInsn.Popfq => ok false
+    | x64_ir.PInsn.Cqo => ok false
+    | x64_ir.PInsn.Cdq => ok false
+    | x64_ir.PInsn.CmpRcxMinusOne _ => ok false
+    | x64_ir.PInsn.CmpEaxImm _ => ok false
+    | x64_ir.PInsn.Load _ _ _ _ _ => ok false
+    | x64_ir.PInsn.Store _ _ _ _ => ok false
+    | x64_ir.PInsn.StoreImm _ _ _ _ => ok false
+    | x64_ir.PInsn.AluRM _ _ _ _ => ok false
+    | x64_ir.PInsn.StoreRspImm _ => ok false
+    | x64_ir.PInsn.StoreRspRax => ok false
+    | x64_ir.PInsn.LockAlu _ _ _ _ _ => ok false
+    | x64_ir.PInsn.LockCmpxchg _ _ _ _ => ok false
+    | x64_ir.PInsn.Xchg _ _ _ _ => ok false
+    | x64_ir.PInsn.Jcc _ _ => ok false
+    | x64_ir.PInsn.Jmp _ => ok false
+    | x64_ir.PInsn.JmpNear _ => ok false
+    | x64_ir.PInsn.Call _ => ok false
+    | x64_ir.PInsn.Jcc8 _ _ => ok false
+    | x64_ir.PInsn.Jmp8 _ => ok false
+    | x64_ir.PInsn.Ret => ok false
+    | x64_ir.PInsn.Pause => ok false
+    | x64_ir.PInsn.Ud2 => ok false
+    | x64_ir.PInsn.CallReg _ => ok false
+    | x64_ir.PInsn.RipLoadDispatcher _ => ok false
+    | x64_ir.PInsn.RipLeaHelperTable _ => ok false
+    | x64_ir.PInsn.DispatcherSlot _ => ok false
+    | x64_ir.PInsn.HelperTable => ok false
+  | x64_ir.PTarget.Local n =>
+    match i with
+    | x64_ir.PInsn.PcLabel _ => ok false
+    | x64_ir.PInsn.Local m => ok (n = m)
+    | x64_ir.PInsn.ExitLabel => ok false
+    | x64_ir.PInsn.RetpolineLabel => ok false
+    | x64_ir.PInsn.Push _ => ok false
+    | x64_ir.PInsn.Pop _ => ok false
+    | x64_ir.PInsn.Alu _ _ _ _ => ok false
+    | x64_ir.PInsn.AluImm _ _ _ _ => ok false
+    | x64_ir.PInsn.ShiftImm _ _ _ _ => ok false
+    | x64_ir.PInsn.ShiftCl _ _ _ => ok false
+    | x64_ir.PInsn.Neg _ _ => ok false
+    | x64_ir.PInsn.MulDivRcx _ _ _ => ok false
+    | x64_ir.PInsn.MovSx _ _ _ _ => ok false
+    | x64_ir.PInsn.Bswap _ _ => ok false
+    | x64_ir.PInsn.Rol16 _ => ok false
+    | x64_ir.PInsn.Cmov _ _ _ => ok false
+    | x64_ir.PInsn.LoadImm _ _ => ok false
+    | x64_ir.PInsn.Pushfq => ok false
+    | x64_ir.PInsn.Popfq => ok false
+    | x64_ir.PInsn.Cqo => ok false
+    | x64_ir.PInsn.Cdq => ok false
+    | x64_ir.PInsn.CmpRcxMinusOne _ => ok false
+    | x64_ir.PInsn.CmpEaxImm _ => ok false
+    | x64_ir.PInsn.Load _ _ _ _ _ => ok false
+    | x64_ir.PInsn.Store _ _ _ _ => ok false
+    | x64_ir.PInsn.StoreImm _ _ _ _ => ok false
+    | x64_ir.PInsn.AluRM _ _ _ _ => ok false
+    | x64_ir.PInsn.StoreRspImm _ => ok false
+    | x64_ir.PInsn.StoreRspRax => ok false
+    | x64_ir.PInsn.LockAlu _ _ _ _ _ => ok false
+    | x64_ir.PInsn.LockCmpxchg _ _ _ _ => ok false
+    | x64_ir.PInsn.Xchg _ _ _ _ => ok false
+    | x64_ir.PInsn.Jcc _ _ => ok false
+    | x64_ir.PInsn.Jmp _ => ok false
+    | x64_ir.PInsn.JmpNear _ => ok false
+    | x64_ir.PInsn.Call _ => ok false
+    | x64_ir.PInsn.Jcc8 _ _ => ok false
+    | x64_ir.PInsn.Jmp8 _ => ok false
+    | x64_ir.PInsn.Ret => ok false
+    | x64_ir.PInsn.Pause => ok false
+    | x64_ir.PInsn.Ud2 => ok false
+    | x64_ir.PInsn.CallReg _ => ok false
+    | x64_ir.PInsn.RipLoadDispatcher _ => ok false
+    | x64_ir.PInsn.RipLeaHelperTable _ => ok false
+    | x64_ir.PInsn.DispatcherSlot _ => ok false
+    | x64_ir.PInsn.HelperTable => ok false
+
+/-- [async_ebpf_verified::x64_sim::find_label]: loop body 0:
+    Source: '../../src/verified/x64_sim.rs', lines 476:2-482:3 -/
+@[rust_loop_body]
+def x64_sim.find_label_loop.body
+  (code : Slice x64_ir.PInsn) (t : x64_ir.PTarget) (n : Std.Usize)
+  (i : Std.Usize) («at» : Std.Usize) :
+  Result (ControlFlow (Std.Usize × Std.Usize) Std.Usize)
+  := do
+  if i < n
+  then
+    let i1 ← n - 1#usize
+    let j ← i1 - i
+    let p ← Slice.index_usize code j
+    let b ← x64_sim.is_target t p
+    let at1 ← if b
+                then ok j
+                else ok «at»
+    let i2 ← i + 1#usize
+    ok (cont (i2, at1))
+  else ok (done «at»)
+
+/-- [async_ebpf_verified::x64_sim::find_label]: loop 0:
+    Source: '../../src/verified/x64_sim.rs', lines 476:2-482:3 -/
+@[rust_loop]
+def x64_sim.find_label_loop
+  (code : Slice x64_ir.PInsn) (t : x64_ir.PTarget) (n : Std.Usize)
+  (i : Std.Usize) («at» : Std.Usize) :
+  Result Std.Usize
+  := do
+  loop
+    (fun (i1, at1) => x64_sim.find_label_loop.body code t n i1 at1)
+    (i, «at»)
+
+/-- [async_ebpf_verified::x64_sim::find_label]:
+    Source: '../../src/verified/x64_sim.rs', lines 472:0-484:1 -/
+def x64_sim.find_label
+  (code : Slice x64_ir.PInsn) (t : x64_ir.PTarget) : Result Std.Usize := do
+  let n := Slice.len code
+  x64_sim.find_label_loop code t n 0#usize n
+
+/-- [async_ebpf_verified::x64_sim::branch]:
+    Source: '../../src/verified/x64_sim.rs', lines 487:0-496:1 -/
+def x64_sim.branch
+  (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) (t : x64_ir.PTarget) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let n := Slice.len code
+  let «at» ← x64_sim.find_label code t
+  if «at» < n
+  then ok (x64_sim.Outcome.Next, { s with pc := «at» })
+  else ok (x64_sim.Outcome.Unsupported, s)
+
+/-- [async_ebpf_verified::x64_sim::alu_rr]:
+    Source: '../../src/verified/x64_sim.rs', lines 504:0-548:1 -/
+def x64_sim.alu_rr
+  (s : x64_sim.Sim) (w64 : Bool) (op : x64_ir.AluRR) (src : Std.U8)
+  (dst : Std.U8) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let a ← x64_sim.reg s dst
+  let b ← x64_sim.reg s src
+  let s1 ←
+    match op with
+    | x64_ir.AluRR.Add =>
+      do
+      let f ← x64_sim.flags_of_add_sub w64 false a b
+      let i ← x64_sim.add64 a b
+      let i1 ← x64_sim.wr w64 i
+      let s2 ← x64_sim.set_reg s dst i1
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRR.Sub =>
+      do
+      let f ← x64_sim.flags_of_add_sub w64 true a b
+      let i ← x64_sim.sub64 a b
+      let i1 ← x64_sim.wr w64 i
+      let s2 ← x64_sim.set_reg s dst i1
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRR.Or =>
+      do
+      let r ← lift (a ||| b)
+      let i ← x64_sim.wr w64 r
+      let s2 ← x64_sim.set_reg s dst i
+      let f ← x64_sim.flags_of_logic w64 r
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRR.And =>
+      do
+      let r ← lift (a &&& b)
+      let i ← x64_sim.wr w64 r
+      let s2 ← x64_sim.set_reg s dst i
+      let f ← x64_sim.flags_of_logic w64 r
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRR.Xor =>
+      do
+      let r ← lift (a ^^^ b)
+      let i ← x64_sim.wr w64 r
+      let s2 ← x64_sim.set_reg s dst i
+      let f ← x64_sim.flags_of_logic w64 r
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRR.Mov => do
+                          let i ← x64_sim.wr w64 b
+                          x64_sim.set_reg s dst i
+    | x64_ir.AluRR.Cmp =>
+      do
+      let f ← x64_sim.flags_of_add_sub w64 true a b
+      x64_sim.set_flags s f
+    | x64_ir.AluRR.Test =>
+      do
+      let i ← lift (a &&& b)
+      let f ← x64_sim.flags_of_logic w64 i
+      x64_sim.set_flags s f
+  let i ← s1.pc + 1#usize
+  ok (x64_sim.Outcome.Next, { s1 with pc := i })
+
+/-- [async_ebpf_verified::x64_sim::alu_imm]:
+    Source: '../../src/verified/x64_sim.rs', lines 552:0-596:1 -/
+def x64_sim.alu_imm
+  (s : x64_sim.Sim) (w64 : Bool) (op : x64_ir.AluRI) (dst : Std.U8)
+  (imm : Std.I32) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let a ← x64_sim.reg s dst
+  let b ←
+    if w64
+    then x64_sim.sx32 imm
+    else do
+         let i ← lift (IScalar.hcast .U32 imm)
+         ok (UScalar.cast .U64 i)
+  let s1 ←
+    match op with
+    | x64_ir.AluRI.Add =>
+      do
+      let f ← x64_sim.flags_of_add_sub w64 false a b
+      let i ← x64_sim.add64 a b
+      let i1 ← x64_sim.wr w64 i
+      let s2 ← x64_sim.set_reg s dst i1
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRI.Or =>
+      do
+      let r ← lift (a ||| b)
+      let i ← x64_sim.wr w64 r
+      let s2 ← x64_sim.set_reg s dst i
+      let f ← x64_sim.flags_of_logic w64 r
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRI.And =>
+      do
+      let r ← lift (a &&& b)
+      let i ← x64_sim.wr w64 r
+      let s2 ← x64_sim.set_reg s dst i
+      let f ← x64_sim.flags_of_logic w64 r
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRI.Sub =>
+      do
+      let f ← x64_sim.flags_of_add_sub w64 true a b
+      let i ← x64_sim.sub64 a b
+      let i1 ← x64_sim.wr w64 i
+      let s2 ← x64_sim.set_reg s dst i1
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRI.Xor =>
+      do
+      let r ← lift (a ^^^ b)
+      let i ← x64_sim.wr w64 r
+      let s2 ← x64_sim.set_reg s dst i
+      let f ← x64_sim.flags_of_logic w64 r
+      x64_sim.set_flags s2 f
+    | x64_ir.AluRI.Cmp =>
+      do
+      let f ← x64_sim.flags_of_add_sub w64 true a b
+      x64_sim.set_flags s f
+    | x64_ir.AluRI.Mov => do
+                          let i ← x64_sim.wr w64 b
+                          x64_sim.set_reg s dst i
+    | x64_ir.AluRI.Test =>
+      do
+      let i ← lift (a &&& b)
+      let f ← x64_sim.flags_of_logic w64 i
+      x64_sim.set_flags s f
+  let i ← s1.pc + 1#usize
+  ok (x64_sim.Outcome.Next, { s1 with pc := i })
+
+/-- [async_ebpf_verified::x64_sim::shift_amount]:
+    Source: '../../src/verified/x64_sim.rs', lines 599:0-602:1 -/
+def x64_sim.shift_amount (w64 : Bool) (n : Std.U8) : Result Std.U32 := do
+  let bits ← x64_sim.width_bits w64
+  let i ← lift (UScalar.cast .U32 n)
+  let i1 ← bits - 1#u32
+  ok (i &&& i1)
+
+/-- [async_ebpf_verified::x64_sim::shift_result]:
+    Source: '../../src/verified/x64_sim.rs', lines 606:0-612:1 -/
+def x64_sim.shift_result
+  (w64 : Bool) (op : x64_ir.ShiftOp) (v : Std.U64) (amt : Std.U32) :
+  Result Std.U64
+  := do
+  match op with
+  | x64_ir.ShiftOp.Shl => x64_sim.shl_at w64 v amt
+  | x64_ir.ShiftOp.Shr => x64_sim.shr_at w64 v amt
+  | x64_ir.ShiftOp.Sar => x64_sim.sar_at w64 v amt
+
+/-- [async_ebpf_verified::x64_sim::shift_flags]:
+    Source: '../../src/verified/x64_sim.rs', lines 617:0-636:1 -/
+def x64_sim.shift_flags
+  (w64 : Bool) (op : x64_ir.ShiftOp) (src : Std.U64) (res : Std.U64)
+  (amt : Std.U32) :
+  Result x64_sim.Flags
+  := do
+  let bits ← x64_sim.width_bits w64
+  let i ← x64_sim.width_mask w64
+  let x ← lift (src &&& i)
+  let cf ←
+    match op with
+    | x64_ir.ShiftOp.Shl =>
+      do
+      let i1 ← bits - amt
+      let i2 ← x >>> i1
+      let i3 ← lift (i2 &&& 1#u64)
+      ok (i3 = 1#u64)
+    | x64_ir.ShiftOp.Shr =>
+      do
+      let i1 ← amt - 1#u32
+      let i2 ← x >>> i1
+      let i3 ← lift (i2 &&& 1#u64)
+      ok (i3 = 1#u64)
+    | x64_ir.ShiftOp.Sar =>
+      do
+      let i1 ← amt - 1#u32
+      let i2 ← x >>> i1
+      let i3 ← lift (i2 &&& 1#u64)
+      ok (i3 = 1#u64)
+  let of ←
+    match op with
+    | x64_ir.ShiftOp.Shl =>
+      do
+      let b ← x64_sim.msb w64 x
+      let i1 ← bits - 2#u32
+      let i2 ← x >>> i1
+      let i3 ← lift (i2 &&& 1#u64)
+      ok (b != (i3 = 1#u64))
+    | x64_ir.ShiftOp.Shr => x64_sim.msb w64 x
+    | x64_ir.ShiftOp.Sar => ok false
+  let i1 ← lift (res &&& i)
+  let b ← x64_sim.msb w64 res
+  ok { cf, zf := (i1 = 0#u64), sf := b, of }
+
+/-- [async_ebpf_verified::x64_sim::shift]:
+    Source: '../../src/verified/x64_sim.rs', lines 641:0-652:1 -/
+def x64_sim.shift
+  (s : x64_sim.Sim) (w64 : Bool) (op : x64_ir.ShiftOp) (dst : Std.U8)
+  (count : Std.U8) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let amt ← x64_sim.shift_amount w64 count
+  let src ← x64_sim.reg s dst
+  let res ← x64_sim.shift_result w64 op src amt
+  let i ← x64_sim.wr w64 res
+  let s1 ← x64_sim.set_reg s dst i
+  let s2 ←
+    if amt != 0#u32
+    then
+      do
+      let f ← x64_sim.shift_flags w64 op src res amt
+      x64_sim.set_flags s1 f
+    else ok s1
+  let i1 ← s2.pc + 1#usize
+  ok (x64_sim.Outcome.Next, { s2 with pc := i1 })
+
+/-- [async_ebpf_verified::x64_sim::neg]:
+    Source: '../../src/verified/x64_sim.rs', lines 655:0-662:1 -/
+def x64_sim.neg
+  (s : x64_sim.Sim) (w64 : Bool) (dst : Std.U8) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let v ← x64_sim.reg s dst
+  let f ← x64_sim.flags_of_add_sub w64 true 0#u64 v
+  let i ← x64_sim.sub64 0#u64 v
+  let i1 ← x64_sim.wr w64 i
+  let s1 ← x64_sim.set_reg s dst i1
+  let s2 ← x64_sim.set_flags s1 f
+  let i2 ← s2.pc + 1#usize
+  ok (x64_sim.Outcome.Next, { s2 with pc := i2 })
+
+/-- [async_ebpf_verified::x64_sim::mul_rcx]:
+    Source: '../../src/verified/x64_sim.rs', lines 667:0-692:1 -/
+def x64_sim.mul_rcx
+  (s : x64_sim.Sim) (w64 : Bool) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let a ← x64_sim.reg s x64_sim.RAX
+  let c ← x64_sim.reg s x64_sim.RCX
+  let (lo, hi) ←
+    if w64
+    then
+      do
+      let i ← lift (UScalar.cast .U128 a)
+      let i1 ← lift (UScalar.cast .U128 c)
+      let p ← i * i1
+      let i2 ← lift (p &&& x64_sim.MASK64)
+      let lo1 ← lift (UScalar.cast .U64 i2)
+      let i3 ← p >>> 64#i32
+      let i4 ← lift (i3 &&& x64_sim.MASK64)
+      let hi1 ← lift (UScalar.cast .U64 i4)
+      ok (lo1, hi1)
+    else
+      do
+      let i ← x64_sim.lo32 a
+      let i1 ← x64_sim.lo32 c
+      let p ← i * i1
+      let lo1 ← lift (p &&& x64_sim.MASK32)
+      let i2 ← p >>> 32#i32
+      let hi1 ← lift (i2 &&& x64_sim.MASK32)
+      ok (lo1, hi1)
+  let s1 ← x64_sim.set_reg s x64_sim.RAX lo
+  let s2 ← x64_sim.set_reg s1 x64_sim.RDX hi
+  let b ← x64_sim.msb w64 lo
+  let s3 ←
+    x64_sim.set_flags s2
+      { cf := (hi != 0#u64), zf := false, sf := b, of := (hi != 0#u64) }
+  let i ← s3.pc + 1#usize
+  ok (x64_sim.Outcome.Next, { s3 with pc := i })
+
+/-- [async_ebpf_verified::x64_sim::div_rcx]:
+    Source: '../../src/verified/x64_sim.rs', lines 698:0-764:1 -/
+def x64_sim.div_rcx
+  (s : x64_sim.Sim) (w64 : Bool) (signed : Bool) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let a ← x64_sim.reg s x64_sim.RAX
+  let d ← x64_sim.reg s x64_sim.RDX
+  let c ← x64_sim.reg s x64_sim.RCX
+  let (quo, rem, ok1) ←
+    if signed
+    then
+      do
+      let dividend ←
+        if w64
+        then
+          do
+          let i ← lift (UScalar.cast .U128 d)
+          let i1 ← i <<< 64#i32
+          let i2 ← lift (UScalar.cast .U128 a)
+          let i3 ← lift (i1 ||| i2)
+          ok (UScalar.hcast .I128 i3)
+        else
+          do
+          let i ← x64_sim.lo32 d
+          let i1 ← i <<< 32#i32
+          let i2 ← x64_sim.lo32 a
+          let i3 ← lift (i1 ||| i2)
+          let i4 ← lift (UScalar.hcast .I64 i3)
+          ok (IScalar.cast .I128 i4)
+      let divisor ←
+        if w64
+        then do
+             let i ← lift (UScalar.hcast .I64 c)
+             ok (IScalar.cast .I128 i)
+        else
+          do
+          let i ← x64_sim.lo32 c
+          let i1 ← lift (UScalar.cast .U32 i)
+          let i2 ← lift (UScalar.hcast .I32 i1)
+          ok (IScalar.cast .I128 i2)
+      let lo_lim ←
+        if w64
+        then ok (IScalar.cast .I128 core.num.I64.MIN)
+        else ok (IScalar.cast .I128 core.num.I32.MIN)
+      let hi_lim ←
+        if w64
+        then ok (IScalar.cast .I128 core.num.I64.MAX)
+        else ok (IScalar.cast .I128 core.num.I32.MAX)
+      let overflows ←
+        if divisor = (-1)#i128
+        then ok (dividend = core.num.I128.MIN)
+        else ok false
+      if divisor != 0#i128
+      then
+        if overflows
+        then ok (0#u64, 0#u64, false)
+        else
+          let q ← dividend / divisor
+          if q >= lo_lim
+          then
+            if q <= hi_lim
+            then
+              let i ← q * divisor
+              let r ← dividend - i
+              let i1 ← lift (IScalar.cast .I64 q)
+              let i2 ← lift (IScalar.hcast .U64 i1)
+              let quo1 ← x64_sim.wr w64 i2
+              let i3 ← lift (IScalar.cast .I64 r)
+              let i4 ← lift (IScalar.hcast .U64 i3)
+              let rem1 ← x64_sim.wr w64 i4
+              ok (quo1, rem1, true)
+            else ok (0#u64, 0#u64, false)
+          else ok (0#u64, 0#u64, false)
+      else ok (0#u64, 0#u64, false)
+    else
+      do
+      let dividend ←
+        if w64
+        then
+          do
+          let i ← lift (UScalar.cast .U128 d)
+          let i1 ← i <<< 64#i32
+          let i2 ← lift (UScalar.cast .U128 a)
+          ok (i1 ||| i2)
+        else
+          do
+          let i ← x64_sim.lo32 d
+          let i1 ← i <<< 32#i32
+          let i2 ← x64_sim.lo32 a
+          let i3 ← lift (i1 ||| i2)
+          ok (UScalar.cast .U128 i3)
+      let divisor ←
+        if w64
+        then ok (UScalar.cast .U128 c)
+        else do
+             let i ← x64_sim.lo32 c
+             ok (UScalar.cast .U128 i)
+      let hi_lim ←
+        if w64
+        then ok x64_sim.MASK64
+        else ok (UScalar.cast .U128 x64_sim.MASK32)
+      if divisor != 0#u128
+      then
+        let q ← dividend / divisor
+        if q <= hi_lim
+        then
+          let i ← q * divisor
+          let r ← dividend - i
+          let i1 ← lift (q &&& x64_sim.MASK64)
+          let quo1 ← lift (UScalar.cast .U64 i1)
+          let i2 ← lift (r &&& x64_sim.MASK64)
+          let rem1 ← lift (UScalar.cast .U64 i2)
+          ok (quo1, rem1, true)
+        else ok (0#u64, 0#u64, false)
+      else ok (0#u64, 0#u64, false)
+  if ok1
+  then
+    let s1 ← x64_sim.set_reg s x64_sim.RAX quo
+    let s2 ← x64_sim.set_reg s1 x64_sim.RDX rem
+    let i ← s2.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s2 with pc := i })
+  else ok (x64_sim.Outcome.Fault, s)
+
+/-- [async_ebpf_verified::x64_sim::movsx]:
+    Source: '../../src/verified/x64_sim.rs', lines 768:0-782:1 -/
+def x64_sim.movsx
+  (s : x64_sim.Sim) (bits : Std.U8) (w64 : Bool) (src : Std.U8) (dst : Std.U8)
+  :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let v ← x64_sim.reg s src
+  let x ←
+    if bits = 8#u8
+    then x64_sim.sign_extend v 8#u32
+    else
+      if bits = 16#u8
+      then x64_sim.sign_extend v 16#u32
+      else if bits = 32#u8
+           then x64_sim.sign_extend v 32#u32
+           else ok v
+  let i ← x64_sim.wr w64 x
+  let s1 ← x64_sim.set_reg s dst i
+  let i1 ← s1.pc + 1#usize
+  ok (x64_sim.Outcome.Next, { s1 with pc := i1 })
+
+/-- [async_ebpf_verified::x64_sim::bswap_bytes]: loop body 0:
+    Source: '../../src/verified/x64_sim.rs', lines 788:2-792:3 -/
+@[rust_loop_body]
+def x64_sim.bswap_bytes_loop.body
+  (bytes : Std.U32) (w : Std.U64) (acc : Std.U64) (i : Std.U32) :
+  Result (ControlFlow (Std.U64 × Std.U32) Std.U64)
+  := do
+  if i < bytes
+  then
+    if i < 8#u32
+    then
+      let i1 ← 8#u32 * i
+      let i2 ← w >>> i1
+      let byte ← lift (i2 &&& 255#u64)
+      let i3 ← bytes - 1#u32
+      let i4 ← i3 - i
+      let i5 ← 8#u32 * i4
+      let i6 ← byte <<< i5
+      let acc1 ← lift (acc ||| i6)
+      let i7 ← i + 1#u32
+      ok (cont (acc1, i7))
+    else ok (done acc)
+  else ok (done acc)
+
+/-- [async_ebpf_verified::x64_sim::bswap_bytes]: loop 0:
+    Source: '../../src/verified/x64_sim.rs', lines 788:2-792:3 -/
+@[rust_loop]
+def x64_sim.bswap_bytes_loop
+  (bytes : Std.U32) (w : Std.U64) (acc : Std.U64) (i : Std.U32) :
+  Result Std.U64
+  := do
+  loop
+    (fun (acc1, i1) => x64_sim.bswap_bytes_loop.body bytes w acc1 i1)
+    (acc, i)
+
+/-- [async_ebpf_verified::x64_sim::bswap_bytes]:
+    Source: '../../src/verified/x64_sim.rs', lines 785:0-794:1 -/
+@[reducible]
+def x64_sim.bswap_bytes (bytes : Std.U32) (w : Std.U64) : Result Std.U64 := do
+  x64_sim.bswap_bytes_loop bytes w 0#u64 0#u32
+
+/-- [async_ebpf_verified::x64_sim::bswap]:
+    Source: '../../src/verified/x64_sim.rs', lines 796:0-806:1 -/
+def x64_sim.bswap
+  (s : x64_sim.Sim) (w64 : Bool) (dst : Std.U8) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let v ← x64_sim.reg s dst
+  let r ←
+    if w64
+    then x64_sim.bswap_bytes 8#u32 v
+    else x64_sim.bswap_bytes 4#u32 v
+  let s1 ← x64_sim.set_reg s dst r
+  let i ← s1.pc + 1#usize
+  ok (x64_sim.Outcome.Next, { s1 with pc := i })
+
+/-- [async_ebpf_verified::x64_sim::rol16]:
+    Source: '../../src/verified/x64_sim.rs', lines 812:0-820:1 -/
+def x64_sim.rol16
+  (s : x64_sim.Sim) (dst : Std.U8) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let v ← x64_sim.reg s dst
+  let lo ← lift (v &&& 65535#u64)
+  let i ← lo <<< 8#i32
+  let i1 ← lo >>> 8#i32
+  let i2 ← lift (i ||| i1)
+  let rot ← lift (i2 &&& 65535#u64)
+  let i3 ← lift (v &&& 18446744073709486080#u64)
+  let i4 ← lift (i3 ||| rot)
+  let s1 ← x64_sim.set_reg s dst i4
+  let i5 ← lift (rot &&& 1#u64)
+  let i6 ← s1.pc + 1#usize
+  ok (x64_sim.Outcome.Next, { s1 with cf := (i5 = 1#u64), pc := i6 })
+
+/-- [async_ebpf_verified::x64_sim::lock_op]:
+    Source: '../../src/verified/x64_sim.rs', lines 825:0-837:1 -/
+def x64_sim.lock_op
+  (op : Std.U8) (a : Std.U64) (b : Std.U64) : Result Std.U64 := do
+  if op = 1#u8
+  then x64_sim.add64 a b
+  else
+    if op = 9#u8
+    then ok (a ||| b)
+    else
+      if op = 33#u8
+      then ok (a &&& b)
+      else if op = 49#u8
+           then ok (a ^^^ b)
+           else ok a
+
+/-- [async_ebpf_verified::x64_sim::lock_alu]:
+    Source: '../../src/verified/x64_sim.rs', lines 841:0-861:1 -/
+def x64_sim.lock_alu
+  (s : x64_sim.Sim) (op : Std.U8) (w64 : Bool) (src : Std.U8) (base : Std.U8)
+  (disp : Std.I32) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let a ← x64_sim.addr s base disp
+  let n ← x64_sim.op_width w64
+  let (ok1, cur) ← x64_sim.load_mem s a n
+  if ok1
+  then
+    let b ← x64_sim.reg s src
+    let v ← x64_sim.lock_op op cur b
+    let (_, s1) ← x64_sim.store_mem s a n v
+    let s2 ←
+      if op = 1#u8
+      then
+        do
+        let f ← x64_sim.flags_of_add_sub w64 false cur b
+        x64_sim.set_flags s1 f
+      else
+        if op = 9#u8
+        then do
+             let f ← x64_sim.flags_of_logic w64 v
+             x64_sim.set_flags s1 f
+        else
+          if op = 33#u8
+          then do
+               let f ← x64_sim.flags_of_logic w64 v
+               x64_sim.set_flags s1 f
+          else
+            if op = 49#u8
+            then
+              do
+              let f ← x64_sim.flags_of_logic w64 v
+              x64_sim.set_flags s1 f
+            else ok s1
+    let i ← s2.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s2 with pc := i })
+  else ok (x64_sim.Outcome.Fault, s)
+
+/-- [async_ebpf_verified::x64_sim::cmpxchg]:
+    Source: '../../src/verified/x64_sim.rs', lines 865:0-884:1 -/
+def x64_sim.cmpxchg
+  (s : x64_sim.Sim) (w64 : Bool) (src : Std.U8) (base : Std.U8)
+  (disp : Std.I32) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let a ← x64_sim.addr s base disp
+  let n ← x64_sim.op_width w64
+  let (ok1, cur) ← x64_sim.load_mem s a n
+  if ok1
+  then
+    let i ← x64_sim.reg s x64_sim.RAX
+    let acc ← x64_sim.wr w64 i
+    let f ← x64_sim.flags_of_add_sub w64 true acc cur
+    let s1 ←
+      if cur = acc
+      then
+        do
+        let v ← x64_sim.reg s src
+        let (_, s2) ← x64_sim.store_mem s a n v
+        ok s2
+      else x64_sim.set_reg s x64_sim.RAX cur
+    let s2 ← x64_sim.set_flags s1 f
+    let i1 ← s2.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s2 with pc := i1 })
+  else ok (x64_sim.Outcome.Fault, s)
+
+/-- [async_ebpf_verified::x64_sim::xchg]:
+    Source: '../../src/verified/x64_sim.rs', lines 887:0-900:1 -/
+def x64_sim.xchg
+  (s : x64_sim.Sim) (w64 : Bool) (src : Std.U8) (base : Std.U8)
+  (disp : Std.I32) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let a ← x64_sim.addr s base disp
+  let n ← x64_sim.op_width w64
+  let (ok1, cur) ← x64_sim.load_mem s a n
+  if ok1
+  then
+    let v ← x64_sim.reg s src
+    let (_, s1) ← x64_sim.store_mem s a n v
+    let s2 ← x64_sim.set_reg s1 src cur
+    let i ← s2.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s2 with pc := i })
+  else ok (x64_sim.Outcome.Fault, s)
+
+/-- [async_ebpf_verified::x64_sim::alu_rm]:
+    Source: '../../src/verified/x64_sim.rs', lines 903:0-939:1 -/
+def x64_sim.alu_rm
+  (s : x64_sim.Sim) (op : x64_ir.AluRM) (r : Std.U8) (base : Std.U8)
+  (disp : Std.I32) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let a ← x64_sim.addr s base disp
+  let (ok1, v) ← x64_sim.load_mem s a 8#usize
+  if ok1
+  then
+    let x ← x64_sim.reg s r
+    let s1 ←
+      match op with
+      | x64_ir.AluRM.Sub =>
+        do
+        let f ← x64_sim.flags_of_add_sub true true x v
+        let i ← x64_sim.sub64 x v
+        let s2 ← x64_sim.set_reg s r i
+        x64_sim.set_flags s2 f
+      | x64_ir.AluRM.Add =>
+        do
+        let f ← x64_sim.flags_of_add_sub true false x v
+        let i ← x64_sim.add64 x v
+        let s2 ← x64_sim.set_reg s r i
+        x64_sim.set_flags s2 f
+      | x64_ir.AluRM.CmpMR =>
+        do
+        let f ← x64_sim.flags_of_add_sub true true v x
+        x64_sim.set_flags s f
+      | x64_ir.AluRM.CmpRM =>
+        do
+        let f ← x64_sim.flags_of_add_sub true true x v
+        x64_sim.set_flags s f
+      | x64_ir.AluRM.Or =>
+        do
+        let y ← lift (x ||| v)
+        let s2 ← x64_sim.set_reg s r y
+        let f ← x64_sim.flags_of_logic true y
+        x64_sim.set_flags s2 f
+    let i ← s1.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s1 with pc := i })
+  else ok (x64_sim.Outcome.Fault, s)
+
+/-- [async_ebpf_verified::x64_sim::load]:
+    Source: '../../src/verified/x64_sim.rs', lines 943:0-966:1 -/
+def x64_sim.load
+  (s : x64_sim.Sim) (size : Std.U8) (sx : Bool) (base : Std.U8) (dst : Std.U8)
+  (disp : Std.I32) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let n ← x64_sim.size_bytes size
+  if sx
+  then
+    if n = 8#usize
+    then let i ← s.pc + 1#usize
+         ok (x64_sim.Outcome.Next, { s with pc := i })
+    else
+      if n = 0#usize
+      then ok (x64_sim.Outcome.Unsupported, s)
+      else
+        let a ← x64_sim.addr s base disp
+        let (ok1, v) ← x64_sim.load_mem s a n
+        if ok1
+        then
+          let i ← lift (UScalar.cast .U32 n)
+          let i1 ← 8#u32 * i
+          let x ← x64_sim.sign_extend v i1
+          let s1 ← x64_sim.set_reg s dst x
+          let i2 ← s1.pc + 1#usize
+          ok (x64_sim.Outcome.Next, { s1 with pc := i2 })
+        else ok (x64_sim.Outcome.Fault, s)
+  else
+    if n = 0#usize
+    then ok (x64_sim.Outcome.Unsupported, s)
+    else
+      let a ← x64_sim.addr s base disp
+      let (ok1, v) ← x64_sim.load_mem s a n
+      if ok1
+      then
+        let s1 ← x64_sim.set_reg s dst v
+        let i ← s1.pc + 1#usize
+        ok (x64_sim.Outcome.Next, { s1 with pc := i })
+      else ok (x64_sim.Outcome.Fault, s)
+
+/-- [async_ebpf_verified::x64_sim::store]:
+    Source: '../../src/verified/x64_sim.rs', lines 969:0-984:1 -/
+def x64_sim.store
+  (s : x64_sim.Sim) (size : Std.U8) (src : Std.U8) (base : Std.U8)
+  (disp : Std.I32) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let n ← x64_sim.size_bytes size
+  if n = 0#usize
+  then ok (x64_sim.Outcome.Unsupported, s)
+  else
+    let a ← x64_sim.addr s base disp
+    let v ← x64_sim.reg s src
+    let (ok1, s1) ← x64_sim.store_mem s a n v
+    if ok1
+    then
+      let i ← s1.pc + 1#usize
+      ok (x64_sim.Outcome.Next, { s1 with pc := i })
+    else ok (x64_sim.Outcome.Fault, s1)
+
+/-- [async_ebpf_verified::x64_sim::store_imm]:
+    Source: '../../src/verified/x64_sim.rs', lines 988:0-1002:1 -/
+def x64_sim.store_imm
+  (s : x64_sim.Sim) (size : Std.U8) (base : Std.U8) (disp : Std.I32)
+  (imm : Std.I32) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let n ← x64_sim.size_bytes size
+  if n = 0#usize
+  then ok (x64_sim.Outcome.Unsupported, s)
+  else
+    let a ← x64_sim.addr s base disp
+    let i ← x64_sim.sx32 imm
+    let (ok1, s1) ← x64_sim.store_mem s a n i
+    if ok1
+    then
+      let i1 ← s1.pc + 1#usize
+      ok (x64_sim.Outcome.Next, { s1 with pc := i1 })
+    else ok (x64_sim.Outcome.Fault, s1)
+
+/-- [async_ebpf_verified::x64_sim::push]:
+    Source: '../../src/verified/x64_sim.rs', lines 1005:0-1014:1 -/
+def x64_sim.push
+  (s : x64_sim.Sim) (v : Std.U64) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let i ← x64_sim.reg s x64_sim.RSP
+  let top ← x64_sim.sub64 i 8#u64
+  let (ok1, s1) ← x64_sim.store_mem s top 8#usize v
+  if ok1
+  then
+    let s2 ← x64_sim.set_reg s1 x64_sim.RSP top
+    ok (x64_sim.Outcome.Next, s2)
+  else ok (x64_sim.Outcome.Fault, s1)
+
+/-- [async_ebpf_verified::x64_sim::pop]:
+    Source: '../../src/verified/x64_sim.rs', lines 1018:0-1029:1 -/
+def x64_sim.pop
+  (s : x64_sim.Sim) (r : Std.U8) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let top ← x64_sim.reg s x64_sim.RSP
+  let (ok1, v) ← x64_sim.load_mem s top 8#usize
+  if ok1
+  then
+    let s1 ← x64_sim.set_reg s r v
+    let i ← x64_sim.add64 top 8#u64
+    let s2 ← x64_sim.set_reg s1 x64_sim.RSP i
+    let i1 ← s2.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s2 with pc := i1 })
+  else ok (x64_sim.Outcome.Fault, s)
+
+/-- [async_ebpf_verified::x64_sim::ret]:
+    Source: '../../src/verified/x64_sim.rs', lines 1032:0-1048:1 -/
+def x64_sim.ret
+  (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let top ← x64_sim.reg s x64_sim.RSP
+  let (ok1, v) ← x64_sim.load_mem s top 8#usize
+  if ok1
+  then
+    let i := Slice.len code
+    let n ← lift (UScalar.cast .U64 i)
+    let «at» ← if v >= s.code_base
+                   then v - s.code_base
+                   else ok n
+    if «at» < n
+    then
+      let i1 ← x64_sim.add64 top 8#u64
+      let s1 ← x64_sim.set_reg s x64_sim.RSP i1
+      let i2 ← lift (UScalar.cast .Usize «at»)
+      ok (x64_sim.Outcome.Next, { s1 with pc := i2 })
+    else ok (x64_sim.Outcome.Unsupported, s)
+  else ok (x64_sim.Outcome.Fault, s)
+
+/-- [async_ebpf_verified::x64_sim::call]:
+    Source: '../../src/verified/x64_sim.rs', lines 1051:0-1067:1 -/
+def x64_sim.call
+  (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) (t : x64_ir.PTarget) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let n := Slice.len code
+  let «at» ← x64_sim.find_label code t
+  if «at» < n
+  then
+    let i ← s.pc + 1#usize
+    let i1 ← lift (UScalar.cast .U64 i)
+    let ret_addr ← x64_sim.add64 s.code_base i1
+    let (pushed, s1) ← x64_sim.push s ret_addr
+    match pushed with
+    | x64_sim.Outcome.Next =>
+      ok (x64_sim.Outcome.Next, { s1 with pc := «at» })
+    | x64_sim.Outcome.Halt => ok (x64_sim.Outcome.Halt, s1)
+    | x64_sim.Outcome.Fault => ok (x64_sim.Outcome.Fault, s1)
+    | x64_sim.Outcome.Unsupported => ok (x64_sim.Outcome.Unsupported, s1)
+  else ok (x64_sim.Outcome.Unsupported, s)
+
+/-- [async_ebpf_verified::x64_sim::step_at]:
+    Source: '../../src/verified/x64_sim.rs', lines 1074:0-1298:1 -/
+def x64_sim.step_at
+  (code : Slice x64_ir.PInsn) (insn : x64_ir.PInsn) (s : x64_sim.Sim) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  match insn with
+  | x64_ir.PInsn.PcLabel _ =>
+    let i ← s.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s with pc := i })
+  | x64_ir.PInsn.Local _ =>
+    let i ← s.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s with pc := i })
+  | x64_ir.PInsn.ExitLabel =>
+    let i ← s.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s with pc := i })
+  | x64_ir.PInsn.RetpolineLabel =>
+    let i ← s.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s with pc := i })
+  | x64_ir.PInsn.Push r =>
+    let v ← x64_sim.reg s r
+    let (done1, s1) ← x64_sim.push s v
+    match done1 with
+    | x64_sim.Outcome.Next =>
+      let i ← s1.pc + 1#usize
+      ok (x64_sim.Outcome.Next, { s1 with pc := i })
+    | x64_sim.Outcome.Halt => ok (x64_sim.Outcome.Halt, s1)
+    | x64_sim.Outcome.Fault => ok (x64_sim.Outcome.Fault, s1)
+    | x64_sim.Outcome.Unsupported => ok (x64_sim.Outcome.Unsupported, s1)
+  | x64_ir.PInsn.Pop r => x64_sim.pop s r
+  | x64_ir.PInsn.Alu w64 op src dst => x64_sim.alu_rr s w64 op src dst
+  | x64_ir.PInsn.AluImm w64 op dst imm => x64_sim.alu_imm s w64 op dst imm
+  | x64_ir.PInsn.ShiftImm w64 op dst imm =>
+    let i ← lift (IScalar.hcast .U8 imm)
+    x64_sim.shift s w64 op dst i
+  | x64_ir.PInsn.ShiftCl w64 op dst =>
+    let i ← x64_sim.reg s x64_sim.RCX
+    let i1 ← lift (i &&& 255#u64)
+    let count ← lift (UScalar.cast .U8 i1)
+    x64_sim.shift s w64 op dst count
+  | x64_ir.PInsn.Neg w64 dst => x64_sim.neg s w64 dst
+  | x64_ir.PInsn.MulDivRcx w64 kind signed =>
+    match kind with
+    | x64_ir.MulDivKind.Mul => x64_sim.mul_rcx s w64
+    | x64_ir.MulDivKind.Div => x64_sim.div_rcx s w64 signed
+    | x64_ir.MulDivKind.Mod => x64_sim.div_rcx s w64 signed
+  | x64_ir.PInsn.MovSx «from» w64 src dst =>
+    x64_sim.movsx s «from» w64 src dst
+  | x64_ir.PInsn.Bswap w64 dst => x64_sim.bswap s w64 dst
+  | x64_ir.PInsn.Rol16 dst => x64_sim.rol16 s dst
+  | x64_ir.PInsn.Cmov cc dst src =>
+    let f ← x64_sim.get_flags s
+    let taken ← x64_sim.cond cc f
+    let s1 ←
+      if taken
+      then do
+           let v ← x64_sim.reg s src
+           x64_sim.set_reg s dst v
+      else ok s
+    let i ← s1.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s1 with pc := i })
+  | x64_ir.PInsn.LoadImm dst imm =>
+    let i ← lift (IScalar.hcast .U64 imm)
+    let s1 ← x64_sim.set_reg s dst i
+    let i1 ← s1.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s1 with pc := i1 })
+  | x64_ir.PInsn.Pushfq =>
+    let f ← x64_sim.get_flags s
+    let v ← x64_sim.flags_word f
+    let (done1, s1) ← x64_sim.push s v
+    match done1 with
+    | x64_sim.Outcome.Next =>
+      let i ← s1.pc + 1#usize
+      ok (x64_sim.Outcome.Next, { s1 with pc := i })
+    | x64_sim.Outcome.Halt => ok (x64_sim.Outcome.Halt, s1)
+    | x64_sim.Outcome.Fault => ok (x64_sim.Outcome.Fault, s1)
+    | x64_sim.Outcome.Unsupported => ok (x64_sim.Outcome.Unsupported, s1)
+  | x64_ir.PInsn.Popfq =>
+    let top ← x64_sim.reg s x64_sim.RSP
+    let (ok1, v) ← x64_sim.load_mem s top 8#usize
+    if ok1
+    then
+      let i ← x64_sim.add64 top 8#u64
+      let s1 ← x64_sim.set_reg s x64_sim.RSP i
+      let f ← x64_sim.flags_of_word v
+      let s2 ← x64_sim.set_flags s1 f
+      let i1 ← s2.pc + 1#usize
+      ok (x64_sim.Outcome.Next, { s2 with pc := i1 })
+    else ok (x64_sim.Outcome.Fault, s)
+  | x64_ir.PInsn.Cqo =>
+    let i ← x64_sim.reg s x64_sim.RAX
+    let b ← x64_sim.msb true i
+    let v ← if b
+              then ok 18446744073709551615#u64
+              else ok 0#u64
+    let s1 ← x64_sim.set_reg s x64_sim.RDX v
+    let i1 ← s1.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s1 with pc := i1 })
+  | x64_ir.PInsn.Cdq =>
+    let i ← x64_sim.reg s x64_sim.RAX
+    let b ← x64_sim.msb false i
+    let v ← if b
+              then ok x64_sim.MASK32
+              else ok 0#u64
+    let s1 ← x64_sim.set_reg s x64_sim.RDX v
+    let i1 ← s1.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s1 with pc := i1 })
+  | x64_ir.PInsn.CmpRcxMinusOne w64 =>
+    let i ← x64_sim.reg s x64_sim.RCX
+    let f ← x64_sim.flags_of_add_sub w64 true i 18446744073709551615#u64
+    let s1 ← x64_sim.set_flags s f
+    let i1 ← s1.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s1 with pc := i1 })
+  | x64_ir.PInsn.CmpEaxImm imm =>
+    let i ← x64_sim.reg s x64_sim.RAX
+    let i1 ← lift (UScalar.cast .U64 imm)
+    let f ← x64_sim.flags_of_add_sub false true i i1
+    let s1 ← x64_sim.set_flags s f
+    let i2 ← s1.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s1 with pc := i2 })
+  | x64_ir.PInsn.Load size sx base dst disp =>
+    x64_sim.load s size sx base dst disp
+  | x64_ir.PInsn.Store size src base disp => x64_sim.store s size src base disp
+  | x64_ir.PInsn.StoreImm size base disp imm =>
+    x64_sim.store_imm s size base disp imm
+  | x64_ir.PInsn.AluRM op r base disp => x64_sim.alu_rm s op r base disp
+  | x64_ir.PInsn.StoreRspImm imm =>
+    let top ← x64_sim.reg s x64_sim.RSP
+    let i ← lift (UScalar.cast .U64 imm)
+    let i1 ← x64_sim.sign_extend i 32#u32
+    let (ok1, s1) ← x64_sim.store_mem s top 8#usize i1
+    if ok1
+    then
+      let i2 ← s1.pc + 1#usize
+      ok (x64_sim.Outcome.Next, { s1 with pc := i2 })
+    else ok (x64_sim.Outcome.Fault, s1)
+  | x64_ir.PInsn.StoreRspRax =>
+    let top ← x64_sim.reg s x64_sim.RSP
+    let v ← x64_sim.reg s x64_sim.RAX
+    let (ok1, s1) ← x64_sim.store_mem s top 8#usize v
+    if ok1
+    then
+      let i ← s1.pc + 1#usize
+      ok (x64_sim.Outcome.Next, { s1 with pc := i })
+    else ok (x64_sim.Outcome.Fault, s1)
+  | x64_ir.PInsn.LockAlu op w64 src base disp =>
+    x64_sim.lock_alu s op w64 src base disp
+  | x64_ir.PInsn.LockCmpxchg w64 src base disp =>
+    x64_sim.cmpxchg s w64 src base disp
+  | x64_ir.PInsn.Xchg w64 src base disp => x64_sim.xchg s w64 src base disp
+  | x64_ir.PInsn.Jcc cc target =>
+    let f ← x64_sim.get_flags s
+    let taken ← x64_sim.cond cc f
+    if taken
+    then x64_sim.branch code s target
+    else let i ← s.pc + 1#usize
+         ok (x64_sim.Outcome.Next, { s with pc := i })
+  | x64_ir.PInsn.Jmp target => x64_sim.branch code s target
+  | x64_ir.PInsn.JmpNear target => x64_sim.branch code s target
+  | x64_ir.PInsn.Call target => x64_sim.call code s target
+  | x64_ir.PInsn.Jcc8 cc target =>
+    let f ← x64_sim.get_flags s
+    let taken ← x64_sim.cond cc f
+    if taken
+    then x64_sim.branch code s (x64_ir.PTarget.Local target)
+    else let i ← s.pc + 1#usize
+         ok (x64_sim.Outcome.Next, { s with pc := i })
+  | x64_ir.PInsn.Jmp8 target =>
+    x64_sim.branch code s (x64_ir.PTarget.Local target)
+  | x64_ir.PInsn.Ret => x64_sim.ret code s
+  | x64_ir.PInsn.Pause =>
+    let i ← s.pc + 1#usize
+    ok (x64_sim.Outcome.Next, { s with pc := i })
+  | x64_ir.PInsn.Ud2 => ok (x64_sim.Outcome.Halt, s)
+  | x64_ir.PInsn.CallReg _ => ok (x64_sim.Outcome.Unsupported, s)
+  | x64_ir.PInsn.RipLoadDispatcher _ => ok (x64_sim.Outcome.Unsupported, s)
+  | x64_ir.PInsn.RipLeaHelperTable _ => ok (x64_sim.Outcome.Unsupported, s)
+  | x64_ir.PInsn.DispatcherSlot _ => ok (x64_sim.Outcome.Halt, s)
+  | x64_ir.PInsn.HelperTable => ok (x64_sim.Outcome.Halt, s)
+
+/-- [async_ebpf_verified::x64_sim::step]:
+    Source: '../../src/verified/x64_sim.rs', lines 1301:0-1308:1
+    Visibility: public -/
+def x64_sim.step
+  (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  let i := Slice.len code
+  if s.pc < i
+  then let insn ← Slice.index_usize code s.pc
+       x64_sim.step_at code insn s
+  else ok (x64_sim.Outcome.Halt, s)
+
+/-- [async_ebpf_verified::x64_sim::run]: loop body 0:
+    Source: '../../src/verified/x64_sim.rs', lines 1317:2-1327:3
+    Visibility: public -/
+@[rust_loop_body]
+def x64_sim.run_loop.body
+  (code : Slice x64_ir.PInsn) (max_steps : Std.Usize) (s : x64_sim.Sim)
+  (i : Std.Usize) (out : x64_sim.Outcome) (done1 : Bool) :
+  Result (ControlFlow (x64_sim.Sim × Std.Usize × x64_sim.Outcome × Bool)
+    (x64_sim.Outcome × x64_sim.Sim))
+  := do
+  if i < max_steps
+  then
+    if done1
+    then ok (done (out, s))
+    else
+      let (o, s1) ← x64_sim.step code s
+      let (out1, done2) ←
+        match o with
+        | x64_sim.Outcome.Next => ok (out, false)
+        | x64_sim.Outcome.Halt => ok (x64_sim.Outcome.Halt, true)
+        | x64_sim.Outcome.Fault => ok (x64_sim.Outcome.Fault, true)
+        | x64_sim.Outcome.Unsupported => ok (x64_sim.Outcome.Unsupported, true)
+      let i1 ← i + 1#usize
+      ok (cont (s1, i1, out1, done2))
+  else ok (done (out, s))
+
+/-- [async_ebpf_verified::x64_sim::run]: loop 0:
+    Source: '../../src/verified/x64_sim.rs', lines 1317:2-1327:3
+    Visibility: public -/
+@[rust_loop]
+def x64_sim.run_loop
+  (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) (max_steps : Std.Usize)
+  (i : Std.Usize) (out : x64_sim.Outcome) (done1 : Bool) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  loop
+    (fun (s1, i1, out1, done2) => x64_sim.run_loop.body code max_steps s1 i1
+      out1 done2)
+    (s, i, out, done1)
+
+/-- [async_ebpf_verified::x64_sim::run]:
+    Source: '../../src/verified/x64_sim.rs', lines 1313:0-1329:1
+    Visibility: public -/
+@[reducible]
+def x64_sim.run
+  (code : Slice x64_ir.PInsn) (s : x64_sim.Sim) (max_steps : Std.Usize) :
+  Result (x64_sim.Outcome × x64_sim.Sim)
+  := do
+  x64_sim.run_loop code s max_steps 0#usize x64_sim.Outcome.Next false
 
 end async_ebpf_verified
