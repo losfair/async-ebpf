@@ -55,11 +55,17 @@ contains the first page — and the `or` is that candidate, or zero.
 `Seg` is a straight-line run of primitives with a state predicate at each
 position, `Seg.trans` concatenates two of them, and `macroOk_of_seg` turns one
 into the `MacroOk` of `AsyncEbpf/X64/Run.lean` (the expansion is straight-line,
-so `leave` is the fallthrough and `returns` is vacuous). The per-primitive
-lemmas below are `AsyncEbpf/X64/Run.lean`'s step shapes in that form. `Mid` is
-the part of `Agree` that holds all the way through: every register but `dst`,
-`scratch` and `r9`, the two fixed registers, the read-only bytes and the
-parked group base.
+so `leave` is the fallthrough and `returns` is vacuous). A position of a run
+carries three obligations: the primitive's accesses are inside the allowed
+set, its *writes* are inside the writable set — the three spill slots are the
+only memory the expansion writes, and every other primitive of it writes
+nothing — and the stack pointer is in the native stack window, which is
+`MacroOk`'s fifth clause and which `Mid` gives for free, since the expansion
+never touches `rsp`. The per-primitive lemmas below are
+`AsyncEbpf/X64/Run.lean`'s step shapes in that form. `Mid` is the part of
+`Agree` that holds all the way through: every register but `dst`, `scratch`
+and `r9`, the two fixed registers, the read-only bytes and the parked group
+base.
 -/
 open Aeneas Aeneas.Std Result
 
@@ -174,9 +180,16 @@ namespace CA
 
 `Seg P code p n A B` is the statement a straight-line run of `n` primitives
 laid out at `p` supports: from a state at `p` satisfying `A`, every step is
-safe and lands one position on, and the state at `p + n` satisfies `B`.
-`Seg.trans` concatenates two runs and `macroOk_of_seg` turns one into a
-`MacroOk`. -/
+safe, writes only where this activation may write, leaves `rsp` in the native
+stack window and lands one position on, and the state at `p + n` satisfies
+`B`. `Seg.trans` concatenates two runs and `macroOk_of_seg` turns one into a
+`MacroOk`, whose five clauses are these three plus the fallthrough and the
+vacuous `returns`. -/
+
+/-- The stack pointer inside the native stack window, which is the `rsp`
+clause of `MacroOk` read as a predicate on one state. -/
+def RspWin (P : Params) (t : State) : Prop :=
+  (t.regs RSP).toNat ≤ P.rsp0.toNat ∧ P.rsp0.toNat ≤ (t.regs RSP).toNat + 128
 
 /-- The primitives of `L` sit at `p`. -/
 def Laid (code : List x64_ir.PInsn) (p : Nat) (L : List x64_ir.PInsn) : Prop :=
@@ -215,6 +228,8 @@ inductive Seg (P : Params) (code : List x64_ir.PInsn) :
   | cons {p n : Nat} {A B C : State → Prop} :
       (∀ t : State, t.pc = p → A t →
         (∀ i, code[p]? = some i → ∀ bn ∈ accesses i t, AccessOk P bn.1 bn.2) ∧
+        (∀ i, code[p]? = some i → ∀ bn ∈ stores i t, StoreOk P bn.1 bn.2) ∧
+        RspWin P t ∧
         (∀ c, Step P code t c → ∃ t', c = .next t' ∧ t'.pc = p + 1 ∧ B t')) →
       Seg P code (p + 1) n B C → Seg P code p (n + 1) A C
 
@@ -243,16 +258,23 @@ theorem Seg.trans {P code p n1} {A B : State → Prop} (h1 : Seg P code p n1 A B
 /-- The one-primitive run. -/
 theorem seg_one {P : Params} {code : List x64_ir.PInsn} {p : Nat} {j : x64_ir.PInsn}
     {A B : State → Prop} (hc : code[p]? = some j)
+    (hrsp : ∀ t : State, t.pc = p → A t → RspWin P t)
     (hacc : ∀ t : State, t.pc = p → A t → ∀ bn ∈ accesses j t, AccessOk P bn.1 bn.2)
+    (hstr : ∀ t : State, t.pc = p → A t → ∀ bn ∈ stores j t, StoreOk P bn.1 bn.2)
     (hstp : ∀ t : State, t.pc = p → A t → ∀ c, Step P code t c →
       ∃ t', c = .next t' ∧ t'.pc = p + 1 ∧ B t') :
     Seg P code p 1 A B := by
-  refine .cons (fun t ht hA => ⟨?_, hstp t ht hA⟩) (.nil (fun _ h => h))
-  intro i hi
-  rw [hc] at hi
-  simp only [Option.some.injEq] at hi
-  subst hi
-  exact hacc t ht hA
+  refine .cons (fun t ht hA => ⟨?_, ?_, hrsp t ht hA, hstp t ht hA⟩) (.nil (fun _ h => h))
+  · intro i hi
+    rw [hc] at hi
+    simp only [Option.some.injEq] at hi
+    subst hi
+    exact hacc t ht hA
+  · intro i hi
+    rw [hc] at hi
+    simp only [Option.some.injEq] at hi
+    subst hi
+    exact hstr t ht hA
 
 /-! ## The run, as a chain of per-position predicates -/
 
@@ -260,6 +282,8 @@ theorem seg_one {P : Params} {code : List x64_ir.PInsn} {p : Nat} {j : x64_ir.PI
 def Chain (P : Params) (code : List x64_ir.PInsn) (p n : Nat) (R : Nat → State → Prop) : Prop :=
   ∀ k, k < n → ∀ t : State, t.pc = p + k → R k t →
     (∀ i, code[p + k]? = some i → ∀ bn ∈ accesses i t, AccessOk P bn.1 bn.2) ∧
+    (∀ i, code[p + k]? = some i → ∀ bn ∈ stores i t, StoreOk P bn.1 bn.2) ∧
+    RspWin P t ∧
     (∀ c, Step P code t c → ∃ t', c = .next t' ∧ t'.pc = p + (k + 1) ∧ R (k + 1) t')
 
 theorem Seg.toChain {P code p n} {A B : State → Prop} (h : Seg P code p n A B) :
@@ -276,16 +300,17 @@ theorem Seg.toChain {P code p n} {A B : State → Prop} (h : Seg P code p n A B)
     match k with
     | 0 =>
       rw [Nat.add_zero] at ht ⊢
-      obtain ⟨hacc, hstp⟩ := hstep t ht hR
-      refine ⟨hacc, fun c hc => ?_⟩
+      obtain ⟨hacc, hstr, hrsp, hstp⟩ := hstep t ht hR
+      refine ⟨hacc, hstr, hrsp, fun c hc => ?_⟩
       obtain ⟨t', he, hp, hB⟩ := hstp c hc
       exact ⟨t', he, by rw [hp], hR0 t' hB⟩
     | j + 1 =>
       have hj : j < n' := by omega
       have ht' : t.pc = p' + 1 + j := by rw [ht]; omega
-      obtain ⟨hacc, hstp⟩ := hCh j hj t ht' hR
-      refine ⟨?_, fun c hc => ?_⟩
+      obtain ⟨hacc, hstr, hrsp, hstp⟩ := hCh j hj t ht' hR
+      refine ⟨?_, ?_, hrsp, fun c hc => ?_⟩
       · rw [show p' + (j + 1) = p' + 1 + j by omega]; exact hacc
+      · rw [show p' + (j + 1) = p' + 1 + j by omega]; exact hstr
       · obtain ⟨t', he, hp, hB⟩ := hstp c hc
         exact ⟨t', he, by rw [hp]; omega, hB⟩
 
@@ -301,24 +326,26 @@ theorem macroOk_of_chain {P : Params} {code : List x64_ir.PInsn} {p n : Nat}
     refine stays_invariant (I := I) ⟨0, by omega, by rw [hs]; omega, hR0 s hs hag⟩ ?_ hsty
     rintro t t' ⟨k, hk, hpc, hRk⟩ hin hstep hin'
     have hkn : k < n := by simp only [Range, hpc] at hin; omega
-    obtain ⟨-, hstp⟩ := h k hkn t hpc hRk
+    obtain ⟨-, -, -, hstp⟩ := h k hkn t hpc hRk
     obtain ⟨u, he, hp, hRu⟩ := hstp _ hstep
     simp only [Config.next.injEq] at he
     subst he
     exact ⟨k + 1, by omega, hp, hRu⟩
-  refine ⟨?_, ?_, ?_⟩
-  · intro s hs hag s' hsty c hstep i hi bn hbn
+  have hpos : ∀ s s' : State, s.pc = p → Agree P pre s →
+      Stays P code (Range p (p + n)) s s' → ∃ k, k < n ∧ s'.pc = p + k ∧ R k s' := by
+    intro s s' hs hag hsty
     obtain ⟨k, hk, hpc, hRk⟩ := hinv s s' hs hag hsty
-    have hkn : k < n := by
-      have := hsty.inside_last; simp only [Range, hpc] at this; omega
-    obtain ⟨hacc, -⟩ := h k hkn s' hpc hRk
+    refine ⟨k, ?_, hpc, hRk⟩
+    have := hsty.inside_last; simp only [Range, hpc] at this; omega
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · intro s hs hag s' hsty c hstep i hi bn hbn
+    obtain ⟨k, hkn, hpc, hRk⟩ := hpos s s' hs hag hsty
+    obtain ⟨hacc, -, -, -⟩ := h k hkn s' hpc hRk
     rw [hpc] at hi
     exact hacc i hi bn hbn
   · intro s hs hag s' hsty s'' hstep hout
-    obtain ⟨k, hk, hpc, hRk⟩ := hinv s s' hs hag hsty
-    have hkn : k < n := by
-      have := hsty.inside_last; simp only [Range, hpc] at this; omega
-    obtain ⟨-, hstp⟩ := h k hkn s' hpc hRk
+    obtain ⟨k, hkn, hpc, hRk⟩ := hpos s s' hs hag hsty
+    obtain ⟨-, -, -, hstp⟩ := h k hkn s' hpc hRk
     obtain ⟨u, he, hp, hRu⟩ := hstp _ hstep
     simp only [Config.next.injEq] at he
     subst he
@@ -329,12 +356,18 @@ theorem macroOk_of_chain {P : Params} {code : List x64_ir.PInsn} {p n : Nat}
     exact Or.inl ⟨hp, hRn _ hRu⟩
   · intro s hs hag s' hsty s'' hstep
     exfalso
-    obtain ⟨k, hk, hpc, hRk⟩ := hinv s s' hs hag hsty
-    have hkn : k < n := by
-      have := hsty.inside_last; simp only [Range, hpc] at this; omega
-    obtain ⟨-, hstp⟩ := h k hkn s' hpc hRk
+    obtain ⟨k, hkn, hpc, hRk⟩ := hpos s s' hs hag hsty
+    obtain ⟨-, -, -, hstp⟩ := h k hkn s' hpc hRk
     obtain ⟨u, he, -, -⟩ := hstp _ hstep
     simp at he
+  · intro s hs hag s' hsty c hstep i hi bn hbn
+    obtain ⟨k, hkn, hpc, hRk⟩ := hpos s s' hs hag hsty
+    obtain ⟨-, hstr, -, -⟩ := h k hkn s' hpc hRk
+    rw [hpc] at hi
+    exact hstr i hi bn hbn
+  · intro s hs hag s' hsty
+    obtain ⟨k, hkn, hpc, hRk⟩ := hpos s s' hs hag hsty
+    exact (h k hkn s' hpc hRk).2.2.1
 
 theorem macroOk_of_seg {P : Params} {code : List x64_ir.PInsn} {p n : Nat}
     {pre post : x64_check.State} {A B : State → Prop}
@@ -359,26 +392,32 @@ theorem step_cmov {P code} {s : State} {c : Config} {cc dst src : Std.U8}
 theorem seg_alu {P : Params} {code : List x64_ir.PInsn} {p : Nat} {w64 : Bool}
     {op : x64_ir.AluRR} {src dst : Std.U8} {A B : State → Prop}
     (hc : code[p]? = some (.Alu w64 op src dst))
+    (hrsp : ∀ t : State, t.pc = p → A t → RspWin P t)
     (hB : ∀ t : State, t.pc = p → A t → B (aluRRStep w64 op src dst t)) :
     Seg P code p 1 A B := by
-  refine seg_one hc (fun t ht hA bn hbn => by simp at hbn) (fun t ht hA c hstep => ?_)
+  refine seg_one hc hrsp (fun t ht hA bn hbn => by simp at hbn)
+    (fun t ht hA bn hbn => by simp at hbn) (fun t ht hA c hstep => ?_)
   exact ⟨_, step_alu (by rw [ht]; exact hc) hstep, by simp [ht], hB t ht hA⟩
 
 theorem seg_aluImm {P : Params} {code : List x64_ir.PInsn} {p : Nat} {w64 : Bool}
     {op : x64_ir.AluRI} {dst : Std.U8} {imm : Std.I32} {A B : State → Prop}
     (hc : code[p]? = some (.AluImm w64 op dst imm))
+    (hrsp : ∀ t : State, t.pc = p → A t → RspWin P t)
     (hB : ∀ t : State, t.pc = p → A t → B (aluImmStep w64 op dst imm t)) :
     Seg P code p 1 A B := by
-  refine seg_one hc (fun t ht hA bn hbn => by simp at hbn) (fun t ht hA c hstep => ?_)
+  refine seg_one hc hrsp (fun t ht hA bn hbn => by simp at hbn)
+    (fun t ht hA bn hbn => by simp at hbn) (fun t ht hA c hstep => ?_)
   exact ⟨_, step_aluImm (by rw [ht]; exact hc) hstep, by simp [ht], hB t ht hA⟩
 
 theorem seg_aluRM {P : Params} {code : List x64_ir.PInsn} {p : Nat} {op : x64_ir.AluRM}
     {reg base : Std.U8} {disp : Std.I32} {A B : State → Prop}
     (hc : code[p]? = some (.AluRM op reg base disp))
+    (hrsp : ∀ t : State, t.pc = p → A t → RspWin P t)
     (hacc : ∀ t : State, t.pc = p → A t → AccessOk P (addr t base disp) 8)
     (hB : ∀ t : State, t.pc = p → A t → B (aluRMStep op reg base disp t)) :
     Seg P code p 1 A B := by
-  refine seg_one hc (fun t ht hA bn hbn => ?_) (fun t ht hA c hstep => ?_)
+  refine seg_one hc hrsp (fun t ht hA bn hbn => ?_) (fun t ht hA bn hbn => by simp at hbn)
+    (fun t ht hA c hstep => ?_)
   · simp only [accesses_aluRM, List.mem_singleton] at hbn
     subst hbn
     exact hacc t ht hA
@@ -386,11 +425,13 @@ theorem seg_aluRM {P : Params} {code : List x64_ir.PInsn} {p : Nat} {op : x64_ir
 
 theorem seg_cmov {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cc dst src : Std.U8}
     {A B : State → Prop} (hc : code[p]? = some (.Cmov cc dst src))
+    (hrsp : ∀ t : State, t.pc = p → A t → RspWin P t)
     (hB1 : ∀ t : State, t.pc = p → A t → cond cc t.flags = true →
       B (wReg t dst (t.regs src.val)))
     (hB2 : ∀ t : State, t.pc = p → A t → cond cc t.flags = false → B (wNext t)) :
     Seg P code p 1 A B := by
-  refine seg_one hc (fun t ht hA bn hbn => by simp [accesses] at hbn) (fun t ht hA c hstep => ?_)
+  refine seg_one hc hrsp (fun t ht hA bn hbn => by simp [accesses] at hbn)
+    (fun t ht hA bn hbn => by simp [stores] at hbn) (fun t ht hA c hstep => ?_)
   rcases step_cmov (by rw [ht]; exact hc) hstep with ⟨hcc, hu⟩ | ⟨hcc, hu⟩
   · exact ⟨_, hu, by simp [wReg, ht], hB1 t ht hA hcc⟩
   · exact ⟨_, hu, by simp [wNext, ht], hB2 t ht hA hcc⟩
@@ -398,10 +439,12 @@ theorem seg_cmov {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cc dst src :
 theorem seg_load8 {P : Params} {code : List x64_ir.PInsn} {p : Nat} {base dst : Std.U8}
     {disp : Std.I32} {A B : State → Prop}
     (hc : code[p]? = some (.Load 8#u8 false base dst disp))
+    (hrsp : ∀ t : State, t.pc = p → A t → RspWin P t)
     (hacc : ∀ t : State, t.pc = p → A t → AccessOk P (addr t base disp) 8)
     (hB : ∀ t : State, t.pc = p → A t → B (wReg t dst (load64 t.mem (addr t base disp)))) :
     Seg P code p 1 A B := by
-  refine seg_one hc (fun t ht hA bn hbn => ?_) (fun t ht hA c hstep => ?_)
+  refine seg_one hc hrsp (fun t ht hA bn hbn => ?_) (fun t ht hA bn hbn => by simp at hbn)
+    (fun t ht hA c hstep => ?_)
   · simp only [accesses_load] at hbn
     rw [if_neg (by simp)] at hbn
     simp only [List.mem_singleton] at hbn
@@ -416,14 +459,20 @@ theorem seg_load8 {P : Params} {code : List x64_ir.PInsn} {p : Nat} {base dst : 
 theorem seg_store8 {P : Params} {code : List x64_ir.PInsn} {p : Nat} {src base : Std.U8}
     {disp : Std.I32} {A B : State → Prop}
     (hc : code[p]? = some (.Store 8#u8 src base disp))
+    (hrsp : ∀ t : State, t.pc = p → A t → RspWin P t)
     (hacc : ∀ t : State, t.pc = p → A t → AccessOk P (addr t base disp) 8)
+    (hstr : ∀ t : State, t.pc = p → A t → StoreOk P (addr t base disp) 8)
     (hB : ∀ t : State, t.pc = p → A t →
       B { t with mem := store64 t.mem (addr t base disp) (t.regs src.val), pc := t.pc + 1 }) :
     Seg P code p 1 A B := by
-  refine seg_one hc (fun t ht hA bn hbn => ?_) (fun t ht hA c hstep => ?_)
+  refine seg_one hc hrsp (fun t ht hA bn hbn => ?_) (fun t ht hA bn hbn => ?_)
+    (fun t ht hA c hstep => ?_)
   · simp only [accesses_store, List.mem_singleton] at hbn
     subst hbn
     exact hacc t ht hA
+  · simp only [stores_store, List.mem_singleton] at hbn
+    subst hbn
+    exact hstr t ht hA
   · refine ⟨_, step_store (by rw [ht]; exact hc) hstep, by simp [ht], ?_⟩
     have := hB t ht hA
     rwa [show (8#u8 : Std.U8).val = 8 from rfl, storeVal_eight]
@@ -455,6 +504,13 @@ theorem Mid.keep {P : Params} {a : x64_check.State} {D S : Nat} {t t' : State}
   · rw [hregs RSP (Ne.symm hD4) (Ne.symm hS4) (by decide)]; exact h.rsp
   · rw [hregs RBP (Ne.symm hD5) (Ne.symm hS5) (by decide)]; exact h.rbp
   · rw [hgrp]; exact h.group
+
+/-- Every position of the expansion keeps the stack pointer where the entry
+state had it, and `Mid` carries that: the depth is the checker's, and the
+checker's depths are inside the native stack window. -/
+theorem Mid.rspWin {P : Params} {a : x64_check.State} {D S : Nat} {t : State}
+    (hL : Layout P) (h : Mid P a D S t) : RspWin P t :=
+  rsp_window_of_depth hL h.rsp h.depth
 
 /-! ## Arithmetic
 
@@ -971,7 +1027,7 @@ theorem regionFrame_head {P : Params} {code : List x64_ir.PInsn} {p : Nat}
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g ∧ K t.mem)
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g ∧
         t.regs scratch.val = g ∧ K t.mem) := by
-    refine seg_alu hc0 (fun t ht hA => ?_)
+    refine seg_alu hc0 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_)
     obtain ⟨hm, hdv, hk⟩ := hA
     rw [alu_mov, wr_true]
     exact ⟨Mid.keep hD4 hD5 hS4 hS5 hm (fun q _ h2 _ => wReg_regs_ne t scratch _ h2) hm.ro rfl,
@@ -982,7 +1038,7 @@ theorem regionFrame_head {P : Params} {code : List x64_ir.PInsn} {p : Nat}
         t.regs scratch.val = g ∧ K t.mem)
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g ∧
         t.regs scratch.val = g - regGb P stack ∧ K t.mem) := by
-    refine seg_aluRM hc1 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_aluRM hc1 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨hm, -, -, -⟩ := hA
       rw [mid_derived_addr hm (by omega)]
       exact derived_access' hL (by omega)
@@ -1001,7 +1057,7 @@ theorem regionFrame_head {P : Params} {code : List x64_ir.PInsn} {p : Nat}
       (fun t => Mid P a dst.val scratch.val t ∧ K t.mem ∧
         t.regs dst.val = regNb P stack + (g - regGb P stack) ∧
         t.regs scratch.val = g - regGb P stack) := by
-    refine seg_aluRM hc2 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_aluRM hc2 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨hm, -, -, -⟩ := hA
       rw [mid_derived_addr hm (by omega)]
       exact derived_access' hL (by omega)
@@ -1045,7 +1101,7 @@ theorem regionFrame_tailSome {P : Params} {code : List x64_ir.PInsn} {q : Nat}
       (fun t => Mid P a dst.val scratch.val t ∧ K t.mem ∧
         t.regs dst.val = regNb P stack + (g - regGb P stack) ∧
         t.regs scratch.val = g - regGb P stack ∧ t.regs 9 = 0#64) := by
-    refine seg_alu hc3 (fun t ht hA => ?_)
+    refine seg_alu hc3 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_)
     obtain ⟨hm, hk, hdv, hsv⟩ := hA
     rw [alu_xor, wr_true]
     refine ⟨Mid.keep hD4 hD5 hS4 hS5 hm
@@ -1062,7 +1118,7 @@ theorem regionFrame_tailSome {P : Params} {code : List x64_ir.PInsn} {q : Nat}
         t.regs dst.val = regNb P stack + (g - regGb P stack) ∧ t.regs 9 = 0#64 ∧
         (t.flags.cf = false → (regGb P stack).toNat ≤ g.toNat ∧
           g.toNat + size.val ≤ (regGt P stack).toNat)) := by
-    refine seg_aluRM hc4 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_aluRM hc4 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨hm, -, -, -, -⟩ := hA
       rw [mid_derived_addr hm (by omega)]
       exact derived_access' hL (by omega)
@@ -1093,7 +1149,8 @@ theorem regionFrame_tailSome {P : Params} {code : List x64_ir.PInsn} {q : Nat}
           g.toNat + size.val ≤ (regGt P stack).toNat))
       (fun t => Mid P a dst.val scratch.val t ∧ K t.mem ∧
         RegionOut P stack size.val g (t.regs dst.val)) := by
-    refine seg_cmov hc5 (fun t ht hA hcc => ?_) (fun t ht hA hcc => ?_)
+    refine seg_cmov hc5 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA hcc => ?_)
+      (fun t ht hA hcc => ?_)
     · obtain ⟨hm, hk, hdv, h9, -⟩ := hA
       refine ⟨Mid.keep hD4 hD5 hS4 hS5 hm (fun j h1 _ _ => wReg_regs_ne t dst _ h1) hm.ro rfl,
         hk, ?_⟩
@@ -1178,7 +1235,7 @@ theorem regionFrame_tailNone {P : Params} {code : List x64_ir.PInsn} {q : Nat}
         t.regs dst.val = regNb P stack + (g - regGb P stack) ∧
         t.regs scratch.val = g - regGb P stack ∧
         (t.regs 9).toNat = (regGt P stack).toNat - 1 - (regGb P stack).toNat) := by
-    refine seg_load8 hc3 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_load8 hc3 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨hm, -, -, -⟩ := hA
       rw [mid_derived_addr hm (by omega)]
       exact derived_access' hL (by omega)
@@ -1201,7 +1258,7 @@ theorem regionFrame_tailNone {P : Params} {code : List x64_ir.PInsn} {q : Nat}
         t.regs scratch.val = g - regGb P stack ∧
         (t.regs 9).toNat
           = (regGt P stack).toNat - size.val - (regGb P stack).toNat) := by
-    refine seg_aluImm hc4 (fun t ht hA => ?_)
+    refine seg_aluImm hc4 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_)
     obtain ⟨hm, hk, hdv, hsv, h9⟩ := hA
     rw [aluImm_sub_true, groupSpan_imm hw1 hw2]
     refine ⟨Mid.keep hD4 hD5 hS4 hS5 hm
@@ -1223,7 +1280,7 @@ theorem regionFrame_tailNone {P : Params} {code : List x64_ir.PInsn} {q : Nat}
         t.regs dst.val = regNb P stack + (g - regGb P stack) ∧
         (t.flags.cf = false → (regGb P stack).toNat ≤ g.toNat ∧
           g.toNat + size.val ≤ (regGt P stack).toNat)) := by
-    refine seg_alu hc5 (fun t ht hA => ?_)
+    refine seg_alu hc5 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_)
     obtain ⟨hm, hk, hdv, hsv, h9⟩ := hA
     rw [alu_cmp_true]
     refine ⟨Mid.keep hD4 hD5 hS4 hS5 hm (fun j _ _ _ => wFlags_regs t _ j) hm.ro rfl, hk,
@@ -1246,7 +1303,7 @@ theorem regionFrame_tailNone {P : Params} {code : List x64_ir.PInsn} {q : Nat}
         t.regs scratch.val = 0#64 ∧
         (t.flags.cf = false → (regGb P stack).toNat ≤ g.toNat ∧
           g.toNat + size.val ≤ (regGt P stack).toNat)) := by
-    refine seg_aluImm hc6 (fun t ht hA => ?_)
+    refine seg_aluImm hc6 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_)
     obtain ⟨hm, hk, hdv, himp⟩ := hA
     rw [aluImm_mov_true, signExtend_zero]
     exact ⟨Mid.keep hD4 hD5 hS4 hS5 hm (fun j _ h2 _ => wReg_regs_ne t scratch _ h2) hm.ro rfl,
@@ -1260,7 +1317,8 @@ theorem regionFrame_tailNone {P : Params} {code : List x64_ir.PInsn} {q : Nat}
           g.toNat + size.val ≤ (regGt P stack).toNat))
       (fun t => Mid P a dst.val scratch.val t ∧ K t.mem ∧
         RegionOut P stack size.val g (t.regs dst.val)) := by
-    refine seg_cmov hc7 (fun t ht hA hcc => ?_) (fun t ht hA hcc => ?_)
+    refine seg_cmov hc7 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA hcc => ?_)
+      (fun t ht hA hcc => ?_)
     · obtain ⟨hm, hk, hdv, hsv, -⟩ := hA
       exact ⟨Mid.keep hD4 hD5 hS4 hS5 hm (fun j h1 _ _ => wReg_regs_ne t dst _ h1) hm.ro rfl,
         hk, Or.inl (by rw [wReg_regs_self]; exact hsv)⟩
@@ -1358,6 +1416,15 @@ theorem mid_frame_access {P : Params} {a : x64_check.State} {D S : Nat} {t : Sta
   simp only [addr, rbp_val, hm.rbp]
   exact frame_slot_ok hL hlo hhi
 
+/-- And the three slots the expansion *writes* — `[rbp - 16]`, `[rbp - 24]`
+and `[rbp - 32]` — are three of the four the contract lets it write. -/
+theorem mid_frame_store {P : Params} {a : x64_check.State} {D S : Nat} {t : State}
+    (hL : Layout P) (hm : Mid P a D S t) {disp : Std.I32} {j : Nat}
+    (hj : j = 16 ∨ j = 24 ∨ j = 32 ∨ j = 144) (hd : disp.val = -(j : Int)) :
+    StoreOk P (addr t x64_ir.RBP disp) 8 := by
+  simp only [addr, rbp_val, hm.rbp]
+  exact storeOk_slot hL hj hd (le_refl 8)
+
 /-! ## The check through the descriptor
 
 The same check with the region's bounds read out of the memory descriptor,
@@ -1417,7 +1484,7 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g ∧ K t.mem)
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g ∧
         t.regs scratch.val = P.desc ∧ K t.mem) := by
-    refine seg_load8 hc0 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_load8 hc0 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨hm, -, -⟩ := hA
       exact mid_frame_access hL hm (by rw [frameOff_val]; norm_num)
         (by rw [frameOff_val]; norm_num)
@@ -1433,7 +1500,7 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
         t.regs scratch.val = P.desc ∧ K t.mem)
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g - regGb P stack ∧
         t.regs scratch.val = P.desc ∧ K t.mem) := by
-    refine seg_aluRM hc1 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_aluRM hc1 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨-, -, hsv, -⟩ := hA
       simp only [addr, hsv]
       exact desc_bottom_access hL stack
@@ -1452,7 +1519,10 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g - regGb P stack ∧
         t.regs scratch.val = P.desc ∧ K t.mem ∧
         load64 t.mem (P.rbp0 - BitVec.ofNat 64 16) = g - regGb P stack) := by
-    refine seg_store8 hc2 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_store8 hc2 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_)
+      (fun t _ hA => mid_frame_store (j := 16) hL hA.1 (by norm_num)
+        (by rw [spill_val]; norm_num))
+      (fun t ht hA => ?_)
     · obtain ⟨hm, -, -, -⟩ := hA
       exact mid_frame_access hL hm (by rw [spill_val]; norm_num) (by rw [spill_val]; norm_num)
     · obtain ⟨hm, hdv, hsv, hk⟩ := hA
@@ -1470,7 +1540,7 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
         t.regs dst.val = regNb P stack + (g - regGb P stack) ∧
         t.regs scratch.val = P.desc ∧ K t.mem ∧
         load64 t.mem (P.rbp0 - BitVec.ofNat 64 16) = g - regGb P stack) := by
-    refine seg_aluRM hc3 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_aluRM hc3 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨-, -, hsv, -, -⟩ := hA
       simp only [addr, hsv]
       exact desc_native_access hL stack
@@ -1494,7 +1564,7 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
         t.regs scratch.val = P.desc ∧ K t.mem ∧
         load64 t.mem (P.rbp0 - BitVec.ofNat 64 16) = g - regGb P stack ∧
         t.regs 9 = regGt P stack) := by
-    refine seg_load8 hc4 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_load8 hc4 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨-, -, hsv, -, -⟩ := hA
       simp only [addr, hsv]
       exact desc_top_access hL stack
@@ -1520,7 +1590,7 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
         t.regs scratch.val = P.desc ∧ K t.mem ∧
         load64 t.mem (P.rbp0 - BitVec.ofNat 64 16) = g - regGb P stack ∧
         t.regs 9 = regGt P stack - BitVec.ofNat 64 size.val) := by
-    refine seg_aluImm hc5 (fun t ht hA => ?_)
+    refine seg_aluImm hc5 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_)
     obtain ⟨hm, hdv, hsv, hk, hsp16, h9⟩ := hA
     rw [aluImm_sub_true,
       signExtend_nonneg (d := Std.UScalar.hcast (src_ty := .U32) .I32 size) (k := size.val)
@@ -1544,7 +1614,7 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
         load64 t.mem (P.rbp0 - BitVec.ofNat 64 16) = g - regGb P stack ∧
         (t.regs 9).toNat
           = (regGt P stack).toNat - size.val - (regGb P stack).toNat) := by
-    refine seg_aluRM hc6 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_aluRM hc6 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨-, -, hsv, -, -, -⟩ := hA
       simp only [addr, hsv]
       exact desc_bottom_access hL stack
@@ -1573,7 +1643,7 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
         load64 t.mem (P.rbp0 - BitVec.ofNat 64 16) = g - regGb P stack ∧
         (t.regs 9).toNat
           = (regGt P stack).toNat - size.val - (regGb P stack).toNat) := by
-    refine seg_alu hc7 (fun t ht hA => ?_)
+    refine seg_alu hc7 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_)
     obtain ⟨hm, hdv, hk, hsp16, h9⟩ := hA
     rw [alu_xor_true]
     refine ⟨Mid.keep hD4 hD5 hS4 hS5 hm (fun j _ h2 _ => wRegFlags_regs_ne t scratch _ _ h2)
@@ -1594,7 +1664,7 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
         t.regs scratch.val = 0#64 ∧
         (t.flags.cf = false → (regGb P stack).toNat ≤ g.toNat ∧
           g.toNat + size.val ≤ (regGt P stack).toNat)) := by
-    refine seg_aluRM hc8 (fun t ht hA => ?_) (fun t ht hA => ?_)
+    refine seg_aluRM hc8 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA => ?_) (fun t ht hA => ?_)
     · obtain ⟨hm, -, -, -, -, -⟩ := hA
       exact mid_frame_access hL hm (by rw [spill_val]; norm_num) (by rw [spill_val]; norm_num)
     · obtain ⟨hm, hdv, hk, hsv, hsp16, h9⟩ := hA
@@ -1617,7 +1687,8 @@ theorem regionViaDescriptor_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat
           g.toNat + size.val ≤ (regGt P stack).toNat))
       (fun t => Mid P a dst.val scratch.val t ∧ K t.mem ∧
         RegionOut P stack size.val g (t.regs dst.val)) := by
-    refine seg_cmov hc9 (fun t ht hA hcc => ?_) (fun t ht hA hcc => ?_)
+    refine seg_cmov hc9 (fun t _ hA => hA.1.rspWin hL) (fun t ht hA hcc => ?_)
+      (fun t ht hA hcc => ?_)
     · obtain ⟨hm, hdv, hk, hsv, -⟩ := hA
       exact ⟨Mid.keep hD4 hD5 hS4 hS5 hm (fun j h1 _ _ => wReg_regs_ne t dst _ h1) hm.ro rfl,
         hk, Or.inl (by rw [wReg_regs_self]; exact hsv)⟩
@@ -1653,8 +1724,9 @@ theorem Chain.toSeg {P : Params} {code : List x64_ir.PInsn} {p n : Nat}
     · exact h 0 (by omega) t (by omega) hR
     · intro k hk t ht hR
       have ht' : t.pc = p + (k + 1) := by omega
-      obtain ⟨hacc, hstp⟩ := h (k + 1) (by omega) t ht' hR
-      refine ⟨by rw [show p + 1 + k = p + (k + 1) from by omega]; exact hacc, fun c hc => ?_⟩
+      obtain ⟨hacc, hstr, hrsp, hstp⟩ := h (k + 1) (by omega) t ht' hR
+      refine ⟨by rw [show p + 1 + k = p + (k + 1) from by omega]; exact hacc,
+        by rw [show p + 1 + k = p + (k + 1) from by omega]; exact hstr, hrsp, fun c hc => ?_⟩
       obtain ⟨t', he, hp, hR'⟩ := hstp c hc
       exact ⟨t', he, by rw [hp]; omega, hR'⟩
 
@@ -1665,8 +1737,8 @@ theorem Seg.exists_index {P : Params} {code : List x64_ir.PInsn} {p n : Nat} {ι
   refine Seg.weaken (Chain.toSeg (R := fun k t => ∃ i, R i k t) ?_) ?_ ?_
   · intro k hk t ht hR
     obtain ⟨i, hRi⟩ := hR
-    obtain ⟨hacc, hstp⟩ := hCh i k hk t ht hRi
-    refine ⟨hacc, fun c hc => ?_⟩
+    obtain ⟨hacc, hstr, hrsp, hstp⟩ := hCh i k hk t ht hRi
+    refine ⟨hacc, hstr, hrsp, fun c hc => ?_⟩
     obtain ⟨t', he, hp, hR'⟩ := hstp c hc
     exact ⟨t', he, hp, ⟨i, hR'⟩⟩
   · rintro t ⟨i, hAi⟩; exact ⟨i, hA i t hAi⟩
@@ -1800,7 +1872,10 @@ theorem probe_seg {P : Params} {code : List x64_ir.PInsn} {q : Nat} {cfg : x64_i
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g)
       (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g ∧
         load64 t.mem (P.rbp0 - BitVec.ofNat 64 24) = g) := by
-    refine seg_store8 hc0 (fun t ht hA' => ?_) (fun t ht hA' => ?_)
+    refine seg_store8 hc0 (fun t _ hA' => hA'.1.rspWin hL) (fun t ht hA' => ?_)
+      (fun t _ hA' => mid_frame_store (j := 24) hL hA'.1 (by norm_num)
+        (by rw [addrSpill_val]; norm_num))
+      (fun t ht hA' => ?_)
     · obtain ⟨hm, -⟩ := hA'
       exact mid_frame_access hL hm (by rw [addrSpill_val]; norm_num)
         (by rw [addrSpill_val]; norm_num)
@@ -1834,7 +1909,10 @@ theorem probe_seg {P : Params} {code : List x64_ir.PInsn} {q : Nat} {cfg : x64_i
         (fun t => Mid P a dst.val scratch.val t ∧
           load64 t.mem (P.rbp0 - BitVec.ofNat 64 24) = g ∧
           RegionOut P true size.val g (load64 t.mem (P.rbp0 - BitVec.ofNat 64 32))) := by
-      refine seg_store8 hc2 (fun t ht hA' => ?_) (fun t ht hA' => ?_)
+      refine seg_store8 hc2 (fun t _ hA' => hA'.1.rspWin hL) (fun t ht hA' => ?_)
+        (fun t _ hA' => mid_frame_store (j := 32) hL hA'.1 (by norm_num)
+          (by rw [accSpill_val]; norm_num))
+        (fun t ht hA' => ?_)
       · obtain ⟨hm, -, -⟩ := hA'
         exact mid_frame_access hL hm (by rw [accSpill_val]; norm_num)
           (by rw [accSpill_val]; norm_num)
@@ -1854,7 +1932,8 @@ theorem probe_seg {P : Params} {code : List x64_ir.PInsn} {q : Nat} {cfg : x64_i
           RegionOut P true size.val g (load64 t.mem (P.rbp0 - BitVec.ofNat 64 32)))
         (fun t => Mid P a dst.val scratch.val t ∧ t.regs dst.val = g ∧
           RegionOut P true size.val g (load64 t.mem (P.rbp0 - BitVec.ofNat 64 32))) := by
-      refine seg_load8 hc3 (fun t ht hA' => ?_) (fun t ht hA' => ?_)
+      refine seg_load8 hc3 (fun t _ hA' => hA'.1.rspWin hL) (fun t ht hA' => ?_)
+        (fun t ht hA' => ?_)
       · obtain ⟨hm, -, -⟩ := hA'
         exact mid_frame_access hL hm (by rw [addrSpill_val]; norm_num)
           (by rw [addrSpill_val]; norm_num)
@@ -1880,7 +1959,8 @@ theorem probe_seg {P : Params} {code : List x64_ir.PInsn} {q : Nat} {cfg : x64_i
         RegionOut P false size.val g (t.regs dst.val))
       (fun t => Mid P a dst.val scratch.val t ∧
         TagOk P (x64_check.Tag.Checked size) (t.regs dst.val)) := by
-    refine seg_aluRM hc5 (fun t ht hA' => ?_) (fun t ht hA' => ?_)
+    refine seg_aluRM hc5 (fun t _ hA' => hA'.1.rspWin hL) (fun t ht hA' => ?_)
+      (fun t ht hA' => ?_)
     · obtain ⟨hm, -, -⟩ := hA'
       exact mid_frame_access hL hm (by rw [accSpill_val]; norm_num)
         (by rw [accSpill_val]; norm_num)
@@ -1907,7 +1987,7 @@ theorem head_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir
   have hmov : ∀ s : Std.U8, code[p]? = some (.Alu true .Mov s dst) →
       Seg P code p 1 (fun t => Mid P a dst.val S t) (fun t => Mid P a dst.val S t) := by
     intro s hc
-    refine seg_alu hc (fun t ht hm => ?_)
+    refine seg_alu hc (fun t _ hm => hm.rspWin hL) (fun t ht hm => ?_)
     rw [alu_mov_true]
     exact Mid.keep hD4 hD5 hS4 hS5 hm (fun j h1 _ _ => wReg_regs_ne t dst _ h1) hm.ro rfl
   have hplain : Laid code p (if src != dst then [(.Alu true .Mov src dst : x64_ir.PInsn)] else [])
@@ -1929,7 +2009,7 @@ theorem head_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir
           (.AluRM .Sub dst x64_ir.RBP x64_ir.frame.FRAME_DELTA_OFFSET) := hlaid.get (k := 1) rfl
       have s1 : Seg P code (p + 1) 1
           (fun t => Mid P a dst.val S t) (fun t => Mid P a dst.val S t) := by
-        refine seg_aluRM hc1 (fun t ht hm => ?_) (fun t ht hm => ?_)
+        refine seg_aluRM hc1 (fun t _ hm => hm.rspWin hL) (fun t ht hm => ?_) (fun t ht hm => ?_)
         · exact mid_frame_access hL hm (by rw [frameDelta_val]; norm_num)
             (by rw [frameDelta_val]; norm_num)
         · rw [aluRM_sub]
@@ -1942,7 +2022,7 @@ theorem head_seg {P : Params} {code : List x64_ir.PInsn} {p : Nat} {cfg : x64_ir
     exact hplain hlaid
 
 theorem off_seg {P : Params} {code : List x64_ir.PInsn} {q : Nat} {a : x64_check.State}
-    {dst : Std.U8} {S : Nat} {offset : Std.I32}
+    {dst : Std.U8} {S : Nat} {offset : Std.I32} (hL : Layout P)
     (hD4 : dst.val ≠ 4) (hD5 : dst.val ≠ 5) (hS4 : S ≠ 4) (hS5 : S ≠ 5)
     (hlaid : Laid code q (caOff dst offset)) :
     Seg P code q (caOff dst offset).length
@@ -1950,7 +2030,7 @@ theorem off_seg {P : Params} {code : List x64_ir.PInsn} {q : Nat} {a : x64_check
   unfold caOff at hlaid ⊢
   by_cases ho : (offset != 0#i32) = true
   · rw [if_pos ho] at hlaid ⊢
-    refine seg_aluImm (hlaid.get (k := 0) rfl) (fun t ht hm => ?_)
+    refine seg_aluImm (hlaid.get (k := 0) rfl) (fun t _ hm => hm.rspWin hL) (fun t ht hm => ?_)
     rw [aluImm_add_true]
     exact Mid.keep hD4 hD5 hS4 hS5 hm (fun j h1 _ _ => wRegFlags_regs_ne t dst _ _ h1) hm.ro rfl
   · rw [if_neg ho] at hlaid ⊢
@@ -2049,7 +2129,7 @@ theorem macroOk_checkedAddr {P : Params} {code : List x64_ir.PInsn} {p : Nat}
     (Laid.right hlaid).shift (by rw [List.length_append])
   have seg := ((head_seg (a := pre) (S := scratch.val) hL hwd.1 hwd.2.1 hwsr.1 hwsr.2.1
       (Laid.left (Laid.left hlaid))).trans
-    (off_seg (a := pre) (S := scratch.val) hwd.1 hwd.2.1 hwsr.1 hwsr.2.1
+    (off_seg (a := pre) (S := scratch.val) hL hwd.1 hwd.2.1 hwsr.1 hwsr.2.1
       (Laid.right (Laid.left hlaid)))).trans
     (body_seg (a := pre) hL hwd.1 hwd.2.1 hwsr.1 hwsr.2.1 hdsv hd9 hs9 hw1 hw2 hcage hbody)
   rw [hlen]
