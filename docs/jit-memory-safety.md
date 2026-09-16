@@ -75,9 +75,9 @@ into the verified core and the bytes left outside:
     │  src/verified/x64_expand.rs  expand: each macro's fixed native sequence
     ▼
   Vec<PInsn>   primitive instructions, one per x86 instruction
-    │  src/jit/emit/x86_64.rs      encode: bytes and relative-branch fixups
+    │  src/verified/x64_encode.rs  assemble: bytes and relative-branch fixups
     ▼
-  bytes
+  bytes        (src/jit/emit/x86_64.rs only reports the two errors)
 ```
 
 The bytes are unchanged: every golden in `src/jit/goldens/x86_64.txt` is the
@@ -88,8 +88,8 @@ same before and after, which is what makes the restructuring reviewable.
 A *macro* (`MInsn`) is one emitted idea: a bounds check, a helper call, a
 lazy local call, a division with eBPF's fix-ups, a guest load. A *primitive*
 (`PInsn`) is one x86 instruction. `expand` turns each macro into its fixed
-primitive sequence; the encoder is a table from primitives to bytes with no
-decisions left in it.
+primitive sequence; the assembler is a table from primitives to bytes with no
+decisions left in it, and a verified decoder inverts it.
 
 The split is what keeps the proof small. The checker reads macros and knows
 each one's *contract* only: what it requires of the abstract state, which
@@ -190,14 +190,49 @@ the division sequence's pushes balance; the fetching atomic's loop
 re-dereferences a base nothing has rewritten.
 
 The theorem is about one activation entered at the head of the list, which
-is how the runtime enters every function it translates.
+is how the runtime enters every function it translates. Four more results
+connect it to the rest of the runtime:
+
+- **Across activations** (`Compose.lean`). The model answers every call out
+  of the list with `ExternalReturn`, an assumption about the callee.
+  `callee_externalReturn` discharges it for the callee that is another
+  instance of this theorem: a lazily compiled function that satisfies
+  `Contract`, entered one stride down with the two floor checks passed,
+  returns to its caller exactly as `ExternalReturn` says, and its own
+  `Layout` follows from the caller's. The dispatcher and the two callbacks
+  are host code and stay assumed.
+- **The layout the runtime checks** (`x64_layout.rs`, `LayoutCheck.lean`).
+  `layout_ok` is twenty-one comparisons over the thirteen numbers the
+  descriptor and the mappings carry; `program.rs` runs it on every
+  invocation and refuses the run if it fails. `layout_of_check` turns a
+  passing check, plus the six per-activation facts only the trampoline can
+  establish, into the theorem's `Layout` hypothesis, clause by clause.
+- **The bytes** (`x64_encode.rs`, `x64_decode.rs`, `Encode.lean`).
+  The encoder is no longer trusted: `assemble` is the two-pass assembler,
+  `decode_one` an independently written inverse, and `decodesTo_all` says
+  every primitive the backend can emit decodes back to its shape and its
+  `size_of` length, every operand symbolic; `assemble_spec` says the
+  assembled bytes are that concatenation with each branch site carrying
+  the displacement to its label, and that an unlabelled target is refused.
+  What remains trusted of the bytes is the decoder's table.
+- **The model and the machine** (`x64_sim.rs`, `SimRefines.lean`,
+  `src/test/x64_sim_native.rs`). `x64_sim` is an executable simulator of the
+  primitives; `step_refines` and `run_refines` prove it is a run of
+  `Machine.lean`'s relation. A differential test runs twenty thousand
+  random primitive lists through the simulator and the processor and
+  compares registers, flags and memory. The test is what ties the model
+  to the hardware; the refinement is what makes it a test of the model.
 
 ## What is trusted
 
-- **The encoder**, `src/jit/emit/x86_64.rs`: primitives to bytes, and the
-  relative-branch fixups. It is a table, pinned byte for byte by the goldens.
-- **The entry trampolines** (`global_asm!` in `program.rs`) and the values
-  the runtime fills into the descriptor and the derived slots.
+- **The x86 instruction set** as the model and the decoder read it: that
+  the bytes the assembler emits mean to the processor what `Machine.lean`
+  says the primitive means. The simulator's differential test against the
+  hardware is the evidence; it is not a proof.
+- **The entry trampolines** (`global_asm!` in `program.rs`): that they
+  enter generated code with `rsp`, `rbp` and the frame register where the
+  six per-activation facts say, inside the mappings `layout_ok` checked,
+  and with the descriptor and derived slots filled as `RoMem` reads them.
 - **The fault handler** and the windows it claims; **the mappings** (islands,
   gaps, the cage, the arena's write-xor-execute discipline).
 - **The host side of every call**: the dispatcher, the resolver (that it
@@ -217,6 +252,15 @@ Nothing in the bytes. Two things at the edge:
   first.)
 - A function the checker refuses is a translation failure naming the slot.
   No known program reaches it.
+- An invocation whose memory layout fails `layout_ok` — the guest regions,
+  their native backings, the coroutine stack and the descriptor not
+  ordered, page-wide and pairwise disjoint — is refused with a
+  `PlatformError` before generated code is entered. No mapping the runtime
+  builds fails it; it is the theorem's hypothesis, checked.
+- A branch to an unlabelled slot is an assembler error rather than a
+  silent branch to the top of the function, and a short branch that does
+  not reach is an error rather than a truncated byte. The checker refuses
+  both before the assembler sees them.
 
 ## Cost, for the record
 

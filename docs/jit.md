@@ -279,8 +279,8 @@ Emitting a function variant:
    arena has left. On x86_64 this is three layers: the verified lowering builds
    a list of macro instructions, the verified checker refuses it unless it is
    memory-safe, the verified expansion turns each macro into its native
-   sequence, and the encoder writes bytes and resolves the branches
-   ([Memory safety of the generated code](jit-memory-safety.md)). This is the
+   sequence, and the verified assembler writes bytes and resolves the
+   branches ([Memory safety of the generated code](jit-memory-safety.md)). This is the
    phase that runs under
    `Timeslicer::run_blocking`; the output is position-independent (the backend
    never sees the buffer's address, and local calls are indirect through
