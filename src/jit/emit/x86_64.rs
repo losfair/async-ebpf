@@ -1,27 +1,27 @@
-//! The x86_64 backend's encoder.
+//! The x86_64 backend's adapter onto the verified core.
 //!
-//! Translating one function happens in three layers, and only the last of them
-//! is here:
+//! Translating one function happens in four layers, none of which is here:
 //!
 //! ```text
 //!   eBPF program + hints + plan
-//!     │  verified::x64_lower::lower    the decisions
+//!     │  verified::x64_lower::lower     the decisions
 //!     ▼
 //!   Vec<MInsn>   macro instructions
-//!     │  verified::x64_expand::expand  each macro's native sequence
+//!     │  verified::x64_expand::expand   each macro's native sequence
 //!     ▼
 //!   Vec<PInsn>   one per x86 instruction
-//!     │  encode                        bytes, and the relative-branch fixups
+//!     │  verified::x64_encode::assemble bytes, and the label resolution
 //!     ▼
 //!   bytes in the code arena
 //! ```
 //!
-//! The first two layers are in the verified core, which `lean/AsyncEbpf/X64/`
-//! is about; see `docs/jit-memory-safety.md`. This module is the adapter around
-//! them: it builds the three descriptions they take from the [`Translator`],
-//! renders each [`Reject`] as the message embedders match on, and encodes the
-//! primitives. [`encode`] is a table with no decisions left in it — which is
-//! what makes it reviewable by reading the goldens.
+//! All four are in the verified core, which `lean/AsyncEbpf/X64/` is about;
+//! see `docs/jit-memory-safety.md`. This module is the adapter around them: it
+//! builds the three descriptions they take from the [`Translator`], renders
+//! each [`Reject`] and each [`AsmError`] as the message embedders match on,
+//! and copies the assembled bytes into the caller's buffer. The table from
+//! primitives to bytes used to live here, and `verified::x64_decode` now
+//! inverts it; what is left has no decisions in it at all.
 //!
 //! # Changing what this emits
 //!
@@ -55,13 +55,10 @@
 use crate::jit::abi;
 use crate::jit::{Config, TranslateError, TranslationInputs, Translator};
 
+use crate::verified::x64_encode::{assemble, AsmError};
 use crate::verified::x64_expand::expand;
-use crate::verified::x64_ir::{
-  AluRI, AluRM, AluRR, Cfg, MulDivKind, PInsn, PTarget, ShiftOp, Size, MAX_EXT_FUNCS,
-};
+use crate::verified::x64_ir::{Cfg, PInsn};
 use crate::verified::x64_lower::{lower, Reject};
-
-use crate::verified::x64_ir::{R12, R13, RBP, RCX, RSP};
 
 // ---------------------------------------------------------------------------
 // The adapter
@@ -185,665 +182,41 @@ fn render(reject: Reject, inputs: &TranslationInputs<'_>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Fixups
-// ---------------------------------------------------------------------------
-
-/// What a reserved displacement is measured against.
-#[derive(Copy, Clone)]
-enum Site {
-  /// A branch, whose target the primitive names.
-  Branch(PTarget),
-  /// The eight bytes of the trailer holding the dispatcher's address.
-  Dispatcher,
-  /// The trailer's helper address table.
-  HelperTable,
-}
-
-/// How a reserved displacement is written.
-#[derive(Copy, Clone)]
-enum Width {
-  /// Four bytes, measured from just past them.
-  Rel32,
-  /// One byte, measured from just past it, with three bytes of padding after.
-  /// Out of range refuses the function.
-  Rel8Padded,
-  /// One byte, measured from just past it, with nothing after.
-  Rel8,
-}
-
-struct Fixup {
-  at: u32,
-  width: Width,
-  site: Site,
-}
-
-// ---------------------------------------------------------------------------
 // The encoder
 // ---------------------------------------------------------------------------
 
 /// Encodes a primitive list, writing it into `buffer`.
 ///
-/// The bytes are built in full first and copied out once, so a buffer too small
-/// is one comparison rather than a partially written function.
+/// The table from primitives to bytes and the label resolution both live in
+/// [`verified::x64_encode`](crate::verified::x64_encode); all this adds is the
+/// wording of the two refusals. The bytes are built in full first and copied
+/// out once, so a buffer too small is one comparison rather than a partially
+/// written function.
 pub fn encode(code: &[PInsn], buffer: &mut [u8]) -> Result<usize, TranslateError> {
-  let mut e = Enc::new(code);
-  let mut i = 0;
-  while i < code.len() {
-    e.one(code[i]);
-    i += 1;
+  let mut bytes = Vec::new();
+  if let Err(e) = assemble(code, &mut bytes) {
+    return Err(TranslateError::Failed(asm_message(e)));
   }
-  if !e.resolve() {
-    return Err(TranslateError::Failed(
-      "Could not patch the relative addresses in the JIT'd code".to_string(),
-    ));
-  }
-  if e.buf.len() > buffer.len() {
+  if bytes.len() > buffer.len() {
     return Err(TranslateError::OutOfSpace);
   }
-  buffer[..e.buf.len()].copy_from_slice(&e.buf);
-  Ok(e.buf.len())
+  buffer[..bytes.len()].copy_from_slice(&bytes);
+  Ok(bytes.len())
 }
 
-struct Enc {
-  buf: Vec<u8>,
-  /// Native offset of each eBPF slot that was labelled. A slot that was never
-  /// labelled reads as zero, as the fixup pass has always treated it.
-  pc_locs: Vec<u32>,
-  local_locs: Vec<u32>,
-  exit_loc: u32,
-  retpoline_loc: u32,
-  dispatcher_loc: u32,
-  helper_table_loc: u32,
-  fixups: Vec<Fixup>,
-}
-
-impl Enc {
-  fn new(code: &[PInsn]) -> Enc {
-    let mut max_pc = 0u32;
-    let mut max_local = 0u32;
-    for insn in code {
-      match *insn {
-        PInsn::PcLabel(pc) => {
-          if pc >= max_pc {
-            max_pc = pc + 1;
-          }
-        }
-        PInsn::Local(n) => {
-          if n >= max_local {
-            max_local = n + 1;
-          }
-        }
-        _ => {}
-      }
+/// The message for one assembly failure.
+///
+/// Both outcomes were the same failure before the assembler distinguished
+/// them — a near jump that did not reach, and a branch whose label the list
+/// never carried — and both keep the wording embedders match on.
+fn asm_message(e: AsmError) -> String {
+  match e {
+    AsmError::MissingLabel => {
+      "Could not patch the relative addresses in the JIT'd code".to_string()
     }
-    Enc {
-      buf: Vec::new(),
-      pc_locs: vec![0; max_pc as usize],
-      local_locs: vec![0; max_local as usize],
-      exit_loc: 0,
-      retpoline_loc: 0,
-      dispatcher_loc: 0,
-      helper_table_loc: 0,
-      fixups: Vec::new(),
+    AsmError::RelocationOutOfRange => {
+      "Could not patch the relative addresses in the JIT'd code".to_string()
     }
-  }
-
-  // -------------------------------------------------------------------------
-  // Bytes
-  // -------------------------------------------------------------------------
-
-  #[inline]
-  fn emit1(&mut self, x: u8) {
-    self.buf.push(x);
-  }
-
-  #[inline]
-  fn emit2(&mut self, x: u16) {
-    self.buf.extend_from_slice(&x.to_le_bytes());
-  }
-
-  #[inline]
-  fn emit4(&mut self, x: u32) {
-    self.buf.extend_from_slice(&x.to_le_bytes());
-  }
-
-  #[inline]
-  fn emit8(&mut self, x: u64) {
-    self.buf.extend_from_slice(&x.to_le_bytes());
-  }
-
-  #[inline]
-  fn offset(&self) -> u32 {
-    self.buf.len() as u32
-  }
-
-  fn emit_modrm(&mut self, md: u8, r: u8, m: u8) {
-    self.emit1((md & 0xc0) | ((r & 7) << 3) | (m & 7));
-  }
-
-  fn emit_modrm_reg2reg(&mut self, r: u8, m: u8) {
-    self.emit_modrm(0xc0, r, m);
-  }
-
-  /// ModRM plus displacement, with the zero-displacement shortcut. Two
-  /// irregular cases matter:
-  ///
-  /// * `RBP`/`R13` cannot encode a bare `[base]`, so they always get an
-  ///   explicit displacement even when it is zero;
-  /// * `R12` needs a SIB byte, emitted as `0x24`.
-  ///
-  /// `RSP` and `R12` share the low three bits that ModRM encodes, and both
-  /// therefore need the SIB byte. No caller passes `RSP` as a base — the
-  /// sequences that address the host stack emit their ModRM and SIB bytes
-  /// literally — so emitting it for `R12` alone produces correct code.
-  fn emit_modrm_and_displacement(&mut self, reg: u8, rm: u8, d: i32) {
-    let rm = rm & 0xf;
-    let reg = reg & 0xf;
-
-    if d == 0 && rm != RSP && rm != RBP && rm != R12 && rm != R13 {
-      self.emit_modrm(0x00, reg, rm);
-      return;
-    }
-
-    let near_disp = (-128..=127).contains(&d);
-    let md = if near_disp { 0x40 } else { 0x80 };
-
-    self.emit_modrm(md, reg, rm);
-    if rm == R12 || rm == RSP {
-      self.emit1(0x24);
-    }
-
-    if near_disp {
-      self.emit1(d as u8);
-    } else {
-      self.emit4(d as u32);
-    }
-  }
-
-  fn emit_rex(&mut self, w: u8, r: u8, x: u8, b: u8) {
-    self.emit1(0x40 | (w << 3) | (r << 2) | (x << 1) | b);
-  }
-
-  /// REX carrying only the high bits of `src`/`dst`, skipped when no bit would
-  /// be set.
-  fn emit_basic_rex(&mut self, w: u8, src: u8, dst: u8) {
-    if w != 0 || (src & 8) != 0 || (dst & 8) != 0 {
-      self.emit_rex(w, u8::from(src & 8 != 0), 0, u8::from(dst & 8 != 0));
-    }
-  }
-
-  fn emit_alu(&mut self, w64: bool, op: u8, src: u8, dst: u8) {
-    self.emit_basic_rex(u8::from(w64), src, dst);
-    self.emit1(op);
-    self.emit_modrm_reg2reg(src, dst);
-  }
-
-  /// `load [src + offset] -> dst`, zero-extending for the narrow widths.
-  fn emit_load(&mut self, size: Size, src: u8, dst: u8, offset: i32) {
-    self.emit_basic_rex(u8::from(size == 8), dst, src);
-    if size == 1 {
-      self.emit1(0x0f);
-      self.emit1(0xb6);
-    } else if size == 2 {
-      self.emit1(0x0f);
-      self.emit1(0xb7);
-    } else {
-      self.emit1(0x8b);
-    }
-    self.emit_modrm_and_displacement(dst, src, offset);
-  }
-
-  /// `load [src + offset] -> dst`, sign-extending to 64 bits. The
-  /// doubleword form emits nothing at all: there is no `ldxdwsx` encoding, so
-  /// no caller reaches it.
-  fn emit_load_sx(&mut self, size: Size, src: u8, dst: u8, offset: i32) {
-    if size == 8 {
-      return;
-    }
-    self.emit_basic_rex(1, dst, src);
-    if size == 4 {
-      self.emit1(0x63);
-    } else {
-      self.emit1(0x0f);
-      self.emit1(if size == 1 { 0xbe } else { 0xbf });
-    }
-    self.emit_modrm_and_displacement(dst, src, offset);
-  }
-
-  /// `store src -> [dst + offset]`.
-  ///
-  /// The byte-width term in the REX condition is what makes a byte store
-  /// through `SIL`/`DIL`/`SPL`/`BPL` name the right register: without a REX
-  /// prefix those encodings mean `AH`/`CH`/`DH`/`BH`.
-  fn emit_store(&mut self, size: Size, src: u8, dst: u8, offset: i32) {
-    if size == 2 {
-      self.emit1(0x66);
-    }
-    let rexw = u8::from(size == 8);
-    if rexw != 0 || (src & 8) != 0 || (dst & 8) != 0 || size == 1 {
-      self.emit_rex(rexw, u8::from(src & 8 != 0), 0, u8::from(dst & 8 != 0));
-    }
-    self.emit1(if size == 1 { 0x88 } else { 0x89 });
-    self.emit_modrm_and_displacement(src, dst, offset);
-  }
-
-  /// `store imm -> [dst + offset]`.
-  fn emit_store_imm(&mut self, size: Size, dst: u8, offset: i32, imm: i32) {
-    if size == 2 {
-      self.emit1(0x66);
-    }
-    self.emit_basic_rex(u8::from(size == 8), 0, dst);
-    self.emit1(if size == 1 { 0xc6 } else { 0xc7 });
-    self.emit_modrm_and_displacement(0, dst, offset);
-    if size == 1 {
-      self.emit1(imm as u8);
-    } else if size == 2 {
-      self.emit2(imm as u16);
-    } else {
-      self.emit4(imm as u32);
-    }
-  }
-
-  /// Materialises a 64-bit immediate, preferring the sign-extended 32-bit
-  /// form.
-  fn emit_load_imm(&mut self, dst: u8, imm: i64) {
-    if (i32::MIN as i64..=i32::MAX as i64).contains(&imm) {
-      self.emit_alu(true, 0xc7, 0, dst);
-      self.emit4(imm as u32);
-      return;
-    }
-    self.emit_basic_rex(1, 0, dst);
-    self.emit1(0xb8 | (dst & 7));
-    self.emit8(imm as u64);
-  }
-
-  /// Reserves the bytes a relative displacement needs and records its fixup.
-  fn reserve(&mut self, width: Width, site: Site) {
-    let at = self.offset();
-    self.fixups.push(Fixup { at, width, site });
-    // A near jump still reserves four bytes, so three are wasted after every
-    // one. They are never executed — the jump is unconditional and lands past
-    // them — so this costs code size and nothing else.
-    match width {
-      Width::Rel8 => self.emit1(0),
-      _ => self.emit4(0),
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // One primitive
-  // -------------------------------------------------------------------------
-
-  fn one(&mut self, insn: PInsn) {
-    match insn {
-      PInsn::PcLabel(pc) => {
-        let here = self.offset();
-        self.pc_locs[pc as usize] = here;
-      }
-      PInsn::Local(n) => {
-        let here = self.offset();
-        self.local_locs[n as usize] = here;
-      }
-      PInsn::ExitLabel => self.exit_loc = self.offset(),
-      PInsn::RetpolineLabel => self.retpoline_loc = self.offset(),
-
-      PInsn::Push(r) => {
-        self.emit_basic_rex(0, 0, r);
-        self.emit1(0x50 | (r & 7));
-      }
-      PInsn::Pop(r) => {
-        self.emit_basic_rex(0, 0, r);
-        self.emit1(0x58 | (r & 7));
-      }
-      PInsn::Alu { w64, op, src, dst } => self.emit_alu(w64, alu_rr_opcode(op), src, dst),
-      PInsn::AluImm { w64, op, dst, imm } => {
-        let (opcode, ext) = alu_ri_opcode(op);
-        self.emit_alu(w64, opcode, ext, dst);
-        self.emit4(imm as u32);
-      }
-      PInsn::ShiftImm { w64, op, dst, imm } => {
-        self.emit_alu(w64, 0xc1, shift_ext(op), dst);
-        // The shift count is a byte, so the immediate is truncated here.
-        self.emit1(imm as u8);
-      }
-      PInsn::ShiftCl { w64, op, dst } => self.emit_alu(w64, 0xd3, shift_ext(op), dst),
-      PInsn::Neg { w64, dst } => self.emit_alu(w64, 0xf7, 3, dst),
-      PInsn::MulDivRcx { w64, kind, signed } => {
-        if w64 {
-          self.emit_rex(1, 0, 0, 0);
-        }
-        // `/4` is MUL, `/6` DIV and `/7` IDIV.
-        let ext = match kind {
-          MulDivKind::Mul => 4,
-          _ => {
-            if signed {
-              7
-            } else {
-              6
-            }
-          }
-        };
-        self.emit_alu(false, 0xf7, ext, RCX);
-      }
-      PInsn::MovSx {
-        from,
-        w64,
-        src,
-        dst,
-      } => {
-        // The explicit REX is what makes a byte source name `SIL`/`DIL`/
-        // `SPL`/`BPL` rather than `AH`/`CH`/`DH`/`BH`, so it is emitted even
-        // when no high-register bit is set.
-        if w64 || from == 8 {
-          self.emit_rex(
-            u8::from(w64),
-            u8::from(dst & 8 != 0),
-            0,
-            u8::from(src & 8 != 0),
-          );
-        } else {
-          self.emit_basic_rex(0, dst, src);
-        }
-        if from == 32 {
-          self.emit1(0x63);
-        } else {
-          self.emit1(0x0f);
-          self.emit1(if from == 8 { 0xbe } else { 0xbf });
-        }
-        self.emit_modrm_reg2reg(dst, src);
-      }
-      PInsn::Bswap { w64, dst } => {
-        self.emit_basic_rex(u8::from(w64), 0, dst);
-        self.emit1(0x0f);
-        self.emit1(0xc8 | (dst & 7));
-      }
-      PInsn::Rol16 { dst } => {
-        self.emit1(0x66);
-        self.emit_alu(false, 0xc1, 0, dst);
-        self.emit1(8);
-      }
-      PInsn::Cmov { cc, dst, src } => {
-        self.emit_basic_rex(1, dst, src);
-        self.emit1(0x0f);
-        // `cmovcc` is the `0x4x` row of the same condition table the near
-        // `jcc` forms name in the `0x8x` row.
-        self.emit1(0x40 | (cc & 0x0f));
-        self.emit_modrm_reg2reg(dst, src);
-      }
-      PInsn::LoadImm { dst, imm } => self.emit_load_imm(dst, imm),
-      PInsn::Pushfq => self.emit1(0x9c),
-      PInsn::Popfq => self.emit1(0x9d),
-      PInsn::Cqo => {
-        self.emit1(0x48);
-        self.emit1(0x99);
-      }
-      PInsn::Cdq => self.emit1(0x99),
-      PInsn::CmpRcxMinusOne { w64 } => {
-        if w64 {
-          self.emit1(0x48);
-        }
-        self.emit1(0x83);
-        self.emit1(0xf9);
-        self.emit1(0xff);
-      }
-      PInsn::CmpEaxImm { imm } => {
-        self.emit1(0x3d);
-        self.emit4(imm);
-      }
-
-      PInsn::Load {
-        size,
-        sx,
-        base,
-        dst,
-        disp,
-      } => {
-        if sx {
-          self.emit_load_sx(size, base, dst, disp);
-        } else {
-          self.emit_load(size, base, dst, disp);
-        }
-      }
-      PInsn::Store {
-        size,
-        src,
-        base,
-        disp,
-      } => self.emit_store(size, src, base, disp),
-      PInsn::StoreImm {
-        size,
-        base,
-        disp,
-        imm,
-      } => self.emit_store_imm(size, base, disp, imm),
-      PInsn::AluRM {
-        op,
-        reg,
-        base,
-        disp,
-      } => {
-        self.emit_basic_rex(1, reg, base);
-        self.emit1(alu_rm_opcode(op));
-        self.emit_modrm_and_displacement(reg, base, disp);
-      }
-      PInsn::StoreRspImm { imm } => {
-        // The ModRM/SIB pair for an `[rsp]` base is emitted literally.
-        self.emit1(0x48);
-        self.emit1(0xc7);
-        self.emit1(0x04);
-        self.emit1(0x24);
-        self.emit4(imm);
-      }
-      PInsn::StoreRspRax => {
-        self.emit1(0x48);
-        self.emit1(0x89);
-        self.emit1(0x04);
-        self.emit1(0x24);
-      }
-
-      PInsn::LockAlu {
-        op,
-        w64,
-        src,
-        base,
-        disp,
-      } => {
-        self.emit1(0xf0);
-        self.emit_basic_rex(u8::from(w64), src, base);
-        self.emit1(op);
-        self.emit_modrm_and_displacement(src, base, disp);
-      }
-      PInsn::LockCmpxchg {
-        w64,
-        src,
-        base,
-        disp,
-      } => {
-        self.emit1(0xf0);
-        self.emit_basic_rex(u8::from(w64), src, base);
-        self.emit1(0x0f);
-        self.emit1(0xb1);
-        self.emit_modrm_and_displacement(src, base, disp);
-      }
-      PInsn::Xchg {
-        w64,
-        src,
-        base,
-        disp,
-      } => {
-        // `xchg` with a memory operand is implicitly locked; the prefix is
-        // emitted anyway.
-        self.emit1(0xf0);
-        self.emit_basic_rex(u8::from(w64), src, base);
-        self.emit1(0x87);
-        self.emit_modrm_and_displacement(src, base, disp);
-      }
-
-      PInsn::Jcc { cc, target } => {
-        self.emit1(0x0f);
-        self.emit1(cc);
-        self.reserve(Width::Rel32, Site::Branch(target));
-      }
-      PInsn::Jmp { target } => {
-        self.emit1(0xe9);
-        self.reserve(Width::Rel32, Site::Branch(target));
-      }
-      PInsn::JmpNear { target } => {
-        self.emit1(0xeb);
-        self.reserve(Width::Rel8Padded, Site::Branch(target));
-      }
-      PInsn::Call { target } => {
-        self.emit1(0xe8);
-        self.reserve(Width::Rel32, Site::Branch(target));
-      }
-      PInsn::Jcc8 { cc, target } => {
-        self.emit1(0x70 | (cc & 0x0f));
-        self.reserve(Width::Rel8, Site::Branch(PTarget::Local(target)));
-      }
-      PInsn::Jmp8 { target } => {
-        self.emit1(0xeb);
-        self.reserve(Width::Rel8, Site::Branch(PTarget::Local(target)));
-      }
-      PInsn::Ret => self.emit1(0xc3),
-      PInsn::Pause => {
-        self.emit1(0xf3);
-        self.emit1(0x90);
-      }
-      PInsn::Ud2 => {
-        self.emit1(0x0f);
-        self.emit1(0x0b);
-      }
-      PInsn::CallReg(reg) => {
-        if reg & 8 != 0 {
-          self.emit1(0x41);
-        }
-        self.emit1(0xff);
-        self.emit1(0xd0 | (reg & 7));
-      }
-      PInsn::RipLoadDispatcher { dst } => {
-        // The REX `R` bit is zero: the only destination is RAX.
-        self.emit_rex(1, 0, 0, 0);
-        self.emit1(0x8b);
-        self.emit_modrm(0, dst, 0x05);
-        self.reserve(Width::Rel32, Site::Dispatcher);
-      }
-      PInsn::RipLeaHelperTable { dst } => {
-        self.emit_rex(1, u8::from(dst & 8 != 0), 0, 0);
-        self.emit1(0x8d);
-        self.emit_modrm(0, dst, 0x05);
-        self.reserve(Width::Rel32, Site::HelperTable);
-      }
-
-      PInsn::DispatcherSlot { addr } => {
-        self.dispatcher_loc = self.offset();
-        self.emit8(addr);
-      }
-      PInsn::HelperTable => {
-        self.helper_table_loc = self.offset();
-        // `async-ebpf` never registers individual helpers — it uses the
-        // dispatcher — so every entry is null. The table is emitted anyway
-        // because the default dispatch path indexes into it and the trailer's
-        // layout is part of the ABI the runtime patches through.
-        let mut k = 0;
-        while k < MAX_EXT_FUNCS {
-          self.emit8(0);
-          k += 1;
-        }
-      }
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Relocation
-  // -------------------------------------------------------------------------
-
-  /// Where a fixup's site landed.
-  fn site_loc(&self, site: Site) -> u32 {
-    match site {
-      Site::Dispatcher => self.dispatcher_loc,
-      Site::HelperTable => self.helper_table_loc,
-      Site::Branch(PTarget::Exit) => self.exit_loc,
-      Site::Branch(PTarget::Retpoline) => self.retpoline_loc,
-      Site::Branch(PTarget::Local(n)) => self.local_locs[n as usize],
-      // A slot that was never labelled resolves to the top of the function.
-      Site::Branch(PTarget::Pc(pc)) => self.pc_locs.get(pc as usize).copied().unwrap_or(0),
-    }
-  }
-
-  /// Writes every reserved displacement. Returns false when a near jump does
-  /// not reach, which the caller turns into a failure.
-  fn resolve(&mut self) -> bool {
-    let fixups = std::mem::take(&mut self.fixups);
-    for fixup in &fixups {
-      let target = self.site_loc(fixup.site);
-      let at = fixup.at as usize;
-      match fixup.width {
-        Width::Rel32 => {
-          let rel = target.wrapping_sub(fixup.at.wrapping_add(4));
-          self.buf[at..at + 4].copy_from_slice(&rel.to_le_bytes());
-        }
-        Width::Rel8Padded => {
-          let rel = target as i64 - (fixup.at as i64 + 1);
-          if !(-128..128).contains(&rel) {
-            return false;
-          }
-          self.buf[at] = rel as i8 as u8;
-        }
-        Width::Rel8 => {
-          let rel = target.wrapping_sub(fixup.at).wrapping_sub(1);
-          self.buf[at] = rel as u8;
-        }
-      }
-    }
-    self.fixups = fixups;
-    true
-  }
-}
-
-/// The register-form opcode byte for each ALU operation.
-fn alu_rr_opcode(op: AluRR) -> u8 {
-  match op {
-    AluRR::Add => 0x01,
-    AluRR::Sub => 0x29,
-    AluRR::Or => 0x09,
-    AluRR::And => 0x21,
-    AluRR::Xor => 0x31,
-    AluRR::Mov => 0x89,
-    AluRR::Cmp => 0x39,
-    AluRR::Test => 0x85,
-  }
-}
-
-/// The opcode byte and ModRM extension for each immediate-form operation.
-fn alu_ri_opcode(op: AluRI) -> (u8, u8) {
-  match op {
-    AluRI::Add => (0x81, 0),
-    AluRI::Or => (0x81, 1),
-    AluRI::And => (0x81, 4),
-    AluRI::Sub => (0x81, 5),
-    AluRI::Xor => (0x81, 6),
-    AluRI::Cmp => (0x81, 7),
-    AluRI::Mov => (0xc7, 0),
-    AluRI::Test => (0xf7, 0),
-  }
-}
-
-fn shift_ext(op: ShiftOp) -> u8 {
-  match op {
-    ShiftOp::Shl => 4,
-    ShiftOp::Shr => 5,
-    ShiftOp::Sar => 7,
-  }
-}
-
-/// The opcode byte for each `op reg, [mem]` form the bounds checks use.
-fn alu_rm_opcode(op: AluRM) -> u8 {
-  match op {
-    AluRM::Sub => 0x2b,
-    AluRM::Add => 0x03,
-    AluRM::CmpMR => 0x39,
-    AluRM::CmpRM => 0x3b,
-    AluRM::Or => 0x0b,
   }
 }
 
@@ -862,7 +235,7 @@ mod tests {
   use crate::jit::isa::{alu, cls, jmp, mode, opcode, size, src as srcbit, Insn};
   use crate::jit::{Dispatcher, LocalCallResolver, LocalCallStackExhausted, PlanEntry, Target};
   // The register map and its two lookups live with the instruction set.
-  use crate::verified::x64_ir::{map_register, unmap_register, R11, R15, R9, REGISTER_MAP};
+  use crate::verified::x64_ir::{map_register, unmap_register, R11, R15, R9, RCX, REGISTER_MAP};
 
   // -----------------------------------------------------------------------
   // Instructions
