@@ -436,10 +436,10 @@ fn size_bytes(size: Size) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Whether an instruction is the label a target names.
-fn is_target(t: PTarget, i: PInsn) -> bool {
+fn is_target(t: PTarget, i: &PInsn) -> bool {
   match t {
     PTarget::Pc(p) => match i {
-      PInsn::PcLabel(q) => p == q,
+      PInsn::PcLabel(q) => p == *q,
       _ => false,
     },
     PTarget::Exit => match i {
@@ -451,34 +451,43 @@ fn is_target(t: PTarget, i: PInsn) -> bool {
       _ => false,
     },
     PTarget::Local(n) => match i {
-      PInsn::Local(m) => n == m,
+      PInsn::Local(m) => n == *m,
       _ => false,
     },
   }
 }
 
-/// Where a branch target sits in the list: the first label that matches it.
-/// The flag is false when the list carries no such label, which is the
-/// encoder's unresolved fixup made into a stuck state.
-fn find_label(code: &[PInsn], t: PTarget) -> (bool, usize) {
+/// Where a branch target sits in the list: the position of the first label
+/// that matches it, or `code.len()` when the list carries no such label —
+/// the encoder's unresolved fixup, made into a stuck state.
+///
+/// The shape is [`x64_ir::unmap_register`](super::x64_ir::unmap_register)'s,
+/// which is the shape the translation copes with: one index, one accumulator
+/// that starts at the "nothing found" sentinel, no early return, and the
+/// accumulator never read inside the loop — so the loop's state is one
+/// unchanging shape and the fixed point is immediate. Keeping the *first*
+/// match, which is what `Machine.lean`'s `pos` names, is what the reversed
+/// index is for: the scan walks the list backwards, so the surviving write is
+/// the earliest position that matches.
+fn find_label(code: &[PInsn], t: PTarget) -> usize {
+  let n = code.len();
   let mut i: usize = 0;
-  let mut found = false;
-  let mut at: usize = 0;
-  while i < code.len() {
-    let here = is_target(t, code[i]);
-    if !found && here {
-      found = true;
-      at = i;
+  let mut at: usize = n;
+  while i < n {
+    let j = n - 1 - i;
+    if is_target(t, &code[j]) {
+      at = j;
     }
     i += 1;
   }
-  (found, at)
+  at
 }
 
 /// Jumps to `t`, or reports a target the list does not carry.
 fn branch(code: &[PInsn], s: &mut Sim, t: PTarget) -> Outcome {
-  let (found, at) = find_label(code, t);
-  if found {
+  let n = code.len();
+  let at = find_label(code, t);
+  if at < n {
     s.pc = at;
     Outcome::Next
   } else {
@@ -1040,8 +1049,9 @@ fn ret(code: &[PInsn], s: &mut Sim) -> Outcome {
 
 /// `call` to a label: push `code_base + (pc + 1)` and go.
 fn call(code: &[PInsn], s: &mut Sim, t: PTarget) -> Outcome {
-  let (found, at) = find_label(code, t);
-  if found {
+  let n = code.len();
+  let at = find_label(code, t);
+  if at < n {
     let ret_addr = add64(s.code_base, (s.pc + 1) as u64);
     let pushed = push(s, ret_addr);
     match pushed {
